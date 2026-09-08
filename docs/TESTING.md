@@ -48,6 +48,7 @@ area. Compile **one entry point at a time**; each declares `@main`.
 | `FinderFileUndoTests.swift` | Undo/Redo history, partial completion, upload batches, and account isolation. |
 | `WorkspaceSwitchingTests.swift` | Tab switching, cached presentation, cancellation, and performance. |
 | `SharedLinkSelectionTests.swift` | Selection across links, recursive roots, batch saving, and download routing. |
+| `SharedLinkRetryTests.swift` | Batch retries, concurrency limits, saved access codes, selection preservation, cancellation, and selection regressions. |
 | `TaskActivityTests.swift` | File-menu tasks, footer progress, results, and account-scoped updates. |
 
 Other test files may require different flags, companion fixture engines, or a
@@ -72,8 +73,10 @@ Files named `*UITestApp.swift` are interactive test apps. For example,
 `SharedLinkSelectionUITestApp.swift` presents the production Links interface
 with synthetic shares and in-memory saves. `FileUndoUITestApp.swift` supplies
 synthetic actions for the Edit menu and keyboard shortcuts.
+`SharedLinkRetryUITestApp.swift` adds failed links with delayed local responses
+to check the batch retry button, progress, and completion results.
 
-For these two fixtures, use the full source list and `FINDER_WORKSPACE_TESTS`
+For these fixtures, use the full source list and `FINDER_WORKSPACE_TESTS`
 flag above, replacing the test entry point with the fixture app. A fixture
 needs its own `.app` wrapper with matching executable metadata and a **distinct
 bundle identifier**. Keep it under ignored `dist/`, and do not bundle the
@@ -86,7 +89,7 @@ tokens, and user files must stay out of repository artifacts.
 ## Release build check
 
 After configuring local credentials as described in the
-[README](../README.md#3-configure-local-client-credentials):
+[README](../README.md#3-provide-application-configuration-for-the-build):
 
 ```sh
 ./scripts/build-app.sh

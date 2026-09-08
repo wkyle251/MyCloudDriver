@@ -422,6 +422,11 @@ struct SharedLinkEntry: Identifiable, Equatable, Codable {
     let addedAt: Date
 }
 
+struct SharedLinkRetryProgress: Equatable {
+    let completed: Int
+    let total: Int
+}
+
 struct ShareAccessInput: Codable, Equatable {
     let url: String
     let passCode: String
@@ -1994,6 +1999,7 @@ final class DownloaderModel: ObservableObject {
     private var fileUndoFixtureItems: [String: BrowserItem] = [:]
     private var fileUndoFixtureTrashed: Set<String> = []
     private var sharedSaveFixtureRequests: [PendingSharedSaveRequest] = []
+    private var sharedLinkLoadFixture: ((UUID, ShareBrowseInput, Process) -> Void)?
     private init(finderFixture: Bool, defaults: UserDefaults) {
         outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("Offline Downloads")
         isFinderWorkspaceFixture = finderFixture
@@ -2364,6 +2370,7 @@ final class DownloaderModel: ObservableObject {
     /// remain selectable and disconnectable.
     @Published private var savingSharedItemIDsByLinkID: [UUID: Set<String>] = [:]
     @Published private(set) var sharedLinks: [SharedLinkEntry] = []
+    @Published private(set) var sharedLinkRetryProgress: SharedLinkRetryProgress?
     @Published private(set) var activeSharedLinkID: UUID?
     @Published private(set) var selectedSharedLinkRootID: UUID?
     private var sharedBrowserSelectionAnchor: SharedBrowserSelectionAnchor?
@@ -2743,6 +2750,10 @@ final class DownloaderModel: ObservableObject {
     private var sharedLinkLoadProcesses: [UUID: Process] = [:]
     private var sharedLinkLoadInputURLs: [UUID: URL] = [:]
     private var sharedLinkLoadsStoppedForLogin = Set<UUID>()
+    private var pendingSharedLinkLoads: [(linkID: UUID, request: ShareBrowseInput)] = []
+    private let maximumConcurrentSharedLinkLoads = 4
+    private var isStartingPendingSharedLinkLoads = false
+    private var sharedLinkRetryBatchIDs = Set<UUID>()
     private var attemptedInitialBrowse = false
     private var shareAccess: ShareAccessInput?
     private var pendingSharedLinkOpenAfterLogin = false
@@ -2986,6 +2997,19 @@ final class DownloaderModel: ObservableObject {
     var activeSharedLink: SharedLinkEntry? {
         guard let activeSharedLinkID else { return nil }
         return sharedLinks.first(where: { $0.id == activeSharedLinkID })
+    }
+
+    var failedSharedLinkCount: Int {
+        sharedLinks.reduce(0) { count, entry in
+            if case .failed = entry.state { return count + 1 }
+            return count
+        }
+    }
+
+    var canRetryFailedSharedLinks: Bool {
+        !isRunning && !isClosingWindow && !isChangingAccount && !isLoginPresented
+            && deferredLoginReason == nil && sharedLinkRetryProgress == nil
+            && failedSharedLinkCount > 0
     }
 
     func isSharedItemSaved(_ itemID: String) -> Bool {
@@ -4288,6 +4312,7 @@ final class DownloaderModel: ObservableObject {
     private var accountWorkIsActive: Bool {
         isRunning || hasBackgroundActivity || isSavingSharedItems
             || !sharedLinkLoadProcesses.isEmpty || !sharedSaveProcesses.isEmpty || !browserTreeLoadProcesses.isEmpty
+            || !pendingSharedLinkLoads.isEmpty || sharedLinkRetryProgress != nil
             || !archiveProcesses.isEmpty || !pendingBrowserMoves.isEmpty || !pendingSharedSaveRequests.isEmpty
             || !fileOpener.activeNames.isEmpty
             || fileSearch.isScanning || fileSearch.isResolving
@@ -4432,6 +4457,9 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func clearAccountWorkspace() {
+        pendingSharedLinkLoads = []
+        sharedLinkRetryBatchIDs = []
+        sharedLinkRetryProgress = nil
         sharedBrowserSelectionAnchor = nil
         clearTransferAccountContext()
         resetDownloadProgress(); downloadRunState = .ready
@@ -4949,10 +4977,15 @@ final class DownloaderModel: ObservableObject {
     }
 
     func retrySharedLink(_ linkID: UUID) {
-        guard !isRunning,
-              sharedLinkLoadProcesses[linkID]?.isRunning != true,
+        guard !isRunning, !isClosingWindow, !isChangingAccount,
+              sharedLinkLoadProcesses[linkID] == nil,
+              !pendingSharedLinkLoads.contains(where: { $0.linkID == linkID }),
               var session = sharedLinkSessions[linkID]
         else { return }
+        guard hasUsableSession else {
+            presentLogin(reason: "Sign in to retry this shared link.")
+            return
+        }
         activateSharedLink(linkID)
         updateSharedLink(linkID) { entry in
             entry.state = .loading
@@ -4976,6 +5009,71 @@ final class DownloaderModel: ObservableObject {
         runInitialSharedLinkLoad(linkID: linkID, request: request)
     }
 
+    /// Snapshot failed roots once. Preparing their requests together preserves
+    /// the active workspace and prevents another click from enqueuing duplicates.
+    func retryAllFailedSharedLinks() {
+        guard canRetryFailedSharedLinks else { return }
+        guard hasUsableSession else {
+            setShareLinkFeedback("Sign in, then choose Retry Failed Links.", tone: .info)
+            presentLogin(reason: "Sign in to retry your failed shared links.")
+            return
+        }
+        let ids = sharedLinks.compactMap { entry -> UUID? in
+            guard case .failed = entry.state,
+                  sharedLinkSessions[entry.id] != nil,
+                  sharedLinkLoadProcesses[entry.id] == nil,
+                  !pendingSharedLinkLoads.contains(where: { $0.linkID == entry.id })
+            else { return nil }
+            return entry.id
+        }
+        guard !ids.isEmpty else { return }
+        sharedLinkRetryBatchIDs = Set(ids)
+        sharedLinkRetryProgress = .init(completed: 0, total: ids.count)
+        for index in sharedLinks.indices where sharedLinkRetryBatchIDs.contains(sharedLinks[index].id) {
+            let id = sharedLinks[index].id
+            guard var session = sharedLinkSessions[id] else { continue }
+            session.workspace = nil
+            sharedLinkSessions[id] = session
+            sharedLinks[index].state = .loading
+            expandedSharedLinkIDs.insert(id)
+            pendingSharedLinkLoads.append((id, ShareBrowseInput(
+                access: session.access, parentId: nil, pageToken: nil, limit: 200
+            )))
+        }
+        if isBrowsingSharedLink, let activeSharedLinkID, sharedLinkRetryBatchIDs.contains(activeSharedLinkID) {
+            sharedBrowserWorkspace = nil
+            shareLinkIsOpen = false
+            resetBrowserWorkspace(root: .sharedRoot)
+        }
+        refreshActiveSharedLinkLoadingState()
+        let noun = ids.count == 1 ? "link" : "links"
+        setShareLinkFeedback("Retrying \(ids.count.formatted()) failed \(noun)…", tone: .progress)
+        setStatus("Retrying \(ids.count.formatted()) failed shared \(noun)…")
+        persistSharedLinkState()
+        startPendingSharedLinkLoads()
+    }
+
+    private func refreshSharedLinkRetryProgress() {
+        guard !sharedLinkRetryBatchIDs.isEmpty else { return }
+        let entries = sharedLinks.filter { sharedLinkRetryBatchIDs.contains($0.id) }
+        let total = sharedLinkRetryBatchIDs.count
+        let loading = entries.filter { $0.state == .loading }.count
+        guard loading == 0 else {
+            sharedLinkRetryProgress = .init(completed: total - loading, total: total)
+            return
+        }
+        let opened = entries.filter { $0.state == .ready }.count
+        let failed = entries.count - opened
+        let removed = total - entries.count
+        sharedLinkRetryBatchIDs = []
+        sharedLinkRetryProgress = nil
+        guard !isClosingWindow else { return }
+        var message = "Retry complete: \(opened.formatted()) opened, \(failed.formatted()) still failed."
+        if removed > 0 { message += " \(removed.formatted()) disconnected." }
+        setShareLinkFeedback(message, tone: failed > 0 ? .error : .success)
+        setStatus(message)
+    }
+
     /// Editing repoints an existing row, so it needs the same quiet state that
     /// disconnecting does plus no in-flight load for this link.
     func canEditSharedLink(_ linkID: UUID) -> Bool {
@@ -4983,7 +5081,8 @@ final class DownloaderModel: ObservableObject {
         // still needs the foreground lane to be free.
         !isRunning
             && canDisconnectSharedLink(linkID)
-            && sharedLinkLoadProcesses[linkID]?.isRunning != true
+            && sharedLinkLoadProcesses[linkID] == nil
+            && !pendingSharedLinkLoads.contains(where: { $0.linkID == linkID })
             && sharedLinks.contains { $0.id == linkID }
     }
 
@@ -5061,6 +5160,8 @@ final class DownloaderModel: ObservableObject {
 
     func removeSharedLink(_ linkID: UUID) {
         guard canDisconnectSharedLink(linkID) else { return }
+        defer { startPendingSharedLinkLoads() }
+        pendingSharedLinkLoads.removeAll { $0.linkID == linkID }
         if let process = sharedLinkLoadProcesses.removeValue(forKey: linkID),
            process.isRunning {
             process.terminate()
@@ -8015,8 +8116,16 @@ final class DownloaderModel: ObservableObject {
         _ = cancelQuickLook()
         quickLookCopies.removeAll(); quickLookCopyOrder.removeAll()
         fileOpener.cancelAll()
+        pendingSharedLinkLoads = []
+        sharedLinkRetryBatchIDs = []
+        sharedLinkRetryProgress = nil
         #if FINDER_WORKSPACE_TESTS
-        if isFinderWorkspaceFixture { fileSearch.close(); return }
+        if isFinderWorkspaceFixture {
+            isClosingWindow = true
+            sharedLinkLoadProcesses.removeAll()
+            fileSearch.close()
+            return
+        }
         #endif
         guard !isClosingWindow else { return }
         flushAllUploadOutputLines()
@@ -10825,21 +10934,72 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
-    /// Resolve an added shared URL without borrowing the single foreground
-    /// Browser helper. Requests are keyed by link id, so several slow links can
-    /// authenticate and load concurrently while the outline remains usable.
+    /// Link roots use a bounded queue separate from the foreground Browser
+    /// helper, so a large retry batch cannot spawn a process for every URL.
     private func runInitialSharedLinkLoad(
         linkID: UUID,
         request: ShareBrowseInput
     ) {
+        guard sharedLinkLoadProcesses[linkID] == nil,
+              !pendingSharedLinkLoads.contains(where: { $0.linkID == linkID })
+        else { return }
+        pendingSharedLinkLoads.append((linkID, request))
+        startPendingSharedLinkLoads()
+    }
+
+    private func startPendingSharedLinkLoads() {
+        guard !isStartingPendingSharedLinkLoads else { return }
+        isStartingPendingSharedLinkLoads = true
+        defer {
+            isStartingPendingSharedLinkLoads = false
+            refreshActiveSharedLinkLoadingState()
+            refreshSharedLinkRetryProgress()
+        }
+        guard !isClosingWindow, hasUsableSession, !isLoginPresented, deferredLoginReason == nil else {
+            failPendingSharedLinkLoads(message: "Sign in, then retry this link.")
+            return
+        }
+        while sharedLinkLoadProcesses.count < maximumConcurrentSharedLinkLoads,
+              !pendingSharedLinkLoads.isEmpty {
+            let pending = pendingSharedLinkLoads.removeFirst()
+            guard sharedLinkSessions[pending.linkID] != nil,
+                  sharedLinks.contains(where: { $0.id == pending.linkID && $0.state == .loading })
+            else { continue }
+            startInitialSharedLinkLoad(linkID: pending.linkID, request: pending.request)
+            // A launch failure can request fresh sign-in synchronously.
+            if isClosingWindow || !hasUsableSession || isLoginPresented || deferredLoginReason != nil {
+                failPendingSharedLinkLoads(message: "Sign in, then retry this link.")
+                break
+            }
+        }
+    }
+
+    private func failPendingSharedLinkLoads(message: String) {
+        let pending = pendingSharedLinkLoads
+        pendingSharedLinkLoads = []
+        for load in pending { markSharedLinkFailed(load.linkID, message: message) }
+        refreshActiveSharedLinkLoadingState()
+        refreshSharedLinkRetryProgress()
+    }
+
+    private func startInitialSharedLinkLoad(linkID: UUID, request: ShareBrowseInput) {
         guard hasUsableSession else {
+            markSharedLinkFailed(linkID, message: "Sign in, then retry this link.")
             presentLogin(reason: "Complete the desktop-session sign-in before accessing PikPak.")
             return
         }
-        guard sharedLinkLoadProcesses[linkID]?.isRunning != true,
+        guard sharedLinkLoadProcesses[linkID] == nil,
               sharedLinkSessions[linkID] != nil,
               sharedLinks.contains(where: { $0.id == linkID })
         else { return }
+        #if FINDER_WORKSPACE_TESTS
+        if isFinderWorkspaceFixture, let sharedLinkLoadFixture {
+            let process = Process()
+            sharedLinkLoadProcesses[linkID] = process
+            sharedLinkLoadFixture(linkID, request, process)
+            return
+        }
+        #endif
         guard let engineURL = Bundle.main.url(forResource: "pikpak", withExtension: nil) else {
             markSharedLinkFailed(linkID, message: "The bundled shared-link engine is missing.")
             setError("The bundled download engine is missing. Rebuild the app.")
@@ -10965,6 +11125,7 @@ final class DownloaderModel: ObservableObject {
         guard let trackedProcess = sharedLinkLoadProcesses[linkID],
               trackedProcess === finishedProcess
         else { return }
+        defer { startPendingSharedLinkLoads() }
 
         sharedLinkLoadProcesses.removeValue(forKey: linkID)
         if let inputURL = sharedLinkLoadInputURLs.removeValue(forKey: linkID) {
@@ -16289,6 +16450,9 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func synchronizeSharedSessionFromDisk() {
+        #if FINDER_WORKSPACE_TESTS
+        if isFinderWorkspaceFixture { return }
+        #endif
         do {
             let newestToken: String
             if let accountStore, let activeAccountID, activeSavedAccount?.needsSignIn == false {
@@ -16879,6 +17043,7 @@ final class DownloaderModel: ObservableObject {
 
     private func presentLogin(reason: String, fromSettings: Bool = false) {
         guard !isClosingWindow else { return }
+        failPendingSharedLinkLoads(message: "Sign in, then retry this link.")
         loginFromSettings = fromSettings
         if !loginFromSettings {
             accountLoginTargetID = activeAccountID
@@ -17510,6 +17675,130 @@ extension DownloaderModel {
         }
         model.activateSharedLink(model.sharedLinks[0].id)
         return model
+    }
+
+    static func sharedLinkRetryFixture(defaults: UserDefaults, failedCount: Int = 9, automatic: Bool = false) -> DownloaderModel {
+        let model = sharedSelectionFixture(defaults: defaults)
+        model.finderSettings.showsPreviewPane = false
+        for number in 1...max(1, failedCount) {
+            let id = UUID()
+            let access = ShareAccessInput(url: "https://mypikpak.com/s/offline-retry-\(number)",
+                passCode: "fixture-code-\(number)", passCodeToken: "fixture-cache-\(number)")
+            model.sharedLinks.append(.init(id: id, url: access.url, name: "Example Link \(number + 2)",
+                state: .failed("The connection timed out. Retry this link."), savedItemCount: 1, addedAt: Date()))
+            model.sharedLinkSessions[id] = SharedLinkSession(access: access, workspace: nil, savedItemIDs: ["already-saved"])
+        }
+        if automatic {
+            model.sharedLinkLoadFixture = { [weak model] id, request, process in
+                Task { @MainActor [weak model] in
+                    try? await Task.sleep(nanoseconds: 4_000_000_000)
+                    model?.completeSharedLinkLoadFixture(id: id, request: request, process: process,
+                        succeeds: !request.url.hasSuffix("-3"))
+                }
+            }
+        }
+        return model
+    }
+
+    private func completeSharedLinkLoadFixture(id: UUID, request: ShareBrowseInput, process: Process, succeeds: Bool) {
+        let page = ShareBrowsePage(files: [], nextPageToken: nil, shareId: "fixture-share", passCodeToken: "fixture-new-cache",
+            parentId: "", folderName: "Example Shared Folder")
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let output = String(data: try! encoder.encode(page), encoding: .utf8)!
+        finishInitialSharedLinkLoad(linkID: id, request: request, process: process,
+            exitCode: succeeds ? 0 : 1, structuredOutput: succeeds ? output : "",
+            errorOutput: succeeds ? "" : "Connection reset by peer")
+    }
+
+    static func testSharedLinkRetries(defaults: UserDefaults) {
+        typealias Load = (id: UUID, request: ShareBrowseInput, process: Process)
+        let model = sharedLinkRetryFixture(defaults: defaults, failedCount: 10)
+        var launched: [Load] = []
+        model.sharedLinkLoadFixture = { launched.append(($0, $1, $2)) }
+        let alreadyLoading = model.sharedLinks.last!.id
+        model.updateSharedLink(alreadyLoading) { $0.state = .loading }
+        model.runInitialSharedLinkLoad(linkID: alreadyLoading, request: .init(
+            access: model.sharedLinkSessions[alreadyLoading]!.access, parentId: nil, pageToken: nil, limit: 200))
+        let active = model.activeSharedLinkID
+        model.toggleBrowserCheckbox(model.browserItem(withID: "Projects")!)
+        let selection = model.selectedBrowserItemIDs
+        let items = model.browserItems
+        let ready = Array(model.sharedLinks.prefix(2))
+        let expectedAccess = model.sharedLinkSessions.mapValues(\.access)
+        let failedID = model.sharedLinks[2].id
+        model.retryAllFailedSharedLinks()
+        precondition(model.sharedLinkRetryProgress == .init(completed: 0, total: 9))
+        precondition(launched.count == 4 && model.pendingSharedLinkLoads.count == 6,
+            "the batch shares four slots with requests that were already loading")
+        precondition(model.activeSharedLinkID == active && model.selectedBrowserItemIDs == selection && model.browserItems == items,
+            "batch retry preserves the active ready link and its selected files")
+        precondition(Array(model.sharedLinks.prefix(2)) == ready, "ready links are untouched")
+        precondition(model.accountWorkIsActive, "queued work prevents an account change")
+        model.retryAllFailedSharedLinks()
+        let queued = model.pendingSharedLinkLoads.last!.linkID
+        model.retrySharedLink(queued)
+        precondition(launched.count == 4 && model.pendingSharedLinkLoads.count == 6 && !model.canEditSharedLink(queued),
+            "repeated batch or row clicks cannot duplicate or edit a queued request")
+        model.removeSharedLink(queued)
+        precondition(model.sharedLinkRetryProgress == .init(completed: 1, total: 9))
+        precondition(!model.pendingSharedLinkLoads.contains { $0.linkID == queued })
+        precondition(model.activateAccountBrowser(), "the account browser stays available during retries")
+        model.isRunning = true // An unrelated foreground request must not stall the batch.
+        var completed = 0
+        while completed < launched.count {
+            let load = launched[completed]
+            precondition(load.request.url == expectedAccess[load.id]!.url
+                && load.request.passCode == expectedAccess[load.id]!.passCode
+                && load.request.passCodeToken == expectedAccess[load.id]!.passCodeToken,
+                "each request retains its own saved URL and access code")
+            model.completeSharedLinkLoadFixture(id: load.id, request: load.request, process: load.process, succeeds: load.id != failedID)
+            precondition(model.sharedLinkLoadProcesses.count <= 4)
+            completed += 1
+        }
+        model.isRunning = false
+        precondition(launched.count == 9 && Set(launched.map(\.id)).count == 9 && !launched.contains { $0.id == queued })
+        precondition(model.sharedLinkRetryProgress == nil && model.pendingSharedLinkLoads.isEmpty && model.failedSharedLinkCount == 1)
+        precondition(model.shareLinkFeedbackMessage == "Retry complete: 7 opened, 1 still failed. 1 disconnected.")
+        precondition(model.browserSource == .account, "late completions never switch tabs")
+        precondition(model.sharedLinkSessions[failedID]!.savedItemIDs == ["already-saved"], "retry keeps saved-item history")
+        model.retryAllFailedSharedLinks()
+        precondition(model.sharedLinkRetryProgress == .init(completed: 0, total: 1) && launched.last!.id == failedID)
+        let last = launched.last!
+        model.completeSharedLinkLoadFixture(id: last.id, request: last.request, process: last.process, succeeds: true)
+        model.completeSharedLinkLoadFixture(id: last.id, request: last.request, process: last.process, succeeds: false)
+        precondition(model.failedSharedLinkCount == 0 && model.sharedLinkRetryProgress == nil && !model.canRetryFailedSharedLinks,
+            "late or duplicate callbacks cannot overwrite a successful retry")
+        print("PASS link retries: failed-only snapshot, four-worker bound, access-code isolation, preserved selection, disconnect, repeat clicks and mixed results")
+
+        let interrupted = sharedLinkRetryFixture(defaults: defaults)
+        var interruptedLoads: [Load] = []
+        interrupted.sharedLinkLoadFixture = { interruptedLoads.append(($0, $1, $2)) }
+        interrupted.retryAllFailedSharedLinks()
+        interrupted.deferredLoginReason = "Fixture requires sign-in"
+        let first = interruptedLoads[0]
+        interrupted.completeSharedLinkLoadFixture(id: first.id, request: first.request, process: first.process, succeeds: false)
+        precondition(interruptedLoads.count == 4 && interrupted.pendingSharedLinkLoads.isEmpty && interrupted.failedSharedLinkCount == 6,
+            "authentication interruption stops all queued requests")
+        interrupted.stopForWindowClose()
+        for load in interruptedLoads.dropFirst() {
+            interrupted.completeSharedLinkLoadFixture(id: load.id, request: load.request, process: load.process, succeeds: true)
+        }
+        precondition(interrupted.sharedLinkRetryProgress == nil && interrupted.sharedLinkLoadProcesses.isEmpty && interruptedLoads.count == 4)
+        precondition(!interrupted.canRetryFailedSharedLinks)
+        print("PASS link retries: login interruption, window-close cancellation and ignored late callbacks")
+
+        let signedOut = sharedLinkRetryFixture(defaults: defaults, failedCount: 1)
+        signedOut.refreshToken = ""
+        signedOut.retryAllFailedSharedLinks()
+        precondition(signedOut.isLoginPresented && signedOut.failedSharedLinkCount == 1 && signedOut.sharedLinkRetryProgress == nil)
+        let missingEngine = sharedLinkRetryFixture(defaults: defaults, failedCount: 50)
+        missingEngine.activateSharedLink(missingEngine.sharedLinks[2].id)
+        missingEngine.retryAllFailedSharedLinks()
+        precondition(missingEngine.failedSharedLinkCount == 50 && missingEngine.sharedLinkRetryProgress == nil
+            && missingEngine.pendingSharedLinkLoads.isEmpty && missingEngine.sharedLinkLoadProcesses.isEmpty && !missingEngine.isOpeningShareLink,
+            "synchronous launch failures drain the queue without recursion or stuck spinners")
+        print("PASS link retries: signed-out prompt and failed helper launch recovery")
     }
 
     static func testSharedSelection(defaults: UserDefaults) {

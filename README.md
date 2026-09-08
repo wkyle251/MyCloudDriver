@@ -36,6 +36,9 @@ tokens, create an `.env` file, or configure account credentials manually.
 - **Batch selection:** use checkboxes, Command-click, or Shift-click. Selected
   folders include their contents. In Links, right-click a selected item and
   choose **Save N Items to My PikPak** to save the whole selection.
+- **Retry failed links:** choose **Retry Failed Links** above the Links list to
+  retry all failed URLs with their saved access codes. Up to four links load at
+  once; the progress count and final result appear above the list.
 - **Background extraction:** extract supported cloud archives while continuing
   to use the app. Password-protected archives prompt for a password; progress
   appears in the status area.

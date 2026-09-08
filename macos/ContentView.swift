@@ -1004,12 +1004,37 @@ struct ContentView: View {
                     onSubmit: { model.openSharedLink() }
                 )
 
-                Label(
-                    "Links use this app's private desktop session, including Save to My PikPak. Safari's separate Web session is never read or refreshed.",
-                    systemImage: "checkmark.shield"
-                )
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    Label(
+                        "Links use this app's private desktop session, including Save to My PikPak. Safari's separate Web session is never read or refreshed.",
+                        systemImage: "checkmark.shield"
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    if let progress = model.sharedLinkRetryProgress {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text("Retrying links: \(progress.completed.formatted()) of \(progress.total.formatted())")
+                                .font(.caption).monospacedDigit()
+                        }
+                        .fixedSize()
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("Retrying failed links")
+                        .accessibilityValue("\(progress.completed) of \(progress.total) completed")
+                    } else if model.failedSharedLinkCount > 0 {
+                        Button { model.retryAllFailedSharedLinks() } label: {
+                            Label("Retry Failed Links (\(model.failedSharedLinkCount.formatted()))", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered).pointingHandCursor()
+                        .fixedSize()
+                        .disabled(!model.canRetryFailedSharedLinks)
+                        .help("Retry every failed link using its saved access code. Links already open or loading are skipped.")
+                        .accessibilityLabel("Retry All Failed Links")
+                        .accessibilityValue("\(model.failedSharedLinkCount) failed \(model.failedSharedLinkCount == 1 ? "link" : "links")")
+                    }
+                }
 
                 if let message = model.shareLinkFeedbackMessage {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
