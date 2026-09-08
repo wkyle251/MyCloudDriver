@@ -8,6 +8,10 @@ The interface uses SwiftUI and AppKit, with a bundled Rust engine for cloud
 operations. This is an unofficial client and requires your own PikPak account.
 Changes to PikPak's API can affect functionality.
 
+To use a built app, sign in through **Settings → Accounts**. The app obtains,
+verifies, and saves your account session automatically. You do not need to copy
+tokens, create an `.env` file, or configure account credentials manually.
+
 [Features](#features) · [Build the app](#build-the-app) ·
 [First use](#first-use) · [Troubleshooting](#troubleshooting) ·
 [Development](#development)
@@ -40,6 +44,10 @@ Changes to PikPak's API can affect functionality.
   share imports, and extractions are outside this history.
 
 ## Build the app
+
+These steps are for compiling the app from source. The application configuration
+used during a build is separate from the account session created by signing in
+to the finished app.
 
 ### 1. Install the prerequisites
 
@@ -79,12 +87,18 @@ cd MyCloudDriver
 Access to this private repository requires an authorized GitHub account. Run
 the remaining commands from the repository root.
 
-### 3. Configure local client credentials
+### 3. Provide application configuration for the build
 
-The app needs two OAuth **application client secrets**, which are excluded from
-Git. Obtain the matching Web and desktop client secrets from the project
-maintainer through a private channel. These fields do not take your account
-password or refresh token; you sign in to your account in the app after building.
+Source builds need two OAuth **application client secrets**, which are excluded
+from Git. These identify the application's Web and desktop client profiles and
+are used to perform sign-in; account login does not create them. Obtain the
+matching values from the project maintainer through a private channel. Do not
+put your account password or refresh token in these fields.
+
+If `.local/pikpak-client-credentials.json` is already configured, skip to
+[Build](#4-build). The build script reads it automatically on each build. Users
+of the finished app receive this application configuration in the app bundle
+and only need to sign in with their own PikPak account.
 
 Create the local configuration without overwriting an existing file:
 
@@ -170,7 +184,8 @@ process.
 ## First use
 
 1. Sign in when prompted, or open **Settings → Accounts**. Complete sign-in on
-   PikPak's page in the app's login window.
+   PikPak's page in the app's login window. The app verifies your account and
+   saves its session automatically for future launches.
 2. Use **Browser** to navigate your folders. Choose **View → as List** or
    **View → as Thumbnails** to change the display.
 3. Select items and choose **Add Selected Items to Download Queue**. Open
@@ -202,8 +217,10 @@ control.
 
 ## Credentials and local data
 
-Build credentials stay in `.local/pikpak-client-credentials.json` or the build
-environment. Account login data is managed separately by the app under:
+Application client configuration is supplied through
+`.local/pikpak-client-credentials.json` or the build environment and included in
+the generated app. Account login data is created and managed automatically by
+the app under:
 
 ```text
 ~/Library/Application Support/My PikPak for Mac/
@@ -229,7 +246,7 @@ before pushing. Only placeholder configuration templates belong in Git.
 | Client credentials are missing or invalid | Check that the local file is valid JSON and both values are nonempty. It belongs in `.local/`; `.env` is not loaded by the build helper. |
 | Architecture mismatch | Check for an ARM Rust host and an `arm64` Terminal session. The app script targets Apple Silicon only. |
 | The UI looks like an older version | Quit other copies, launch from `~/Applications`, and archive loose backup apps using the helper above. |
-| The app requests sign-in again | Check the current account in Settings → Accounts. Account sessions are separate from build credentials. |
+| The app requests sign-in again | Sign in through Settings → Accounts; the app saves the new session automatically. No manual token or build configuration changes are needed. |
 | A cloud operation fails | Open the footer's status details. Account limits, connectivity, and PikPak API changes can affect operations. |
 
 ## Development
