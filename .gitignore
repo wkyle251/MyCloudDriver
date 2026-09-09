@@ -65,3 +65,10 @@ __pycache__/
 *~
 *.swp
 *.swo
+
+# FileTwin build outputs, native models and private similarity catalogs
+/vendor/FileTwin/target/
+.filetwin/
+*.onnx
+*.torchscript.pt
+*.dylib

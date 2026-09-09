@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum FinderTaskKind: String, CaseIterable, Identifiable {
-    case duplicates, emptyFolders, dsStore, folderMerge
+    case duplicates, emptyFolders, dsStore, folderMerge, similarityCloud, similarityLocal
     var id: Self { self }
     var title: String {
         switch self {
@@ -9,6 +9,8 @@ enum FinderTaskKind: String, CaseIterable, Identifiable {
         case .emptyFolders: return "Remove Empty Folders"
         case .dsStore: return "Remove .DS_Store Files"
         case .folderMerge: return "Merge Folders"
+        case .similarityCloud: return "Similar Files · PikPak Cloud"
+        case .similarityLocal: return "Similar Files · This Mac"
         }
     }
     var symbol: String {
@@ -17,6 +19,7 @@ enum FinderTaskKind: String, CaseIterable, Identifiable {
         case .emptyFolders: return "folder.badge.minus"
         case .dsStore: return "doc.badge.minus"
         case .folderMerge: return "arrow.triangle.merge"
+        case .similarityCloud, .similarityLocal: return "doc.text.magnifyingglass"
         }
     }
 }
@@ -101,8 +104,8 @@ final class FinderTaskActivityStore: ObservableObject {
         tasks.removeAll { $0.kind == kind && !$0.state.isActive }
     }
 
-    func reset() {
-        tasks = []
+    func reset(keeping kinds: Set<FinderTaskKind> = []) {
+        tasks.removeAll { !kinds.contains($0.kind) }
         showsDetails = false
         showsDuplicateResults = false
     }
@@ -137,6 +140,12 @@ struct FinderTaskActivityRows: View {
                     ErrorDiagnosticBlock(diagnostic: diagnostic, summary: task.message)
                 }
                 HStack {
+                    if task.kind == .similarityCloud || task.kind == .similarityLocal {
+                        Button(task.state.isActive ? "Show Scan…" : "Review Results…") {
+                            activity.showsDetails = false
+                            model.fileSimilarity.present(source: task.kind == .similarityCloud ? .cloud : .local)
+                        }
+                    }
                     if task.state.isActive {
                         Button("Cancel") { cancel(task.kind) }
                             .disabled(task.state == .stopping)
@@ -179,6 +188,8 @@ struct FinderTaskActivityRows: View {
         case .duplicates: model.cancelDuplicateScan()
         case .emptyFolders, .dsStore: model.cancelMaintenanceScan()
         case .folderMerge: model.cancelFolderMerge()
+        case .similarityCloud: model.fileSimilarity.cloud.cancel()
+        case .similarityLocal: model.fileSimilarity.local.cancel()
         }
     }
 }

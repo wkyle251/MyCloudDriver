@@ -18,6 +18,8 @@ esac
 
 cd "${PROJECT_ROOT}"
 python3 "${SCRIPT_DIRECTORY}/with-client-credentials.py" cargo build --release --locked
+cargo build --release --locked --manifest-path "${PROJECT_ROOT}/vendor/FileTwin/Cargo.toml" -p filetwin-worker
+python3 "${SCRIPT_DIRECTORY}/prepare-similarity-assets.py" --verify-only
 
 if [[ -e "${APP_BUNDLE}" ]]; then
     rm -rf -- "${APP_BUNDLE}"
@@ -44,6 +46,8 @@ swiftc \
     "${PROJECT_ROOT}/macos/CredentialParser.swift" \
     "${PROJECT_ROOT}/macos/PreviewTransport.swift" \
     "${PROJECT_ROOT}/macos/ImagePreview.swift" \
+    "${PROJECT_ROOT}/macos/FileSimilarity.swift" \
+    "${PROJECT_ROOT}/macos/FileSimilarityView.swift" \
     "${PROJECT_ROOT}/macos/FileSearch.swift" \
     "${PROJECT_ROOT}/macos/FileSearchView.swift" \
     "${PROJECT_ROOT}/macos/TransferScheduling.swift" \
@@ -72,12 +76,20 @@ swiftc \
     -o "${CONTENTS}/MacOS/${APP_EXECUTABLE}"
 
 cp "${PROJECT_ROOT}/target/release/pikpak" "${CONTENTS}/Resources/pikpak"
+cp "${PROJECT_ROOT}/vendor/FileTwin/target/release/filetwin-worker" "${CONTENTS}/Resources/filetwin-worker"
+python3 "${SCRIPT_DIRECTORY}/prepare-similarity-assets.py" --destination "${CONTENTS}/Resources/FileTwinModels"
+chmod 755 "${CONTENTS}/Resources/filetwin-worker"
 cp "${PROJECT_ROOT}/macos/Assets/AppIcon.icns" "${CONTENTS}/Resources/AppIcon.icns"
 cp "${PROJECT_ROOT}/macos/Info.plist" "${CONTENTS}/Info.plist"
 python3 "${SCRIPT_DIRECTORY}/with-client-credentials.py" --write-plist "${CONTENTS}/Info.plist"
 chmod 755 "${CONTENTS}/MacOS/${APP_EXECUTABLE}" "${CONTENTS}/Resources/pikpak"
 
 plutil -lint "${CONTENTS}/Info.plist"
-codesign --force --deep --sign - "${APP_BUNDLE}"
+# Preserve the upstream native-library bytes: FileTwin verifies their pinned
+# SHA-256 at runtime. Sign our executables explicitly instead of re-signing
+# third-party libraries with --deep.
+codesign --force --sign - "${CONTENTS}/Resources/pikpak"
+codesign --force --sign - "${CONTENTS}/Resources/filetwin-worker"
+codesign --force --sign - "${APP_BUNDLE}"
 
 print "Built: ${APP_BUNDLE}"

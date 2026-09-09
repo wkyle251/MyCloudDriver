@@ -9,6 +9,7 @@ pub mod error;
 pub mod file_undo;
 pub mod search;
 pub mod share;
+pub mod similarity;
 pub mod types;
 pub mod upload;
 pub mod upload_checkpoint;

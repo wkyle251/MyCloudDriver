@@ -50,9 +50,42 @@ area. Compile **one entry point at a time**; each declares `@main`.
 | `SharedLinkSelectionTests.swift` | Selection across links, recursive roots, batch saving, and download routing. |
 | `SharedLinkRetryTests.swift` | Batch retries, concurrency limits, saved access codes, selection preservation, cancellation, and selection regressions. |
 | `TaskActivityTests.swift` | File-menu tasks, footer progress, results, and account-scoped updates. |
+| `SimilarityTests.swift` | Integer limits, independent sources, a real local scan and cancellation, streamed progress, report decoding, and temporary cleanup. Pass the built app's `Contents/Resources` path as its first argument. |
 
 Other test files may require different flags, companion fixture engines, or a
 smaller source list. Read their entry points before running them.
+
+## FileTwin content similarity
+
+The cloud regression suite uses a local HTTP server and synthetic OAuth replies.
+It checks paginated listings, overlapping selections, download limits, hidden
+and oversized files, path traversal protection, cloud result mapping, and
+cancellation of a stalled request. It never contacts PikPak:
+
+```sh
+cargo test --locked --lib similarity::tests
+```
+
+After building the app, verify the actual bundled model, worker and native
+libraries. This creates synthetic TXT, DOCX, PDF, PNG, WAV and MP4 files and
+scans them without an account. FFmpeg 9 and ffprobe 9 must be installed:
+
+```sh
+python3 scripts/test-similarity-native.py \
+  --resources 'dist/My PikPak for Mac.app/Contents/Resources'
+```
+
+Compile `scripts/SimilarityTests.swift` with the native model test command above,
+then run it with the **absolute** `Contents/Resources` path. It launches the real
+local scanner from a private temporary directory; it uses no saved account.
+The imported FileTwin source is unchanged and includes its upstream Rust tests.
+`vendor/FileTwin/UPSTREAM-SHA256.json` records the imported source checksums.
+
+`SimilarityUITestApp.swift` renders the production review window with synthetic
+documents, image groups and skipped files. Verify the two source tabs, all three
+result filters, selection, coverage sheet, integer-only limits, and both small
+and large window sizes. Changing options should keep the **Last scan** scope
+and threshold attached to existing results until a new scan begins.
 
 ## Focused layout test
 

@@ -37,6 +37,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Scan local or PikPak content using the bundled FileTwin engine.
+    SimilarityScan(SimilarityScanArgs),
     /// List files and directories.
     Ls(LsArgs),
     /// Return one JSON page of folder entries for an interactive browser.
@@ -87,6 +89,12 @@ enum Command {
     Quota(QuotaArgs),
     /// Check the signed-in account and print its profile as JSON.
     Account,
+}
+
+#[derive(Debug, Parser)]
+struct SimilarityScanArgs {
+    #[arg(long)]
+    request_file: PathBuf,
 }
 
 #[derive(Debug, Parser)]
@@ -1262,13 +1270,31 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let command = cli.command;
+    // The local scanner is usable when signed out and needs no OAuth client.
+    let command = match cli.command {
+        Command::SimilarityScan(args) => {
+            let request: pikpak::similarity::ScanRequest = read_json_request(&args.request_file)?;
+            request.validate()?;
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            signal_hook::flag::register(signal_hook::consts::SIGTERM, cancelled.clone())?;
+            signal_hook::flag::register(signal_hook::consts::SIGINT, cancelled.clone())?;
+            if request.source == pikpak::similarity::ScanSource::Local {
+                return pikpak::similarity::scan(request, None, cancelled).await;
+            }
+            let (client, token) = build_client()?;
+            let result = pikpak::similarity::scan(request, Some(&client), cancelled).await;
+            persist_rotated_token(&client, &token).await;
+            return result;
+        }
+        command => command,
+    };
 
     // Every native-app operation, including share browsing, uses the app's
     // independently persisted desktop OAuth session. Its device id and
     // refresh-token lock are separate from Safari's Web token chain.
     let (client, original_token) = build_client()?;
     let result = match command {
+        Command::SimilarityScan(_) => unreachable!("handled before account setup"),
         Command::Ls(args) => cmd_ls(&client, args).await,
         Command::Browse(args) => cmd_browse(&client, args).await,
         Command::SearchIndex(args) => {

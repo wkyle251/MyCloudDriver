@@ -24,6 +24,9 @@ base64 = "0.22"
 bytes = "1"
 futures-util = "0.3"
 ring = "0.17"
+filetwin-core = { path = "vendor/FileTwin/crates/filetwin-core", features = ["bundled-sqlite"] }
+signal-hook = "0.3"
+tempfile = "3"
 
 [profile.release]
 lto = "thin"

@@ -1986,6 +1986,20 @@ final class DownloaderModel: ObservableObject {
     }()
     private(set) var finderSettings = FinderSettings()
     let fileSearch = FileSearchModel()
+    lazy var fileSimilarity: FileSimilarityCoordinator = {
+        let coordinator = FileSimilarityCoordinator(activity: taskActivity)
+        coordinator.cloud.onRunningChanged = { [weak self] in self?.objectWillChange.send() }
+        coordinator.configuration = { [weak self] source in
+            guard let self else { throw CocoaError(.userCancelled) }
+            return try self.similarityConfiguration(source)
+        }
+        coordinator.cloudScope = { [weak self] selection in
+            guard let self else { throw CocoaError(.userCancelled) }
+            return try self.similarityCloudScope(selection: selection)
+        }
+        coordinator.openCloudFile = { [weak self] file in self?.openSimilarityCloudFile(file) }
+        return coordinator
+    }()
     let imagePreview = ImagePreviewModel()
     var imagePreviewRequestGeneration: UUID { previewLoadGeneration }
     private var pendingFileSearchNavigation: FileSearchNavigation?
@@ -2082,6 +2096,12 @@ final class DownloaderModel: ObservableObject {
             activities[pid] = .init(name: "Indexing files for search",
                 detail: "\(fileSearch.contextName)\n\(fileSearch.indexedItems.formatted()) items · \(fileSearch.progress.scannedFolders.formatted()) folders indexed",
                 symbol: "magnifyingglass")
+        }
+        for scan in fileSimilarity.runs {
+            if let pid = scan.processIdentifier {
+                activities[pid] = .init(name: "Finding similar files · \(scan.source.title)",
+                    detail: "\(scan.scopeLabel)\n\(scan.message)\n\(scan.detail)", symbol: "doc.text.magnifyingglass")
+            }
         }
         var inApp: [String] = []
         if let pid = accountVerifier.processIdentifier {
@@ -4315,7 +4335,7 @@ final class DownloaderModel: ObservableObject {
             || !pendingSharedLinkLoads.isEmpty || sharedLinkRetryProgress != nil
             || !archiveProcesses.isEmpty || !pendingBrowserMoves.isEmpty || !pendingSharedSaveRequests.isEmpty
             || !fileOpener.activeNames.isEmpty
-            || fileSearch.isScanning || fileSearch.isResolving
+            || fileSearch.isScanning || fileSearch.isResolving || fileSimilarity.cloud.isRunning
     }
 
     private func applyAccounts(_ document: PikPakAccountsDocument) {
@@ -4475,7 +4495,8 @@ final class DownloaderModel: ObservableObject {
         emptyFolderScannedFolders = 0; emptyFolderDiscoveredFolders = 0; emptyFolderCandidateCount = 0
         emptyFolderCheckedFolders = 0; emptyFolderRemovedFolders = 0; emptyFolderSkippedFolders = 0
         emptyFolderCurrentPath = ""; maintenanceStatus = ""
-        taskActivity.reset()
+        fileSimilarity.cloud.clearAccount()
+        taskActivity.reset(keeping: [.similarityLocal])
         fileUndoHistory.reset()
         uploadUndoMutations.removeAll()
         _ = cancelQuickLook()
@@ -8113,6 +8134,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     func stopForWindowClose() {
+        fileSimilarity.close()
         _ = cancelQuickLook()
         quickLookCopies.removeAll(); quickLookCopyOrder.removeAll()
         fileOpener.cancelAll()
@@ -16468,6 +16490,95 @@ final class DownloaderModel: ObservableObject {
         } catch {
             appendOutput("Warning: shared session could not be reloaded: \(error.localizedDescription)\n")
         }
+    }
+
+    private func similarityConfiguration(_ source: SimilaritySource) throws -> SimilarityConfiguration {
+        guard !isClosingWindow else { throw CocoaError(.userCancelled) }
+        guard let resources = Bundle.main.resourceURL,
+              FileManager.default.isExecutableFile(atPath: resources.appendingPathComponent("filetwin-worker").path) else {
+            throw NSError(domain: "FileSimilarity", code: 1, userInfo: [NSLocalizedDescriptionKey: "The FileTwin worker is missing. Rebuild the app with the similarity components."])
+        }
+        let support = try LocalCredentialStore.applicationSupportDirectoryURL().appendingPathComponent("Similarity", isDirectory: true)
+        let identity: String
+        var environment: [String: String]
+        if source == .cloud {
+            guard hasUsableSession else {
+                throw NSError(domain: "FileSimilarity", code: 2, userInfo: [NSLocalizedDescriptionKey: "Sign in from Settings → Accounts before scanning PikPak files."])
+            }
+            environment = try engineEnvironment()
+            let proxy = proxyURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            environment["PIKPAK_PROXY"] = proxy.isEmpty ? nil : proxy
+            identity = "Cloud/\(activeAccountID?.uuidString ?? "desktop")"
+        } else {
+            // A local scan works without login or an OAuth configuration.
+            environment = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("PIKPAK_") }
+            identity = "Local"
+        }
+        return SimilarityConfiguration(executable: resources.appendingPathComponent("pikpak"),
+            models: resources.appendingPathComponent("FileTwinModels", isDirectory: true),
+            worker: resources.appendingPathComponent("filetwin-worker"),
+            dataDirectory: support.appendingPathComponent(identity, isDirectory: true),
+            temporaryDirectory: support.appendingPathComponent("Temporary", isDirectory: true), environment: environment)
+    }
+
+    private func similarityCloudScope(selection: Bool) throws -> [SimilarityCloudRoot] {
+        guard hasUsableSession else {
+            throw NSError(domain: "FileSimilarity", code: 2, userInfo: [NSLocalizedDescriptionKey: "Sign in from Settings → Accounts to choose cloud files. This Mac scans are available without signing in."])
+        }
+        guard !isBrowsingSharedLink else {
+            throw NSError(domain: "FileSimilarity", code: 3, userInfo: [NSLocalizedDescriptionKey: "Choose a folder or files in the Browser tab, then use that scope here. Shared links are not part of your cloud scan."])
+        }
+        if selection {
+            let items = browserItemsSelectedForAction
+            guard !items.isEmpty else {
+                throw NSError(domain: "FileSimilarity", code: 4, userInfo: [NSLocalizedDescriptionKey: "Select files or folders in Browser first, then choose Use Browser Selection."])
+            }
+            return items.map { item in
+                let route = browserNavigationStack(opening: item)
+                return SimilarityCloudRoot(id: item.id, name: item.name, path: route.last?.path ?? item.name,
+                    isFolder: item.isFolder, size: item.size,
+                    ancestors: route.dropFirst().dropLast().map { SimilarityAncestor(id: $0.id, name: $0.name) })
+            }
+        }
+        let folder = browserStack.last ?? .root
+        return [SimilarityCloudRoot(id: folder.id, name: folder.name, path: folder.path, isFolder: true, size: 0,
+            ancestors: browserStack.dropFirst().dropLast().map { SimilarityAncestor(id: $0.id, name: $0.name) })]
+    }
+
+    #if FINDER_WORKSPACE_TESTS
+    static func testSimilarityScope(defaults: UserDefaults) throws {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        let root = try model.similarityCloudScope(selection: false)
+        precondition(root.count == 1 && root[0].id.isEmpty && root[0].path == "/")
+        let projects = model.browserItems.first { $0.name == "Projects" }!
+        model.openFolder(projects)
+        let drafts = model.browserItems.first { $0.name == "Drafts" }!
+        model.selectBrowserItem(drafts)
+        let selected = try model.similarityCloudScope(selection: true)
+        precondition(selected.count == 1 && selected[0].isFolder && selected[0].path == "/Projects/Drafts")
+        precondition(selected[0].ancestors.map(\.id) == [projects.id])
+        model.taskActivity.begin(.similarityLocal, scope: "/Local", message: "Comparing")
+        precondition(!model.accountWorkIsActive, "Local similarity activity does not prevent switching cloud accounts")
+        model.fileSimilarity.cloud.cloudRoots = selected
+        model.fileSimilarity.cloud.clearAccount()
+        precondition(model.fileSimilarity.cloud.cloudRoots.isEmpty)
+        model.stopForWindowClose()
+        print("PASS current cloud folder, nested selection ancestry and account scope clearing")
+    }
+    #endif
+
+    private func openSimilarityCloudFile(_ file: SimilarityFile) {
+        guard let fileID = file.cloudId, hasUsableSession, !isClosingWindow else { return }
+        do {
+            // Results are account files even when the main window is in Links.
+            let configuration = try similarityConfiguration(.cloud)
+            let opening = FinderFileOpenConfiguration(executable: configuration.executable, environment: configuration.environment,
+                arguments: ["preview", "--id", fileID], exchangeDirectory: try makePrivateExchangeDirectory(),
+                copiesDirectory: try LocalCredentialStore.applicationSupportDirectoryURL().appendingPathComponent("Opened Files", isDirectory: true),
+                proxyURL: proxyURL)
+            fileOpener.open(identity: "similarity:\(activeAccountID?.uuidString ?? "desktop"):\(fileID):\(file.bytes)",
+                name: file.name, application: nil, configuration: opening)
+        } catch { fileSimilarity.cloud.error = "Could not open this cloud file: \(error.localizedDescription)" }
     }
 
     private func engineEnvironment() throws -> [String: String] {

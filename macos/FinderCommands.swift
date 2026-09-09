@@ -22,6 +22,7 @@ struct FinderWindowActions {
     var canRemoveDSStoreFiles: Bool
     var canMergeFolders: Bool
     var checkDuplicates: () -> Void
+    var findSimilarFiles: () -> Void
     var reviewDuplicates: () -> Void
     var removeEmptyFolders: () -> Void
     var removeDSStoreFiles: () -> Void
@@ -87,6 +88,8 @@ struct FinderCommands: Commands {
                 .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(actions?.canTrash != true)
             Divider()
+            Button("Find Similar Files…") { actions?.findSimilarFiles() }
+                .disabled(actions == nil)
             Button("Check for Duplicates") { actions?.checkDuplicates() }
                 .keyboardShortcut("d", modifiers: [.command, .shift])
                 .disabled(actions?.canCheckDuplicates != true)

@@ -782,6 +782,7 @@ struct ContentView: View {
                 model.scanCurrentFolderForDuplicates()
                 showTaskStatusAfterPresentation()
             },
+            findSimilarFiles: { model.fileSimilarity.present() },
             reviewDuplicates: { model.taskActivity.showsDuplicateResults = true },
             removeEmptyFolders: requestEmptyFolderCleanup,
             removeDSStoreFiles: requestDSStoreCleanup,
