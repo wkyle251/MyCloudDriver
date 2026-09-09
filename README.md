@@ -1,14 +1,15 @@
 # MyCloudDriver
 
-A native macOS app for managing PikPak cloud files, shared links, uploads, and
-downloads. The repository is named **MyCloudDriver**; the installed app is named
-**My PikPak for Mac**.
+A native macOS app for **PikPak, iCloud Drive and Apple Photos**. Choose a drive
+on the home screen, then browse, organise, preview and compare its content in a
+consistent workspace. The repository and installed app are named **MyCloudDriver**.
 
 The interface uses SwiftUI and AppKit, with a bundled Rust engine for cloud
-operations. This is an unofficial client and requires your own PikPak account.
-Changes to PikPak's API can affect functionality.
+operations. PikPak is an unofficial integration and requires your own PikPak
+account. iCloud Drive and Photos use the Apple Account configured on your Mac.
+Changes to provider APIs can affect functionality.
 
-To use a built app, sign in through **Settings → Accounts**. The app obtains,
+For PikPak, sign in through **Settings → Accounts**. The app obtains,
 verifies, and saves your account session automatically. You do not need to copy
 tokens, create an `.env` file, or configure account credentials manually.
 
@@ -20,6 +21,7 @@ tokens, create an `.env` file, or configure account credentials manually.
 
 | Area | What you can do |
 | --- | --- |
+| **Drives** | Start with PikPak, iCloud Drive or Apple Photos; use All Drives or the header switcher to change workspace without stopping background work. |
 | **Browser** | Browse in List or Thumbnails, search, select multiple items, rename, move, create folders, and move items to Trash. |
 | **Transfers** | Queue uploads and downloads, change worker limits, monitor progress, and pause, resume, or retry supported transfers. |
 | **Links** | Open multiple shared links, select items across expanded links, save selections to your PikPak, and queue downloads. |
@@ -27,6 +29,31 @@ tokens, create an `.env` file, or configure account credentials manually.
 | **Maintenance** | Check for duplicates, remove empty folders or `.DS_Store` files, and merge selected folders through the File menu. |
 | **Similarity** | Find similar documents, images, audio and video using FileTwin, with separate cloud and local scans. |
 | **Status** | Follow background activity in the footer; open its status control for progress, results, and available actions. |
+
+### Provider support
+
+| Function | PikPak | iCloud Drive | Apple Photos |
+| --- | --- | --- | --- |
+| Browse, search, list/grid, multi-select | Files and folders | Files and folders | Photos, videos and albums |
+| Open With and Space Quick Look | Downloads a copy | Downloads cloud-only files as needed | Fetches original media as needed |
+| Import / export | Upload / download queues | Copy into / out of the connected folder | Import media / export originals |
+| Organise | Create, rename, move, copy, Trash | Create, rename, move, copy, Finder Trash | Create/rename albums, add/move album membership, delete |
+| Duplicate and similarity scans | Cloud or separate This Mac scope | Selected items or current folder | Selected media, albums or library |
+| Cleanup and merge | Folder maintenance | Folder maintenance | Empty albums and album merging |
+| Archive extraction | PikPak's cloud extractor | Background extraction using macOS libarchive | Not applicable to a photo library |
+| Shared links | PikPak links | Not applicable | Not applicable |
+
+Photos uses the system photo library through PhotoKit. It does not expose
+arbitrary filename renaming or programmatic undelete. Album edits and membership
+changes have Undo; deleted media is restored in **Photos → Recently Deleted**.
+Opening or exporting produces the original still image or video, not a Photos
+editing session; a Live Photo's paired motion resource is not exported as a
+separate video. Photos edits are managed in Apple's app.
+
+iCloud file changes sync through macOS. Native imports and exports start
+immediately, show progress and support cancellation; PikPak retains its own
+pause/resume queue. iCloud rename, move, copy, Trash, cleanup, merge and extraction
+support session Undo. Existing PikPak Undo coverage is described below.
 
 - **Finder-style file actions:** right-click for **Open**, **Open With**, and
   **Other…**. Opening a cloud file fetches a local copy for the selected app.
@@ -174,12 +201,12 @@ Ordinary builds and scans do not download models. You may set
 ```
 
 The script builds the Rust engine and FileTwin worker with locked dependencies,
-compiles the native interface, bundles the model, ONNX Runtime, PDFium and
+compiles the native interface and C archive reader, bundles the model, ONNX Runtime, PDFium and
 notices, injects the local client configuration, and applies an ad-hoc signature.
 The completed app is:
 
 ```text
-dist/My PikPak for Mac.app
+dist/MyCloudDriver.app
 ```
 
 No Xcode project or workspace file is needed: the script invokes the compilers
@@ -199,19 +226,23 @@ available. This does not change the app's macOS 13 deployment target.
 
 ### 5. Install and launch
 
-1. Quit any running copy of **My PikPak for Mac** after its active work finishes.
-2. In Finder, copy `dist/My PikPak for Mac.app` into `~/Applications`. Create
+1. Quit any running copy of **MyCloudDriver** after its active work finishes.
+2. In Finder, copy `dist/MyCloudDriver.app` into `~/Applications`. Create
    that folder if necessary; choose **Replace** when updating an existing copy.
 3. Launch the app from `~/Applications`.
 
 You can launch that installed copy from Terminal:
 
 ```sh
-open "$HOME/Applications/My PikPak for Mac.app"
+open "$HOME/Applications/MyCloudDriver.app"
 ```
 
 Keep rollback copies as ZIP archives. Loose backup `.app` bundles share the
 same app identity, and macOS launchers can open an older copy by mistake.
+When upgrading from **My PikPak for Mac**, archive that old app and remove its
+loose bundle before launching MyCloudDriver. Both versions intentionally share
+the same bundle identifier and private data location, preserving accounts and
+transfer history.
 For backups in this project's `dist/installed-backup-*` or `dist/update-backup-*`
 folders, run:
 
@@ -229,19 +260,27 @@ process.
 
 ## First use
 
-1. Sign in when prompted, or open **Settings → Accounts**. Complete sign-in on
-   PikPak's page in the app's login window. The app verifies your account and
-   saves its session automatically for future launches.
+1. Choose a drive on the home screen:
+   - **PikPak:** sign in through **Settings → Accounts**. The app verifies and
+     saves the session automatically.
+   - **iCloud Drive:** choose **Connect Folder**, then select iCloud Drive or
+     one of its folders from the macOS picker. The saved connection is restored
+     on subsequent launches. Enable iCloud Drive in System Settings first.
+   - **Apple Photos:** choose **Allow Photos Access** and answer the macOS
+     permission prompt. Photos/iCloud Photos must already be configured on this Mac.
 2. Use **Browser** to navigate your folders. Choose **View → as List** or
    **View → as Thumbnails** to change the display.
-3. Select items and choose **Add Selected Items to Download Queue**. Open
+3. In PikPak, select items and choose **Add Selected Items to Download Queue**. Open
    **Transfers**, check the download destination, and start the download.
-4. To upload, drag files from Finder onto a destination folder, or use
-   **File → Upload Files or Folders…**.
+4. In iCloud Drive or Photos, use **Import…** or drop files into the open
+   location. Use **Export…** to save selected items to a folder on this Mac.
+   In PikPak, use **File → Upload Files or Folders…** or drop onto a destination folder.
 5. In **Links**, add a share URL and an access code if needed. Expand the link,
    select its files or folders, and right-click to save or download them.
 
-Settings also contains transfer worker limits and Resources, which shows
+Use **All Drives** or **Go → All Drives** to return home. Settings → Drives
+manages iCloud's saved folder and Photos access. Settings also contains
+transfer worker limits and Resources, which shows
 resource usage and the background tasks responsible for it. Maintenance
 commands are in **File**; progress and results appear in the footer's status
 control.
@@ -250,6 +289,7 @@ control.
 
 | Action | Shortcut |
 | --- | --- |
+| All Drives | Command-Shift-H |
 | Browser / Transfers / Links | Control-Command-1 / 2 / 3 |
 | List / Thumbnails | Command-1 / 2 |
 | Quick Look | Space; Up/Down changes the selected item |
@@ -267,6 +307,9 @@ control.
 2. In **PikPak Cloud**, use the current Browser folder or its selection. A folder
    includes descendants. In **This Mac**, choose files or folders with the file
    picker; no PikPak login is required. The two sources are never mixed.
+   From iCloud Drive or Apple Photos, the same command uses that drive's current
+   selection or location. Each drive keeps its own scan and results. Photos
+   prepares original media privately; iCloud scans its materialized files.
 3. Choose content types and a minimum score from **5% to 100%**. Higher values require closer
    matches. **Include byte-identical copies** also checks SHA-256 for every
    included file type, including formats without a similarity decoder.
@@ -320,6 +363,13 @@ the app under:
 ```text
 ~/Library/Application Support/My PikPak for Mac/
 ```
+
+The legacy folder name and `com.wky.PikPakDownloader` bundle identifier are
+retained for upgrade compatibility. iCloud connection bookmarks live in the
+app's preferences. Native similarity catalogs are separated under
+`Similarity/Native/icloud` and `Similarity/Native/photos`; temporary Photos
+originals are removed when a scan finishes or is cancelled. Originals handed
+to another app are kept in the private `OpenFiles` cache so they survive exit.
 
 The app stores its desktop session with owner-only file permissions. Session
 files are plaintext and readable by processes running as your macOS user. The

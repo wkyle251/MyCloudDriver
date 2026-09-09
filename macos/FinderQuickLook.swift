@@ -209,7 +209,7 @@ private struct QuickLookPendingView: View {
             case .failed(let message):
                 Text(message).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 Button("Try Again", action: retry).buttonStyle(.bordered)
-            case .folder: Text("Folder in PikPak").foregroundStyle(.secondary)
+            case .folder: Text("Folder").foregroundStyle(.secondary)
             }
             Text("↑ ↓ to browse · Space or Esc to close")
                 .font(.caption).foregroundStyle(.secondary).padding(.top, 10)

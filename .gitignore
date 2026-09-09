@@ -21,6 +21,8 @@ credentials/
 *.token
 *.tokens
 *.session
+*.bookmark
+*.photoslibrary/
 *.pem
 *.key
 *.p12

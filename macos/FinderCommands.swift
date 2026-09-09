@@ -38,6 +38,13 @@ struct FinderWindowActions {
     var download: () -> Void
     var newFolder: () -> Void
     var trash: () -> Void
+    var containerTitle = "New Folder…"
+    var importTitle = "Upload Files or Folders…"
+    var exportTitle = "Add Selected Items to Download Queue"
+    var trashTitle = "Move Selected Items to Trash"
+    var emptyTitle = "Remove Empty Folders…"
+    var mergeTitle = "Merge Selected Folders…"
+    var supportsLinks = true
     var isFileWorkspace: Bool { section == 0 || section == 3 }
 }
 
@@ -75,16 +82,16 @@ struct FinderCommands: Commands {
                       : !undoFocus.allowsFileActions || actions?.canRedo != true)
         }
         CommandGroup(replacing: .newItem) {
-            Button("New Folder…") { actions?.newFolder() }
+            Button(actions?.containerTitle ?? "New Folder…") { actions?.newFolder() }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
                 .disabled(actions?.canCreateFolder != true)
-            Button("Upload Files or Folders…") { actions?.upload() }
+            Button(actions?.importTitle ?? "Import Files or Folders…") { actions?.upload() }
                 .keyboardShortcut("u", modifiers: [.command, .shift])
                 .disabled(actions?.canUpload != true)
-            Button("Add Selected Items to Download Queue") { actions?.download() }
+            Button(actions?.exportTitle ?? "Export Selected Items…") { actions?.download() }
                 .keyboardShortcut("d", modifiers: [.command, .option])
                 .disabled(actions?.canDownload != true)
-            Button("Move Selected Items to Trash") { actions?.trash() }
+            Button(actions?.trashTitle ?? "Move Selected Items to Trash") { actions?.trash() }
                 .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(actions?.canTrash != true)
             Divider()
@@ -95,11 +102,11 @@ struct FinderCommands: Commands {
                 .disabled(actions?.canCheckDuplicates != true)
             Button("Review Duplicate Results…") { actions?.reviewDuplicates() }
                 .disabled(actions?.canReviewDuplicates != true)
-            Button("Remove Empty Folders…") { actions?.removeEmptyFolders() }
+            Button(actions?.emptyTitle ?? "Remove Empty Folders…") { actions?.removeEmptyFolders() }
                 .disabled(actions?.canRemoveEmptyFolders != true)
             Button("Remove .DS_Store Files…") { actions?.removeDSStoreFiles() }
                 .disabled(actions?.canRemoveDSStoreFiles != true)
-            Button("Merge Selected Folders…") { actions?.mergeFolders() }
+            Button(actions?.mergeTitle ?? "Merge Selected Folders…") { actions?.mergeFolders() }
                 .disabled(actions?.canMergeFolders != true)
             Divider()
             Button("Show Status") { actions?.showStatus() }
@@ -140,6 +147,9 @@ struct FinderCommands: Commands {
             Divider()
         }
         CommandMenu("Go") {
+            Button("All Drives") { NotificationCenter.default.post(name: .init("MyCloudDriverAllDrives"), object: nil) }
+                .keyboardShortcut("h", modifiers: [.command, .shift])
+            Divider()
             Button("Back") { actions?.goBack() }
                 .keyboardShortcut("[", modifiers: .command)
                 .disabled(actions?.canGoBack != true)
@@ -147,7 +157,7 @@ struct FinderCommands: Commands {
             ForEach(FinderWorkspaceSection.allCases) { section in
                 Button(section.title) { actions?.selectSection(section.rawValue) }
                     .keyboardShortcut(KeyEquivalent(Character(String(section.shortcut))), modifiers: [.command, .control])
-                    .disabled(actions == nil)
+                    .disabled(actions == nil || (section.rawValue == 3 && actions?.supportsLinks != true))
             }
         }
     }

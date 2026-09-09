@@ -61,7 +61,7 @@ enum TaskResourceAttribution {
         }
         return Dictionary(grouping: rows, by: owner).map { pid, members in
             let fallback = pid == rootPID
-                ? TaskResourceActivity(name: "My PikPak for Mac", detail: "Interface & shared app work", symbol: "macwindow")
+                ? TaskResourceActivity(name: "MyCloudDriver", detail: "Interface & shared app work", symbol: "macwindow")
                 : TaskResourceActivity(name: "Background helper", detail: byPID[pid]?.name ?? "")
             return TaskResourceGroup(id: pid, activity: activities[pid] ?? fallback,
                 processIDs: members.map(\.pid).sorted(),
@@ -136,7 +136,7 @@ enum TaskResourceSampler {
                 var name = [CChar](repeating: 0, count: 256)
                 _ = proc_name(pid, &name, UInt32(name.count))
                 samples.append(TaskProcessSample(pid: pid,
-                    name: pid == rootPID ? "My PikPak for Mac" : String(cString: name),
+                    name: pid == rootPID ? "MyCloudDriver" : String(cString: name),
                     started: bsd.pbi_start_tvsec &* 1_000_000 &+ bsd.pbi_start_tvusec,
                     cpuNanoseconds: nanoseconds(fromMachTicks: info.pti_total_user &+ info.pti_total_system,
                                                 numerator: timebase.numer, denominator: timebase.denom),

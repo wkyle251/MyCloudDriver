@@ -257,11 +257,13 @@ struct FinderSettingsView: View {
     @ObservedObject var model: DownloaderModel
     @StateObject private var monitor = TaskResourceMonitor()
     private let initialPane: Int?
+    private let connections: AnyView?
 
-    init(settings: FinderSettings, model: DownloaderModel, initialPane: Int? = nil) {
+    init(settings: FinderSettings, model: DownloaderModel, initialPane: Int? = nil, connections: AnyView? = nil) {
         self.settings = settings
         self.model = model
         self.initialPane = initialPane
+        self.connections = connections
     }
 
     var body: some View {
@@ -330,6 +332,9 @@ struct FinderSettingsView: View {
             FinderAccountsSettingsView(model: model)
                 .tabItem { Label("Accounts", systemImage: "person.crop.circle") }
                 .tag(2)
+            if let connections {
+                connections.tabItem { Label("Drives", systemImage: "externaldrive") }.tag(3)
+            }
         }
         .tint(FinderAppearance.accent)
         .buttonStyle(FinderButtonStyle())

@@ -22,27 +22,20 @@ entry point. The executable has no bundled PikPak engine.
 For Browser/Links selection and batch-save regressions:
 
 ```zsh
-test_sources=(macos/*.swift)
-test_sources=("${(@)test_sources:#macos/PikPakDownloaderApp.swift}")
 test_output="$(mktemp -d)"
-
-swiftc \
-  -D FINDER_WORKSPACE_TESTS \
-  -swift-version 5 \
-  -target arm64-apple-macos13.0 \
-  -parse-as-library \
-  "${test_sources[@]}" \
-  scripts/SharedLinkSelectionTests.swift \
-  -o "$test_output/shared-link-selection-tests"
+./scripts/build-native-test.sh scripts/SharedLinkSelectionTests.swift \
+  "$test_output/shared-link-selection-tests"
 
 "$test_output/shared-link-selection-tests"
 ```
 
-Use the same compiler options with one of these entry points to test another
+The helper also compiles the C archive reader and links macOS `libarchive.2`.
+Use the same helper with one of these entry points to test another
 area. Compile **one entry point at a time**; each declares `@main`.
 
 | Entry point in `scripts/` | Coverage |
 | --- | --- |
+| `NativeDriveTests.swift` | iCloud path boundaries, copying/rollback, cleanup revalidation, Undo/Redo, folder merge, Photos membership planning, search cancellation, concurrent native scans and Photos staging cleanup. Pass the built app's Resources path to include real engine scans. |
 | `FinderWorkspaceTests.swift` | Settings, resource attribution, navigation, and account management. |
 | `FinderFileOpeningTests.swift` | File handoff, Open With, Quick Look loading, navigation, and cancellation. |
 | `FinderFileUndoTests.swift` | Undo/Redo history, partial completion, upload batches, and account isolation. |
@@ -72,7 +65,7 @@ scans them without an account. FFmpeg 9 and ffprobe 9 must be installed:
 
 ```sh
 python3 scripts/test-similarity-native.py \
-  --resources 'dist/My PikPak for Mac.app/Contents/Resources'
+  --resources 'dist/MyCloudDriver.app/Contents/Resources'
 ```
 
 Compile `scripts/SimilarityTests.swift` with the native model test command above,
@@ -94,6 +87,28 @@ stage bar, elapsed timer, current-file details and metrics remain readable at
 the minimum window size. No file-size or download-limit controls should remain.
 
 ## Focused layout test
+
+The multi-drive suite uses temporary folders and a simulated Photos provider;
+it never authorizes PhotoKit or alters a live library:
+
+```sh
+./scripts/build-native-test.sh scripts/NativeDriveTests.swift /tmp/native-drive-tests
+/tmp/native-drive-tests "$PWD/dist/MyCloudDriver.app/Contents/Resources"
+python3 scripts/test-drive-archive.py
+```
+
+`NativeDriveUITestApp.swift` displays the production home screen, drive switcher,
+iCloud browser, Photos grid, settings and activity footer with synthetic files.
+Use its Fixture menu to switch appearance, resize to the minimum window size
+and show scan progress. Check that changing drives preserves each selection and
+does not stop the synthetic activity. Do not grant access to a real Photos
+library as part of the fixture test.
+
+The archive suite checks normal/encrypted ZIPs, password retries, Unicode names,
+streaming progress, cancellation, links and traversal rejection. Native archive
+formats depend on macOS's libarchive build; unsupported encryption is reported.
+
+### Other focused layouts
 
 Check the shared-link input layout without compiling the full app:
 

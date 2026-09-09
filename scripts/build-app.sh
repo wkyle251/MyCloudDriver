@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIRECTORY="${0:A:h}"
 PROJECT_ROOT="${SCRIPT_DIRECTORY:h}"
-APP_NAME="My PikPak for Mac"
+APP_NAME="MyCloudDriver"
 APP_EXECUTABLE="PikPakDownloader"
 APP_BUNDLE="${PROJECT_ROOT}/dist/${APP_NAME}.app"
 CONTENTS="${APP_BUNDLE}/Contents"
@@ -27,6 +27,10 @@ fi
 
 mkdir -p "${CONTENTS}/MacOS" "${CONTENTS}/Resources"
 
+ARCHIVE_OBJECT="${PROJECT_ROOT}/dist/DriveArchive.o"
+xcrun clang -target arm64-apple-macos13.0 -O2 -Wall -Wextra -c \
+    "${PROJECT_ROOT}/macos/DriveArchive.c" -o "${ARCHIVE_OBJECT}"
+
 swiftc \
     -swift-version 5 \
     -target arm64-apple-macos13.0 \
@@ -37,6 +41,10 @@ swiftc \
     -framework AVFoundation \
     -framework AVKit \
     -framework QuickLookUI \
+    -framework QuickLookThumbnailing \
+    -framework Photos \
+    -larchive.2 \
+    "${ARCHIVE_OBJECT}" \
     -framework Security \
     -framework WebKit \
     "${PROJECT_ROOT}/macos/LegacyKeychainStore.swift" \
@@ -45,6 +53,15 @@ swiftc \
     "${PROJECT_ROOT}/macos/PikPakAccountVerifier.swift" \
     "${PROJECT_ROOT}/macos/CredentialParser.swift" \
     "${PROJECT_ROOT}/macos/PreviewTransport.swift" \
+    "${PROJECT_ROOT}/macos/CloudDriveTypes.swift" \
+    "${PROJECT_ROOT}/macos/CloudDriveHub.swift" \
+    "${PROJECT_ROOT}/macos/ICloudDriveProvider.swift" \
+    "${PROJECT_ROOT}/macos/PhotosDriveProvider.swift" \
+    "${PROJECT_ROOT}/macos/NativeDriveModel.swift" \
+    "${PROJECT_ROOT}/macos/NativeDriveOperations.swift" \
+    "${PROJECT_ROOT}/macos/NativeDriveDuplicates.swift" \
+    "${PROJECT_ROOT}/macos/NativeDriveWorkspace.swift" \
+    "${PROJECT_ROOT}/macos/NativeMediaThumbnail.swift" \
     "${PROJECT_ROOT}/macos/ImagePreview.swift" \
     "${PROJECT_ROOT}/macos/FileSimilarity.swift" \
     "${PROJECT_ROOT}/macos/FileSimilarityView.swift" \

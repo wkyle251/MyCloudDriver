@@ -377,6 +377,9 @@ struct ContentView: View {
     @State private var advancedExpanded = false
     @State private var activityExpanded = false
     @StateObject private var workspaceNavigation = FinderWorkspaceNavigation()
+    init(navigation: FinderWorkspaceNavigation? = nil) {
+        _workspaceNavigation = StateObject(wrappedValue: navigation ?? FinderWorkspaceNavigation())
+    }
     private var selectedTab: Int {
         get { workspaceNavigation.section }
         nonmutating set { workspaceNavigation.showImmediately(newValue) }
@@ -533,11 +536,8 @@ struct ContentView: View {
             )
             model.loadBrowserIfReady()
         }
-        .onDisappear {
-            #if !BROWSER_SCROLL_PROFILING
-            model.stopForWindowClose()
-            #endif
-        }
+        // Leaving this drive must not cancel transfers. AppDelegate owns shutdown.
+        .onDisappear { _ = model.cancelQuickLook(); model.previewPlayer?.pause() }
         .sheet(isPresented: Binding(get: { model.isLoginPresented && !model.loginFromSettings }, set: {
             if !$0 && model.isLoginPresented && !model.loginFromSettings { model.cancelLogin() }
         })) {
@@ -689,7 +689,7 @@ struct ContentView: View {
             HStack(spacing: 8) {
                 Image(nsImage: NSApplication.shared.applicationIconImage)
                     .resizable().frame(width: 29, height: 29)
-                Text("My PikPak").font(.headline)
+                Text("MyCloudDriver").font(.headline)
             }
             .padding(.horizontal, 12).padding(.top, 16).padding(.bottom, 16)
 

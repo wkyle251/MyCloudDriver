@@ -5,7 +5,7 @@ private struct SimilarityProgressView: View {
     @ObservedObject var model: SimilarityScanModel
     private var progress: SimilarityScanProgress { model.progress }
     private var steps: [SimilarityScanStage] {
-        model.source == .cloud ? [.inventory, .downloading, .analysing, .comparison, .grouping]
+        model.source == .cloud || model.externalTitle != nil ? [.inventory, .downloading, .analysing, .comparison, .grouping]
             : [.inventory, .analysing, .comparison, .grouping]
     }
     private var stepIndex: Int { steps.firstIndex(of: progress.stage) ?? steps.count - 1 }
@@ -139,13 +139,16 @@ struct FileSimilarityView: View {
                     .frame(width: 50, height: 50)
                     .background(FinderAppearance.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Find Similar Files").font(.title2.weight(.semibold))
-                    Text("Compare content. Review related files together.").foregroundStyle(.secondary)
+                    Text(coordinator.duplicatesOnly ? "Check for Duplicates" : "Find Similar Files").font(.title2.weight(.semibold))
+                    Text(coordinator.duplicatesOnly ? "Review files with identical content." : "Compare content. Review related files together.").foregroundStyle(.secondary)
                 }
                 Spacer()
-                Picker("Scan source", selection: $coordinator.source) {
+                if let title = coordinator.externalTitle {
+                    Label(title, systemImage: coordinator.externalSymbol).foregroundStyle(FinderAppearance.accent)
+                } else { Picker("Scan source", selection: $coordinator.source) {
                     ForEach(SimilaritySource.allCases) { source in Text(source.title).tag(source) }
                 }.pickerStyle(.segmented).labelsHidden().frame(width: 245).help("Cloud and local scans have separate scopes and results")
+                }
             }.padding(22)
             Divider()
             SimilarityScanView(model: coordinator.source == .cloud ? coordinator.cloud : coordinator.local,
@@ -186,7 +189,7 @@ private struct SimilarityScanView: View {
             resultArea.frame(maxWidth: .infinity, maxHeight: .infinity)
             footer
         }.padding(18)
-        .onReceive(model.$report) { report in selectedGroupID = report?.groups.first?.id; groupFilter = 0 }
+        .onReceive(model.$report) { report in selectedGroupID = report?.groups.first?.id; groupFilter = coordinator.duplicatesOnly ? 2 : 0 }
         .onChange(of: groupFilter) { _ in selectedGroupID = groups.first?.id }
         .sheet(isPresented: $showsIssues) { issuesSheet }
     }
@@ -195,9 +198,11 @@ private struct SimilarityScanView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Image(systemName: model.source.symbol).foregroundStyle(FinderAppearance.accent)
-                Text(model.source == .cloud ? "Cloud scan scope" : "Files and folders on this Mac").font(.headline)
+                Text(model.externalTitle.map { "\($0) scan scope" } ?? (model.source == .cloud ? "Cloud scan scope" : "Files and folders on this Mac")).font(.headline)
                 Spacer()
-                if model.source == .cloud {
+                if model.externalTitle != nil {
+                    Text("Choose a different scope in the drive browser").font(.caption).foregroundStyle(.secondary)
+                } else if model.source == .cloud {
                     Button("Use Browser Folder") { coordinator.useBrowserSelection(false) }
                         .help("Recursively scan the folder currently open in Browser")
                     Button("Use Browser Selection") { coordinator.useBrowserSelection(true) }
@@ -207,7 +212,8 @@ private struct SimilarityScanView: View {
                 }
             }.disabled(model.isRunning)
             scopeLocations
-            Text(model.source == .cloud
+            Text(model.externalTitle != nil ? "Originals are prepared as needed. Analysis runs on this Mac while you keep browsing."
+                 : model.source == .cloud
                  ? "Cloud files are downloaded temporarily for analysis, then removed. Choose a scope in Browser; local files are compared in a separate scan."
                  : "Selected folders include their subfolders. Analysis runs on this Mac; local file content is not uploaded.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -217,7 +223,9 @@ private struct SimilarityScanView: View {
 
     @ViewBuilder private var scopeLocations: some View {
         let isEmpty = model.source == .local ? model.localURLs.isEmpty : model.cloudRoots.isEmpty
-        if isEmpty {
+        if model.externalTitle != nil {
+            Text(model.externalScopeNames.joined(separator: ", ")).lineLimit(2).truncationMode(.middle)
+        } else if isEmpty {
             Text(model.source == .cloud ? "Sign in from Settings → Accounts, then choose a folder in Browser."
                  : "Choose two or more files, or a folder containing files to compare.")
                 .foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 8)
@@ -252,6 +260,17 @@ private struct SimilarityScanView: View {
 
     private var scanControls: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if coordinator.duplicatesOnly {
+                HStack {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Identical copies · all file types").font(.headline)
+                        Text("Compare file sizes and SHA-256 content hashes. Review results before removing anything.").font(.callout).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if model.isRunning { Button("Cancel Scan") { model.cancel() }.disabled(model.isCancelling) }
+                    else { Button("Start Scan") { coordinator.start(model) }.buttonStyle(.borderedProminent).disabled(!model.canStart) }
+                }
+            } else {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("CONTENT TYPES").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
@@ -282,11 +301,13 @@ private struct SimilarityScanView: View {
                 }
             }
             HStack {
-                Toggle("Include byte-identical copies (all file types)", isOn: $model.exactDuplicates).disabled(model.isRunning)
+                Toggle("Include byte-identical copies (all file types)", isOn: $model.exactDuplicates).disabled(model.isRunning || coordinator.duplicatesOnly)
                     .font(.callout).help("Also compare SHA-256 content hashes, including formats without a similarity decoder")
                 Spacer()
-                Toggle("Include hidden files", isOn: $model.includeHidden)
-                    .font(.callout).disabled(model.isRunning)
+                if model.externalTitle == nil {
+                    Toggle("Include hidden files", isOn: $model.includeHidden)
+                        .font(.callout).disabled(model.isRunning)
+                }
             }
             if SimilarityScanModel.mediaTool("ffmpeg") == nil || SimilarityScanModel.mediaTool("ffprobe") == nil {
                 Text("Audio, video and HEIF images require FFmpeg 9 and ffprobe on this Mac. Missing decoders are reported as skipped files.")
@@ -295,6 +316,7 @@ private struct SimilarityScanView: View {
             if !SimilarityScanModel.visualSimilarityAvailable {
                 Text("Image and video similarity requires macOS 14 or later. Document, audio and byte-identical comparisons are available on this Mac.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
             }
         }
     }
@@ -391,7 +413,7 @@ private struct SimilarityScanView: View {
                                 Button { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) } label: { Image(systemName: "folder") }
                                     .help("Show \(file.name) in Finder")
                             }
-                            Button("Open") { open(file) }.disabled(file.localPath == nil && file.cloudId == nil)
+                            Button("Open") { open(file) }.disabled(file.localPath == nil && file.cloudId == nil && coordinator.openExternalFile == nil)
                                 .help(model.source == .local ? "Open this file in its default app" : "Fetch this cloud file and open it in its default app")
                         }.padding(13)
                         Divider().padding(.leading, 53)
@@ -406,7 +428,8 @@ private struct SimilarityScanView: View {
     }
 
     private func open(_ file: SimilarityFile) {
-        if let path = file.localPath {
+        if let open = coordinator.openExternalFile { open(file) }
+        else if let path = file.localPath {
             if !NSWorkspace.shared.open(URL(fileURLWithPath: path)) { model.error = "This file could not be opened. It may have moved since the scan." }
         } else { coordinator.openCloudFile(file) }
     }

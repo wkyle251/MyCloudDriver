@@ -2,7 +2,11 @@ import AppKit
 import SwiftUI
 
 enum FinderAppearance {
-    static let accent = Color(red: 0.08, green: 0.42, blue: 0.95)
+    static let accent = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0.35, green: 0.65, blue: 1, alpha: 1)
+            : NSColor(srgbRed: 0.08, green: 0.42, blue: 0.95, alpha: 1)
+    })
     static let sidebarBackground = Color(nsColor: NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             ? NSColor(srgbRed: 0.075, green: 0.12, blue: 0.20, alpha: 1)

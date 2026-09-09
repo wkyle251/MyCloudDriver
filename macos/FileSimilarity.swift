@@ -204,6 +204,13 @@ final class SimilarityScanModel: ObservableObject {
     @Published private(set) var fraction: Double?
     @Published private(set) var progress = SimilarityScanProgress()
     @Published private(set) var startedAt: Date?
+    var externalTitle: String?
+    var externalDuplicatesOnly = false
+    var externalScopeNames: [String] = []
+    var prepareExternalScope: (() async throws -> [URL])?
+    var cleanupExternalScope: () -> Void = {}
+    var transformExternalReport: ((SimilarityReport) -> SimilarityReport)?
+    private var preparationTask: Task<Void, Never>?
     @Published private(set) var report: SimilarityReport?
     @Published var error: String?
     private var process: Process?
@@ -214,11 +221,11 @@ final class SimilarityScanModel: ObservableObject {
     init(source: SimilaritySource, activity: FinderTaskActivityStore) { self.source = source; self.activity = activity }
     var processIdentifier: Int32? { process.flatMap { $0.isRunning ? $0.processIdentifier : nil } }
     var scopeLabel: String {
-        let names = source == .local ? localURLs.map(\.lastPathComponent) : cloudRoots.map { $0.path == "/" ? "All PikPak files" : $0.path }
+        let names = externalTitle != nil ? externalScopeNames : source == .local ? localURLs.map(\.lastPathComponent) : cloudRoots.map { $0.path == "/" ? "All PikPak files" : $0.path }
         return names.isEmpty ? "No scope selected" : names.count == 1 ? names[0] : "\(names.count) selected locations"
     }
     var canStart: Bool {
-        !isRunning && !families.isEmpty && (source == .local ? !localURLs.isEmpty : !cloudRoots.isEmpty)
+        !isRunning && (externalDuplicatesOnly || !families.isEmpty) && (externalTitle != nil ? !externalScopeNames.isEmpty : source == .local ? !localURLs.isEmpty : !cloudRoots.isEmpty)
             && threshold.isFinite && (0.05...1).contains(threshold)
     }
     static func mediaTool(_ name: String) -> String? {
@@ -250,6 +257,43 @@ final class SimilarityScanModel: ObservableObject {
 
     func start(_ configuration: SimilarityConfiguration) {
         guard canStart else { return }
+        guard let prepareExternalScope else { launch(configuration); return }
+        isRunning = true; isCancelling = false; report = nil; error = nil; startedAt = Date()
+        message = "Preparing \(externalTitle ?? "drive") files…"; detail = scopeLabel
+        progress = SimilarityScanProgress(event: ["stage":"downloading"])
+        activity.begin(source.taskKind, scope: scopeLabel, message: message)
+        preparationTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let urls = try await prepareExternalScope()
+                try Task.checkCancellation()
+                guard !urls.isEmpty else { throw CloudDriveError.message("No readable files were found in this scope.") }
+                self.localURLs = urls
+                if self.externalDuplicatesOnly {
+                    let report = try await NativeDriveDuplicates.scan(urls) { [weak self] event in
+                        Task { @MainActor in
+                            guard let self, self.isRunning, !self.isCancelling else { return }; self.receive(event)
+                        }
+                    }
+                    self.preparationTask = nil; self.finish(report, diagnostic: "", exitCode: 0)
+                } else { self.preparationTask = nil; self.launch(configuration) }
+            } catch {
+                self.isCancelling = self.isCancelling || error is CancellationError
+                self.preparationTask = nil
+                self.finish(nil, diagnostic: error.localizedDescription, exitCode: 1)
+            }
+        }
+    }
+
+    func externalProgress(_ value: CloudDriveProgress) {
+        guard isRunning, !isCancelling else { return }
+        var event: [String: Any] = ["event":"progress", "stage":value.total > 0 ? "downloading" : "inventory", "completed":value.completed,
+            "current_file":["name":value.message, "bytes":value.fileSize], "file_bytes_read":value.bytes, "operation":"downloading"]
+        if value.total > 0 { event["total"] = value.total }
+        receive(event, preparing: true)
+    }
+
+    private func launch(_ configuration: SimilarityConfiguration) {
         let runID = UUID()
         let directory = configuration.temporaryDirectory.appendingPathComponent(runID.uuidString, isDirectory: true)
         do {
@@ -278,8 +322,9 @@ final class SimilarityScanModel: ObservableObject {
             generation = runID; process = child
             scopes = localURLs.filter { $0.startAccessingSecurityScopedResource() }
             isRunning = true; isCancelling = false; report = nil; error = nil; fraction = nil
-            progress = SimilarityScanProgress(); startedAt = Date()
-            message = "Starting \(source.title) scan…"; detail = ""
+            progress = externalTitle == nil ? SimilarityScanProgress() : SimilarityScanProgress(event: ["stage":"analysing"])
+            if externalTitle == nil || startedAt == nil { startedAt = Date() }
+            message = "Starting \(externalTitle ?? source.title) scan…"; detail = ""
             activity.begin(source.taskKind, scope: scopeLabel, message: message)
             let reader = SimilarityProcessReader()
             reader.start(output: output, errors: errors) { [weak self] event in
@@ -311,8 +356,10 @@ final class SimilarityScanModel: ObservableObject {
         }
     }
 
-    private func receive(_ event: [String: Any]) {
+    private func receive(_ event: [String: Any], preparing: Bool = false) {
         guard event["event"] as? String == "progress" else { return }
+        var event = event
+        if externalTitle != nil && !preparing && event["stage"] as? String == "inventory" { event["stage"] = "analysing" }
         progress = SimilarityScanProgress(event: event)
         message = progress.stage.title + "…"
         fraction = progress.fraction
@@ -326,8 +373,9 @@ final class SimilarityScanModel: ObservableObject {
         let cancelled = isCancelling || result?.status == "cancelled"
         scopes.forEach { $0.stopAccessingSecurityScopedResource() }; scopes = []
         process = nil; isRunning = false; isCancelling = false; fraction = nil
-        report = result
-        if let result, exitCode == 0 {
+        report = result.map { transformExternalReport?($0) ?? $0 }
+        cleanupExternalScope()
+        if let result = report, exitCode == 0 {
             let state: FinderTaskActivity.State = cancelled ? .cancelled : result.status == "failed" ? .failed : result.status == "partial" ? .partial : .completed
             message = cancelled ? "Scan cancelled" : state == .failed ? "Scan could not finish" : "\(result.totalGroups.formatted()) match groups found"
             detail = "\(result.analysedFiles.formatted()) analysed · \(result.skippedFiles.formatted()) skipped"
@@ -340,6 +388,11 @@ final class SimilarityScanModel: ObservableObject {
     }
 
     func cancel() {
+        if let preparationTask {
+            isCancelling = true; message = "Stopping scan…"
+            activity.stopping(source.taskKind, message: message)
+            preparationTask.cancel(); return
+        }
         guard let child = process, child.isRunning, !isCancelling else { return }
         isCancelling = true; message = "Stopping and removing temporary copies…"
         activity.stopping(source.taskKind, message: message)
@@ -431,6 +484,10 @@ final class FileSimilarityCoordinator: ObservableObject {
     var configuration: (SimilaritySource) throws -> SimilarityConfiguration = { _ in throw CocoaError(.fileNoSuchFile) }
     var cloudScope: (Bool) throws -> [SimilarityCloudRoot] = { _ in [] }
     var openCloudFile: (SimilarityFile) -> Void = { _ in }
+    var externalTitle: String?
+    var externalSymbol = "externaldrive"
+    @Published var duplicatesOnly = false
+    var openExternalFile: ((SimilarityFile) -> Void)?
     private var window: NSWindow?
     var runs: [SimilarityScanModel] { [cloud, local] }
 
@@ -459,6 +516,7 @@ final class FileSimilarityCoordinator: ObservableObject {
             window.contentView = NSHostingView(rootView: FileSimilarityView(coordinator: self))
             window.center(); self.window = window
         }
+        window?.title = duplicatesOnly ? "Check for Duplicates" : "Find Similar Files"
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }

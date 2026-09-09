@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>My PikPak for Mac</string>
+	<string>MyCloudDriver</string>
 	<key>CFBundleExecutable</key>
 	<string>PikPakDownloader</string>
 	<key>CFBundleIdentifier</key>
@@ -15,13 +15,13 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>My PikPak for Mac</string>
+	<string>MyCloudDriver</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.89.0</string>
+	<string>2.0.0</string>
 	<key>CFBundleVersion</key>
-	<string>157</string>
+	<string>158</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
@@ -32,5 +32,7 @@
 	<true/>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>MyCloudDriver browses, previews and compares your photos and videos, and manages albums or imports and deletes media when you choose those actions.</string>
 </dict>
 </plist>

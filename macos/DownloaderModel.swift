@@ -2058,6 +2058,8 @@ final class DownloaderModel: ObservableObject {
 
     /// Describe work from the owning task's state, never command lines, tokens
     /// or signed URLs. Polling also notices helpers owned by nested models.
+    var additionalResourceActivities: () -> [Int32: TaskResourceActivity] = { [:] }
+    var additionalResourceDescriptions: () -> [String] = { [] }
     var resourceActivities: [Int32: TaskResourceActivity] {
         var activities: [Int32: TaskResourceActivity] = [:]
         func record(_ child: Process?, _ activity: @autoclosure () -> TaskResourceActivity) {
@@ -2117,8 +2119,9 @@ final class DownloaderModel: ObservableObject {
         let openingNames = fileOpener.activeNames.values.sorted()
         if !openingNames.isEmpty { inApp.append("Opening: " + openingNames.joined(separator: ", ")) }
         if fileSearch.isScanning || fileSearch.isResolving { inApp.append("Updating search results") }
-        activities[getpid()] = .init(name: "My PikPak for Mac",
-            detail: (["Interface & shared app work"] + inApp).joined(separator: "\n"), symbol: "macwindow")
+        activities.merge(additionalResourceActivities(), uniquingKeysWith: { _, value in value })
+        activities[getpid()] = .init(name: "MyCloudDriver",
+            detail: (["Interface & shared app work"] + inApp + additionalResourceDescriptions()).joined(separator: "\n"), symbol: "macwindow")
         return activities
     }
 
@@ -4323,7 +4326,7 @@ final class DownloaderModel: ObservableObject {
     var canChangeAccount: Bool { accountStore != nil && !isClosingWindow && !accountWorkIsActive && !isCheckingAccount && !isChangingAccount && !isLoginPresented }
     var canCheckAccountStatus: Bool { hasAccountSession && !isClosingWindow && !isCheckingAccount && !isChangingAccount && !isLoginPresented }
     var accountChangeBlockedReason: String? {
-        if isClosingWindow { return "Reopen My PikPak to manage accounts." }
+        if isClosingWindow { return "Reopen MyCloudDriver to manage accounts." }
         if accountWorkIsActive { return "Finish or stop active transfers, scans and file requests before changing accounts." }
         if isChangingAccount { return "Checking the account before switching…" }
         return nil
@@ -9668,7 +9671,7 @@ final class DownloaderModel: ObservableObject {
             let message = "The bundled folder-merge engine is missing. Rebuild the app."
             mergeStatus = message
             mergeErrorDiagnostic = AppErrorDiagnostic(
-                source: "My PikPak for Mac",
+                source: "MyCloudDriver",
                 code: "MERGE_ENGINE_MISSING",
                 message: message,
                 context: nil
@@ -16492,6 +16495,13 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
+    func nativeSimilarityConfiguration(drive: String) throws -> SimilarityConfiguration {
+        let base = try similarityConfiguration(.local)
+        return SimilarityConfiguration(executable: base.executable, models: base.models, worker: base.worker,
+            dataDirectory: base.dataDirectory.deletingLastPathComponent().appendingPathComponent("Native/\(drive)"),
+            temporaryDirectory: base.temporaryDirectory.appendingPathComponent(drive), environment: base.environment)
+    }
+
     private func similarityConfiguration(_ source: SimilaritySource) throws -> SimilarityConfiguration {
         guard !isClosingWindow else { throw CocoaError(.userCancelled) }
         guard let resources = Bundle.main.resourceURL,
@@ -16648,7 +16658,7 @@ final class DownloaderModel: ObservableObject {
         isQuotaLoading = false
         quotaRefreshPending = false
         presentLogin(
-            reason: "The saved session is not an independent desktop session. Sign in here to keep My PikPak for Mac separate from Safari."
+            reason: "The saved session is not an independent desktop session. Sign in here to keep MyCloudDriver separate from Safari."
         )
     }
 

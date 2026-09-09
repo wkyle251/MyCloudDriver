@@ -11,7 +11,8 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parent.parent
-APP_NAME = "My PikPak for Mac.app"
+APP_NAME = "MyCloudDriver.app"
+LEGACY_APP_NAME = "My PikPak for Mac.app"
 LSREGISTER = Path(
     "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
     "LaunchServices.framework/Support/lsregister"
@@ -59,7 +60,8 @@ def main():
     backups = [
         path for pattern in ("installed-backup-*", "update-backup-*")
         for directory in dist.glob(pattern)
-        if (path := directory / APP_NAME).is_dir()
+        for name in (APP_NAME, LEGACY_APP_NAME)
+        if (path := directory / name).is_dir()
     ]
     commands = running_commands()
     for app in backups:
@@ -70,9 +72,10 @@ def main():
     installed = Path.home() / "Applications" / APP_NAME
     # The build artifact also shares the app identity. Launchers should resolve
     # that identity to the installed copy rather than a distribution directory.
-    build = dist / APP_NAME
-    if build.exists():
-        subprocess.run([str(LSREGISTER), "-u", str(build)], check=True)
+    for name in (APP_NAME, LEGACY_APP_NAME):
+        build = dist / name
+        if build.exists():
+            subprocess.run([str(LSREGISTER), "-u", str(build)], check=True)
     if installed.exists():
         subprocess.run([str(LSREGISTER), "-f", str(installed)], check=True)
     print(f"Registered installed app: {installed}", flush=True)
