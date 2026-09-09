@@ -157,7 +157,14 @@ private final class SyntheticPhotosDrive: NativeCloudDrive, @unchecked Sendable 
         for current in [model, photo] {
             precondition(current.similarity.local.error == nil, current.similarity.local.error ?? "")
             precondition(current.similarity.local.report?.analysedFiles == 2)
-            precondition(current.similarity.local.report?.totalGroups == 2)
+            precondition(current.similarity.local.report?.totalGroups == 1 && current.similarity.local.report?.scoresRetained == 1)
+            while current.similarity.local.results.isIndexing { try await Task.sleep(nanoseconds: 10_000_000) }
+            let reference = current.similarity.local.report!.files!.first!
+            current.similarity.local.results.select(reference.id)
+            try await wait { !current.similarity.local.results.isLoading }
+            precondition(current.similarity.local.results.error == nil, current.similarity.local.results.error ?? "")
+            precondition(current.similarity.local.results.related.first?.score == 1)
+            if current.kind == .photos { precondition(current.similarity.local.results.related.first?.file.id.hasPrefix("asset:") == true) }
         }
         precondition(photo.similarity.local.localURLs.count == 1)
         precondition(photo.similarity.local.report!.groups.flatMap(\.members).allSatisfy { $0.id.hasPrefix("asset:") && $0.localPath == nil })

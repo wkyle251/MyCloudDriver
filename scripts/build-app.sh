@@ -65,6 +65,10 @@ swiftc \
     "${PROJECT_ROOT}/macos/ImagePreview.swift" \
     "${PROJECT_ROOT}/macos/FileSimilarity.swift" \
     "${PROJECT_ROOT}/macos/FileSimilarityView.swift" \
+    "${PROJECT_ROOT}/macos/SimilarityResults.swift" \
+    "${PROJECT_ROOT}/macos/SimilarityFileTree.swift" \
+    "${PROJECT_ROOT}/macos/SimilarityResultsView.swift" \
+    "${PROJECT_ROOT}/macos/SimilarityPreview.swift" \
     "${PROJECT_ROOT}/macos/FileSearch.swift" \
     "${PROJECT_ROOT}/macos/FileSearchView.swift" \
     "${PROJECT_ROOT}/macos/TransferScheduling.swift" \

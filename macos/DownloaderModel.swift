@@ -1998,6 +1998,10 @@ final class DownloaderModel: ObservableObject {
             return try self.similarityCloudScope(selection: selection)
         }
         coordinator.openCloudFile = { [weak self] file in self?.openSimilarityCloudFile(file) }
+        coordinator.preparePreview = { [weak self] file, directory in
+            guard let self else { throw CancellationError() }
+            return try await self.prepareSimilarityPreview(file, directory: directory)
+        }
         return coordinator
     }()
     let imagePreview = ImagePreviewModel()
@@ -16576,6 +16580,26 @@ final class DownloaderModel: ObservableObject {
         print("PASS current cloud folder, nested selection ancestry and account scope clearing")
     }
     #endif
+
+    private func prepareSimilarityPreview(_ file: SimilarityFile, directory: URL) async throws -> URL {
+        guard let fileID = file.cloudId, hasUsableSession, !isClosingWindow else { throw CloudDriveError.message("Sign in to this file's PikPak account to preview it.") }
+        let account = activeAccountID, configuration = try similarityConfiguration(.cloud)
+        let data = try await SimilarityHelper.request(configuration: configuration, command: "preview", input: Data(), arguments: ["--id", fileID])
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let info = try decoder.decode(PreviewInfo.self, from: data)
+        guard let source = FinderFileOpenStorage.originalURL(info) else { throw CloudDriveError.message("PikPak has not provided an original file to preview.") }
+        let session = URLSession(configuration: PreviewTransport.configuration(proxyURL: proxyURL))
+        defer { session.invalidateAndCancel() }
+        var request = URLRequest(url: source)
+        for (field, value) in PreviewTransport.mediaHeaders { request.setValue(value, forHTTPHeaderField: field) }
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        let (temporary, response) = try await session.download(for: request)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try Task.checkCancellation()
+        guard account == activeAccountID, hasUsableSession else { throw CancellationError() }
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw CloudDriveError.message("The file could not be downloaded. Try Preview again.") }
+        return try FinderFileOpenStorage.preserveDownload(temporary, name: file.name, expectedSize: info.size, directory: directory)
+    }
 
     private func openSimilarityCloudFile(_ file: SimilarityFile) {
         guard let fileID = file.cloudId, hasUsableSession, !isClosingWindow else { return }

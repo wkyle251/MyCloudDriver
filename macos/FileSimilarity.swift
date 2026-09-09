@@ -30,6 +30,10 @@ struct SimilarityFile: Codable, Identifiable {
     let localPath: String?
     let cloudId: String?
     let ancestors: [SimilarityAncestor]
+    var engineIndex: UInt64? = nil
+    var engineId: String? = nil
+    var state: String? = nil
+    var scoreID: String { engineId ?? id }
     var symbol: String {
         switch family { case "image": return "photo"; case "audio": return "waveform"; case "video": return "film"; default: return "doc.text" }
     }
@@ -61,6 +65,10 @@ struct SimilarityReport: Codable {
     let truncated: Bool
     let coverage: String
     let elapsedSeconds: Double
+    var files: [SimilarityFile]? = nil
+    var runId: String? = nil
+    var resultRevision: UInt64? = nil
+    var scoresRetained: UInt64? = nil
 }
 
 struct SimilarityConfiguration {
@@ -129,13 +137,20 @@ struct SimilarityScanProgress {
     var currentBytes: UInt64 = 0
     var currentSize: UInt64 = 0
     var operation = ""
+    var bytesRead: UInt64 = 0
+    var bytesHashed: UInt64 = 0
+    var pairsCompared: UInt64 = 0
+    var scoresRetained: UInt64 = 0
 
     init() {}
     init(event: [String: Any]) {
-        stage = SimilarityScanStage(rawValue: event["stage"] as? String ?? "") ?? .analysing
-        completed = (event["completed"] as? NSNumber)?.uint64Value ?? 0
-        total = (event["total"] as? NSNumber)?.uint64Value
+        let rawStage = event["stage"] as? String ?? ""
+        stage = rawStage == "comparing" ? .comparison : SimilarityScanStage(rawValue: rawStage) ?? .analysing
         let counts = event["counts"] as? [String: Any] ?? [:]
+        let completedKey = stage == .comparison ? "pairs_processed" : "files_processed"
+        let totalKey = stage == .comparison ? "pairs_total" : "files_total"
+        completed = (event["completed"] as? NSNumber)?.uint64Value ?? (counts[completedKey] as? NSNumber)?.uint64Value ?? 0
+        total = (event["total"] as? NSNumber)?.uint64Value ?? ((stage == .analysing || stage == .comparison) ? (counts[totalKey] as? NSNumber)?.uint64Value : nil)
         analysed = (counts["files_ready"] as? NSNumber)?.uint64Value ?? 0
         skipped = ((counts["files_failed"] as? NSNumber)?.uint64Value ?? 0)
             + ((counts["files_excluded"] as? NSNumber)?.uint64Value ?? 0)
@@ -148,6 +163,10 @@ struct SimilarityScanProgress {
         currentSize = (file?["bytes"] as? NSNumber)?.uint64Value ?? 0
         currentBytes = (event["file_bytes_read"] as? NSNumber)?.uint64Value ?? 0
         operation = event["operation"] as? String ?? ""
+        bytesRead = (counts["bytes_read"] as? NSNumber)?.uint64Value ?? 0
+        bytesHashed = (counts["bytes_hashed"] as? NSNumber)?.uint64Value ?? 0
+        pairsCompared = (counts["pairs_compared"] as? NSNumber)?.uint64Value ?? 0
+        scoresRetained = (counts["scores_retained"] as? NSNumber)?.uint64Value ?? 0
     }
     var fraction: Double? {
         guard let total, total > 0 else { return nil }
@@ -161,7 +180,7 @@ struct SimilarityScanProgress {
         switch stage {
         case .inventory: return "\(count) files found"
         case .downloading: return "\(count) files processed"
-        case .analysing: return "\(count) files checked"
+        case .analysing: return "\(count) items processed"
         case .comparison: return "\(count) pairs checked"
         case .grouping: return "\(count) match entries grouped"
         case .finishing: return "Saving the report and clearing temporary files"
@@ -217,6 +236,8 @@ final class SimilarityScanModel: ObservableObject {
     private var generation = UUID()
     private var scopes: [URL] = []
     var onRunningChanged: () -> Void = {}
+    let results = SimilarityResultsModel()
+    private(set) var resultConfiguration: SimilarityConfiguration?
 
     init(source: SimilaritySource, activity: FinderTaskActivityStore) { self.source = source; self.activity = activity }
     var processIdentifier: Int32? { process.flatMap { $0.isRunning ? $0.processIdentifier : nil } }
@@ -257,6 +278,7 @@ final class SimilarityScanModel: ObservableObject {
 
     func start(_ configuration: SimilarityConfiguration) {
         guard canStart else { return }
+        resultConfiguration = configuration; results.reset()
         guard let prepareExternalScope else { launch(configuration); return }
         isRunning = true; isCancelling = false; report = nil; error = nil; startedAt = Date()
         message = "Preparing \(externalTitle ?? "drive") files…"; detail = scopeLabel
@@ -374,10 +396,11 @@ final class SimilarityScanModel: ObservableObject {
         scopes.forEach { $0.stopAccessingSecurityScopedResource() }; scopes = []
         process = nil; isRunning = false; isCancelling = false; fraction = nil
         report = result.map { transformExternalReport?($0) ?? $0 }
+        if let report { results.load(report, configuration: resultConfiguration) }
         cleanupExternalScope()
         if let result = report, exitCode == 0 {
             let state: FinderTaskActivity.State = cancelled ? .cancelled : result.status == "failed" ? .failed : result.status == "partial" ? .partial : .completed
-            message = cancelled ? "Scan cancelled" : state == .failed ? "Scan could not finish" : "\(result.totalGroups.formatted()) match groups found"
+            message = cancelled ? "Scan cancelled" : state == .failed ? "Scan could not finish" : "\(result.analysedFiles.formatted()) files ready to review"
             detail = "\(result.analysedFiles.formatted()) analysed · \(result.skippedFiles.formatted()) skipped"
             activity.finish(source.taskKind, state: state, message: "\(source.title): \(message)", detail: detail)
         } else {
@@ -405,6 +428,7 @@ final class SimilarityScanModel: ObservableObject {
 
     func clearAccount() {
         guard !isRunning else { return }
+        results.reset(); resultConfiguration = nil
         cloudRoots = []; report = nil; error = nil; message = "Ready to scan"; detail = ""
     }
 
@@ -425,7 +449,7 @@ final class SimilarityScanModel: ObservableObject {
     }
 
     #if FINDER_WORKSPACE_TESTS
-    func setFixtureReport(_ value: SimilarityReport) { report = value; message = "\(value.totalGroups) match groups found" }
+    func setFixtureReport(_ value: SimilarityReport) { report = value; results.load(value, configuration: resultConfiguration); message = "\(value.analysedFiles) files ready to review" }
     func setFixtureProgress(_ event: [String: Any]) {
         report = nil; isRunning = true; startedAt = Date().addingTimeInterval(-72)
         activity.begin(source.taskKind, scope: scopeLabel, message: "Starting scan")
@@ -488,6 +512,8 @@ final class FileSimilarityCoordinator: ObservableObject {
     var externalSymbol = "externaldrive"
     @Published var duplicatesOnly = false
     var openExternalFile: ((SimilarityFile) -> Void)?
+    var preparePreview: ((SimilarityFile, URL) async throws -> URL)?
+    let preview = SimilarityPreviewModel()
     private var window: NSWindow?
     var runs: [SimilarityScanModel] { [cloud, local] }
 
@@ -520,5 +546,5 @@ final class FileSimilarityCoordinator: ObservableObject {
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
-    func close() { runs.forEach { $0.cancel() }; window?.close(); window?.contentView = nil; window = nil }
+    func close() { runs.forEach { $0.cancel(); $0.results.reset() }; preview.close(); window?.close(); window?.contentView = nil; window = nil }
 }

@@ -22,8 +22,11 @@ enum NativeDriveDuplicates {
             }
             let sizeCounts = Dictionary(grouping: files, by: { $0.1 }).mapValues(\.count)
             var byHash: [String: [SimilarityFile]] = [:], checked = 0, last = Date.distantPast
+            var inventory: [SimilarityFile] = []
             for (url, size, modified) in files {
                 try Task.checkCancellation()
+                var record = SimilarityFile(id: url.absoluteString, name: url.lastPathComponent, path: url.path,
+                    bytes: size, family: "other", localPath: url.path, cloudId: nil, ancestors: [], state: "ready")
                 do {
                     if sizeCounts[size, default: 0] > 1 {
                         let digest: String = try CloudDriveFiles.coordinated(url) { url in
@@ -44,14 +47,15 @@ enum NativeDriveDuplicates {
                             }
                             return digest.finalize().map { String(format: "%02x", $0) }.joined()
                         }
-                        byHash[digest, default: []].append(.init(id: url.absoluteString, name: url.lastPathComponent, path: url.path,
-                            bytes: size, family: "other", localPath: url.path, cloudId: nil, ancestors: []))
+                        byHash[digest, default: []].append(record)
                     }
                     checked += 1
                 } catch {
                     if Task.isCancelled || error is CancellationError { throw CancellationError() }
                     issues.append(.init(path: url.path, reason: error.localizedDescription))
+                    record.state = "failed"
                 }
+                inventory.append(record)
             }
             let matches = byHash.filter { $0.value.count > 1 }.sorted { $0.key < $1.key }
             var groups: [SimilarityGroup] = [], members = 0, truncated = false
@@ -65,7 +69,7 @@ enum NativeDriveDuplicates {
             return .init(source: .local, scope: roots.map(\.path), status: issues.isEmpty ? "completed" : "partial", threshold: 1,
                 scannedFiles: UInt64(files.count), analysedFiles: UInt64(checked), skippedFiles: UInt64(issues.count), downloadedBytes: 0,
                 totalGroups: UInt64(matches.count), groups: groups, issues: Array(issues.prefix(500)), truncated: truncated || issues.count > 500,
-                coverage: "Files with equal sizes were compared using SHA-256. Hidden files and symbolic links are excluded.", elapsedSeconds: Date().timeIntervalSince(started))
+                coverage: "Files with equal sizes were compared using SHA-256. Hidden files and symbolic links are excluded.", elapsedSeconds: Date().timeIntervalSince(started), files: inventory)
         }
     }
 }

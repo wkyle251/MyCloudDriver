@@ -5,8 +5,8 @@ private struct SimilarityProgressView: View {
     @ObservedObject var model: SimilarityScanModel
     private var progress: SimilarityScanProgress { model.progress }
     private var steps: [SimilarityScanStage] {
-        model.source == .cloud || model.externalTitle != nil ? [.inventory, .downloading, .analysing, .comparison, .grouping]
-            : [.inventory, .analysing, .comparison, .grouping]
+        model.source == .cloud || model.externalTitle != nil ? [.inventory, .downloading, .analysing, .comparison, .finishing]
+            : [.analysing, .comparison, .finishing]
     }
     private var stepIndex: Int { steps.firstIndex(of: progress.stage) ?? steps.count - 1 }
 
@@ -90,10 +90,13 @@ private struct SimilarityProgressView: View {
                     Divider().frame(height: 34).padding(.horizontal, 20)
                     metric("Skipped", value: progress.skipped.formatted())
                     Divider().frame(height: 34).padding(.horizontal, 20)
-                    metric("Matching pairs", value: progress.matches.formatted())
+                    metric(model.externalDuplicatesOnly ? "Identical pairs" : "Scores saved", value: (model.externalDuplicatesOnly ? progress.matches : progress.scoresRetained).formatted())
                     if model.source == .cloud {
                         Divider().frame(height: 34).padding(.horizontal, 20)
                         metric("Downloaded", value: SimilarityScanProgress.bytes(progress.downloadedBytes))
+                    } else {
+                        Divider().frame(height: 34).padding(.horizontal, 20)
+                        metric("Read", value: SimilarityScanProgress.bytes(progress.bytesRead))
                     }
                 }
                 Text(model.isCancelling ? "Finishing the current operation and clearing temporary files."
@@ -108,9 +111,9 @@ private struct SimilarityProgressView: View {
         switch progress.stage {
         case .inventory: return "Building the file list before reading content"
         case .downloading: return "Preparing temporary cloud copies"
-        case .analysing: return "Preparing the next file"
-        case .comparison: return "Checking content similarity and identical copies"
-        case .grouping: return "Organising matching files into review groups"
+        case .analysing: return progress.total == nil ? "Discovering and analysing files · total not known yet" : "Analysing the file inventory"
+        case .comparison: return "\(progress.pairsCompared.formatted()) compatible comparisons · saving individual scores"
+        case .grouping: return "Organising identical-copy evidence"
         case .finishing: return "Your results will appear here"
         }
     }
@@ -164,19 +167,26 @@ struct FileSimilarityView: View {
 private struct SimilarityScanView: View {
     @ObservedObject var model: SimilarityScanModel
     let coordinator: FileSimilarityCoordinator
-    @State private var selectedGroupID: String?
-    @State private var groupFilter = 0
+    @State private var showsScanSettings = true
     @State private var showsIssues = false
-
-    private var groups: [SimilarityGroup] {
-        (model.report?.groups ?? []).filter { groupFilter == 0 || (groupFilter == 1 ? !$0.isExact : $0.isExact) }
-    }
-    private var selectedGroup: SimilarityGroup? { groups.first { $0.id == selectedGroupID } ?? groups.first }
 
     var body: some View {
         VStack(spacing: 14) {
-            scopeCard
-            scanControls
+            if model.report != nil && !model.isRunning {
+                HStack {
+                    Label(model.report?.scope.joined(separator: ", ") ?? model.scopeLabel, systemImage: coordinator.externalTitle == nil ? model.source.symbol : coordinator.externalSymbol)
+                        .font(.callout).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    Button { showsScanSettings.toggle() } label: {
+                        Label("Scan Settings", systemImage: showsScanSettings ? "chevron.up" : "slider.horizontal.3")
+                    }
+                    Button("Scan Again") { coordinator.start(model) }.disabled(!model.canStart)
+                }
+            }
+            if showsScanSettings || model.report == nil || model.isRunning {
+                scopeCard
+                scanControls
+            }
             if let error = model.error {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
@@ -189,8 +199,10 @@ private struct SimilarityScanView: View {
             resultArea.frame(maxWidth: .infinity, maxHeight: .infinity)
             footer
         }.padding(18)
-        .onReceive(model.$report) { report in selectedGroupID = report?.groups.first?.id; groupFilter = coordinator.duplicatesOnly ? 2 : 0 }
-        .onChange(of: groupFilter) { _ in selectedGroupID = groups.first?.id }
+        .onReceive(model.$report) { report in
+            showsScanSettings = report == nil
+            coordinator.preview.close()
+        }
         .sheet(isPresented: $showsIssues) { issuesSheet }
     }
 
@@ -334,104 +346,12 @@ private struct SimilarityScanView: View {
         if model.isRunning {
             SimilarityProgressView(model: model)
         } else if let report = model.report {
-            VStack(spacing: 0) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("\(report.totalGroups.formatted()) match groups").font(.headline)
-                        Text("Last scan · \(report.scope.joined(separator: ", ")) · minimum score \(String(format: "%.0f%%", report.threshold * 100))")
-                            .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                            .help(report.scope.joined(separator: "\n"))
-                    }
-                    Spacer()
-                    Picker("Match type", selection: $groupFilter) {
-                        Text("All").tag(0); Text("Similar").tag(1); Text("Identical").tag(2)
-                    }.pickerStyle(.segmented).labelsHidden().frame(width: 245)
-                }.padding(12)
-                Divider()
-                if groups.isEmpty {
-                    emptyState(symbol: "checkmark.circle", title: report.status == "cancelled" ? "Scan cancelled" : "No matches to show",
-                               message: report.skippedFiles > 0 ? "Some files were skipped. Review coverage before drawing conclusions." : "Try a lower minimum score or choose more files.")
-                } else {
-                    GeometryReader { geometry in
-                        HSplitView {
-                            groupList.frame(minWidth: 245, idealWidth: 305, maxWidth: 390)
-                            if let group = selectedGroup { memberList(group).frame(minWidth: 400, maxWidth: .infinity) }
-                        }.frame(width: geometry.size.width, height: geometry.size.height)
-                    }
-                }
-            }.background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 11))
-                .clipShape(RoundedRectangle(cornerRadius: 11))
-                .overlay(RoundedRectangle(cornerRadius: 11).stroke(Color.primary.opacity(0.08)))
+            SimilarityResultsView(results: model.results, report: report, coordinator: coordinator)
         } else {
             emptyState(symbol: "doc.on.doc", title: "Find related content, even with different names",
-                       message: "Choose a scope and start a scan. Matches stay grouped here for you to review.")
+                       message: "Choose a scope and start a scan. Browse the resulting file tree, then select a file to review its matches and scores.")
                 .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 11))
         }
-    }
-
-    private var groupList: some View {
-        List(selection: $selectedGroupID) {
-            ForEach(groups) { group in
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: group.isExact ? "equal.square" : group.members.first?.symbol ?? "doc")
-                        .font(.title3).foregroundStyle(FinderAppearance.accent).frame(width: 24)
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(group.title).lineLimit(1).truncationMode(.middle).font(.callout.weight(.medium))
-                        Text("\(group.memberCount) files · \(group.scoreLabel)").font(.caption).foregroundStyle(.secondary)
-                    }
-                }.padding(.vertical, 6).tag(group.id)
-            }
-        }.listStyle(.inset)
-    }
-
-    private func memberList(_ group: SimilarityGroup) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack {
-                    Text(group.isExact ? "Byte-identical copies" : "Similar content").font(.headline)
-                    Spacer()
-                    Text(group.scoreLabel).font(.caption.weight(.semibold)).foregroundStyle(FinderAppearance.accent)
-                }
-                Text(group.isExact ? "These files have the same SHA-256 content hash."
-                     : "Every pair in this group meets the scan’s score threshold. Review before making changes.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }.padding(15)
-            Divider()
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(group.members) { file in
-                        HStack(alignment: .center, spacing: 10) {
-                            Image(systemName: file.symbol).font(.title2).foregroundStyle(FinderAppearance.accent).frame(width: 30)
-                            VStack(alignment: .leading, spacing: 5) {
-                                Text(file.name).font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
-                                Text(file.path).font(.caption).foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle).help(file.path)
-                                Text(ByteCountFormatter.string(fromByteCount: Int64(clamping: file.bytes), countStyle: .file))
-                                    .font(.caption2).foregroundStyle(.secondary)
-                            }
-                            Spacer(minLength: 4)
-                            if let path = file.localPath {
-                                Button { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) } label: { Image(systemName: "folder") }
-                                    .help("Show \(file.name) in Finder")
-                            }
-                            Button("Open") { open(file) }.disabled(file.localPath == nil && file.cloudId == nil && coordinator.openExternalFile == nil)
-                                .help(model.source == .local ? "Open this file in its default app" : "Fetch this cloud file and open it in its default app")
-                        }.padding(13)
-                        Divider().padding(.leading, 53)
-                    }
-                }
-            }
-            if group.members.count < group.memberCount {
-                Text("Showing \(group.members.count) of \(group.memberCount) files. Scan a smaller scope to review the remaining members.")
-                    .font(.caption).foregroundStyle(.orange).padding(12)
-            }
-        }
-    }
-
-    private func open(_ file: SimilarityFile) {
-        if let open = coordinator.openExternalFile { open(file) }
-        else if let path = file.localPath {
-            if !NSWorkspace.shared.open(URL(fileURLWithPath: path)) { model.error = "This file could not be opened. It may have moved since the scan." }
-        } else { coordinator.openCloudFile(file) }
     }
 
     private var footer: some View {
@@ -444,10 +364,10 @@ private struct SimilarityScanView: View {
                         .font(.callout).foregroundStyle(.secondary)
                     Spacer()
                     Button("Coverage & Skipped Files…") { showsIssues = true }
-                    Button("Export Results…") { model.exportReport() }
+                    Button("Export Scan Summary…") { model.exportReport() }
                 }
                 if report.truncated {
-                    Text("Showing the first \(report.groups.count) groups, up to 20,000 members. Narrow the scan to review remaining matches. Exports contain the displayed results.")
+                    Text("Some file or identical-copy results exceed the display limit. Narrow the scope to review the rest. The exported summary contains the displayed inventory and identical-copy evidence.")
                         .font(.caption).foregroundStyle(.orange)
                 }
             }

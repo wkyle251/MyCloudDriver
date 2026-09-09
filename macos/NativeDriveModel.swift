@@ -88,6 +88,12 @@ struct CloudDriveActivityRecord: Identifiable {
             guard let self, let item = self.scanItemsByID[file.id] else { return }
             self.open(item)
         }
+        similarity.preparePreview = { [weak self] file, directory in
+            guard let self, let provider = self.provider, let item = self.scanItemsByID[file.id] else {
+                throw CloudDriveError.message("This item is no longer available in the connected drive.")
+            }
+            return try await provider.materialize(item, directory: directory, progress: { _ in })
+        }
         quickLook.onClose = { [weak self] in self?.closePreview() }
         quickLook.onMove = { [weak self] offset in self?.movePreview(offset) }
         quickLook.onRetry = { [weak self] in self?.previewSelection() }
@@ -363,7 +369,7 @@ struct CloudDriveActivityRecord: Identifiable {
                 do {
                     let url = try await provider.materialize(item, directory: directory, progress: fileProgress)
                     let path = url.standardizedFileURL.resolvingSymlinksInPath().path
-                    self.scanItemsByPath[path] = item; self.scanItemsByID[item.id] = item
+                    self.scanItemsByPath[path] = item; self.scanItemsByPath[url.standardizedFileURL.path] = item; self.scanItemsByID[item.id] = item
                 } catch {
                     if Task.isCancelled || error is CancellationError { throw CancellationError() }
                     self.preparationIssues.append(.init(path: item.name, reason: error.localizedDescription))
@@ -379,14 +385,17 @@ struct CloudDriveActivityRecord: Identifiable {
         }
         similarity.local.transformExternalReport = { [weak self] report in
             guard let self else { return report }
+            let itemsByPath = self.scanItemsByPath, kind = self.kind
+            func mapped(_ file: SimilarityFile) -> SimilarityFile {
+                let path = URL(fileURLWithPath: file.localPath ?? file.path).standardizedFileURL.path
+                guard let item = itemsByPath[path] else { return file }
+                return SimilarityFile(id: item.id, name: item.name, path: item.url?.path ?? "\(kind.title)/\(location.title)/\(item.name)", bytes: file.bytes,
+                    family: file.family, localPath: kind == .icloud ? item.url?.path : nil, cloudId: nil, ancestors: [],
+                    engineIndex: file.engineIndex, engineId: file.scoreID, state: file.state)
+            }
             let groups = report.groups.filter { !exactOnly || $0.isExact }.map { group in
                 SimilarityGroup(id: group.id, matchKind: group.matchKind, family: group.family, minimumScore: group.minimumScore,
-                    memberCount: group.memberCount, members: group.members.map { file in
-                        let path = URL(fileURLWithPath: file.localPath ?? file.path).standardizedFileURL.resolvingSymlinksInPath().path
-                        guard let item = self.scanItemsByPath[path] else { return file }
-                        return SimilarityFile(id: item.id, name: item.name, path: item.url?.path ?? "\(self.kind.title)/\(item.name)", bytes: file.bytes,
-                            family: file.family, localPath: self.kind == .icloud ? item.url?.path : nil, cloudId: nil, ancestors: [])
-                    })
+                    memberCount: group.memberCount, members: group.members.map(mapped))
             }
             let issues = self.preparationIssues + report.issues.map { issue in
                 let path = URL(fileURLWithPath: issue.path).standardizedFileURL.resolvingSymlinksInPath().path
@@ -397,7 +406,8 @@ struct CloudDriveActivityRecord: Identifiable {
                 skippedFiles: report.skippedFiles + UInt64(self.preparationIssues.count), downloadedBytes: report.downloadedBytes,
                 totalGroups: report.totalGroups, groups: groups,
                 issues: Array(issues.prefix(500)), truncated: report.truncated || issues.count > 500,
-                coverage: (self.preparationIssues.isEmpty ? "" : "Some originals could not be prepared. ") + report.coverage, elapsedSeconds: report.elapsedSeconds)
+                coverage: (self.preparationIssues.isEmpty ? "" : "Some originals could not be prepared. ") + report.coverage, elapsedSeconds: report.elapsedSeconds,
+                files: report.files?.map(mapped), runId: report.runId, resultRevision: report.resultRevision, scoresRetained: report.scoresRetained)
         }
         similarity.local.cleanupExternalScope = { [weak self] in
             if let directory = self?.scanDirectory { try? FileManager.default.removeItem(at: directory); self?.scanDirectory = nil }

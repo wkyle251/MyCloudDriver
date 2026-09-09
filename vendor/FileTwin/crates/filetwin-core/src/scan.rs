@@ -43,19 +43,12 @@ pub(crate) fn discover(work: &mut Work<'_>) -> Result<()> {
     work.job.run = None;
     work.job.source_partial = false;
     work.job.counts.files_discovered = 0;
+    work.job.counts.files_processed = 0;
+    work.job.counts.files_total = None;
     work.job.counts.files_ready = 0;
     work.job.counts.files_failed = 0;
     work.job.counts.files_excluded = 0;
     work.job.counts.locations = 0;
-    // Inventory paths on disk before expensive reads, giving progress a stable
-    // denominator without holding a large folder tree in memory. The queue is
-    // connection-local and rebuilt after interruption just like directory_tasks.
-    work.db.execute_batch(
-        "PRAGMA temp_store=FILE; DROP TABLE IF EXISTS temp.scan_inputs;
-        CREATE TEMP TABLE scan_inputs (id INTEGER PRIMARY KEY, path BLOB NOT NULL,
-        root BLOB NOT NULL, source TEXT NOT NULL, UNIQUE(path, source));",
-    )?;
-    work.progress_stage("inventory", None);
     work.checkpoint()?;
     let namespace = store::namespace(&work.db)?;
     loop {
@@ -76,7 +69,7 @@ pub(crate) fn discover(work: &mut Work<'_>) -> Result<()> {
             let handle = local::open_secure(&path)?;
             let meta = handle.metadata()?;
             if meta.is_file() {
-                return queue_file(work, &path, &root, &source);
+                return process_file(work, &path, &root, &source, &namespace, &filters, &excluded);
             }
             if !meta.is_dir() {
                 return Err(Error::new(
@@ -118,7 +111,9 @@ pub(crate) fn discover(work: &mut Work<'_>) -> Result<()> {
                         excluded_entry(work, &child, &source, "non_recursive_scope")?;
                     }
                 } else if metadata.is_file() {
-                    queue_file(work, &child, &root, &source)?;
+                    process_file(
+                        work, &child, &root, &source, &namespace, &filters, &excluded,
+                    )?;
                 } else {
                     excluded_entry(
                         work,
@@ -163,80 +158,9 @@ pub(crate) fn discover(work: &mut Work<'_>) -> Result<()> {
             .execute("UPDATE directory_tasks SET done=1 WHERE id=?1", [task_id])?;
         work.checkpoint()?;
     }
-    let total = work
-        .db
-        .query_row("SELECT count(*) FROM scan_inputs", [], |r| r.get(0))?;
-    work.progress_stage("analysing", Some(total));
-    let mut after = 0i64;
-    loop {
-        work.check()?;
-        let next = work
-            .db
-            .query_row(
-                "SELECT id,path,root,source FROM scan_inputs WHERE id>?1 ORDER BY id LIMIT 1",
-                [after],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, Vec<u8>>(1)?,
-                        r.get::<_, Vec<u8>>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((id, path, root, source)) = next else {
-            break;
-        };
-        after = id;
-        let path = local::from_bytes(path);
-        let root = local::from_bytes(root);
-        work.progress.current_file = Some(json!({"locator":local::locator(&path)}));
-        work.progress.file_bytes_read.set(0);
-        work.progress.operation = "reading";
-        let outcome = process_file(work, &path, &root, &source, &namespace, &filters, &excluded);
-        if let Err(error) = outcome {
-            if matches!(
-                error.code,
-                ErrorCode::Cancelled
-                    | ErrorCode::OutputClosed
-                    | ErrorCode::BudgetExhausted
-                    | ErrorCode::StorageError
-            ) {
-                return Err(error);
-            }
-            work.job.source_partial = true;
-            work.file_error(error.for_file(&source, None))?;
-        }
-        work.progress.completed += 1;
-        work.progress.current_file = None;
-        work.checkpoint()?;
-    }
-    work.progress_event();
-    work.db.execute_batch("DROP TABLE temp.scan_inputs")?;
     refresh_counts(work)?;
-    Ok(())
-}
-
-fn queue_file(work: &mut Work<'_>, path: &Path, root: &Path, source: &str) -> Result<()> {
-    let added = work.db.execute(
-        "INSERT OR IGNORE INTO scan_inputs(path,root,source) VALUES(?1,?2,?3)",
-        params![local::path_bytes(path), local::path_bytes(root), source],
-    )?;
-    work.progress.completed += added as u64;
-    Ok(())
-}
-
-struct ProgressReader<'a, R> {
-    reader: R,
-    bytes: &'a std::cell::Cell<u64>,
-}
-impl<R: Read> Read for ProgressReader<'_, R> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.reader.read(buffer)?;
-        self.bytes.set(self.bytes.get().saturating_add(n as u64));
-        Ok(n)
-    }
+    work.job.counts.files_total = Some(work.job.counts.files_processed);
+    work.checkpoint()
 }
 
 fn excluded_entry(work: &mut Work<'_>, path: &Path, source: &str, reason: &str) -> Result<()> {
@@ -281,9 +205,6 @@ fn process_file(
         return Ok(());
     }
     let revision = Revision::of(&meta);
-    if let Some(current) = &mut work.progress.current_file {
-        current["bytes"] = json!(revision.bytes);
-    }
     let fid = revision.file_id(namespace);
     let relative = if path == root {
         path.file_name().map(Path::new).unwrap_or(path)
@@ -424,7 +345,7 @@ fn process_file(
     }
     let p = profile::find(selected.as_deref().expect("Selected profile"))?;
     let encoded = if format == "utf8" {
-        text::encode(ProgressReader { reader: &mut file, bytes: &work.progress.file_bytes_read }, compute, &|| work.check()).map(|e| {
+        text::encode(&mut file, compute, &|| work.check()).map(|e| {
             work.job.counts.bytes_read += e.bytes_read;
             if compute { work.job.counts.bytes_hashed += e.bytes_read; }
             (Encoded { family: "text".into(), format: "text/plain; charset=utf-8".into(), vector: e.vector,
@@ -600,6 +521,7 @@ fn save_observation(
 fn refresh_counts(work: &mut Work<'_>) -> Result<()> {
     let counts=work.db.query_row("SELECT count(*),coalesce(sum(vector_id IS NOT NULL),0),coalesce(sum(json_extract(payload,'$.state')='excluded'),0),coalesce(sum(json_extract(payload,'$.state') IN ('failed','unsupported','insufficient_content','stale')),0) FROM job_files WHERE job_id=?1",[&work.job.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
     work.job.counts.files_discovered = counts.0;
+    work.job.counts.files_processed = counts.0;
     work.job.counts.files_ready = counts.1;
     work.job.counts.files_excluded = counts.2;
     work.job.counts.files_failed = counts.3;
@@ -633,7 +555,7 @@ pub(crate) fn verify_vector(db: &rusqlite::Connection, id: &str) -> Result<Vec<f
     profile::decode_vector(&bytes, profile::find(&profile_id)?.dimensions)
 }
 
-fn hash_file(file: &mut impl Read, check: &dyn Fn() -> Result<()>) -> Result<(String, u64)> {
+fn hash_file(file: &mut File, check: &dyn Fn() -> Result<()>) -> Result<(String, u64)> {
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 65536];
     let mut bytes = 0;
@@ -660,15 +582,7 @@ fn hash_file(file: &mut impl Read, check: &dyn Fn() -> Result<()>) -> Result<(St
 }
 
 fn read_digest(work: &mut Work<'_>, file: &mut File) -> Result<String> {
-    work.progress.operation = "hashing";
-    work.progress.file_bytes_read.set(0);
-    match hash_file(
-        &mut ProgressReader {
-            reader: file,
-            bytes: &work.progress.file_bytes_read,
-        },
-        &|| work.check(),
-    ) {
+    match hash_file(file, &|| work.check()) {
         Ok((sha, bytes)) => {
             work.job.counts.bytes_read += bytes;
             work.job.counts.bytes_hashed += bytes;

@@ -119,6 +119,49 @@ fn mixed_dimensions_profiles_cache_and_frozen_comparison() {
 }
 
 #[test]
+fn matrices_keep_incompatible_profiles_null_even_when_dimensions_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    response(&root.join("image.json"), "image", 512);
+    response(&root.join("video.json"), "video", 512);
+    let cfg = config(
+        &root,
+        &format!(
+            "request=$(/bin/cat)\ncase \"$request\" in *'\"format\":\"media\"'*) /bin/cat '{}' ;; *) /bin/cat '{}' ;; esac",
+            root.join("video.json").display(),
+            root.join("image.json").display()
+        ),
+    );
+    let input = root.join("input");
+    fs::create_dir(&input).unwrap();
+    fs::write(input.join("image.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    fs::write(input.join("video.mp4"), b"\0\0\0\x18ftypisom").unwrap();
+    let engine = Engine::open(cfg, HostServices::default()).unwrap();
+    let summary = engine
+        .submit(JobRequest::experimental_scores([input]))
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(summary.counts.files_ready, 2, "{summary:?}");
+    let matrix = Catalog::open_read_only(root.join("data"))
+        .unwrap()
+        .matrix(MatrixQuery::new(summary.run_id.unwrap()))
+        .unwrap();
+    assert_eq!(
+        matrix.scores,
+        vec![vec![Some(1.0), None], vec![None, Some(1.0)]]
+    );
+    assert_eq!(
+        matrix.unavailable_reasons[0][1],
+        Some(MatrixUnavailable::IncompatibleProfile)
+    );
+    assert_eq!(
+        matrix.unavailable_reasons[1][0],
+        Some(MatrixUnavailable::IncompatibleProfile)
+    );
+}
+
+#[test]
 fn malformed_worker_output_is_a_file_failure_and_does_not_stop_text() {
     let temp = tempfile::tempdir().unwrap();
     let tmp = temp.path().canonicalize().unwrap();
@@ -174,10 +217,26 @@ fn cancellation_kills_native_descendants_and_removes_staging() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let pid: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+    let events = job.events();
+    loop {
+        match events.recv_timeout(Duration::from_secs(5)).unwrap() {
+            JobEvent::Progress { data, .. } => {
+                assert_eq!(data["stage"], "discovery");
+                assert_eq!(data["counts"]["files_processed"], 0);
+                assert!(data["counts"]["files_total"].is_null());
+                assert!(data["counts"]["pairs_total"].is_null());
+                break;
+            }
+            JobEvent::Summary(_) => panic!("Native fixture finished before cancellation"),
+            _ => (),
+        }
+    }
     job.cancel();
     let summary = job.wait().unwrap();
     assert_eq!(summary.status, "cancelled");
     assert_eq!(summary.counts.files_ready, 0);
+    assert_eq!(summary.counts.files_processed, 0);
+    assert_eq!(summary.counts.files_total, None);
     assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
     // A killed descendant can be briefly visible as a zombie until the system
     // reaper observes it. It must never continue running after cancellation.

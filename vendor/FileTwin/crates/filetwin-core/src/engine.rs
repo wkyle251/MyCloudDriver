@@ -182,6 +182,7 @@ impl Engine {
                     .ok_or_else(|| Error::invalid("Snapshot has no profiles"))?,
             )?;
         }
+        prepare_score_input(&db, &mut request)?;
         let job = store::insert_job(&db, request)?;
         self.start(&mut slot, job)
     }
@@ -192,6 +193,7 @@ impl Engine {
         let db = store::open_writer(&self.config.data_dir)?;
         let mut job = store::load_job(&db, id)?;
         job.request.clone().resolve()?;
+        prepare_score_input(&db, &mut job.request)?;
         if let Some(sid) = &job.request.snapshot_id {
             let (request, _) = store::snapshot_request(&db, sid)?;
             job.request.validate_thresholds(
@@ -348,6 +350,31 @@ impl Drop for Engine {
     }
 }
 
+fn prepare_score_input(db: &Connection, request: &mut JobRequest) -> Result<()> {
+    let Some(run) = &request.source_run_id else {
+        return Ok(());
+    };
+    let source = store::score_run(db, run, request.source_revision)?;
+    if source.summary.completeness.comparison_coverage != "exhaustive_for_snapshot" {
+        return Err(Error::invalid(
+            "group requires an exhaustive saved score revision; incomplete scores can still be queried as a matrix or score pages",
+        ));
+    }
+    if request.pair_scope.is_some() && request.pair_scope != source.request.pair_scope {
+        return Err(Error::invalid(
+            "group cannot change the saved score run's pair scope",
+        ));
+    }
+    let profiles = store::snapshot_request(db, &source.snapshot)?
+        .0
+        .profiles
+        .unwrap_or_default();
+    request.validate_thresholds(&profiles)?;
+    request.source_revision = Some(source.revision);
+    request.pair_scope = source.request.pair_scope;
+    Ok(())
+}
+
 /// Even a publication failure produces a terminal outcome for a live caller.
 /// Null result IDs mean no newly published result is promised. If persistence
 /// itself fails, keep that fact explicit and leave crash recovery to the catalog.
@@ -408,38 +435,8 @@ pub(crate) struct Work<'a> {
     previous_elapsed: f64,
     last_progress: Instant,
     last_heartbeat: std::cell::Cell<Instant>,
-    pub progress: ScanProgress,
-}
-
-/// Transient UI telemetry; never part of the catalog or resumable job state.
-#[derive(Default, serde::Serialize)]
-pub(crate) struct ScanProgress {
-    pub stage: Option<&'static str>,
-    pub total: Option<u64>,
-    pub completed: u64,
-    pub current_file: Option<serde_json::Value>,
-    pub file_bytes_read: std::cell::Cell<u64>,
-    pub operation: &'static str,
 }
 impl Work<'_> {
-    pub fn progress_event(&self) {
-        let _ = self.events.try_send(JobEvent::Progress {
-            job_id: self.job.id.clone(),
-            run_id: self.job.run.clone(),
-            data: json!({"attempt_id":self.job.attempt,
-                "stage":self.progress.stage.unwrap_or(&self.job.stage),
-                "counts":self.job.counts, "elapsed_seconds":self.elapsed(),
-                "work":self.progress}),
-        });
-    }
-    pub fn progress_stage(&mut self, stage: &'static str, total: Option<u64>) {
-        self.progress = ScanProgress {
-            stage: Some(stage),
-            total,
-            ..ScanProgress::default()
-        };
-        self.progress_event();
-    }
     pub fn check(&self) -> Result<()> {
         self.cancel.check()?;
         if self.last_heartbeat.get().elapsed() >= Duration::from_millis(250) {
@@ -447,7 +444,7 @@ impl Work<'_> {
                 "UPDATE jobs SET elapsed=?2,updated_at=?3 WHERE id=?1",
                 rusqlite::params![self.job.id, self.elapsed(), store::now()],
             )?;
-            self.progress_event();
+            let _=self.events.try_send(JobEvent::Progress{job_id:self.job.id.clone(),run_id:self.job.run.clone(),data:json!({"attempt_id":self.job.attempt,"stage":self.job.stage,"counts":self.job.counts,"elapsed_seconds":self.elapsed(),"bytes_transferred":0,"eta_seconds":null})});
             self.last_heartbeat.set(Instant::now());
         }
         if self
@@ -491,7 +488,7 @@ impl Work<'_> {
         self.job.elapsed = self.elapsed();
         store::save_job(&self.db, &self.job)?;
         if self.last_progress.elapsed() >= Duration::from_millis(250) {
-            self.progress_event();
+            let _=self.events.try_send(JobEvent::Progress{job_id:self.job.id.clone(),run_id:self.job.run.clone(),data:json!({"attempt_id":self.job.attempt,"stage":self.job.stage,"counts":self.job.counts,"elapsed_seconds":self.job.elapsed,"bytes_transferred":0,"eta_seconds":null})});
             self.last_progress = Instant::now();
         }
         Ok(())
@@ -529,13 +526,27 @@ fn run(
         previous_elapsed,
         last_progress: Instant::now(),
         last_heartbeat: std::cell::Cell::new(Instant::now()),
-        progress: ScanProgress::default(),
     };
     work.job.status = "running".into();
     work.checkpoint()?;
     let outcome = (|| -> Result<()> {
-        if work.job.request.operation == Operation::Compare && work.job.snapshot.is_none() {
-            work.job.snapshot = work.job.request.snapshot_id.clone();
+        if work.job.request.operation.uses_saved_input() && work.job.snapshot.is_none() {
+            work.job.snapshot = if work.job.request.operation == Operation::Group {
+                Some(
+                    store::score_run(
+                        &work.db,
+                        work.job
+                            .request
+                            .source_run_id
+                            .as_deref()
+                            .expect("Score run"),
+                        work.job.request.source_revision,
+                    )?
+                    .snapshot,
+                )
+            } else {
+                work.job.request.snapshot_id.clone()
+            };
             let (_, partial) = store::snapshot_request(
                 &work.db,
                 work.job.snapshot.as_ref().expect("Compare snapshot"),
@@ -552,8 +563,20 @@ fn run(
             }
         }
         if work.job.run.is_some() {
-            matching::compare(&mut work)?;
-            matching::group(&mut work)?;
+            if work.job.request.operation == Operation::Group {
+                matching::filter_scores(&mut work)?;
+            } else {
+                matching::compare(&mut work)?;
+            }
+            if work
+                .job
+                .request
+                .matching
+                .as_ref()
+                .is_some_and(|m| m.grouping == "all_pairs")
+            {
+                matching::group(&mut work)?;
+            }
         }
         Ok(())
     })();
@@ -570,7 +593,7 @@ fn run(
     }
     if work.job.stage == "discovery"
         && work.job.status != "completed"
-        && work.job.request.operation != Operation::Compare
+        && !work.job.request.operation.uses_saved_input()
     {
         work.job.source_partial = true;
         store::publish_snapshot(&work.db, &mut work.job)?;
@@ -585,7 +608,7 @@ fn run(
     } else {
         1
     };
-    let selected = if let Some(sid) = &work.job.request.snapshot_id {
+    let selected = if let Some(sid) = &work.job.snapshot {
         store::snapshot_request(&work.db, sid)?
             .0
             .profiles
@@ -610,7 +633,7 @@ fn run(
                 .is_some_and(|limit| work.job.elapsed >= limit as f64),
         snapshot_id: work.job.snapshot.clone(),
         result_revision: work.job.snapshot.as_ref().map(|_| revision),
-        scope_summary: json!({"families":selected.keys().collect::<Vec<_>>(),"profiles":selected_profiles,"pair_scope":work.job.request.pair_scope}),
+        scope_summary: json!({"families":selected.keys().collect::<Vec<_>>(),"profiles":selected_profiles,"pair_scope":work.job.request.pair_scope,"matching":work.job.request.matching,"source_run_id":work.job.request.source_run_id,"source_revision":work.job.request.source_revision}),
         started_at: work.job.started_at.clone(),
         finished_at: store::now(),
         elapsed_seconds: work.job.elapsed,
@@ -640,7 +663,7 @@ fn run(
             } else {
                 vec![]
             },
-            freshness: if work.job.request.operation == Operation::Compare {
+            freshness: if work.job.request.operation.uses_saved_input() {
                 "snapshot_observation"
             } else {
                 "fast_metadata_heuristic"

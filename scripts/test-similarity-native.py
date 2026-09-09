@@ -76,21 +76,40 @@ def main():
         assert run.returncode == 0, run.stderr
         updates = [json.loads(line) for line in run.stdout.splitlines() if line.startswith('{')]
         progress = [event for event in updates if event.get("event") == "progress"]
-        assert {"inventory", "analysing", "comparison", "grouping", "finishing"} <= {p["stage"] for p in progress}
+        assert progress and updates[-1]["event"] == "finished"
         analysis = [p for p in progress if p["stage"] == "analysing"]
-        assert all(p["total"] == 11 for p in analysis), "Analysis total changed during the scan"
-        assert analysis[-1]["completed"] == 11
-        assert any(p.get("current_file") and p.get("operation") == "decoding" for p in analysis)
+        assert analysis, "No analysis progress was received"
         assert all(p.get("total") is None or p["completed"] <= p["total"] for p in progress)
+        for event in analysis:
+            assert event["completed"] == event["counts"]["files_processed"]
+            assert event["total"] == event["counts"]["files_total"]
+        terminal = next(p for p in reversed(progress) if p["stage"] == "finishing")
+        assert terminal["counts"]["files_processed"] == terminal["counts"]["files_total"] == 11
+        assert terminal["counts"]["pairs_processed"] == terminal["counts"]["pairs_total"] == 55
         report = json.loads(Path(request["report_path"]).read_text())
         assert report["analysed_files"] == 11, json.dumps(report, indent=2)
         assert report["skipped_files"] == 0, report["issues"]
-        families = {group["family"] for group in report["groups"] if group["match_kind"] == "similar_content"}
+        families = {file["family"] for file in report["files"] if file["state"] == "ready"}
         assert families == {"text", "image", "audio", "video"}, families
+        assert report["scores_retained"] == 13
         assert not list(Path(request["temp_dir"]).iterdir()), "temporary copies remain"
-        print("PASS shipped FileTwin decoders: UTF-8, DOCX, PDF, PNG, WAV and MP4; all four content families grouped")
-        print("PASS local CLI with no account configuration, exact copies, fresh reads and temporary cleanup")
-        print("PASS stable file totals, current-file decoder progress, pair/group totals and all scan stages")
+        # Scores, including per-family decoder output, survive removal of all inputs.
+        shutil.rmtree(files)
+        for family in sorted(families):
+            reference = next(file for file in report["files"] if file["family"] == family)
+            query = dict(data_dir=request["data_dir"], run_id=report["run_id"], result_revision=report["result_revision"],
+                         file_id=reference["id"], row_offset=reference["engine_index"])
+            query_path = root / "query.json"; query_path.write_text(json.dumps(query))
+            response = subprocess.run([str(resources / "pikpak"), "similarity-scores", "--request-file", str(query_path)],
+                                      env=environment, capture_output=True, text=True, check=True, timeout=30)
+            row = json.loads(response.stdout)
+            assert row["file_id"] == reference["id"] and row["entries"]
+            assert all(-1 <= entry["score"] <= 1 for entry in row["entries"])
+            assert row["unavailable"].get("incompatible_profile", 0) > 0
+        print("PASS shipped FileTwin decoders: UTF-8, DOCX, PDF, PNG, WAV and MP4; individual scores in all four families")
+        print("PASS local CLI without login, exact copies, source-independent saved rows and temporary cleanup")
+        print("PASS upstream file/pair counters, honest unknown totals, full file inventory and incompatible-score reasons")
+
 
 
 if __name__ == "__main__":

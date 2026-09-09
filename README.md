@@ -27,7 +27,7 @@ tokens, create an `.env` file, or configure account credentials manually.
 | **Links** | Open multiple shared links, select items across expanded links, save selections to your PikPak, and queue downloads. |
 | **Accounts** | Sign in, check login status, add accounts, switch accounts, and log out from Settings. |
 | **Maintenance** | Check for duplicates, remove empty folders or `.DS_Store` files, and merge selected folders through the File menu. |
-| **Similarity** | Find similar documents, images, audio and video using FileTwin, with separate cloud and local scans. |
+| **Similarity** | Browse a scanned file tree, select a reference file, and review individual similarity scores, previews and identical copies. Filter saved scores from 5% without rescanning. |
 | **Status** | Follow background activity in the footer; open its status control for progress, results, and available actions. |
 
 ### Provider support
@@ -71,8 +71,15 @@ support session Undo. Existing PikPak Undo coverage is described below.
   to use the app. Password-protected archives prompt for a password; progress
   appears in the status area.
 - **Content similarity:** open **File → Find Similar Files…** to compare actual
-  content and review grouped matches. Closing the window keeps the scan running;
+  content. Results use an expandable file tree and a ranked match pane with actual
+  pair scores, paths and Preview/Open actions. Change the 5–100% minimum score
+  without rescanning. Closing the window keeps the scan running;
   reopen it from the status footer. Nothing is deleted automatically.
+  FileTwin reports raw file/pair counters; unknown totals use an activity indicator.
+  Scores are loaded for the selected file, so the UI does not load the full matrix.
+  **Export Scan Summary** exports the displayed inventory and identical-copy
+  evidence; it does not export the complete score matrix. See the
+  [results design](docs/SIMILARITY_RESULTS_DESIGN.md).
 - **Undo and Redo:** reverse supported Trash, move, upload, rename, and new-folder
   actions. History lasts for the current account's app session. Cleanup tools,
   share imports, and extractions are outside this history.

@@ -8,7 +8,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use filetwin_core::{
     api::{
         Cache, CacheMode, EngineConfig, ExactDuplicates, Filters, JobEvent, JobRequest, JobSummary,
-        Limits, ResultsQuery, RuntimeConfig,
+        Limits, Matching, MatrixQuery, ResultsQuery, RuntimeConfig,
     },
     Catalog, Engine, HostServices,
 };
@@ -36,6 +36,7 @@ const MAX_CLOUD_FILES: usize = 100_000;
 const MAX_GROUPS: usize = 2_000;
 const MAX_MEMBERS: usize = 20_000;
 const MAX_ISSUES: usize = 500;
+const MAX_FILES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +130,8 @@ pub struct MatchedFile {
     pub local_path: Option<String>,
     pub cloud_id: Option<String>,
     pub ancestors: Vec<CloudAncestor>,
+    pub engine_index: Option<u64>,
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +166,54 @@ pub struct ScanReport {
     pub truncated: bool,
     pub coverage: String,
     pub elapsed_seconds: f64,
+    pub files: Vec<MatchedFile>,
+    pub run_id: Option<String>,
+    pub result_revision: Option<u64>,
+    pub scores_retained: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScoreRowRequest {
+    pub data_dir: PathBuf,
+    pub run_id: String,
+    pub result_revision: u64,
+    pub file_id: String,
+    pub row_offset: u64,
+}
+
+/// Query saved measurements only. Locators and temporary paths never leave this
+/// adapter; the app joins opaque file IDs to its provider-specific inventory.
+pub fn score_row(request: ScoreRowRequest, cancel: &AtomicBool) -> Result<Value> {
+    if !request.data_dir.is_absolute() { bail!("The score catalog path must be absolute."); }
+    let catalog = Catalog::open_read_only(&request.data_dir)?;
+    let mut offset = 0;
+    let mut entries = Vec::new();
+    let mut unavailable = std::collections::BTreeMap::<String, u64>::new();
+    let mut omitted = 0u64;
+    loop {
+        check_cancel(cancel)?;
+        let page = catalog.matrix_with_cancel(MatrixQuery {
+            row_offset: request.row_offset, column_offset: offset, row_limit: 1, column_limit: 256,
+            result_revision: Some(request.result_revision), ..MatrixQuery::new(&request.run_id)
+        }, &|| cancel.load(Ordering::Acquire))?;
+        if page.rows.first().map(|f| f.file_id.as_str()) != Some(request.file_id.as_str()) {
+            bail!("This file no longer belongs to the selected scan revision. Run a new scan.");
+        }
+        for (index, file) in page.columns.iter().enumerate() {
+            if file.file_id == request.file_id { continue; }
+            if let Some(score) = page.scores[0][index] {
+                if entries.len() < MAX_FILES {
+                    entries.push(json!({"file_id":file.file_id,"score":score}));
+                } else { omitted += 1; }
+            } else if let Some(reason) = page.unavailable_reasons[0][index] {
+                let reason = serde_json::to_value(reason)?.as_str().unwrap().to_owned();
+                *unavailable.entry(reason).or_default() += 1;
+            }
+        }
+        match page.next_column_offset { Some(next) => offset = next, None => break }
+    }
+    Ok(json!({"file_id":request.file_id,"entries":entries,"unavailable":unavailable,"omitted":omitted}))
 }
 
 struct StagedCloud {
@@ -287,6 +338,7 @@ pub async fn scan(
         truncated: false,
         coverage: String::new(),
         elapsed_seconds: 0.0,
+        files: vec![], run_id: None, result_revision: None, scores_retained: 0,
     };
     if !cancel.load(Ordering::Acquire)
         && (request.source == ScanSource::Local || !staged.files.is_empty())
@@ -357,6 +409,7 @@ fn engine_progress(
     elapsed: f64,
 ) -> Value {
     let work = &data["work"];
+    let counts = &data["counts"];
     let current = &work["current_file"];
     let file = value_path(current).and_then(|path| {
         let name = if request.source == ScanSource::Cloud {
@@ -368,15 +421,21 @@ fn engine_progress(
     });
     // Cloud inventory has already completed before downloading. FileTwin's
     // quick inventory of the staged copies belongs to its analysis stage.
-    let stage = if request.source == ScanSource::Cloud && data["stage"] == "inventory" {
+    let stage = if data["stage"] == "discovery" || (request.source == ScanSource::Cloud && data["stage"] == "inventory") {
         "analysing"
     } else if data["stage"] == "comparing" {
         "comparison"
     } else {
         data["stage"].as_str().unwrap_or("analysing")
     };
-    json!({"event":"progress", "stage":stage, "counts":data["counts"],
-        "completed":work["completed"], "total":work["total"], "current_file":file,
+    let (completed, total) = match stage {
+        "analysing" => (&counts["files_processed"], &counts["files_total"]),
+        "comparison" => (&counts["pairs_processed"], &counts["pairs_total"]),
+        "filtering" => (&counts["scores_reused"], &counts["scores_total"]),
+        _ => (&work["completed"], &work["total"]),
+    };
+    json!({"event":"progress", "stage":stage, "counts":counts,
+        "completed":completed, "total":total, "current_file":file,
         "file_bytes_read":work["file_bytes_read"], "operation":work["operation"],
         "skipped":staged.skipped, "downloaded_bytes":staged.bytes, "elapsed_seconds":elapsed})
 }
@@ -386,11 +445,9 @@ fn engine_request(request: &ScanRequest, roots: Vec<PathBuf>) -> JobRequest {
     job.families = Some(request.families.clone());
     let profiles = job.profiles.as_mut().expect("experimental profiles");
     profiles.retain(|family, _| request.families.contains(family));
-    job.matching
-        .as_mut()
-        .expect("matching")
-        .threshold_overrides
-        .retain(|id, _| profiles.values().any(|p| p == id));
+    // Filtering belongs to the review UI. Preserve every compatible score and
+    // avoid rebuilding conservative groups whenever the user changes a cutoff.
+    job.matching = Some(Matching::all_scores());
     job.recursive = Some(true);
     job.filters = Some(Filters {
         include_hidden: request.include_hidden,
@@ -655,6 +712,8 @@ fn matched_file(value: &Value, staged: &StagedCloud, source: ScanSource) -> Opti
         },
         cloud_id: cloud.map(|f| f.id.clone()),
         ancestors: cloud.map(|f| f.ancestors.clone()).unwrap_or_default(),
+        engine_index: None,
+        state: value["state"].as_str().unwrap_or("ready").into(),
     })
 }
 
@@ -710,7 +769,9 @@ fn collect_report(
     report.analysed_files = summary.counts.files_ready;
     report.skipped_files =
         staged.skipped + summary.counts.files_failed + summary.counts.files_excluded;
-    report.total_groups = summary.counts.groups;
+    report.run_id = summary.run_id.clone();
+    report.result_revision = summary.result_revision;
+    report.scores_retained = summary.counts.scores_retained;
     report.coverage = format!(
         "Source coverage: {}. Comparison coverage: {}.{}",
         summary.completeness.source_coverage,
@@ -731,39 +792,6 @@ fn collect_report(
         return Ok(());
     }
     let catalog = Catalog::open_read_only(&request.data_dir)?;
-    let mut member_count = 0;
-    report.truncated = !visit_results(&catalog, summary, "groups", None, |group| {
-        if report.groups.len() >= MAX_GROUPS || member_count >= MAX_MEMBERS {
-            return Ok(false);
-        }
-        let id = group["group_id"]
-            .as_str()
-            .context("Missing match group ID")?;
-        let mut members = Vec::new();
-        visit_results(&catalog, summary, "members", Some(id), |file| {
-            if member_count >= MAX_MEMBERS {
-                return Ok(false);
-            }
-            if let Some(file) = matched_file(&file, staged, request.source) {
-                members.push(file);
-                member_count += 1;
-            }
-            Ok(true)
-        })?;
-        report.groups.push(MatchGroup {
-            id: id.into(),
-            match_kind: group["match_kind"].as_str().unwrap_or("").into(),
-            family: group["family"].as_str().unwrap_or("other").into(),
-            minimum_score: group["minimum_score"].as_f64(),
-            member_count: group["member_count"].as_u64().unwrap_or(0),
-            members,
-        });
-        Ok(true)
-    })?;
-    report.truncated |= report
-        .groups
-        .iter()
-        .any(|g| g.members.len() < g.member_count as usize);
     let mut errors = HashMap::new();
     visit_results(&catalog, summary, "errors", None, |error| {
         if errors.len() >= MAX_ISSUES {
@@ -783,11 +811,29 @@ fn collect_report(
         }
         Ok(true)
     })?;
+    let mut hashes = std::collections::BTreeMap::<String, Vec<MatchedFile>>::new();
+    let mut ordinal = 0u64;
+    let mut inventory_bytes = 0usize;
     visit_results(&catalog, summary, "files", None, |file| {
-        if report.issues.len() >= MAX_ISSUES {
-            return Ok(false);
+        // File pages and matrix axes use the immutable snapshot file-ID order.
+        // Keep excluded non-file entries in the ordinal even though the tree
+        // only displays files. Never derive the row from the filtered tree.
+        let index = ordinal;
+        ordinal += 1;
+        if !file["bytes"].is_null() {
+            if let Some(mut mapped) = matched_file(&file, staged, request.source) {
+                mapped.engine_index = Some(index);
+                let bytes = serde_json::to_vec(&mapped)?.len();
+                if report.files.len() < MAX_FILES && inventory_bytes + bytes < 40 * 1024 * 1024 {
+                    inventory_bytes += bytes;
+                    if let Some(hash) = file["sha256"].as_str().filter(|_| request.exact_duplicates) {
+                        hashes.entry(hash.to_owned()).or_default().push(mapped.clone());
+                    }
+                    report.files.push(mapped);
+                } else { report.truncated = true; }
+            }
         }
-        if file["state"].as_str() != Some("ready") {
+        if file["state"].as_str() != Some("ready") && report.issues.len() < MAX_ISSUES {
             if let Some(path) = value_path(&file) {
                 let path = staged
                     .files
@@ -812,6 +858,16 @@ fn collect_report(
         }
         Ok(true)
     })?;
+    let mut member_count = 0;
+    for (hash, members) in hashes.into_iter().filter(|(_, files)| files.len() > 1) {
+        report.total_groups += 1;
+        if report.groups.len() >= MAX_GROUPS || member_count + members.len() > MAX_MEMBERS {
+            report.truncated = true; continue;
+        }
+        member_count += members.len();
+        report.groups.push(MatchGroup { id: hash, match_kind: "byte_identical".into(), family: "other".into(),
+            minimum_score: None, member_count: members.len() as u64, members });
+    }
     Ok(())
 }
 
@@ -892,10 +948,27 @@ mod tests {
             .groups
             .iter()
             .any(|g| g.match_kind == "byte_identical" && g.members.len() == 2));
-        assert!(report
-            .groups
-            .iter()
-            .any(|g| g.match_kind == "similar_content" && g.members.len() == 3));
+        assert_eq!(report.files.len(), 4, "Unmatched files remain in the tree inventory");
+        assert_eq!(report.scores_retained, 6);
+        let original = report.files.iter().find(|f| f.name == "original.txt").unwrap();
+        // Saved rows remain usable after originals have gone away. Changing a
+        // display cutoff never re-reads source files or recomputes vectors.
+        std::fs::remove_dir_all(&r.local_paths[0]).unwrap();
+        let row = score_row(ScoreRowRequest { data_dir: r.data_dir.clone(), run_id: report.run_id.clone().unwrap(),
+            result_revision: report.result_revision.unwrap(), file_id: original.id.clone(), row_offset: original.engine_index.unwrap() }, &AtomicBool::new(false)).unwrap();
+        assert_eq!(row["entries"].as_array().unwrap().len(), 3);
+        for entry in row["entries"].as_array().unwrap() {
+            let other = report.files.iter().find(|f| f.id == entry["file_id"]).unwrap();
+            let score = entry["score"].as_f64().unwrap();
+            match other.name.as_str() {
+                "copy.txt" => assert_eq!(score, 1.0),
+                "edited.txt" => assert!(score > 0.85 && score < 1.0),
+                "different.txt" => assert!(score < 0.85, "Below-cutoff scores are retained"),
+                _ => panic!("Unexpected reference or self score"),
+            }
+        }
+        assert!(score_row(ScoreRowRequest { data_dir: r.data_dir.clone(), run_id: report.run_id.clone().unwrap(),
+            result_revision: report.result_revision.unwrap(), file_id: "wrong-file".into(), row_offset: original.engine_index.unwrap() }, &AtomicBool::new(false)).is_err());
         assert!(report
             .groups
             .iter()
@@ -1092,7 +1165,7 @@ mod tests {
                 ancestors: vec![],
             },
         );
-        let data = json!({"stage":"analysing", "counts":{"files_ready":4},
+        let data = json!({"stage":"analysing", "counts":{"files_ready":4,"files_processed":4,"files_total":16},
             "work":{"completed":4,"total":16,"operation":"reading","file_bytes_read":600,
                 "current_file":{"locator":{"root":path},"bytes":1200}}});
         let progress = engine_progress(&r, &staged, &data, 12.0);
@@ -1104,7 +1177,7 @@ mod tests {
     }
 
     #[test]
-    fn local_inventory_has_a_stable_total_and_reports_all_comparison_work() {
+    fn upstream_raw_counters_report_real_inventory_and_candidate_work() {
         let dir = tempfile::tempdir().unwrap();
         let r = request(dir.path());
         let files = &r.local_paths[0];
@@ -1142,19 +1215,21 @@ mod tests {
         assert_eq!(summary.counts.files_ready, 2);
         assert_eq!(summary.counts.files_failed, 1); // unsupported archive
         assert_eq!(summary.counts.files_excluded, 1); // hidden, not oversized
-        let analysis: Vec<_> = updates
-            .iter()
-            .filter(|p| p["stage"] == "analysing")
-            .collect();
-        assert!(!analysis.is_empty());
-        assert!(analysis.iter().all(|p| p["work"]["total"] == 3));
-        assert_eq!(analysis.last().unwrap()["work"]["completed"], 3);
-        assert!(updates.iter().any(|p| p["stage"] == "comparing"
-            && p["work"]["total"] == 1
-            && p["work"]["completed"] == 1));
-        assert!(updates.iter().any(|p| p["stage"] == "grouping"
-            && p["work"]["total"] == 2
-            && p["work"]["completed"] == 2));
+        assert_eq!(summary.counts.files_processed, 4);
+        assert_eq!(summary.counts.files_total, Some(4));
+        assert_eq!(summary.counts.pairs_processed, 1);
+        assert_eq!(summary.counts.pairs_total, Some(1));
+        assert_eq!(summary.counts.scores_retained, 1);
+        for data in updates {
+            let progress = engine_progress(&r, &StagedCloud::new(), &data, 1.0);
+            if data["stage"] == "discovery" {
+                assert_eq!(progress["completed"], data["counts"]["files_processed"]);
+                assert_eq!(progress["total"], data["counts"]["files_total"]);
+            } else if data["stage"] == "comparing" {
+                assert_eq!(progress["completed"], data["counts"]["pairs_processed"]);
+                assert_eq!(progress["total"], data["counts"]["pairs_total"]);
+            }
+        }
     }
 
     #[tokio::test]

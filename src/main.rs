@@ -39,6 +39,8 @@ struct Cli {
 enum Command {
     /// Scan local or PikPak content using the bundled FileTwin engine.
     SimilarityScan(SimilarityScanArgs),
+    /// Read one file's saved similarity scores without opening originals.
+    SimilarityScores(SimilarityScanArgs),
     /// List files and directories.
     Ls(LsArgs),
     /// Return one JSON page of folder entries for an interactive browser.
@@ -1272,6 +1274,12 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<()> {
     // The local scanner is usable when signed out and needs no OAuth client.
     let command = match cli.command {
+        Command::SimilarityScores(args) => {
+            let request = read_json_request(&args.request_file)?;
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            signal_hook::flag::register(signal_hook::consts::SIGTERM, cancelled.clone())?;
+            return pikpak::similarity::emit(&pikpak::similarity::score_row(request, &cancelled)?);
+        }
         Command::SimilarityScan(args) => {
             let request: pikpak::similarity::ScanRequest = read_json_request(&args.request_file)?;
             request.validate()?;
@@ -1294,7 +1302,7 @@ async fn run(cli: Cli) -> Result<()> {
     // refresh-token lock are separate from Safari's Web token chain.
     let (client, original_token) = build_client()?;
     let result = match command {
-        Command::SimilarityScan(_) => unreachable!("handled before account setup"),
+        Command::SimilarityScan(_) | Command::SimilarityScores(_) => unreachable!("handled before account setup"),
         Command::Ls(args) => cmd_ls(&client, args).await,
         Command::Browse(args) => cmd_browse(&client, args).await,
         Command::SearchIndex(args) => {
