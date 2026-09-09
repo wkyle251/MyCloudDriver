@@ -1,6 +1,132 @@
 import AppKit
 import SwiftUI
 
+private struct SimilarityProgressView: View {
+    @ObservedObject var model: SimilarityScanModel
+    private var progress: SimilarityScanProgress { model.progress }
+    private var steps: [SimilarityScanStage] {
+        model.source == .cloud ? [.inventory, .downloading, .analysing, .comparison, .grouping]
+            : [.inventory, .analysing, .comparison, .grouping]
+    }
+    private var stepIndex: Int { steps.firstIndex(of: progress.stage) ?? steps.count - 1 }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                HStack(spacing: 0) {
+                    ForEach(Array(steps.enumerated()), id: \.offset) { index, step in
+                        HStack(spacing: 7) {
+                            Image(systemName: index < stepIndex ? "checkmark.circle.fill" : index == stepIndex ? "circle.inset.filled" : "circle")
+                            Text(step.stepTitle).font(.callout.weight(index == stepIndex ? .semibold : .regular))
+                        }.foregroundStyle(index <= stepIndex ? FinderAppearance.accent : Color.secondary)
+                        if index < steps.count - 1 {
+                            Rectangle().fill(index < stepIndex ? FinderAppearance.accent.opacity(0.4) : Color.primary.opacity(0.10))
+                                .frame(height: 1).padding(.horizontal, 12)
+                        }
+                    }
+                }.accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Step \(stepIndex + 1) of \(steps.count): \(progress.stage.title)")
+
+                HStack(alignment: .top, spacing: 14) {
+                    Image(systemName: model.source.symbol).font(.system(size: 23))
+                        .foregroundStyle(FinderAppearance.accent).frame(width: 48, height: 48)
+                        .background(FinderAppearance.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(model.isCancelling ? "Stopping scan…" : progress.stage.title).font(.title2.weight(.semibold))
+                        Text(progress.completedLabel).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        VStack(alignment: .trailing, spacing: 5) {
+                            Text(elapsed(at: context.date)).font(.title3.monospacedDigit().weight(.medium))
+                            Text("Elapsed").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("\(progress.stage.stepTitle) progress").font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        if let label = progress.percentLabel {
+                            Text(label).font(.callout.monospacedDigit().weight(.semibold))
+                        } else {
+                            Text(progress.stage == .inventory ? "Counting files…" : "In progress…")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    if let fraction = progress.fraction {
+                        ProgressView(value: fraction).progressViewStyle(.linear)
+                            .accessibilityLabel("\(progress.stage.stepTitle) progress")
+                    } else {
+                        ProgressView().progressViewStyle(.linear).accessibilityLabel(progress.stage.title)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack(spacing: 8) {
+                        Image(systemName: progress.currentName == nil ? "waveform.path" : "doc")
+                            .foregroundStyle(FinderAppearance.accent)
+                        Text(progress.currentName ?? stageDetail).font(.callout.weight(.medium))
+                            .lineLimit(1).truncationMode(.middle)
+                            .help(progress.currentName ?? stageDetail)
+                        Spacer(minLength: 0)
+                        if progress.currentName != nil { ProgressView().controlSize(.small) }
+                    }
+                    if progress.currentName != nil {
+                        HStack {
+                            Text(progress.currentOperation).font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            if progress.currentSize > 0 || progress.currentBytes > 0 {
+                                Text(progress.currentByteLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }.padding(13).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(FinderAppearance.accent.opacity(0.045), in: RoundedRectangle(cornerRadius: 9))
+
+                HStack(spacing: 0) {
+                    metric("Analysed", value: progress.analysed.formatted())
+                    Divider().frame(height: 34).padding(.horizontal, 20)
+                    metric("Skipped", value: progress.skipped.formatted())
+                    Divider().frame(height: 34).padding(.horizontal, 20)
+                    metric("Matching pairs", value: progress.matches.formatted())
+                    if model.source == .cloud {
+                        Divider().frame(height: 34).padding(.horizontal, 20)
+                        metric("Downloaded", value: SimilarityScanProgress.bytes(progress.downloadedBytes))
+                    }
+                }
+                Text(model.isCancelling ? "Finishing the current operation and clearing temporary files."
+                     : "Keep browsing while this runs. You can close this window and follow progress in the status footer.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }.padding(24)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 11))
+            .overlay(RoundedRectangle(cornerRadius: 11).stroke(Color.primary.opacity(0.08)))
+    }
+    private var stageDetail: String {
+        switch progress.stage {
+        case .inventory: return "Building the file list before reading content"
+        case .downloading: return "Preparing temporary cloud copies"
+        case .analysing: return "Preparing the next file"
+        case .comparison: return "Checking content similarity and identical copies"
+        case .grouping: return "Organising matching files into review groups"
+        case .finishing: return "Your results will appear here"
+        }
+    }
+    private func metric(_ label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(value).font(.title3.monospacedDigit().weight(.semibold))
+            Text(label).font(.caption).foregroundStyle(.secondary)
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+    private func elapsed(at date: Date) -> String {
+        let seconds = max(0, Int(date.timeIntervalSince(model.startedAt ?? date)))
+        return seconds >= 3600 ? String(format: "%dh %02dm %02ds", seconds / 3600, seconds / 60 % 60, seconds % 60)
+            : seconds >= 60 ? String(format: "%dm %02ds", seconds / 60, seconds % 60) : "\(seconds)s"
+    }
+}
+
 struct FileSimilarityView: View {
     @ObservedObject var coordinator: FileSimilarityCoordinator
 
@@ -37,7 +163,6 @@ private struct SimilarityScanView: View {
     let coordinator: FileSimilarityCoordinator
     @State private var selectedGroupID: String?
     @State private var groupFilter = 0
-    @State private var showsAdvanced = false
     @State private var showsIssues = false
 
     private var groups: [SimilarityGroup] {
@@ -141,11 +266,12 @@ private struct SimilarityScanView: View {
                 VStack(alignment: .leading, spacing: 7) {
                     HStack {
                         Text("MINIMUM SCORE").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
-                        Text(String(format: "%.2f", model.threshold)).font(.caption.monospacedDigit().weight(.semibold))
+                        Text(String(format: "%.0f%%", model.threshold * 100)).font(.caption.monospacedDigit().weight(.semibold))
                     }
-                    Slider(value: $model.threshold, in: 0.5...1, step: 0.01).frame(width: 185).disabled(model.isRunning)
+                    Slider(value: $model.threshold, in: 0.05...1, step: 0.01).frame(width: 185).disabled(model.isRunning)
                         .accessibilityLabel("Minimum similarity score")
-                        .help("Higher scores show closer matches. Scores are experimental cosine similarity, not probabilities.")
+                        .accessibilityValue(String(format: "%.0f percent", model.threshold * 100))
+                        .help("Choose a score from 5% to 100%. Higher scores show closer matches. Scores are experimental cosine similarity, not probabilities.")
                 }
                 if model.isRunning {
                     Button("Cancel Scan") { model.cancel() }.disabled(model.isCancelling).frame(width: 112)
@@ -159,27 +285,8 @@ private struct SimilarityScanView: View {
                 Toggle("Include byte-identical copies (all file types)", isOn: $model.exactDuplicates).disabled(model.isRunning)
                     .font(.callout).help("Also compare SHA-256 content hashes, including formats without a similarity decoder")
                 Spacer()
-                Button(showsAdvanced ? "Hide Options" : "Scan Options…") { showsAdvanced.toggle() }
-                    .buttonStyle(.borderless).font(.callout)
-            }
-            if showsAdvanced {
-                HStack(spacing: 18) {
-                    Toggle("Include hidden files", isOn: $model.includeHidden)
-                    Spacer()
-                    Text("Maximum file size")
-                    numberField($model.maxFileMB, label: "Maximum file size in MB", maximum: 102_400)
-                    Text("MB").foregroundStyle(.secondary)
-                    if model.source == .cloud {
-                        Text("Download budget")
-                        numberField($model.downloadGB, label: "Temporary download budget in GB", maximum: 1000)
-                        Text("GB").foregroundStyle(.secondary)
-                    }
-                }.font(.callout).disabled(model.isRunning)
-                Text("Files over the limit are skipped and listed in the report. Exact matching reads every included file. Symlinks are not followed.")
-                    .font(.caption).foregroundStyle(.secondary)
-            } else if model.source == .cloud {
-                Text("Temporary download budget: \(model.downloadGB) GB · Maximum file: \(model.maxFileMB) MB")
-                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Include hidden files", isOn: $model.includeHidden)
+                    .font(.callout).disabled(model.isRunning)
             }
             if SimilarityScanModel.mediaTool("ffmpeg") == nil || SimilarityScanModel.mediaTool("ffprobe") == nil {
                 Text("Audio, video and HEIF images require FFmpeg 9 and ffprobe on this Mac. Missing decoders are reported as skipped files.")
@@ -201,30 +308,15 @@ private struct SimilarityScanView: View {
             .help(family == "text" ? "UTF-8 text, DOCX and PDFs with a text layer" : "Compare \(label.lowercased()) by content")
     }
 
-    private func numberField(_ value: Binding<String>, label: String, maximum: UInt64) -> some View {
-        TextField("", text: Binding(get: { value.wrappedValue }, set: { value.wrappedValue = SimilarityScanModel.numericInput($0) }))
-            .textFieldStyle(.roundedBorder).frame(width: 65).multilineTextAlignment(.trailing)
-            .accessibilityLabel(label).help("Enter an integer from 1 to \(maximum)")
-            .overlay(RoundedRectangle(cornerRadius: 4).stroke(SimilarityScanModel.integer(value.wrappedValue, maximum: maximum) == nil ? Color.orange : .clear))
-    }
-
     @ViewBuilder private var resultArea: some View {
         if model.isRunning {
-            VStack(spacing: 16) {
-                ProgressView().controlSize(.large)
-                Text(model.message).font(.headline)
-                Text(model.detail).font(.callout).foregroundStyle(.secondary).lineLimit(2)
-                if let fraction = model.fraction { ProgressView(value: fraction).frame(maxWidth: 360) }
-                Text("Continue browsing or close this window. Progress stays in the status footer.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }.frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(FinderAppearance.accent.opacity(0.04), in: RoundedRectangle(cornerRadius: 11))
+            SimilarityProgressView(model: model)
         } else if let report = model.report {
             VStack(spacing: 0) {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("\(report.totalGroups.formatted()) match groups").font(.headline)
-                        Text("Last scan · \(report.scope.joined(separator: ", ")) · minimum score \(String(format: "%.2f", report.threshold))")
+                        Text("Last scan · \(report.scope.joined(separator: ", ")) · minimum score \(String(format: "%.0f%%", report.threshold * 100))")
                             .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                             .help(report.scope.joined(separator: "\n"))
                     }

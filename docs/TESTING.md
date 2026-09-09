@@ -50,7 +50,7 @@ area. Compile **one entry point at a time**; each declares `@main`.
 | `SharedLinkSelectionTests.swift` | Selection across links, recursive roots, batch saving, and download routing. |
 | `SharedLinkRetryTests.swift` | Batch retries, concurrency limits, saved access codes, selection preservation, cancellation, and selection regressions. |
 | `TaskActivityTests.swift` | File-menu tasks, footer progress, results, and account-scoped updates. |
-| `SimilarityTests.swift` | Integer limits, independent sources, a real local scan and cancellation, streamed progress, report decoding, and temporary cleanup. Pass the built app's `Contents/Resources` path as its first argument. |
+| `SimilarityTests.swift` | 5% minimum score, per-stage progress, independent sources, a real local scan and cancellation, report decoding, and temporary cleanup. Pass the built app's `Contents/Resources` path as its first argument. |
 
 Other test files may require different flags, companion fixture engines, or a
 smaller source list. Read their entry points before running them.
@@ -58,8 +58,8 @@ smaller source list. Read their entry points before running them.
 ## FileTwin content similarity
 
 The cloud regression suite uses a local HTTP server and synthetic OAuth replies.
-It checks paginated listings, overlapping selections, download limits, hidden
-and oversized files, path traversal protection, cloud result mapping, and
+It checks paginated listings, overlapping selections, unrestricted file sizes,
+hidden files, stable analysis totals, comparison/grouping progress, path traversal protection, cloud result mapping, and
 cancellation of a stalled request. It never contacts PikPak:
 
 ```sh
@@ -78,14 +78,20 @@ python3 scripts/test-similarity-native.py \
 Compile `scripts/SimilarityTests.swift` with the native model test command above,
 then run it with the **absolute** `Contents/Resources` path. It launches the real
 local scanner from a private temporary directory; it uses no saved account.
-The imported FileTwin source is unchanged and includes its upstream Rust tests.
-`vendor/FileTwin/UPSTREAM-SHA256.json` records the imported source checksums.
+The imported FileTwin source includes its upstream Rust tests. Run them after
+changes to the core using `cargo test --locked --manifest-path vendor/FileTwin/Cargo.toml -p filetwin-core`.
+`vendor/FileTwin/UPSTREAM-SHA256.json` records the original imported source
+checksums; `vendor/FileTwin/IMPORT.md` documents the local progress changes.
 
 `SimilarityUITestApp.swift` renders the production review window with synthetic
 documents, image groups and skipped files. Verify the two source tabs, all three
-result filters, selection, coverage sheet, integer-only limits, and both small
+result filters, selection, coverage sheet, the 5% slider minimum, and both small
 and large window sizes. Changing options should keep the **Last scan** scope
 and threshold attached to existing results until a new scan begins.
+Launch the fixture with `--progress` for local analysis, or `--progress --cloud`
+for downloads; both use synthetic filenames and work counts. Check that the
+stage bar, elapsed timer, current-file details and metrics remain readable at
+the minimum window size. No file-size or download-limit controls should remain.
 
 ## Focused layout test
 

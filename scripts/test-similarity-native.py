@@ -64,8 +64,8 @@ def main():
         shutil.copy2(files / "clip.mp4", files / "clip-copy.mp4")
         models = resources / "FileTwinModels"
         request = dict(source="local", local_paths=[str(files)], cloud_items=[], families=["text", "image", "audio", "video"],
-            threshold=0.9, exact_duplicates=True, include_hidden=False, max_file_bytes=1024**3,
-            download_budget_bytes=1024**3, data_dir=str(root / "index"), model_dir=str(models), temp_dir=str(root / "temporary"),
+            threshold=0.9, exact_duplicates=True, include_hidden=False,
+            data_dir=str(root / "index"), model_dir=str(models), temp_dir=str(root / "temporary"),
             report_path=str(root / "result/report.json"), runtime=dict(worker_path=str(resources / "filetwin-worker"),
                 ffmpeg_path=ffmpeg, ffprobe_path=ffprobe, onnxruntime_path=str(models / "runtime/libonnxruntime.dylib"),
                 pdfium_path=str(models / "runtime/libpdfium.dylib")))
@@ -74,6 +74,14 @@ def main():
         run = subprocess.run([str(resources / "pikpak"), "similarity-scan", "--request-file", str(request_path)],
             cwd=root, env=environment, capture_output=True, text=True, timeout=180)
         assert run.returncode == 0, run.stderr
+        updates = [json.loads(line) for line in run.stdout.splitlines() if line.startswith('{')]
+        progress = [event for event in updates if event.get("event") == "progress"]
+        assert {"inventory", "analysing", "comparison", "grouping", "finishing"} <= {p["stage"] for p in progress}
+        analysis = [p for p in progress if p["stage"] == "analysing"]
+        assert all(p["total"] == 11 for p in analysis), "Analysis total changed during the scan"
+        assert analysis[-1]["completed"] == 11
+        assert any(p.get("current_file") and p.get("operation") == "decoding" for p in analysis)
+        assert all(p.get("total") is None or p["completed"] <= p["total"] for p in progress)
         report = json.loads(Path(request["report_path"]).read_text())
         assert report["analysed_files"] == 11, json.dumps(report, indent=2)
         assert report["skipped_files"] == 0, report["issues"]
@@ -82,6 +90,7 @@ def main():
         assert not list(Path(request["temp_dir"]).iterdir()), "temporary copies remain"
         print("PASS shipped FileTwin decoders: UTF-8, DOCX, PDF, PNG, WAV and MP4; all four content families grouped")
         print("PASS local CLI with no account configuration, exact copies, fresh reads and temporary cleanup")
+        print("PASS stable file totals, current-file decoder progress, pair/group totals and all scan stages")
 
 
 if __name__ == "__main__":

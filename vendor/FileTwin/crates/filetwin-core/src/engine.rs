@@ -408,8 +408,38 @@ pub(crate) struct Work<'a> {
     previous_elapsed: f64,
     last_progress: Instant,
     last_heartbeat: std::cell::Cell<Instant>,
+    pub progress: ScanProgress,
+}
+
+/// Transient UI telemetry; never part of the catalog or resumable job state.
+#[derive(Default, serde::Serialize)]
+pub(crate) struct ScanProgress {
+    pub stage: Option<&'static str>,
+    pub total: Option<u64>,
+    pub completed: u64,
+    pub current_file: Option<serde_json::Value>,
+    pub file_bytes_read: std::cell::Cell<u64>,
+    pub operation: &'static str,
 }
 impl Work<'_> {
+    pub fn progress_event(&self) {
+        let _ = self.events.try_send(JobEvent::Progress {
+            job_id: self.job.id.clone(),
+            run_id: self.job.run.clone(),
+            data: json!({"attempt_id":self.job.attempt,
+                "stage":self.progress.stage.unwrap_or(&self.job.stage),
+                "counts":self.job.counts, "elapsed_seconds":self.elapsed(),
+                "work":self.progress}),
+        });
+    }
+    pub fn progress_stage(&mut self, stage: &'static str, total: Option<u64>) {
+        self.progress = ScanProgress {
+            stage: Some(stage),
+            total,
+            ..ScanProgress::default()
+        };
+        self.progress_event();
+    }
     pub fn check(&self) -> Result<()> {
         self.cancel.check()?;
         if self.last_heartbeat.get().elapsed() >= Duration::from_millis(250) {
@@ -417,7 +447,7 @@ impl Work<'_> {
                 "UPDATE jobs SET elapsed=?2,updated_at=?3 WHERE id=?1",
                 rusqlite::params![self.job.id, self.elapsed(), store::now()],
             )?;
-            let _=self.events.try_send(JobEvent::Progress{job_id:self.job.id.clone(),run_id:self.job.run.clone(),data:json!({"attempt_id":self.job.attempt,"stage":self.job.stage,"counts":self.job.counts,"elapsed_seconds":self.elapsed(),"bytes_transferred":0,"eta_seconds":null})});
+            self.progress_event();
             self.last_heartbeat.set(Instant::now());
         }
         if self
@@ -461,7 +491,7 @@ impl Work<'_> {
         self.job.elapsed = self.elapsed();
         store::save_job(&self.db, &self.job)?;
         if self.last_progress.elapsed() >= Duration::from_millis(250) {
-            let _=self.events.try_send(JobEvent::Progress{job_id:self.job.id.clone(),run_id:self.job.run.clone(),data:json!({"attempt_id":self.job.attempt,"stage":self.job.stage,"counts":self.job.counts,"elapsed_seconds":self.job.elapsed,"bytes_transferred":0,"eta_seconds":null})});
+            self.progress_event();
             self.last_progress = Instant::now();
         }
         Ok(())
@@ -499,6 +529,7 @@ fn run(
         previous_elapsed,
         last_progress: Instant::now(),
         last_heartbeat: std::cell::Cell::new(Instant::now()),
+        progress: ScanProgress::default(),
     };
     work.job.status = "running".into();
     work.checkpoint()?;

@@ -46,6 +46,24 @@ pub(crate) fn compare(work: &mut Work<'_>) -> Result<()> {
     let run = work.job.run.clone().expect("Comparison run");
     let (request, _) = store::snapshot_request(&work.db, &sid)?;
     let report_exact = request.exact_duplicates != Some(ExactDuplicates::Off);
+    let candidates: u64 = work.db.query_row("SELECT count(*) FROM snapshot_files WHERE snapshot_id=?1 AND (vector_id IS NOT NULL OR digest IS NOT NULL)",
+        [&sid], |r| r.get(0))?;
+    work.progress_stage(
+        "comparing",
+        Some(candidates.saturating_mul(candidates.saturating_sub(1)) / 2),
+    );
+    // Restore progress from the frozen comparison cursor when resuming.
+    let before: u64 = work.db.query_row("SELECT count(*) FROM snapshot_files WHERE snapshot_id=?1 AND ordinal<?2 AND (vector_id IS NOT NULL OR digest IS NOT NULL)",
+        params![sid, work.job.next_a], |r| r.get(0))?;
+    let within: u64 = work.db.query_row("SELECT count(*) FROM snapshot_files WHERE snapshot_id=?1 AND ordinal>?2 AND ordinal<=?3 AND (vector_id IS NOT NULL OR digest IS NOT NULL)",
+        params![sid, work.job.next_a, work.job.next_b], |r| r.get(0))?;
+    work.progress.completed = before.saturating_mul(
+        candidates
+            .saturating_mul(2)
+            .saturating_sub(before)
+            .saturating_sub(1),
+    ) / 2
+        + within;
     if work.job.request.operation == Operation::Compare {
         let (n,ready,excluded,failed)=work.db.query_row("SELECT count(*),coalesce(sum(vector_id IS NOT NULL),0),coalesce(sum(json_extract(payload,'$.state')='excluded'),0),coalesce(sum(json_extract(payload,'$.state') IN ('failed','unsupported','insufficient_content','stale')),0) FROM snapshot_files WHERE snapshot_id=?1",[&sid],|r|Ok((r.get::<_,u64>(0)?,r.get::<_,u64>(1)?,r.get::<_,u64>(2)?,r.get::<_,u64>(3)?)))?;
         work.job.counts.files_discovered = n;
@@ -136,6 +154,9 @@ pub(crate) fn compare(work: &mut Work<'_>) -> Result<()> {
             }
             work.job.next_a = left.ordinal;
             work.job.next_b = right.ordinal;
+            // Includes byte-identical checks and incompatible-family pairs
+            // examined by this loop, not just successful cosine calculations.
+            work.progress.completed += 1;
         }
         {
             let tx = work.db.unchecked_transaction()?;
@@ -151,12 +172,16 @@ pub(crate) fn compare(work: &mut Work<'_>) -> Result<()> {
             return Err(e);
         }
     }
+    work.progress_event();
     work.job.stage = "grouping".into();
     work.checkpoint()
 }
 
 pub(crate) fn group(work: &mut Work<'_>) -> Result<()> {
     let run = work.job.run.clone().expect("Run");
+    let total = work.db.query_row("SELECT count(*) FROM (SELECT kind,a AS file_id FROM work_pairs WHERE run_id=?1 UNION SELECT kind,b AS file_id FROM work_pairs WHERE run_id=?1)",
+        [&run], |r| r.get(0))?;
+    work.progress_stage("grouping", Some(total));
     work.db
         .execute("DELETE FROM work_members WHERE run_id=?1", [&run])?;
     work.db
@@ -203,11 +228,13 @@ pub(crate) fn group(work: &mut Work<'_>) -> Result<()> {
                     "INSERT INTO work_members(run_id,kind,group_id,file_id) VALUES(?1,?2,?3,?4)",
                     params![run, kind, group_id, fid],
                 )?;
+                work.progress.completed += 1;
             }
             work.checkpoint()?;
         }
     }
     work.job.counts.groups=work.db.query_row("SELECT count(*) FROM (SELECT group_id FROM work_members WHERE run_id=?1 GROUP BY kind,group_id HAVING count(*)>=2)",[&run],|r|r.get(0))?;
+    work.progress_event();
     work.checkpoint()
 }
 

@@ -8,24 +8,29 @@ import Foundation
         defer { defaults.removePersistentDomain(forName: suite) }
         try DownloaderModel.testSimilarityScope(defaults: defaults)
         try DownloaderModel.testTaskActivity(defaults: defaults)
-        precondition(SimilarityScanModel.numericInput("1.2a٣-4") == "124")
-        precondition(SimilarityScanModel.integer("0", maximum: 1000) == nil)
-        precondition(SimilarityScanModel.integer("1.5", maximum: 1000) == nil)
-        precondition(SimilarityScanModel.integer("1001", maximum: 1000) == nil)
-        precondition(SimilarityScanModel.integer("20", maximum: 1000) == 20)
         let activity = FinderTaskActivityStore()
         let coordinator = FileSimilarityCoordinator(activity: activity)
         coordinator.local.localURLs = [URL(fileURLWithPath: "/tmp/synthetic.txt")]
         coordinator.local.threshold = 0.8
         precondition(coordinator.cloud.localURLs.isEmpty && coordinator.cloud.threshold == 0.9)
         precondition(coordinator.local.canStart && !coordinator.cloud.canStart)
-        coordinator.local.maxFileMB = "0"; precondition(!coordinator.local.canStart)
-        coordinator.local.maxFileMB = "1024"
+        coordinator.local.threshold = 0.05; precondition(coordinator.local.canStart)
+        coordinator.local.threshold = 0.04; precondition(!coordinator.local.canStart)
+        coordinator.local.threshold = 0.8
+        let analysing = SimilarityScanProgress(event: ["stage":"analysing", "completed":15, "total":16,
+            "current_file":["name":"Example.mov", "bytes":1000], "file_bytes_read":500, "operation":"decoding",
+            "counts":["files_ready":14, "files_failed":1]])
+        precondition(analysing.fraction == 15.0 / 16 && analysing.analysed == 14 && analysing.skipped == 1)
+        precondition(analysing.currentName == "Example.mov" && analysing.currentBytes == 500)
+        precondition(SimilarityScanProgress(event: ["stage":"inventory", "completed":16]).fraction == nil)
+        precondition(SimilarityScanProgress(event: ["stage":"comparison", "completed":50, "total":100]).fraction == 0.5)
+        precondition(SimilarityScanProgress(event: ["stage":"analysing", "completed":999, "total":1000]).percentLabel == "99%")
+        precondition(SimilarityScanProgress(event: ["stage":"grouping", "completed":0, "total":0]).fraction == nil)
         activity.begin(.similarityLocal, scope: "/Local", message: "Comparing local files")
         activity.begin(.similarityCloud, scope: "/Cloud", message: "Comparing cloud files")
         activity.reset(keeping: [.similarityLocal])
         precondition(activity.activeTasks.map(\.kind) == [.similarityLocal])
-        print("PASS numeric limits, independent scan state and local activity surviving account reset")
+        print("PASS 5% minimum score, honest stage progress, independent state and local activity surviving account reset")
 
         // Exercise the real async process/JSONL/report adapter without a login.
         let manager = FileManager.default
@@ -38,7 +43,7 @@ import Foundation
         for name in ["one.txt", "two.txt"] { try text.write(to: files.appendingPathComponent(name), atomically: true, encoding: .utf8) }
         let resources = URL(fileURLWithPath: CommandLine.arguments[1])
         let scan = coordinator.local
-        scan.localURLs = [files]; scan.families = ["text"]
+        scan.localURLs = [files]; scan.families = ["text"]; scan.threshold = 0.05
         coordinator.configuration = { source in
             SimilarityConfiguration(executable: resources.appendingPathComponent("pikpak"), models: resources.appendingPathComponent("FileTwinModels"),
                 worker: resources.appendingPathComponent("filetwin-worker"), dataDirectory: root.appendingPathComponent(source.rawValue),
@@ -50,6 +55,7 @@ import Foundation
         while scan.isRunning && Date() < deadline { try await Task.sleep(nanoseconds: 50_000_000) }
         precondition(!scan.isRunning && scan.error == nil, scan.error ?? "Scan timed out")
         precondition(scan.report?.analysedFiles == 2 && scan.report?.totalGroups == 2)
+        precondition(scan.report?.threshold == 0.05)
         precondition(coordinator.cloud.report == nil)
         precondition(activity.tasks.first(where: { $0.kind == .similarityLocal })?.state == .completed)
         let leftovers = try manager.contentsOfDirectory(atPath: root.appendingPathComponent("temporary").path)

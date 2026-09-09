@@ -1,5 +1,5 @@
 //! FileTwin content analysis with independent local and PikPak scan scopes.
-//! Cloud originals are never modified. Only bounded, private temporary copies
+//! Cloud originals are never modified. Only private temporary copies
 //! are downloaded; account credentials and signed URLs never enter a report.
 
 use crate::Client;
@@ -32,7 +32,6 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 
-const GIB: u64 = 1024 * 1024 * 1024;
 const MAX_CLOUD_FILES: usize = 100_000;
 const MAX_GROUPS: usize = 2_000;
 const MAX_MEMBERS: usize = 20_000;
@@ -74,8 +73,6 @@ pub struct ScanRequest {
     pub threshold: f64,
     pub exact_duplicates: bool,
     pub include_hidden: bool,
-    pub max_file_bytes: u64,
-    pub download_budget_bytes: u64,
     pub data_dir: PathBuf,
     pub model_dir: PathBuf,
     pub temp_dir: PathBuf,
@@ -107,13 +104,6 @@ impl ScanRequest {
         }
         if self.local_paths.len() + self.cloud_items.len() > 1000 {
             bail!("Choose at most 1,000 scan roots.");
-        }
-        if self.max_file_bytes == 0
-            || self.max_file_bytes > 100 * GIB
-            || self.download_budget_bytes == 0
-            || self.download_budget_bytes > 1000 * GIB
-        {
-            bail!("File and download limits must be positive and within the supported range.");
         }
         for path in self.local_paths.iter().chain([
             &self.data_dir,
@@ -308,9 +298,6 @@ pub async fn scan(
         let engine = Engine::open(config, HostServices::default())?;
         let job = engine.submit(engine_request(&request, roots))?;
         let events = job.events();
-        emit(
-            &json!({"event":"progress", "stage":"analysing", "message":"Reading and comparing file content…", "downloaded_bytes":staged.bytes}),
-        )?;
         // No GUI thread is involved. The bounded event channel coalesces updates.
         while !job.is_finished() || !events.is_empty() {
             if cancel.load(Ordering::Acquire) {
@@ -319,12 +306,23 @@ pub async fn scan(
             if let Ok(JobEvent::Progress { data, .. }) =
                 events.recv_timeout(Duration::from_millis(100))
             {
-                if emit(&json!({"event":"progress", "stage":data["stage"], "counts":data["counts"], "downloaded_bytes":staged.bytes})).is_err() {
+                if emit(&engine_progress(
+                    &request,
+                    &staged,
+                    &data,
+                    started.elapsed().as_secs_f64(),
+                ))
+                .is_err()
+                {
                     job.cancel_for_output_failure();
                 }
             }
         }
         let summary = job.wait()?;
+        emit(
+            &json!({"event":"progress", "stage":"finishing", "counts":summary.counts,
+            "skipped":staged.skipped, "downloaded_bytes":staged.bytes, "elapsed_seconds":started.elapsed().as_secs_f64()}),
+        )?;
         collect_report(&request, &staged, &summary, &mut report)?;
     }
     if cancel.load(Ordering::Acquire) {
@@ -352,6 +350,37 @@ pub async fn scan(
     Ok(())
 }
 
+fn engine_progress(
+    request: &ScanRequest,
+    staged: &StagedCloud,
+    data: &Value,
+    elapsed: f64,
+) -> Value {
+    let work = &data["work"];
+    let current = &work["current_file"];
+    let file = value_path(current).and_then(|path| {
+        let name = if request.source == ScanSource::Cloud {
+            staged.files.get(&path)?.name.clone()
+        } else {
+            path.file_name()?.to_string_lossy().into_owned()
+        };
+        Some(json!({"name":name, "bytes":current["bytes"]}))
+    });
+    // Cloud inventory has already completed before downloading. FileTwin's
+    // quick inventory of the staged copies belongs to its analysis stage.
+    let stage = if request.source == ScanSource::Cloud && data["stage"] == "inventory" {
+        "analysing"
+    } else if data["stage"] == "comparing" {
+        "comparison"
+    } else {
+        data["stage"].as_str().unwrap_or("analysing")
+    };
+    json!({"event":"progress", "stage":stage, "counts":data["counts"],
+        "completed":work["completed"], "total":work["total"], "current_file":file,
+        "file_bytes_read":work["file_bytes_read"], "operation":work["operation"],
+        "skipped":staged.skipped, "downloaded_bytes":staged.bytes, "elapsed_seconds":elapsed})
+}
+
 fn engine_request(request: &ScanRequest, roots: Vec<PathBuf>) -> JobRequest {
     let mut job = JobRequest::experimental_scan(roots, request.threshold);
     job.families = Some(request.families.clone());
@@ -365,7 +394,6 @@ fn engine_request(request: &ScanRequest, roots: Vec<PathBuf>) -> JobRequest {
     job.recursive = Some(true);
     job.filters = Some(Filters {
         include_hidden: request.include_hidden,
-        max_bytes: Some(request.max_file_bytes),
         ..Filters::default()
     });
     job.exact_duplicates = Some(if request.exact_duplicates {
@@ -382,7 +410,10 @@ fn engine_request(request: &ScanRequest, roots: Vec<PathBuf>) -> JobRequest {
     });
     job.limits = Some(Limits {
         memory_bytes: Some(512 * 1024 * 1024),
-        staging_bytes: Some(request.max_file_bytes.saturating_mul(2).max(2 * GIB)),
+        // FileTwin requires a signed 64-bit staging allowance. Use its full
+        // addressable range, so it does not impose another per-file size cap.
+        // Original copies are streamed to disk; decoder memory stays bounded.
+        staging_bytes: Some(i64::MAX as u64),
         result_bytes: Some(256 * 1024 * 1024),
         io_workers: Some(2),
         inference_workers: Some(1),
@@ -404,7 +435,7 @@ async fn stage_cloud(
     let mut pending: VecDeque<_> = request.cloud_items.clone().into();
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
-    emit(&json!({"event":"progress", "stage":"discovery", "message":"Finding cloud files…"}))?;
+    emit(&json!({"event":"progress", "stage":"inventory", "completed":0}))?;
     while let Some(item) = pending.pop_front() {
         check_cancel(cancel)?;
         if !seen.insert(item.id.clone()) {
@@ -462,7 +493,7 @@ async fn stage_cloud(
                 });
             }
             emit(
-                &json!({"event":"progress", "stage":"discovery", "message":"Finding cloud files…", "discovered":staged.discovered, "pending":pending.len()}),
+                &json!({"event":"progress", "stage":"inventory", "completed":staged.discovered, "pending":pending.len()}),
             )?;
             token = page.next_page_token;
             match &token {
@@ -489,20 +520,6 @@ async fn stage_cloud(
     let total = candidates.len();
     for (index, item) in candidates.into_iter().enumerate() {
         check_cancel(cancel)?;
-        if item.size > request.max_file_bytes {
-            staged.skip(
-                &item.path,
-                "Exceeds the maximum file size set for this scan.",
-            );
-            continue;
-        }
-        if item.size > request.download_budget_bytes.saturating_sub(staged.bytes) {
-            staged.skip(
-                &item.path,
-                "Exceeds the remaining temporary download budget.",
-            );
-            continue;
-        }
         // Names and IDs are untrusted. Neither can become a filesystem path.
         let extension = Path::new(&item.name)
             .extension()
@@ -513,26 +530,42 @@ async fn stage_cloud(
             .take(16)
             .collect::<String>();
         let path = directory.join(format!("{index:08}.{extension}"));
-        emit(
-            &json!({"event":"progress", "stage":"downloading", "name":item.name, "completed":index, "total":total, "downloaded_bytes":staged.bytes}),
-        )?;
-        match download_copy(request, client, &item, &path, cancel, staged, index, total).await {
+        emit(&download_progress(
+            &item, staged, index, total, 0, item.size,
+        ))?;
+        match download_copy(client, &item, &path, cancel, staged, index, total).await {
             Ok(()) => {
                 staged.files.insert(std::fs::canonicalize(&path)?, item);
             }
             Err(_) => {
                 let _ = std::fs::remove_file(&path);
                 check_cancel(cancel)?;
-                staged.skip(&item.path, "Could not fetch a complete copy within the file/download limits. Check your connection, login and limits, then retry.");
+                staged.skip(&item.path, "Could not fetch a complete copy. Check your connection, login and available disk space, then retry.");
             }
         }
+        emit(
+            &json!({"event":"progress", "stage":"downloading", "completed":index+1,
+            "total":total, "downloaded_bytes":staged.bytes, "skipped":staged.skipped}),
+        )?;
     }
     Ok(())
 }
 
+fn download_progress(
+    item: &CloudItem,
+    staged: &StagedCloud,
+    index: usize,
+    total: usize,
+    written: u64,
+    expected: u64,
+) -> Value {
+    json!({"event":"progress", "stage":"downloading", "current_file":{"name":item.name,"bytes":expected},
+        "completed":index, "total":total, "file_bytes_read":written, "operation":"downloading",
+        "downloaded_bytes":staged.bytes, "skipped":staged.skipped})
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn download_copy(
-    request: &ScanRequest,
     client: &Client,
     item: &CloudItem,
     path: &Path,
@@ -546,11 +579,6 @@ async fn download_copy(
     })
     .await?;
     let expected = if info.size > 0 { info.size } else { item.size };
-    if expected > request.max_file_bytes
-        || expected > request.download_budget_bytes.saturating_sub(staged.bytes)
-    {
-        bail!("Download limit reached.");
-    }
     let response = cancellable(cancel, async {
         client
             .http_client()
@@ -561,12 +589,6 @@ async fn download_copy(
             .map_err(Into::into)
     })
     .await?;
-    if response.content_length().is_some_and(|bytes| {
-        bytes > request.max_file_bytes
-            || bytes > request.download_budget_bytes.saturating_sub(staged.bytes)
-    }) {
-        bail!("Download limit reached.");
-    }
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -578,17 +600,14 @@ async fn download_copy(
     let mut last = Instant::now();
     while let Some(chunk) = cancellable(cancel, async { Ok(stream.next().await) }).await? {
         let chunk = chunk?;
-        // Charge received bytes even when a failed/inconsistent response is discarded.
+        // Count received bytes even when a failed/inconsistent response is discarded.
         staged.bytes = staged.bytes.saturating_add(chunk.len() as u64);
         written += chunk.len() as u64;
-        if written > request.max_file_bytes || staged.bytes > request.download_budget_bytes {
-            bail!("Download limit reached.");
-        }
         file.write_all(&chunk).await?;
         if last.elapsed() >= Duration::from_millis(250) {
-            emit(
-                &json!({"event":"progress", "stage":"downloading", "name":item.name, "completed":index, "total":total, "downloaded_bytes":staged.bytes}),
-            )?;
+            emit(&download_progress(
+                item, staged, index, total, written, expected,
+            ))?;
             last = Instant::now();
         }
     }
@@ -820,8 +839,6 @@ mod tests {
             threshold: 0.85,
             exact_duplicates: true,
             include_hidden: false,
-            max_file_bytes: GIB,
-            download_budget_bytes: GIB,
             data_dir: root.join("index"),
             model_dir: root.join("models"),
             temp_dir: root.join("tmp"),
@@ -830,7 +847,7 @@ mod tests {
         }
     }
     #[test]
-    fn rejects_mixed_sources_and_invalid_limits() {
+    fn rejects_mixed_sources_and_invalid_thresholds() {
         let dir = tempfile::tempdir().unwrap();
         let mut r = request(dir.path());
         assert!(r.validate().is_ok());
@@ -839,9 +856,11 @@ mod tests {
         r.source = ScanSource::Local;
         r.threshold = f64::NAN;
         assert!(r.validate().is_err());
-        r.threshold = 0.9;
-        r.max_file_bytes = 0;
-        assert!(r.validate().is_err());
+        r.threshold = 0.05;
+        assert!(r.validate().is_ok());
+        let job = engine_request(&r, r.local_paths.clone());
+        assert!(job.filters.unwrap().max_bytes.is_none());
+        assert_eq!(job.limits.unwrap().staging_bytes, Some(i64::MAX as u64));
     }
     #[tokio::test]
     async fn local_scan_finds_content_without_cloud_credentials_and_cleans_up() {
@@ -926,7 +945,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cloud_scan_paginates_deduplicates_and_enforces_private_download_limits() {
+    async fn cloud_scan_paginates_deduplicates_without_size_or_download_caps() {
         use std::sync::atomic::AtomicUsize;
         use tokio::io::AsyncReadExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -975,13 +994,14 @@ mod tests {
                             .contains("authorization: bearer fixture-access"));
                         if route.contains("page_token=second") {
                             json!({"files":[{"id":"b","name":"copy.txt","kind":"drive#file","size":size.to_string()},
-                                {"id":"big","name":"large.txt","kind":"drive#file","size":"9999999"}],"next_page_token":null}).to_string()
+                                {"id":"big","name":"large.txt","kind":"drive#file","size":"2147483648"}],"next_page_token":null}).to_string()
                         } else {
                             json!({"files":[{"id":"a","name":"unsafe/../../escape.txt","kind":"drive#file","size":size.to_string()},
                                 {"id":"hidden","name":".hidden","kind":"drive#folder"}],"next_page_token":"second"}).to_string()
                         }
                     } else if route.starts_with("GET /drive/v1/files/a?")
                         || route.starts_with("GET /drive/v1/files/b?")
+                        || route.starts_with("GET /drive/v1/files/big?")
                     {
                         json!({"id":"file","name":"unsafe/../../escape.txt","size":size.to_string(),"web_content_link":format!("http://{address}/content?signature=fixture-signed-url")}).to_string()
                     } else if route.starts_with("GET /content?") {
@@ -1009,7 +1029,6 @@ mod tests {
         let mut r = request(dir.path());
         r.source = ScanSource::Cloud;
         r.local_paths.clear();
-        r.max_file_bytes = size * 2;
         r.cloud_items = vec![
             CloudItem {
                 id: "".into(),
@@ -1034,9 +1053,10 @@ mod tests {
         let bytes = std::fs::read(&r.report_path).unwrap();
         let report: ScanReport = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(report.status, "partial");
-        assert_eq!(report.analysed_files, 2);
-        assert_eq!(downloads.load(Ordering::SeqCst), 2);
-        assert_eq!(report.skipped_files, 2);
+        assert_eq!(report.analysed_files, 3);
+        assert_eq!(downloads.load(Ordering::SeqCst), 3);
+        assert_eq!(report.skipped_files, 1);
+        assert_eq!(report.downloaded_bytes, size * 3);
         assert!(report
             .groups
             .iter()
@@ -1051,17 +1071,90 @@ mod tests {
         assert!(!json.contains("fixture-signed-url"));
         assert_eq!(std::fs::read_dir(&r.temp_dir).unwrap().count(), 0);
         assert!(!dir.path().join("escape.txt").exists());
-        r.download_budget_bytes = size;
-        scan(r.clone(), Some(&client), Arc::new(AtomicBool::new(false)))
-            .await
-            .unwrap();
-        let limited: ScanReport =
-            serde_json::from_slice(&std::fs::read(&r.report_path).unwrap()).unwrap();
-        assert_eq!(limited.downloaded_bytes, size);
-        assert_eq!(limited.analysed_files, 1);
-        assert_eq!(limited.skipped_files, 3);
-        assert!(limited.groups.is_empty());
         server.abort();
+    }
+
+    #[test]
+    fn progress_maps_cloud_names_and_never_exposes_staging_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = request(dir.path());
+        r.source = ScanSource::Cloud;
+        let path = dir.path().join("temporary-copy.txt");
+        let mut staged = StagedCloud::new();
+        staged.files.insert(
+            path.clone(),
+            CloudItem {
+                id: "cloud-file".into(),
+                name: "Original.txt".into(),
+                path: "/Projects/Original.txt".into(),
+                is_folder: false,
+                size: 1200,
+                ancestors: vec![],
+            },
+        );
+        let data = json!({"stage":"analysing", "counts":{"files_ready":4},
+            "work":{"completed":4,"total":16,"operation":"reading","file_bytes_read":600,
+                "current_file":{"locator":{"root":path},"bytes":1200}}});
+        let progress = engine_progress(&r, &staged, &data, 12.0);
+        assert_eq!(progress["current_file"]["name"], "Original.txt");
+        assert_eq!(progress["total"], 16);
+        assert_eq!(progress["completed"], 4);
+        assert_eq!(progress["file_bytes_read"], 600);
+        assert!(!progress.to_string().contains("temporary-copy"));
+    }
+
+    #[test]
+    fn local_inventory_has_a_stable_total_and_reports_all_comparison_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = request(dir.path());
+        let files = &r.local_paths[0];
+        std::fs::create_dir_all(files.join("nested")).unwrap();
+        std::fs::write(
+            files.join("a.txt"),
+            "a garden with flowers and trees".repeat(10),
+        )
+        .unwrap();
+        std::fs::write(
+            files.join("nested/b.txt"),
+            "a garden with flowers and trees".repeat(10),
+        )
+        .unwrap();
+        std::fs::write(files.join(".hidden.txt"), "hidden").unwrap();
+        // A sparse file over the old 1 GiB cap is still examined. Unsupported
+        // content may be skipped by the decoder, but never by a size filter.
+        let mut large = std::fs::File::create(files.join("large.gz")).unwrap();
+        large.write_all(&[0x1f, 0x8b]).unwrap();
+        large.set_len(1024 * 1024 * 1024 + 1).unwrap();
+        let mut job = engine_request(&r, r.local_paths.clone());
+        job.exact_duplicates = Some(ExactDuplicates::Off);
+        let engine = Engine::open(EngineConfig::new(&r.data_dir), HostServices::default()).unwrap();
+        let handle = engine.submit(job).unwrap();
+        let events = handle.events();
+        let mut updates = Vec::new();
+        while !handle.is_finished() || !events.is_empty() {
+            if let Ok(JobEvent::Progress { data, .. }) =
+                events.recv_timeout(Duration::from_millis(50))
+            {
+                updates.push(data);
+            }
+        }
+        let summary = handle.wait().unwrap();
+        assert_eq!(summary.counts.files_ready, 2);
+        assert_eq!(summary.counts.files_failed, 1); // unsupported archive
+        assert_eq!(summary.counts.files_excluded, 1); // hidden, not oversized
+        let analysis: Vec<_> = updates
+            .iter()
+            .filter(|p| p["stage"] == "analysing")
+            .collect();
+        assert!(!analysis.is_empty());
+        assert!(analysis.iter().all(|p| p["work"]["total"] == 3));
+        assert_eq!(analysis.last().unwrap()["work"]["completed"], 3);
+        assert!(updates.iter().any(|p| p["stage"] == "comparing"
+            && p["work"]["total"] == 1
+            && p["work"]["completed"] == 1));
+        assert!(updates.iter().any(|p| p["stage"] == "grouping"
+            && p["work"]["total"] == 2
+            && p["work"]["completed"] == 2));
     }
 
     #[tokio::test]

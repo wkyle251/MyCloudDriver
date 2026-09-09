@@ -267,20 +267,24 @@ control.
 2. In **PikPak Cloud**, use the current Browser folder or its selection. A folder
    includes descendants. In **This Mac**, choose files or folders with the file
    picker; no PikPak login is required. The two sources are never mixed.
-3. Choose content types and a minimum score. Higher values require closer
+3. Choose content types and a minimum score from **5% to 100%**. Higher values require closer
    matches. **Include byte-identical copies** also checks SHA-256 for every
    included file type, including formats without a similarity decoder.
 4. Start the scan. Browsing, transfers and other background tasks remain
-   available. Each source has its own progress and Cancel action in the footer
-   and its own entry in **Settings → Resources**.
+   available. The progress panel shows the current stage, completed/total work,
+   current file, bytes read, elapsed time and counts. Percentages describe the
+   current stage; finding files and preparing the report stay indeterminate
+   until their work is known. Each source also has progress and Cancel in the
+   footer and its own entry in **Settings → Resources**.
 5. Review groups with the **All**, **Similar**, or **Identical** filter. Open a
    file in its default app, reveal local files in Finder, inspect coverage and
    skipped items, or export the displayed results as JSON.
 
-Cloud analysis reads actual file content by downloading temporary copies. The
-defaults are **10 GiB per cloud scan** and **1 GiB per file**; change them in
-**Scan Options** before starting. Received bytes count toward the budget even
-if a download fails. Temporary copies are removed on completion or cancellation.
+Cloud analysis reads actual file content by downloading temporary copies.
+There is **no per-file size limit or per-scan cloud download cap**. Copies are
+streamed to disk and removed on completion or cancellation; cloud scans need
+local space for the selected files. Decoder memory and result-storage bounds
+still apply, and failures are included in scan coverage.
 Local content stays on the Mac. New scans re-read content instead of trusting a
 previous result. Results remain in the window until a new scan or app exit;
 cloud results clear when changing accounts. An active cloud scan must finish or
@@ -293,7 +297,7 @@ uses sampled frames, without audio or sequence order. Scores are experimental
 cosine similarity, not a probability or a guarantee that files are duplicates.
 Groups require every member pair to meet the cutoff.
 
-Unsupported, unreadable, changing, hidden or oversized files are reported as
+Unsupported, unreadable, changing or excluded hidden files are reported as
 skipped. Check **Coverage & Skipped Files** before treating an empty result as
 exhaustive. The review/export is bounded to 2,000 groups and 20,000 members, with
 up to 500 issue details; a notice appears if more results exist. Choose smaller

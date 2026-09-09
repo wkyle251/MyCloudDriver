@@ -59,11 +59,13 @@ pub(crate) fn encode(
     let mut hash = compute.then(Sha256::new);
     let mut bytes = 0u64;
     let mut buffer = [0u8; 65536];
+    work.progress.operation = "reading";
     loop {
         work.check()?;
         let n = file.read(&mut buffer)?;
         work.job.counts.bytes_read += n as u64;
         bytes += n as u64;
+        work.progress.file_bytes_read.set(bytes);
         if bytes > source_limit {
             return Err(Error::new(
                 ErrorCode::ResourceBudgetTooSmall,
@@ -93,6 +95,8 @@ pub(crate) fn encode(
         memory_bytes,
         parent_pid: std::process::id(),
     };
+    work.progress.operation = "decoding";
+    work.progress_event();
     let result = invoke(&work.config, &request, private.path(), &|| work.check());
     match result {
         Ok(encoded) => {

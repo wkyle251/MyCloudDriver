@@ -43,7 +43,7 @@ struct SimilarityGroup: Codable, Identifiable {
     let members: [SimilarityFile]
     var isExact: Bool { matchKind == "byte_identical" }
     var title: String { members.first?.name ?? "Match group" }
-    var scoreLabel: String { isExact ? "Identical content" : String(format: "Score %.3f", minimumScore ?? 0) }
+    var scoreLabel: String { isExact ? "Identical content" : String(format: "Score %.1f%%", (minimumScore ?? 0) * 100) }
 }
 struct SimilarityIssue: Codable { let path: String; let reason: String }
 struct SimilarityReport: Codable {
@@ -87,13 +87,101 @@ private struct SimilarityRequest: Encodable {
     let threshold: Double
     let exactDuplicates: Bool
     let includeHidden: Bool
-    let maxFileBytes: UInt64
-    let downloadBudgetBytes: UInt64
     let dataDir: String
     let modelDir: String
     let tempDir: String
     let reportPath: String
     let runtime: SimilarityRuntime
+}
+
+enum SimilarityScanStage: String, CaseIterable {
+    case inventory, downloading, analysing, comparison, grouping, finishing
+    var title: String {
+        switch self {
+        case .inventory: return "Finding files"
+        case .downloading: return "Fetching cloud files"
+        case .analysing: return "Analysing file content"
+        case .comparison: return "Comparing files"
+        case .grouping: return "Grouping matches"
+        case .finishing: return "Preparing results"
+        }
+    }
+    var stepTitle: String {
+        switch self {
+        case .inventory: return "Find files"
+        case .downloading: return "Fetch copies"
+        case .analysing: return "Analyse"
+        case .comparison: return "Compare"
+        case .grouping, .finishing: return "Results"
+        }
+    }
+}
+
+struct SimilarityScanProgress {
+    var stage: SimilarityScanStage = .inventory
+    var completed: UInt64 = 0
+    var total: UInt64?
+    var analysed: UInt64 = 0
+    var skipped: UInt64 = 0
+    var matches: UInt64 = 0
+    var downloadedBytes: UInt64 = 0
+    var currentName: String?
+    var currentBytes: UInt64 = 0
+    var currentSize: UInt64 = 0
+    var operation = ""
+
+    init() {}
+    init(event: [String: Any]) {
+        stage = SimilarityScanStage(rawValue: event["stage"] as? String ?? "") ?? .analysing
+        completed = (event["completed"] as? NSNumber)?.uint64Value ?? 0
+        total = (event["total"] as? NSNumber)?.uint64Value
+        let counts = event["counts"] as? [String: Any] ?? [:]
+        analysed = (counts["files_ready"] as? NSNumber)?.uint64Value ?? 0
+        skipped = ((counts["files_failed"] as? NSNumber)?.uint64Value ?? 0)
+            + ((counts["files_excluded"] as? NSNumber)?.uint64Value ?? 0)
+            + ((event["skipped"] as? NSNumber)?.uint64Value ?? 0)
+        matches = ((counts["similar_pairs"] as? NSNumber)?.uint64Value ?? 0)
+            + ((counts["exact_pairs"] as? NSNumber)?.uint64Value ?? 0)
+        downloadedBytes = (event["downloaded_bytes"] as? NSNumber)?.uint64Value ?? 0
+        let file = event["current_file"] as? [String: Any]
+        currentName = file?["name"] as? String
+        currentSize = (file?["bytes"] as? NSNumber)?.uint64Value ?? 0
+        currentBytes = (event["file_bytes_read"] as? NSNumber)?.uint64Value ?? 0
+        operation = event["operation"] as? String ?? ""
+    }
+    var fraction: Double? {
+        guard let total, total > 0 else { return nil }
+        return min(1, max(0, Double(completed) / Double(total)))
+    }
+    var percentLabel: String? {
+        fraction.map { "\(Int(($0 * 100).rounded(.down)))%" }
+    }
+    var completedLabel: String {
+        let count = total.map { "\(completed.formatted()) of \($0.formatted())" } ?? completed.formatted()
+        switch stage {
+        case .inventory: return "\(count) files found"
+        case .downloading: return "\(count) files processed"
+        case .analysing: return "\(count) files checked"
+        case .comparison: return "\(count) pairs checked"
+        case .grouping: return "\(count) match entries grouped"
+        case .finishing: return "Saving the report and clearing temporary files"
+        }
+    }
+    var currentOperation: String {
+        switch operation {
+        case "downloading": return "Downloading temporary copy"
+        case "decoding": return "Decoding and analysing content"
+        case "hashing": return "Checking identical content"
+        default: return "Reading file content"
+        }
+    }
+    static func bytes(_ value: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(clamping: value), countStyle: .file)
+    }
+    var currentByteLabel: String {
+        guard currentSize > 0 else { return Self.bytes(currentBytes) }
+        return "\(Self.bytes(min(currentBytes, currentSize))) of \(Self.bytes(currentSize))"
+    }
 }
 
 /// Each source owns its process and published state. Progress never causes
@@ -109,13 +197,13 @@ final class SimilarityScanModel: ObservableObject {
     @Published var threshold = 0.9
     @Published var exactDuplicates = true
     @Published var includeHidden = false
-    @Published var maxFileMB = "1024"
-    @Published var downloadGB = "10"
     @Published private(set) var isRunning = false { didSet { if oldValue != isRunning { onRunningChanged() } } }
     @Published private(set) var isCancelling = false
     @Published private(set) var message = "Ready to scan"
     @Published private(set) var detail = ""
     @Published private(set) var fraction: Double?
+    @Published private(set) var progress = SimilarityScanProgress()
+    @Published private(set) var startedAt: Date?
     @Published private(set) var report: SimilarityReport?
     @Published var error: String?
     private var process: Process?
@@ -131,12 +219,7 @@ final class SimilarityScanModel: ObservableObject {
     }
     var canStart: Bool {
         !isRunning && !families.isEmpty && (source == .local ? !localURLs.isEmpty : !cloudRoots.isEmpty)
-            && Self.integer(maxFileMB, maximum: 102_400) != nil && Self.integer(downloadGB, maximum: 1000) != nil
-    }
-    static func numericInput(_ text: String) -> String { String(text.filter { $0 >= "0" && $0 <= "9" }.prefix(6)) }
-    static func integer(_ text: String, maximum: UInt64) -> UInt64? {
-        guard !text.isEmpty, text == numericInput(text), let value = UInt64(text), (1...maximum).contains(value) else { return nil }
-        return value
+            && threshold.isFinite && (0.05...1).contains(threshold)
     }
     static func mediaTool(_ name: String) -> String? {
         ["/opt/homebrew/bin/", "/usr/local/bin/"].map { $0 + name }.first { FileManager.default.isExecutableFile(atPath: $0) }
@@ -176,8 +259,6 @@ final class SimilarityScanModel: ObservableObject {
             let request = SimilarityRequest(source: source, localPaths: source == .local ? localURLs.map(\.path) : [],
                 cloudItems: source == .cloud ? cloudRoots : [], families: families.sorted(), threshold: threshold,
                 exactDuplicates: exactDuplicates, includeHidden: includeHidden,
-                maxFileBytes: Self.integer(maxFileMB, maximum: 102_400)! * 1024 * 1024,
-                downloadBudgetBytes: Self.integer(downloadGB, maximum: 1000)! * 1024 * 1024 * 1024,
                 dataDir: configuration.dataDirectory.path, modelDir: configuration.models.path,
                 tempDir: directory.appendingPathComponent("copies", isDirectory: true).path,
                 reportPath: reportURL.path,
@@ -197,6 +278,7 @@ final class SimilarityScanModel: ObservableObject {
             generation = runID; process = child
             scopes = localURLs.filter { $0.startAccessingSecurityScopedResource() }
             isRunning = true; isCancelling = false; report = nil; error = nil; fraction = nil
+            progress = SimilarityScanProgress(); startedAt = Date()
             message = "Starting \(source.title) scan…"; detail = ""
             activity.begin(source.taskKind, scope: scopeLabel, message: message)
             let reader = SimilarityProcessReader()
@@ -231,39 +313,13 @@ final class SimilarityScanModel: ObservableObject {
 
     private func receive(_ event: [String: Any]) {
         guard event["event"] as? String == "progress" else { return }
-        let stage = event["stage"] as? String ?? "analysing"
-        switch stage {
-        case "downloading":
-            let complete = (event["completed"] as? NSNumber)?.doubleValue ?? 0
-            let total = (event["total"] as? NSNumber)?.doubleValue ?? 0
-            message = "Fetching temporary copies · \(Int(complete)) of \(Int(total))"
-            fraction = total > 0 ? complete / total : nil
-            detail = event["name"] as? String ?? ""
-        case "discovery":
-            if let counts = event["counts"] as? [String: Any] {
-                message = "Analysing file content…"; detail = countsDetail(counts)
-            } else {
-                message = "Finding cloud files…"
-                detail = "\((event["discovered"] as? NSNumber)?.intValue ?? 0) files found"
-            }
-            fraction = nil
-        default:
-            message = stage == "grouping" ? "Grouping matching files…"
-                : stage == "matching" || stage == "comparison" ? "Comparing file content…" : "Analysing file content…"
-            detail = (event["counts"] as? [String: Any]).map(countsDetail) ?? ""
-            fraction = nil
-        }
-        if let bytes = (event["downloaded_bytes"] as? NSNumber)?.int64Value, bytes > 0 {
-            detail += " · \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) fetched"
-        }
+        progress = SimilarityScanProgress(event: event)
+        message = progress.stage.title + "…"
+        fraction = progress.fraction
+        detail = progress.completedLabel
+        if let name = progress.currentName { detail += " · \(name)" }
+        if progress.downloadedBytes > 0 { detail += " · \(SimilarityScanProgress.bytes(progress.downloadedBytes)) fetched" }
         activity.update(source.taskKind, message: message, detail: detail, fraction: fraction)
-    }
-
-    private func countsDetail(_ counts: [String: Any]) -> String {
-        let found = (counts["files_discovered"] as? NSNumber)?.intValue ?? 0
-        let ready = (counts["files_ready"] as? NSNumber)?.intValue ?? 0
-        let pairs = (counts["pairs_compared"] as? NSNumber)?.intValue ?? 0
-        return "\(found.formatted()) files · \(ready.formatted()) analysed · \(pairs.formatted()) pairs compared"
     }
 
     private func finish(_ result: SimilarityReport?, diagnostic: String, exitCode: Int32) {
@@ -317,6 +373,11 @@ final class SimilarityScanModel: ObservableObject {
 
     #if FINDER_WORKSPACE_TESTS
     func setFixtureReport(_ value: SimilarityReport) { report = value; message = "\(value.totalGroups) match groups found" }
+    func setFixtureProgress(_ event: [String: Any]) {
+        report = nil; isRunning = true; startedAt = Date().addingTimeInterval(-72)
+        activity.begin(source.taskKind, scope: scopeLabel, message: "Starting scan")
+        receive(event)
+    }
     #endif
 }
 

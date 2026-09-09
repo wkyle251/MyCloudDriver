@@ -24,10 +24,22 @@ import SwiftUI
                 SimilarityGroup(id: "copies", matchKind: "byte_identical", family: "other", minimumScore: nil, memberCount: 2, members: photos)],
             issues: [SimilarityIssue(path: "/Users/demo/Documents/Archive.zip", reason: "Unsupported content format; checked for identical bytes"),
                 SimilarityIssue(path: "/Users/demo/Documents/Private.pdf", reason: "Password-protected PDF"),
-                SimilarityIssue(path: "/Users/demo/Documents/Large.mov", reason: "Exceeds the maximum file size")],
+                SimilarityIssue(path: "/Users/demo/Documents/Offline.mov", reason: "File is unavailable")],
             truncated: false, coverage: "Source coverage: partial. Comparison coverage: exhaustive for analysed files.", elapsedSeconds: 24))
         coordinator.cloudScope = { _ in [SimilarityCloudRoot(id: "projects", name: "Projects", path: "/Projects", isFolder: true, size: 0, ancestors: [])] }
         coordinator.useBrowserSelection(false)
+        if CommandLine.arguments.contains("--progress") || Bundle.main.object(forInfoDictionaryKey: "SimilarityProgressFixture") as? Bool == true {
+            let cloud = CommandLine.arguments.contains("--cloud")
+            coordinator.source = cloud ? .cloud : .local
+            for scan in coordinator.runs {
+                let isCloud = scan.source == .cloud
+                scan.threshold = 0.05
+                scan.setFixtureProgress(["event":"progress", "stage":isCloud ? "downloading" : "analysing", "completed":15, "total":24,
+                    "current_file":["name":"Garden walkthrough.mov", "bytes":2_147_483_648], "file_bytes_read":1_207_959_552,
+                    "operation":isCloud ? "downloading" : "decoding", "downloaded_bytes":isCloud ? 17_000_000_000 : 0,
+                    "counts":["files_ready":isCloud ? 0 : 14, "files_failed":isCloud ? 0 : 1, "similar_pairs":0, "exact_pairs":0]])
+            }
+        }
         self.coordinator = coordinator
         super.init()
     }
@@ -44,7 +56,7 @@ import SwiftUI
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "Quit Similarity Design Test", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu; menu.addItem(appItem); NSApp.mainMenu = menu
-        coordinator.present(source: .local)
+        coordinator.present(source: coordinator.source)
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationWillTerminate(_ notification: Notification) { coordinator.close() }
