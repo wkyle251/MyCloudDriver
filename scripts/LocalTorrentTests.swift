@@ -80,6 +80,7 @@ import SwiftUI
         try await engineReselect()
         try await streamingUploads()
         try await ramReclaim()
+        try await ramRecycle()
         try sourceAndPersistence()
         try await selectionAndRecovery()
         try await metadataAndCancellation()
@@ -952,5 +953,22 @@ extension LocalTorrentTests {
         precondition(exists("two.bin"), "a file that has not been uploaded must never be unlinked")
         model.shutdown()
         print("PASS RAM reclaim: shared-piece safety respected, drained file deselected then unlinked")
+    }
+}
+
+extension LocalTorrentTests {
+    /// Emptying a `ram://` image in place does not give memory back: the image
+    /// keeps every block it ever wrote until it is detached, so a 43 GB window
+    /// would stay claimed for every window that followed it.
+    @MainActor static func ramRecycle() async throws {
+        let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let ram = RelayFixtureRAM(), id = UUID()
+        let first = try await ram.acquire(id: id, bytes: 256 * 1024 * 1024, directory: root)
+        let second = try await ram.recycle(first, id: id, bytes: 256 * 1024 * 1024, directory: root)
+        precondition(ram.released == 1, "recycle must detach the old image")
+        precondition(ram.volumes.count == 1, "exactly one image stays attached")
+        precondition(second.uuid != first.uuid, "a fresh image resets the high-water mark")
+        precondition(second.owner == id && second.bytes == 256 * 1024 * 1024)
+        print("PASS RAM recycle: the window boundary detaches and reattaches, resetting the high-water mark")
     }
 }

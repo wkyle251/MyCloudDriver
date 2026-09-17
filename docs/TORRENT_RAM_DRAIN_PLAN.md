@@ -933,15 +933,16 @@ extension LocalTorrentTests {
         let ram = RelayFixtureRAM(), id = UUID()
         let first = try await ram.acquire(id: id, bytes: 256 * 1024 * 1024, directory: root)
         let second = try await ram.recycle(first, id: id, bytes: 256 * 1024 * 1024, directory: root)
-        precondition(ram.released.contains(first.uuid), "recycle must detach the old image")
+        precondition(ram.released == 1, "recycle must detach the old image")
         precondition(ram.volumes.count == 1, "exactly one image stays attached")
+        precondition(second.uuid != first.uuid, "a fresh image resets the high-water mark")
         precondition(second.owner == id && second.bytes == 256 * 1024 * 1024)
         print("PASS RAM recycle: the window boundary detaches and reattaches, resetting the high-water mark")
     }
 }
 ```
 
-Add `var released: [String] = []` to `RelayFixtureRAM` and append `volume.uuid` in its `release`. Register `try await ramRecycle()` in `main()`.
+Register `try await ramRecycle()` in `main()`.
 
 - [ ] **Step 2: Run to verify it fails**
 

@@ -193,11 +193,14 @@ extension LocalTorrentJob {
         busy.insert(id); defer { finishOperation(id) }
         let advancedBatch = state.batch != value.relay?.batch
         let oldVolume = state.volume
-        let volume = try await ram.acquire(id: id, bytes: state.memoryBytes, directory: store.jobDirectory(id))
+        var volume = try await ram.acquire(id: id, bytes: state.memoryBytes, directory: store.jobDirectory(id))
         try checkRelay(id, generation)
         if oldVolume?.uuid != volume.uuid { state.batchReady = false; state.batchDownloaded = 0 }
         state.volume = volume
-        if advancedBatch { try await ram.clear(volume) }
+        if advancedBatch {
+            volume = try await ram.recycle(volume, id: id, bytes: state.memoryBytes, directory: try store.jobDirectory(id))
+            state.volume = volume; state.drained = []
+        }
         edit(id) { $0.relay = state }
         try save()
         if state.batchReady {
@@ -205,8 +208,9 @@ extension LocalTorrentJob {
             let remaining = Set(state.batches[state.batch]).subtracting(state.uploaded)
             if !remaining.isEmpty { try await runRelayUpload(id, reconcile: false, generation: generation, indexes: remaining) }
             try checkRelay(id, generation)
-            try await ram.clear(volume)
-            edit(id) { $0.relay?.batchReady = false; $0.relay?.batch += 1; $0.relay?.batchDownloaded = 0; $0.relay?.currentBytes = 0 }
+            let next = try await ram.recycle(volume, id: id, bytes: state.memoryBytes, directory: try store.jobDirectory(id))
+            edit(id) { $0.relay?.volume = next; $0.relay?.batchReady = false; $0.relay?.batch += 1
+                       $0.relay?.batchDownloaded = 0; $0.relay?.currentBytes = 0; $0.relay?.drained = [] }
             try save()
             try await advanceRelay(id, generation: generation)
             return
