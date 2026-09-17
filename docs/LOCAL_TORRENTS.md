@@ -91,10 +91,16 @@ files produce a clear selection error; there is no disk-cache fallback.
   reattached and torrent pieces are checked. After a Mac restart, lost RAM is
   recreated and unfinished files are downloaded again. An interrupted file's
   multipart upload may restart; completed cloud files are preserved.
-- The task is bound to the original account, login method and destination.
-  Select that account and login method before resuming. Uploads consume that
-  login's upload allowance. User/Guest/Dynamic content mode does not change
-  upload authentication. No PikPak credentials reach the BitTorrent engine.
+- The task is bound to the original PikPak **account** and destination. Select
+  that account before resuming. The login method may change mid-transfer —
+  switch between normal sign-in and a Personal Access Token and the transfer
+  continues under whichever is active, which is how an upload moves off a
+  token's 25% allowance onto the full account allowance. Saved cloud receipts
+  stay valid across the switch, so nothing is uploaded twice. The account
+  itself is checked here and verified again against the server before any
+  cloud change. Uploads consume the active login's allowance.
+  User/Guest/Dynamic content mode does not change upload authentication. No
+  PikPak credentials reach the BitTorrent engine.
 - **Remove Torrent** stops the work, releases RAM and deletes its resume
   history. Completed PikPak files remain in their destination.
 

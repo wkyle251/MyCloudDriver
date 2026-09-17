@@ -1,9 +1,12 @@
 import Foundation
 
 struct TorrentRelayState: Codable {
-    let identity: UUID
+    /// The saved login this transfer is currently running under. Followed
+    /// rather than enforced: macOS re-issues account-entry UUIDs when a session
+    /// is re-registered, and the login method is the user's to change.
+    var identity: UUID
     let accountID: String
-    let credentialKind: PikPakCredentialKind
+    var credentialKind: PikPakCredentialKind
     let accountName: String
     let parentID: String
     let parentName: String
@@ -101,12 +104,29 @@ extension LocalTorrentJob {
             return account?.pikpakManagement.context
         }
     }
+    /// The PikPak account this transfer belongs to — not one of this Mac's
+    /// saved login entries.
+    ///
+    /// Entry UUIDs are re-issued whenever a session is re-registered, so a
+    /// transfer that runs for days cannot be pinned to one; and the login
+    /// method is the user's to change mid-transfer, which is how an upload
+    /// moves off a personal access token's 25% allowance onto the full account
+    /// allowance. The account is what must not change, and the upload helper
+    /// re-verifies it against the server before any cloud mutation.
     func relayContext(_ state: TorrentRelayState) throws -> PikPakManagementContext {
-        guard let context = relayContextProvider?(), context.identity == state.identity,
-              context.accountID == state.accountID, context.credentialKind == state.credentialKind else {
-            throw LocalTorrentError.message("Select \(state.accountName) with \(state.credentialKind.loginTitle.lowercased()) in the sidebar, then Resume this torrent.")
+        guard let context = relayContextProvider?(), context.accountID == state.accountID else {
+            throw LocalTorrentError.message("Select \(state.accountName) in the sidebar, then Resume this torrent.")
         }
         return context
+    }
+
+    /// Record the login a transfer is now running under, so its card and its
+    /// saved state name the credentials actually being used.
+    private func adoptRelayLogin(_ id: UUID, _ context: PikPakManagementContext) {
+        guard let state = job(id)?.relay, state.accountID == context.accountID,
+              state.identity != context.identity || state.credentialKind != context.credentialKind else { return }
+        edit(id) { $0.relay?.identity = context.identity; $0.relay?.credentialKind = context.credentialKind }
+        saveOrReport()
     }
     func downloadToPikPak(_ id: UUID, selected: Set<Int>, context: PikPakManagementContext, accountName: String,
                          parentID: String, parentName: String, memoryBytes: UInt64) async {
@@ -130,7 +150,7 @@ extension LocalTorrentJob {
         guard let value = job(id), let state = value.relay, !busy.contains(id), !closed else { return }
         error = nil
         do {
-            _ = try relayContext(state)
+            adoptRelayLogin(id, try relayContext(state))
             if relayTasks[id] != nil {
                 try relayUploaders[id]?.pause(false)
                 edit(id) { $0.phase = .uploading; $0.message = "" }

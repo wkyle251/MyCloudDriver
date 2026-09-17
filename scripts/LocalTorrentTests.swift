@@ -81,6 +81,7 @@ import SwiftUI
         try await streamingUploads()
         try await ramReclaim()
         try await ramRecycle()
+        try await relayLoginSwitch()
         try sourceAndPersistence()
         try await selectionAndRecovery()
         try await metadataAndCancellation()
@@ -606,9 +607,10 @@ extension LocalTorrentTests {
         cloud.blockUploads=false
         try await Task.sleep(nanoseconds:100_000_000)
         precondition(cloud.uploads.isEmpty)
-        // A credential-kind change is guarded just like an account change.
-        model.relayContextProvider={relayContext(identity:context.identity,kind:.desktopOAuth)}
+        // The login method may change mid-transfer; the PikPak account may not.
+        model.relayContextProvider={relayContext(identity:UUID(),account:"other-account",kind:.desktopOAuth)}
         await model.resume(id);precondition(model.job(id)?.phase == .paused && model.error != nil)
+        model.error=nil
         model.relayContextProvider={context};await model.resume(id)
         try await until("paused uploader resumed") { model.job(id)?.phase == .completed }
         precondition(cloud.invocations == calls && cloud.uploads == [1,2])
@@ -979,5 +981,37 @@ extension LocalTorrentTests {
         precondition(second.uuid != first.uuid, "a fresh image resets the high-water mark")
         precondition(second.owner == id && second.bytes == 256 * 1024 * 1024)
         print("PASS RAM recycle: the window boundary detaches and reattaches, resetting the high-water mark")
+    }
+}
+
+extension LocalTorrentTests {
+    /// A transfer is bound to a PikPak account, not to one of this Mac's saved
+    /// login entries. Account-entry UUIDs are re-issued when a session is
+    /// re-registered, and a transfer running for days must survive that; the
+    /// login method is also the user's to change mid-transfer, which is how an
+    /// upload moves off a token's 25% allowance onto the full account.
+    @MainActor static func relayLoginSwitch() async throws {
+        let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let ram = RelayFixtureRAM(), cloud = RelayFixtureCloud()
+        let (model, _, id, _) = try await startRelay(root: root, ram: ram, cloud: cloud)
+        precondition(model.job(id)?.relay?.credentialKind == .personalAccessToken)
+
+        await model.pause(id)
+        // Same PikPak account, different saved entry and different login kind.
+        let switched = relayContext(identity: UUID(), account: "account-a", kind: .desktopOAuth)
+        model.relayContextProvider = { switched }
+        await model.resumeRelay(id)
+        try await until("resumes under the new login") { model.job(id)?.phase == .downloading && !model.busy.contains(id) }
+        precondition(model.job(id)?.relay?.credentialKind == .desktopOAuth, "the stored login must follow the active one")
+        precondition(model.job(id)?.relay?.identity == switched.identity, "the stored entry must follow the active one")
+        precondition(model.job(id)?.relay?.accountID == "account-a", "the PikPak account itself must never change")
+
+        // A different PikPak account must still be refused.
+        await model.pause(id)
+        model.relayContextProvider = { relayContext(identity: UUID(), account: "account-b", kind: .desktopOAuth) }
+        await model.resumeRelay(id)
+        precondition(model.job(id)?.phase != .downloading, "a different PikPak account must be refused")
+        model.shutdown()
+        print("PASS relay login switch: the same account continues under a new login; another account is refused")
     }
 }
