@@ -79,6 +79,7 @@ import SwiftUI
         try drainLogic()
         try await engineReselect()
         try await streamingUploads()
+        try await ramReclaim()
         try sourceAndPersistence()
         try await selectionAndRecovery()
         try await metadataAndCancellation()
@@ -904,5 +905,52 @@ extension LocalTorrentTests {
         precondition(model.job(id)?.phase == .downloading, "the download must resume after the upload")
         model.shutdown()
         print("PASS streaming uploads: a completed file reaches PikPak while its batch is still downloading")
+    }
+}
+
+extension LocalTorrentTests {
+    /// Uploaded files must give their memory back — but only once no file still
+    /// being downloaded needs a piece that overlaps them. Deleting too early
+    /// makes aria2 recreate the file and fetch it a second time.
+    @MainActor static func ramReclaim() async throws {
+        let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let ram = RelayFixtureRAM(), cloud = RelayFixtureCloud()
+        // 700-byte files against 1000-byte pieces: every piece is shared, the
+        // regime of the real torrent (22 MB files, 32 MiB pieces).
+        let (model, engine, id, _) = try await startRelay(root: root, ram: ram, cloud: cloud,
+            files: [("a/one.bin", 700), ("a/two.bin", 700), ("a/three.bin", 700)])
+        model.edit(id) { $0.pieceLength = 1000 }
+        guard let gid = model.gids[id], let volume = model.job(id)?.relay?.volume else { preconditionFailure("missing RAM job") }
+        precondition(model.job(id)?.relay?.batches == [[1, 2, 3]])
+        let payload = volume.payload.appendingPathComponent("a")
+        try FileManager.default.createDirectory(at: payload, withIntermediateDirectories: true)
+        for name in ["one.bin", "two.bin", "three.bin"] {
+            try Data(repeating: 7, count: 700).write(to: payload.appendingPathComponent(name))
+        }
+        func exists(_ name: String) -> Bool { FileManager.default.fileExists(atPath: payload.appendingPathComponent(name).path) }
+
+        // File 1 finishes and is uploaded, but file 2 shares its piece and is
+        // still downloading, so nothing may be unlinked yet.
+        engine.setFileProgress(gid, [1: 700, 2: 0, 3: 0])
+        await model.refreshRelay(id)
+        model.relayQueuedSince[id] = Date().addingTimeInterval(-TorrentRelayDrain.flushWait - 1)
+        model.relayFileCensusAt[id] = nil
+        await model.refreshRelay(id)
+        try await until("file 1 uploaded", seconds: 10) { model.job(id)?.relay?.uploaded.contains(1) == true }
+        model.relayFileCensusAt[id] = nil
+        await model.refreshRelay(id)
+        precondition(exists("one.bin"), "a file sharing a piece with an incomplete neighbour must stay in RAM")
+        precondition(engine.reselected.isEmpty, "nothing may be deselected while its pieces are still wanted")
+
+        // File 2 completes, so file 1's pieces are settled and it may go.
+        engine.setFileProgress(gid, [1: 700, 2: 700, 3: 0])
+        model.relayFileCensusAt[id] = nil
+        await model.refreshRelay(id)
+        try await until("file 1 unlinked", seconds: 10) { !exists("one.bin") }
+        precondition(model.job(id)?.relay?.drained?.contains(1) == true)
+        precondition(engine.reselected.last?.1 == [2, 3], "the drained file must be deselected before it is unlinked")
+        precondition(exists("two.bin"), "a file that has not been uploaded must never be unlinked")
+        model.shutdown()
+        print("PASS RAM reclaim: shared-piece safety respected, drained file deselected then unlinked")
     }
 }

@@ -277,6 +277,10 @@ extension LocalTorrentJob {
             if (relayQueued[id] ?? []).isEmpty { relayQueuedSince[id] = Date() }
             relayQueued[id, default: []].formUnion(fresh)
         }
+        // A file becomes removable when a *neighbour* finishes, which is a
+        // download event, so this runs every census rather than only on commit.
+        await reclaimRelayRAM(id, complete: done)
+        guard job(id)?.phase == .downloading, gids[id] == gid, !busy.contains(id) else { return false }
         let queued = relayQueued[id] ?? []
         let bytes = value.files.filter { queued.contains($0.index) }.reduce(UInt64(0)) { $0 + $1.length }
         let waiting = relayQueuedSince[id].map { Date().timeIntervalSince($0) } ?? 0
@@ -284,6 +288,53 @@ extension LocalTorrentJob {
         relayQueued[id] = []; relayQueuedSince[id] = nil
         try await flushRelayUploads(id, indexes: queued)
         return true
+    }
+
+    /// Deselect and unlink committed files whose pieces no longer serve any
+    /// file still being downloaded, returning their RAM to the volume.
+    ///
+    /// Order matters: aria2 rewrites a file that is still selected, so the
+    /// selection is narrowed first and the unlink follows. A file sharing a
+    /// piece with an unfinished neighbour is left alone — deleting it would
+    /// only fetch it a second time, which is measurably what aria2 does.
+    private func reclaimRelayRAM(_ id: UUID, complete: Set<Int>) async {
+        guard !closed, let value = job(id), let state = value.relay, let volume = state.volume,
+              let gid = gids[id], let pieceLength = value.pieceLength, pieceLength > 0,
+              engine.running, state.batch < state.batches.count else { return }
+        let window = Set(state.batches[state.batch])
+        let removed = Set(state.drained ?? [])
+        let layout = TorrentRelayDrain.Layout(files: value.files, pieceLength: pieceLength)
+        let ready = TorrentRelayDrain.removable(layout: layout, complete: complete,
+                                                committed: state.uploaded, removed: removed)
+            .filter { window.contains($0) }
+        guard !ready.isEmpty else { return }
+        let keep = window.subtracting(removed).subtracting(ready).sorted()
+        do {
+            // Never hand aria2 an empty selection; the window boundary tears the
+            // download down instead.
+            if !keep.isEmpty { try await engine.reselect(gid, selection: keep) }
+            guard job(id)?.relay?.volume == volume, gids[id] == gid else { return }
+            var unlinked: [Int] = []
+            for index in ready {
+                guard let file = value.files.first(where: { $0.index == index }) else { continue }
+                let path = volume.payload.appendingPathComponent(file.path)
+                if FileManager.default.fileExists(atPath: path.path) {
+                    // Leave a stubborn file for the window boundary rather than
+                    // failing the transfer; its bytes are already in PikPak.
+                    do { try FileManager.default.removeItem(at: path) } catch { continue }
+                }
+                unlinked.append(index)
+            }
+            guard !unlinked.isEmpty else { return }
+            edit(id) { job in
+                let current = job.relay?.drained ?? []
+                job.relay?.drained = current.appendingUnique(unlinked)
+            }
+            saveOrReport()
+        } catch {
+            // Reclaim is opportunistic: a failure costs memory, never data.
+            return
+        }
     }
 
     /// Upload completed files while the rest of the window keeps downloading.
