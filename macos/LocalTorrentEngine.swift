@@ -72,6 +72,7 @@ struct LocalTorrentPeerCensus: Equatable {
     func status(_ id: String, files: Bool) async throws -> LocalTorrentStatus
     func peerCensus(_ id: String, attempted: Int) async throws -> LocalTorrentPeerCensus
     func begin(_ id: String, directory: URL, selection: [Int]) async throws
+    func reselect(_ id: String, selection: [Int]) async throws
     func pause(_ id: String) async throws
     func remove(_ id: String) async throws
     func stop()
@@ -294,6 +295,13 @@ extension LocalTorrentDriving {
         let indexes = try LocalTorrentSource.selectionString(selection)
         _ = try await call("changeOption", [id, ["dir":directory.path, "select-file":indexes, "bt-metadata-only":"false", "seed-time":"0"]])
         _ = try await call("unpause", [id])
+    }
+    /// Narrow a running download's file selection without resuming it.
+    /// `begin` unpauses as well; a mid-flight deselection must not, or pausing
+    /// a transfer would be undone by the next drained file.
+    func reselect(_ id: String, selection: [Int]) async throws {
+        let indexes = try LocalTorrentSource.selectionString(selection)
+        _ = try await call("changeOption", [id, ["select-file": indexes]])
     }
     func pause(_ id: String) async throws { _ = try await call("forcePause", [id]) }
     func remove(_ id: String) async throws {

@@ -7,6 +7,7 @@ import SwiftUI
     var states: [String: [String: Any]] = [:]
     var directories: [String: URL] = [:]
     var begun: [(String, URL, [Int])] = []
+    var reselected: [(String, [Int])] = []
     var metadataRequests = 0
     var metadataFailures = 0
     var files = [("Examples/one.txt", UInt64(512)), ("Examples/two.txt", UInt64(1024))]
@@ -45,6 +46,7 @@ import SwiftUI
         if delayBegin { await withCheckedContinuation { beginGate = $0 } }
         if ambiguousBegin { throw LocalTorrentError.message("Lost local RPC reply") }
     }
+    func reselect(_ id: String, selection: [Int]) async throws { reselected.append((id, selection)) }
     func pause(_ id: String) async throws { states[id]?["status"] = "paused" }
     func remove(_ id: String) async throws { states[id] = nil }
     func stop() { running = false }
@@ -66,6 +68,7 @@ import SwiftUI
         try queueCompatibility()
         try perFileProgress()
         try drainLogic()
+        try await engineReselect()
         try sourceAndPersistence()
         try await selectionAndRecovery()
         try await metadataAndCancellation()
@@ -846,5 +849,20 @@ extension LocalTorrentTests {
         precondition(TorrentRelayDrain.shouldFlush(count: 1, bytes: 1, waiting: 180, windowComplete: false))
         precondition(TorrentRelayDrain.shouldFlush(count: 31, bytes: 1, waiting: 179, windowComplete: false) == false)
         print("PASS drain logic: piece spans, shared-piece safety and flush policy")
+    }
+}
+
+extension LocalTorrentTests {
+    @MainActor static func engineReselect() async throws {
+        let fixture = TorrentFixtureEngine()
+        // Through the protocol: the relay only ever holds a LocalTorrentDriving.
+        let engine: LocalTorrentDriving = fixture
+        try await engine.start()
+        let gid = try await engine.addTorrent(Data("x".utf8), directory: URL(fileURLWithPath: "/tmp"), selection: [1, 2])
+        try await engine.reselect(gid, selection: [2])
+        precondition(fixture.reselected.count == 1 && fixture.reselected[0].1 == [2])
+        // Reselect must not resume a paused download; only `begin` unpauses.
+        precondition(fixture.states[gid]?["status"] as? String == "paused", "reselect must not unpause")
+        print("PASS engine reselect: selection changes without unpausing")
     }
 }
