@@ -47,6 +47,15 @@ import SwiftUI
         if ambiguousBegin { throw LocalTorrentError.message("Lost local RPC reply") }
     }
     func reselect(_ id: String, selection: [Int]) async throws { reselected.append((id, selection)) }
+    /// Drive per-file `completedLength` on a fixture download.
+    func setFileProgress(_ id: String, _ progress: [Int: UInt64]) {
+        guard var entries = states[id]?["files"] as? [[String: Any]] else { return }
+        for position in entries.indices {
+            let index = Int(entries[position]["index"] as? String ?? "") ?? 0
+            entries[position]["completedLength"] = "\(progress[index] ?? 0)"
+        }
+        states[id]?["files"] = entries
+    }
     func pause(_ id: String) async throws { states[id]?["status"] = "paused" }
     func remove(_ id: String) async throws { states[id] = nil }
     func stop() { running = false }
@@ -69,6 +78,7 @@ import SwiftUI
         try perFileProgress()
         try drainLogic()
         try await engineReselect()
+        try await streamingUploads()
         try sourceAndPersistence()
         try await selectionAndRecovery()
         try await metadataAndCancellation()
@@ -864,5 +874,35 @@ extension LocalTorrentTests {
         // Reselect must not resume a paused download; only `begin` unpauses.
         precondition(fixture.states[gid]?["status"] as? String == "paused", "reselect must not unpause")
         print("PASS engine reselect: selection changes without unpausing")
+    }
+}
+
+extension LocalTorrentTests {
+    /// Files must reach PikPak while their batch is still downloading. Before
+    /// this, nothing uploaded until aria2 reported the whole batch complete —
+    /// 66 hours away on the 440 GB torrent that prompted the change.
+    @MainActor static func streamingUploads() async throws {
+        let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let ram = RelayFixtureRAM(), cloud = RelayFixtureCloud()
+        let (model, engine, id, _) = try await startRelay(root: root, ram: ram, cloud: cloud)
+        precondition(model.job(id)?.relay?.batches == [[1, 2], [3]])
+        guard let gid = model.gids[id] else { preconditionFailure("missing RAM gid") }
+
+        // aria2 finishes file 1 while file 2 is still arriving.
+        engine.setFileProgress(gid, [1: 104_857_600, 2: 1_000, 3: 0])
+        await model.refreshRelay(id)
+        precondition(cloud.uploads.isEmpty, "one small file must not spawn an uploader immediately")
+
+        // Having waited long enough, it goes on its own rather than waiting for
+        // the rest of the batch.
+        model.relayQueuedSince[id] = Date().addingTimeInterval(-TorrentRelayDrain.flushWait - 1)
+        model.relayFileCensusAt[id] = nil
+        await model.refreshRelay(id)
+        try await until("file 1 saved mid-batch", seconds: 10) { model.job(id)?.relay?.uploaded.contains(1) == true }
+        precondition(cloud.uploads == [1], "only the completed file should have been uploaded")
+        precondition(engine.states[gid]?["status"] as? String != "complete", "the batch must still be downloading")
+        precondition(model.job(id)?.phase == .downloading, "the download must resume after the upload")
+        model.shutdown()
+        print("PASS streaming uploads: a completed file reaches PikPak while its batch is still downloading")
     }
 }
