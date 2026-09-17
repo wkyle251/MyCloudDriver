@@ -658,11 +658,15 @@ extension LocalTorrentTests {
     let original: URL
     let ram: TorrentRAMDriving
     var hashes: [Int: SHA256.Digest] = [:]
+    /// How many files each non-reconcile upload carried. A batch smaller than
+    /// the selection proves a file was saved before its batch finished.
+    var batchesSent: [Int] = []
     init(original: URL, ram: TorrentRAMDriving) { self.original = original; self.ram = ram }
     func pause(_ paused: Bool) throws {}
     func stop() {}
     func run(request: [String: Any], directory: URL, context: PikPakManagementContext, event: @escaping ([String: Any]) -> Void) async throws {
         if request["reconcile_only"] as? Bool == true { event(["event":"finished"]); return }
+        batchesSent.append((request["files"] as! [[String: Any]]).count)
         let mount = URL(fileURLWithPath:request["ram_root"] as! String)
         let volume = try JSONDecoder().decode(TorrentRAMVolume.self, from:Data(contentsOf:directory.appendingPathComponent("ram-volume.json")))
         try await ram.validate(volume)
@@ -688,6 +692,9 @@ extension LocalTorrentTests {
         func makeModel() -> LocalTorrentModel {
             let model=LocalTorrentModel(directory:state,engine:Aria2TorrentEngine(executable:executable,directory:state.appendingPathComponent("Engine"),extraOptions:options,trackers:[],mapsPorts:false),ram:ram)
             model.relayContextProvider={context};model.relayUploaderFactory={uploader}
+            // The fixture torrent is far too small to reach the 3-minute or
+            // 256 MB flush triggers, so upload every completed file at once.
+            model.relayFlushWait=0; model.relayFileCensusInterval=0.5
             return model
         }
         let first=makeModel();let id=try first.add(magnet:config["magnet"] as! String)
@@ -706,6 +713,8 @@ extension LocalTorrentTests {
             try await until("verified RAM payload reaches upload sink",seconds:70){[.completed,.failed].contains(next.job(id)?.phase ?? .metadata)}
             guard next.job(id)?.phase == .completed else {await next.stop(id);throw LocalTorrentError.message(next.job(id)?.message ?? "RAM relay did not complete")}
             precondition(Set(uploader.hashes.keys) == [1,3])
+            precondition(uploader.batchesSent.contains { $0 < 2 },
+                         "every upload carried the whole batch; no file was saved while it was still downloading")
             precondition(next.job(id)?.relay?.volume == nil)
             next.shutdown()
             print("PASS real peers → RAM → upload sink: selective SHA-256 verified files, partial-piece pause/restart/resume, RAM identity retained and released after commit")

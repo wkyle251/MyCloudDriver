@@ -95,10 +95,12 @@ enum TorrentRelayDrain {
 
     /// Whether the queued completed files are worth one uploader spawn. The
     /// wait trigger is what keeps a slow swarm showing steady progress.
-    static func shouldFlush(count: Int, bytes: UInt64, waiting: TimeInterval, windowComplete: Bool) -> Bool {
+    static func shouldFlush(count: Int, bytes: UInt64, waiting: TimeInterval, windowComplete: Bool,
+                            fileLimit: Int = flushFileLimit, byteLimit: UInt64 = flushByteLimit,
+                            wait: TimeInterval = flushWait) -> Bool {
         guard count > 0 else { return false }
         if windowComplete { return true }
-        return count >= flushFileLimit || bytes >= flushByteLimit || waiting >= flushWait
+        return count >= fileLimit || bytes >= byteLimit || waiting >= wait
     }
 }
 

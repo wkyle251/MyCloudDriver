@@ -288,7 +288,8 @@ extension LocalTorrentJob {
         let queued = relayQueued[id] ?? []
         let bytes = value.files.filter { queued.contains($0.index) }.reduce(UInt64(0)) { $0 + $1.length }
         let waiting = relayQueuedSince[id].map { Date().timeIntervalSince($0) } ?? 0
-        guard TorrentRelayDrain.shouldFlush(count: queued.count, bytes: bytes, waiting: waiting, windowComplete: false) else { return false }
+        guard TorrentRelayDrain.shouldFlush(count: queued.count, bytes: bytes, waiting: waiting,
+                                            windowComplete: false, wait: relayFlushWait) else { return false }
         relayQueued[id] = []; relayQueuedSince[id] = nil
         try await flushRelayUploads(id, indexes: queued)
         return true

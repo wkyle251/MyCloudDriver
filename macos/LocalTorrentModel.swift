@@ -235,6 +235,8 @@ struct LocalTorrentStore {
     /// speeds and peers keep refreshing every second.
     var relayFileCensusAt: [UUID: Date] = [:]
     var relayFileCensusInterval: TimeInterval = 5
+    /// How long a completed file waits for company before it is uploaded alone.
+    var relayFlushWait: TimeInterval = TorrentRelayDrain.flushWait
 
     init(directory: URL? = nil, engine: LocalTorrentDriving? = nil, ram: TorrentRAMDriving? = nil) {
         let root = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("MyCloudDriver/LocalTorrents", isDirectory: true)
