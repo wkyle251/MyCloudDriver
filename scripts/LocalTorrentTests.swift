@@ -64,6 +64,7 @@ import SwiftUI
             try await actualTransfer(URL(fileURLWithPath: CommandLine.arguments[index + 1])); return
         }
         try queueCompatibility()
+        try perFileProgress()
         try sourceAndPersistence()
         try await selectionAndRecovery()
         try await metadataAndCancellation()
@@ -767,5 +768,29 @@ extension LocalTorrentTests {
         let round = try JSONDecoder().decode(LocalTorrentStore.Saved.self, from: JSONEncoder().encode(saved))
         precondition(round.jobs[0].relay?.batches == [[1], [2]])
         print("PASS queue compatibility: a queue saved by the shipping build still decodes, and round-trips")
+    }
+}
+
+extension LocalTorrentTests {
+    /// aria2 reports how much of each file it has verified. Reading it is what
+    /// lets a finished file reach PikPak without waiting for its whole batch.
+    @MainActor static func perFileProgress() throws {
+        let status = LocalTorrentStatus([
+            "status": "active", "totalLength": "3000", "completedLength": "1500",
+            "files": [
+                ["index": "1", "path": "/x/one.bin", "length": "1000", "completedLength": "1000"],
+                ["index": "2", "path": "/x/two.bin", "length": "2000", "completedLength": "500"],
+            ],
+        ])
+        precondition(status.files.count == 2)
+        precondition(status.files[0].completedLength == 1000 && status.files[0].length == 1000)
+        precondition(status.files[1].completedLength == 500)
+        // A reply without the key must not drop the file.
+        let sparse = LocalTorrentStatus([
+            "status": "active",
+            "files": [["index": "1", "path": "/x/one.bin", "length": "1000"]],
+        ])
+        precondition(sparse.files.count == 1 && sparse.files[0].completedLength == 0)
+        print("PASS per-file progress: completedLength parsed, absent key defaults to zero")
     }
 }
