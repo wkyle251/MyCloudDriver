@@ -65,6 +65,7 @@ import SwiftUI
         }
         try queueCompatibility()
         try perFileProgress()
+        try drainLogic()
         try sourceAndPersistence()
         try await selectionAndRecovery()
         try await metadataAndCancellation()
@@ -792,5 +793,58 @@ extension LocalTorrentTests {
         ])
         precondition(sparse.files.count == 1 && sparse.files[0].completedLength == 0)
         print("PASS per-file progress: completedLength parsed, absent key defaults to zero")
+    }
+}
+
+extension LocalTorrentTests {
+    private static func drainFiles(_ lengths: [UInt64]) -> [LocalTorrentFile] {
+        lengths.enumerated().map { .init(index: $0.offset + 1, path: "f\($0.offset).bin", length: $0.element) }
+    }
+
+    @MainActor static func drainLogic() throws {
+        // Four 700-byte files against 1000-byte pieces: every piece is shared,
+        // exactly the regime of the live torrent (22 MB files, 32 MiB pieces).
+        let files = drainFiles([700, 700, 700, 700])
+        let layout = TorrentRelayDrain.Layout(files: files, pieceLength: 1000)
+        // file 1 = bytes 0..<700    -> piece 0       -> piece bytes 0..<1000
+        // file 2 = bytes 700..<1400 -> pieces 0...1  -> piece bytes 0..<2000
+        precondition(layout.pieceBytes(0) == 0..<1000)
+        precondition(layout.pieceBytes(1) == 0..<2000)
+        precondition(layout.touching(0..<1000) == 0..<2, "piece 0 carries files 1 and 2")
+
+        // A lone committed file whose neighbour is still downloading must NOT
+        // be removed: aria2 rewrites it when the shared piece lands. Measured
+        // against aria2 1.37 during the design probe.
+        precondition(TorrentRelayDrain.removable(layout: layout, complete: [1],
+                                                 committed: [1], removed: []) == [])
+        // Once the sharing neighbour is complete too, file 1 may go.
+        precondition(TorrentRelayDrain.removable(layout: layout, complete: [1, 2],
+                                                 committed: [1], removed: []) == [1])
+        // Committed but not complete is never removable.
+        precondition(TorrentRelayDrain.removable(layout: layout, complete: [2],
+                                                 committed: [1], removed: []) == [])
+        // Already removed files are not offered twice, and count as settled.
+        precondition(TorrentRelayDrain.removable(layout: layout, complete: [2, 3],
+                                                 committed: [2], removed: [1]) == [2])
+
+        // A file larger than a piece owns its interior pieces outright.
+        let big = TorrentRelayDrain.Layout(files: drainFiles([4000, 700]), pieceLength: 1000)
+        precondition(big.pieceBytes(0) == 0..<4000)
+        precondition(TorrentRelayDrain.removable(layout: big, complete: [1],
+                                                 committed: [1], removed: []) == [1])
+
+        // Zero-length files hold no bytes and never block a neighbour.
+        let empty = TorrentRelayDrain.Layout(files: drainFiles([700, 0, 700]), pieceLength: 1000)
+        precondition(TorrentRelayDrain.removable(layout: empty, complete: [1, 2, 3],
+                                                 committed: [2], removed: []) == [2])
+
+        // Flush policy.
+        precondition(TorrentRelayDrain.shouldFlush(count: 0, bytes: 0, waiting: 9999, windowComplete: true) == false)
+        precondition(TorrentRelayDrain.shouldFlush(count: 1, bytes: 1, waiting: 0, windowComplete: true))
+        precondition(TorrentRelayDrain.shouldFlush(count: 32, bytes: 1, waiting: 0, windowComplete: false))
+        precondition(TorrentRelayDrain.shouldFlush(count: 1, bytes: 256 * 1024 * 1024, waiting: 0, windowComplete: false))
+        precondition(TorrentRelayDrain.shouldFlush(count: 1, bytes: 1, waiting: 180, windowComplete: false))
+        precondition(TorrentRelayDrain.shouldFlush(count: 31, bytes: 1, waiting: 179, windowComplete: false) == false)
+        print("PASS drain logic: piece spans, shared-piece safety and flush policy")
     }
 }
