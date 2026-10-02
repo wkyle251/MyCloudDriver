@@ -162,6 +162,30 @@ final class FileSearchIndex {
         if failures.count < 20 { failures.append(Self.redacted(text)) }
     }
 
+    /// The engine prints `note:` status lines — a refresh token it already
+    /// rotated and persisted, for instance — to stderr after every command,
+    /// successful or not. They are not problems, and because they arrive last
+    /// they otherwise replace the real cause in a one-line diagnostic. Drop
+    /// them, with the indented continuations that can carry a raw token, before
+    /// any stderr text becomes a user-facing error.
+    static func withoutStatusNotes(_ text: String) -> String {
+        var kept: [String] = []
+        var droppingContinuation = false
+        for line in text.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if droppingContinuation, line.first?.isWhitespace == true, !trimmed.isEmpty { continue }
+            droppingContinuation = false
+            let lowered = trimmed.lowercased()
+            if lowered.hasPrefix("note:") { droppingContinuation = true; continue }
+            // A rotated-token warning is kept, but its continuation is the token.
+            if lowered.hasPrefix("warning:"), lowered.contains("refresh token rotated") {
+                droppingContinuation = true
+            }
+            kept.append(line)
+        }
+        return kept.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static func redacted(_ text: String) -> String {
         var result = String(text.prefix(8000))
         for pattern in [
@@ -402,7 +426,8 @@ private final class FileSearchWorker: @unchecked Sendable {
         queue.async { [self] in
             guard generation == runID else { return }
             if code != 0 || (!index.complete && index.failures.isEmpty) {
-                index.addFailure("Source: PikPak name search\nCode: SEARCH_ENGINE_\(code)\nMessage: \(error.isEmpty ? "The scan stopped before completion. Scan again to retry." : error)")
+                let reported = FileSearchIndex.withoutStatusNotes(error)
+                index.addFailure("Source: PikPak name search\nCode: SEARCH_ENGINE_\(code)\nMessage: \(reported.isEmpty ? "The scan stopped before completion. Scan again to retry." : reported)")
             }
             completion(makeSnapshot())
         }
@@ -463,6 +488,8 @@ final class FileSearchModel: ObservableObject {
     private var generation = UUID()
     private var resultLimit = 100
     private var queryTask: Task<Void, Never>?
+    private var retryTask: Task<Void, Never>?
+    private var retryAttempt = 0
     private var hasStartedScan = false
     private var rootCacheComplete = false
     private var configurationFailure: String?
@@ -521,8 +548,11 @@ final class FileSearchModel: ObservableObject {
         }
     }
 
-    func scanAgain() {
+    func scanAgain() { scanAgain(automatic: false) }
+    private func scanAgain(automatic: Bool) {
         guard canScan, let configuration else { return }
+        retryTask?.cancel(); retryTask = nil
+        if !automatic { retryAttempt = 0 }
         job?.cancel()
         generation = UUID()
         let runID = generation
@@ -545,12 +575,15 @@ final class FileSearchModel: ObservableObject {
                     self.isScanning = false
                     self.job = nil
                     self.apply(snapshot)
+                    if code != 0 || !snapshot.complete { self.scheduleRetry(runID) }
+                    else { self.retryAttempt = 0 }
                 }
             }
         })
     }
 
     func stopScan() {
+        retryTask?.cancel(); retryTask = nil; retryAttempt = 0
         queryTask?.cancel()
         job?.cancel()
         job = nil
@@ -559,6 +592,18 @@ final class FileSearchModel: ObservableObject {
         isScanning = false
         isResolving = false
         // Keep partial metadata in memory for immediate subsequent queries.
+    }
+
+    private func scheduleRetry(_ runID: UUID) {
+        guard isPresented, scope == .root, generation == runID else { return }
+        let delay = AutomaticRecovery.delay(attempt: retryAttempt)
+        retryAttempt = AutomaticRecovery.nextAttempt(retryAttempt)
+        retryTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return }
+            guard let self, self.isPresented, self.generation == runID, !Task.isCancelled else { return }
+            self.retryTask = nil
+            self.scanAgain(automatic: true)
+        }
     }
 
     func close() {

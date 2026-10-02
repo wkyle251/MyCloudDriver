@@ -4,6 +4,7 @@ enum CredentialParserError: LocalizedError {
     case empty
     case accessToken
     case missingRefreshToken
+    case invalidPersonalAccessToken
 
     var errorDescription: String? {
         switch self {
@@ -13,11 +14,24 @@ enum CredentialParserError: LocalizedError {
             return "That appears to be access_token. Copy refresh_token from the credentials entry instead."
         case .missingRefreshToken:
             return "The pasted credentials data does not contain refresh_token."
+        case .invalidPersonalAccessToken:
+            return "Paste the token from PikPak’s Personal Access Tokens page. Use the token itself, without JSON or extra text."
         }
     }
 }
 
 enum CredentialParser {
+    static func personalAccessToken(from input: String) throws -> String {
+        var token = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if token.lowercased().hasPrefix("bearer ") { token = String(token.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines) }
+        // PATs may be JWTs. Do not pass them through the refresh-token parser.
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~+/=")
+        guard (16...16384).contains(token.count), token.unicodeScalars.allSatisfy(allowed.contains) else {
+            throw CredentialParserError.invalidPersonalAccessToken
+        }
+        return token
+    }
+
     /// Accept a raw refresh token, a JSON string copied from the console, or
     /// the complete PikPak `credentials_*` Local Storage JSON value.
     static func refreshToken(from input: String) throws -> String {

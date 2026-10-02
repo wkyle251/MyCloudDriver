@@ -5,6 +5,7 @@ import WebKit
 struct PikPakWebSession {
     let refreshToken: String
     let deviceID: String
+    var credentialKind: PikPakCredentialKind = .desktopOAuth
 }
 
 enum PikPakDesktopOAuth {
@@ -77,14 +78,45 @@ enum PikPakLoginDataStore {
 struct PikPakLoginView: View {
     let reason: String
     let currentDeviceID: String
+    var initialCredentialKind: PikPakCredentialKind = .desktopOAuth
     let onSession: (PikPakWebSession) -> Void
     let onCancel: () -> Void
 
     @State private var pageStatus = "Opening PikPak Web Drive…"
     @State private var pageErrorDetails: String?
     @State private var reloadRequest = 0
+    @State private var credentialKind: PikPakCredentialKind = .desktopOAuth
+
+    init(reason: String, currentDeviceID: String, initialCredentialKind: PikPakCredentialKind = .desktopOAuth,
+         onSession: @escaping (PikPakWebSession) -> Void, onCancel: @escaping () -> Void) {
+        self.reason = reason
+        self.currentDeviceID = currentDeviceID
+        self.initialCredentialKind = initialCredentialKind
+        self.onSession = onSession
+        self.onCancel = onCancel
+        _credentialKind = State(initialValue: initialCredentialKind)
+    }
 
     var body: some View {
+        VStack(spacing: 0) {
+            Picker("Connection method", selection: $credentialKind) {
+                Text("PikPak Sign-in").tag(PikPakCredentialKind.desktopOAuth)
+                Text("Personal Access Token").tag(PikPakCredentialKind.personalAccessToken)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .accessibilityLabel("Connection method")
+            .frame(width: 370)
+            .padding(.top, 20)
+            if credentialKind == .personalAccessToken {
+                PikPakPersonalAccessTokenView(currentDeviceID: currentDeviceID, onSession: onSession, onCancel: onCancel)
+            } else {
+                webLoginBody
+            }
+        }
+    }
+
+    private var webLoginBody: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 12) {
                 Image(nsImage: NSApplication.shared.applicationIconImage)
@@ -172,6 +204,84 @@ struct PikPakLoginView: View {
     private func copyLoginError(_ details: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString("\(pageStatus)\n\(details)", forType: .string)
+    }
+}
+
+struct PikPakPersonalAccessTokenView: View {
+    let currentDeviceID: String
+    let onSession: (PikPakWebSession) -> Void
+    let onCancel: () -> Void
+    @State private var token = ""
+    @State private var error: String?
+    @FocusState private var tokenIsFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            HStack(alignment: .top, spacing: 14) {
+                Image(nsImage: FinderSymbolImage.template(named: "key.fill", style: .settingsTab))
+                    .foregroundStyle(FinderAppearance.accent)
+                    .frame(width: 48, height: 48)
+                    .background(FinderAppearance.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Connect with a token").font(.title2.weight(.semibold))
+                    Text("Use a Personal Access Token created by PikPak.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("1. Create a token in PikPak").font(.headline)
+                Text("Open Account & Security → Connected Apps → Personal Access Tokens. Name it MyCloudDriver and choose an expiry.")
+                    .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text("Read files covers downloads, previews and similarity scans. Moving, uploading or deleting files needs additional permissions.")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Link("Open PikPak Account & Security ↗", destination: URL(string: "https://mypikpak.com/drive/account")!)
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("2. Paste your token here").font(.headline)
+                SecureField("Personal Access Token", text: $token)
+                    .textFieldStyle(.roundedBorder).focused($tokenIsFocused)
+                    .accessibilityLabel("Personal Access Token")
+                    .onSubmit(connect)
+                    .onChange(of: token) { _ in error = nil }
+                Text("Stored privately on this Mac after checking your account. Your normal login stays saved.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Label("Connected Apps transfer allowance", systemImage: "info.circle")
+                    .font(.callout.weight(.semibold))
+                Text("PikPak gives Connected Apps a shared 25% of your account’s transfer quota. Token usage also counts toward the account total.")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+
+            if let error {
+                Text(error).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Button("Cancel", role: .cancel, action: onCancel).keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Verify & Connect", action: connect)
+                    .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    .disabled(token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(26)
+        .frame(width: 560)
+        .onAppear { tokenIsFocused = true }
+        .onDisappear { token = "" }
+    }
+
+    private func connect() {
+        do {
+            let parsed = try CredentialParser.personalAccessToken(from: token)
+            token = ""
+            onSession(.init(refreshToken: parsed, deviceID: currentDeviceID, credentialKind: .personalAccessToken))
+        } catch { self.error = error.localizedDescription }
     }
 }
 

@@ -7,11 +7,42 @@ final class SimilarityTreeNode: NSObject {
     let name: String
     let path: String
     let file: SimilarityFile?
+    var group: SimilarityResultGroup?
     var children: [SimilarityTreeNode] = []
     var fileCount = 0
     init(id: String, name: String, path: String, file: SimilarityFile? = nil) {
         self.id = id; self.name = name; self.path = path; self.file = file
     }
+}
+
+struct SimilarityResultGroup: Identifiable {
+    let id: String
+    let members: [SimilarityFile]
+    let minimumScore: Double?
+    let identical: Bool
+    var hasRemovedMembers = false
+    var strengthLabel: String {
+        identical ? "Identical content" : String(format: hasRemovedMembers ? "Every pair ≥ %.1f%%" : "Weakest pair %.1f%%", (minimumScore ?? 0) * 100)
+    }
+}
+
+/// A new ID makes a repeated Expand/Collapse All click an explicit command.
+struct SimilarityGroupExpansion: Equatable {
+    let id = UUID()
+    let expanded: Bool
+}
+
+private struct SimilaritySavedGroups: Decodable {
+    struct Group: Decodable {
+        let id: String
+        let fileIds: [String]
+        let minimumScore: Double?
+        let identical: Bool
+    }
+    let runId: String
+    let resultRevision: UInt64
+    let minimumScore: Double
+    let groups: [Group]
 }
 
 struct SimilarityResultIndex {
@@ -63,11 +94,14 @@ struct SimilarityResultIndex {
             exactGroups: exactGroups, exactGroupForFile: membership)
     }
 
-    func filteredRoots(_ query: String) -> [SimilarityTreeNode] {
+    func filteredRoots(_ query: String, excluding: Set<String> = []) -> [SimilarityTreeNode] {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return roots }
+        guard !query.isEmpty || !excluding.isEmpty else { return roots }
         func filter(_ node: SimilarityTreeNode) -> SimilarityTreeNode? {
-            if node.path.localizedStandardContains(query) { return node }
+            if let file = node.file {
+                return !excluding.contains(file.id) && (query.isEmpty || node.path.localizedStandardContains(query)) ? node : nil
+            }
+            if excluding.isEmpty && node.path.localizedStandardContains(query) { return node }
             guard node.file == nil else { return nil }
             let children = node.children.compactMap(filter)
             guard !children.isEmpty else { return nil }
@@ -107,9 +141,20 @@ struct SimilarityRelatedFile: Identifiable {
     @Published private(set) var error: String?
     @Published private(set) var unavailable: [String: UInt64] = [:]
     @Published private(set) var omitted: UInt64 = 0
+    @Published private(set) var groups: [SimilarityResultGroup] = []
+    @Published private(set) var selectedGroupID: String?
+    @Published private(set) var isGrouping = false
+    @Published private(set) var groupingError: String?
+    @Published private(set) var groupExpansion: SimilarityGroupExpansion?
+    @Published private(set) var trashedIDs: Set<String> = []
+    @Published private(set) var trashingIDs: Set<String> = []
+    @Published var fileActionMessage: String?
+    @Published var fileActionError: String?
+    @Published var browseGroups = true { didSet { filterTree() } }
     @Published var query = "" { didSet { filterTree() } }
-    @Published var minimumScore = 0.9 { didSet { filterMatches() } }
-    @Published var identicalOnly = false { didSet { filterMatches() } }
+    @Published var minimumScore = 0.9 { didSet { if oldValue != minimumScore { filterMatches(); regroup() } } }
+    @Published var identicalOnly = false { didSet { if oldValue != identicalOnly { filterMatches(); regroup() } } }
+    @Published var showAllScores = false { didSet { filterMatches() } }
     private var report: SimilarityReport?
     private var configuration: SimilarityConfiguration?
     private var generation = UUID()
@@ -118,32 +163,150 @@ struct SimilarityRelatedFile: Identifiable {
     private var queryTask: Task<Void, Never>?
     private var matchTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
+    private var groupingTask: Task<Void, Never>?
+    private var groupingID = UUID()
+    private var groupCache: [String: [SimilarityResultGroup]] = [:]
+    private var groupCacheOrder: [String] = []
     private var rows: [String: SimilarityScoreRow] = [:]
     private var rowOrder: [String] = []
     private var allRelated: [SimilarityRelatedFile] = []
+    private var unfilteredGroups: [SimilarityResultGroup] = []
     var selectedFile: SimilarityFile? { selectedID.flatMap { index?.byID[$0] } }
+    var selectedGroup: SimilarityResultGroup? { groups.first { $0.id == selectedGroupID } }
+    var selectedNodeID: String? { selectedID ?? selectedGroupID }
+    var groupedFileCount: Int { groups.reduce(0) { $0 + $1.members.count } }
+    var availableFileCount: Int { index?.files.filter { !trashedIDs.contains($0.id) && ($0.state == nil || $0.state == "ready") }.count ?? 0 }
+    var hasSavedComparisons: Bool { report?.runId != nil && report?.resultRevision != nil }
+    var visibleFileCount: Int { max(0, (index?.files.count ?? 0) - trashedIDs.count) }
+    var sessionToken: UUID { generation }
+    private(set) var allowsSizeBasedCleanup = true
+
+    func keepSmallestPlan(groupID: String? = nil) -> SimilarityKeepSmallestPlan? {
+        guard allowsSizeBasedCleanup, !isIndexing, !isGrouping, groupingError == nil, trashingIDs.isEmpty else { return nil }
+        let scope = groupID.map { id in groups.filter { $0.id == id } } ?? groups
+        let plan = SimilarityKeepSmallestPlan(groups: scope, session: generation,
+            minimumScore: minimumScore, identicalOnly: identicalOnly)
+        return plan.removals.isEmpty ? nil : plan
+    }
+
+    func validateKeepSmallest(_ plan: SimilarityKeepSmallestPlan) throws {
+        guard allowsSizeBasedCleanup, generation == plan.session, !isIndexing, !isGrouping, groupingError == nil,
+              minimumScore == plan.minimumScore, identicalOnly == plan.identicalOnly else {
+            throw CloudDriveError.message("The similarity groups changed. Review the current groups and try again.")
+        }
+        let current = SimilarityKeepSmallestPlan(groups: groups.filter { plan.groupIDs.contains($0.id) },
+            session: generation, minimumScore: minimumScore, identicalOnly: identicalOnly)
+        guard current.groupIDs == plan.groupIDs, current.removalIDs == plan.removalIDs,
+              Set(current.keepers.map(\.id)) == Set(plan.keepers.map(\.id)), !plan.removals.isEmpty,
+              (plan.keepers + plan.removals).allSatisfy({ file in
+                  guard let stored = index?.byID[file.id] else { return false }
+                  return !trashedIDs.contains(file.id) && stored.bytes == file.bytes
+                      && SimilarityKeepSmallestPlan.originalID(stored) == SimilarityKeepSmallestPlan.originalID(file)
+              }) else {
+            throw CloudDriveError.message("These files changed since the groups were displayed. Review the results and try again.")
+        }
+    }
+
+    func keepSmallest(_ plan: SimilarityKeepSmallestPlan, destination: String = "Trash",
+                     using operation: @escaping (SimilarityKeepSmallestPlan) async throws -> Set<String>) {
+        guard trashingIDs.isEmpty else { return }
+        do { try validateKeepSmallest(plan) }
+        catch { fileActionError = error.localizedDescription; return }
+        trashingIDs = plan.removalIDs; fileActionError = nil; fileActionMessage = nil
+        Task { [weak self] in
+            guard let self, self.generation == plan.session else { return }
+            do {
+                let confirmed = try await operation(plan).intersection(plan.removalIDs)
+                guard self.generation == plan.session else { return }
+                self.setTrashedIDs(confirmed, true)
+                if confirmed == plan.removalIDs {
+                    self.fileActionMessage = "Kept \(plan.keepers.count) smallest \(plan.keepers.count == 1 ? "file" : "files"). Moved \(confirmed.count) to \(destination)."
+                    if plan.groupIDs.count == 1, let keeper = plan.keepers.first {
+                        self.query = ""; self.showAllFiles(); self.select(keeper.id)
+                    }
+                } else {
+                    self.fileActionError = "Moved \(confirmed.count) of \(plan.removals.count) files to \(destination). The drive did not confirm the others; they remain in the results. All kept files were preserved."
+                }
+            } catch {
+                guard self.generation == plan.session else { return }
+                self.fileActionError = FileSearchIndex.redacted(error.localizedDescription)
+            }
+            self.trashingIDs = []
+        }
+    }
+
+    func moveToTrash(_ file: SimilarityFile, using operation: @escaping (SimilarityFile) async throws -> Void) {
+        guard index?.byID[file.id] != nil, !trashedIDs.contains(file.id), trashingIDs.isEmpty else { return }
+        let token = generation
+        trashingIDs.insert(file.id); fileActionError = nil; fileActionMessage = nil
+        Task { [weak self] in
+            guard let self, self.generation == token else { return }
+            do {
+                try await operation(file)
+                guard self.generation == token else { return }
+                self.setTrashed(file.id, true)
+                self.fileActionMessage = "\(file.name) moved to Trash."
+            } catch {
+                guard self.generation == token else { return }
+                self.fileActionError = FileSearchIndex.redacted(error.localizedDescription)
+            }
+            self.trashingIDs.remove(file.id)
+        }
+    }
+
+    /// Keep the saved matrix immutable. Trash/Undo only change which files are
+    /// offered for review, including late score rows and cached regrouping.
+    func setTrashed(_ id: String, _ trashed: Bool) {
+        setTrashedIDs([id], trashed)
+    }
+    func setTrashedIDs(_ ids: Set<String>, _ trashed: Bool) {
+        let ids = ids.filter { index?.byID[$0] != nil }
+        guard !ids.isEmpty else { return }
+        if trashed { trashedIDs.formUnion(ids) } else { trashedIDs.subtract(ids) }
+        if trashed, let selectedID, ids.contains(selectedID) { select(nil) }
+        if !trashed { fileActionMessage = nil }
+        // A Trash acknowledgement can arrive while the threshold's new groups
+        // are loading. Keep that loading state until the new groups arrive.
+        let regrouping = isGrouping
+        filterMatches(); applyGroups(unfilteredGroups)
+        isGrouping = regrouping
+    }
+    func setCloudFilesTrashed(_ ids: Set<String>, _ trashed: Bool) {
+        guard !ids.isEmpty else { return }
+        setTrashedIDs(Set((index?.files ?? []).filter { $0.cloudId.map(ids.contains) == true }.map(\.id)), trashed)
+    }
 
     func reset() {
         generation = UUID(); requestID = UUID()
-        indexTask?.cancel(); queryTask?.cancel(); matchTask?.cancel(); searchTask?.cancel()
+        indexTask?.cancel(); queryTask?.cancel(); matchTask?.cancel(); searchTask?.cancel(); groupingTask?.cancel()
         indexTask = nil; queryTask = nil; searchTask = nil
         index = nil; roots = []; selectedID = nil; related = []; allRelated = []; rows = [:]; rowOrder = []
         isLoading = false; isIndexing = false; error = nil; unavailable = [:]; omitted = 0
+        groupingID = UUID(); groups = []; selectedGroupID = nil; isGrouping = false; groupingError = nil
+        groupExpansion = nil
+        trashedIDs = []; trashingIDs = []; unfilteredGroups = []; fileActionMessage = nil; fileActionError = nil
+        groupCache = [:]; groupCacheOrder = []
         report = nil; configuration = nil; query = ""
+        minimumScore = 0.9; identicalOnly = false; showAllScores = false; browseGroups = true
     }
-    func load(_ report: SimilarityReport, configuration: SimilarityConfiguration?) {
+    func load(_ report: SimilarityReport, configuration: SimilarityConfiguration?, allowsSizeBasedCleanup: Bool = true) {
         reset(); self.report = report; self.configuration = configuration
-        minimumScore = report.threshold; identicalOnly = false; isIndexing = true
+        self.allowsSizeBasedCleanup = allowsSizeBasedCleanup
+        minimumScore = report.threshold; identicalOnly = false; showAllScores = false; isIndexing = true
+        browseGroups = report.status != "cancelled" && (report.runId != nil || !report.groups.isEmpty)
         let token = generation
         indexTask = Task { [weak self] in
             let index = await Task.detached(priority: .userInitiated) { SimilarityResultIndex.build(report) }.value
             guard let self, !Task.isCancelled, self.generation == token else { return }
             self.index = index; self.roots = index.roots; self.isIndexing = false
+            self.regroup(immediate: true)
             // Let the user choose the reference file instead of fetching a
             // potentially large cloud original as a side effect of finishing.
         }
     }
     func select(_ id: String?) {
+        if let id, trashedIDs.contains(id) { return }
+        selectedGroupID = nil
         guard selectedID != id else { return }
         queryTask?.cancel(); matchTask?.cancel(); requestID = UUID(); selectedID = id
         allRelated = []; related = []; unavailable = [:]; omitted = 0; error = nil; isLoading = false
@@ -175,6 +338,31 @@ struct SimilarityRelatedFile: Identifiable {
             }
         }
     }
+    func selectNode(_ id: String?) {
+        if let id, groups.contains(where: { $0.id == id }) {
+            select(nil); selectedGroupID = id
+        } else { select(id) }
+    }
+    func showAllFiles() {
+        let first = selectedGroup?.members.first?.id
+        browseGroups = false
+        if let first { select(first) }
+    }
+    func setAllGroupsExpanded(_ expanded: Bool) {
+        guard browseGroups, !isGrouping, !groups.isEmpty else { return }
+        // Keep the selection visible after collapsing its containing group.
+        if !expanded, let selectedID,
+           let group = groups.first(where: { $0.members.contains(where: { $0.id == selectedID }) }) {
+            selectNode(group.id)
+        }
+        groupExpansion = SimilarityGroupExpansion(expanded: expanded)
+    }
+    func setMinimumScoreFromSlider(_ value: Double) {
+        guard value.isFinite else { return }
+        // Snap the continuous slider to whole percentages without requesting
+        // macOS's densely packed step marks. Never round saved measurements.
+        minimumScore = min(1, max(0.05, (value * 100).rounded() / 100))
+    }
     func retry() { let id = selectedID; selectedID = nil; select(id) }
     private func apply(_ row: SimilarityScoreRow, file: SimilarityFile) {
         guard let index else { return }
@@ -205,23 +393,101 @@ struct SimilarityRelatedFile: Identifiable {
         return matches
     }
     private func filterMatches() {
-        related = allRelated.filter { identicalOnly ? $0.identical : $0.identical || ($0.score.map { $0 >= minimumScore } ?? false) }
+        related = allRelated.filter { !trashedIDs.contains($0.id) && (identicalOnly ? $0.identical : showAllScores || $0.identical || ($0.score.map { $0 >= minimumScore } ?? false)) }
     }
     private func filterTree() {
         searchTask?.cancel()
         guard let index else { return }
-        let query = query, token = generation
+        let query = query, token = generation, groups = groups, grouped = browseGroups, excluded = trashedIDs
         searchTask = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: 160_000_000) } catch { return }
-            let roots = await Task.detached(priority: .userInitiated) { index.filteredRoots(query) }.value
+            let roots = await Task.detached(priority: .userInitiated) {
+                grouped ? Self.groupRoots(groups, query: query) : index.filteredRoots(query, excluding: excluded)
+            }.value
             guard let self, !Task.isCancelled, self.generation == token else { return }
             self.roots = roots
+        }
+    }
+
+    private nonisolated static func groupRoots(_ groups: [SimilarityResultGroup], query: String) -> [SimilarityTreeNode] {
+        let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return groups.enumerated().compactMap { number, group in
+            // Keep the whole group visible when one member matches the search.
+            guard search.isEmpty || group.members.contains(where: { $0.path.localizedStandardContains(search) }) else { return nil }
+            let node = SimilarityTreeNode(id: group.id, name: "Group \(number + 1)", path: group.strengthLabel)
+            node.group = group; node.fileCount = group.members.count
+            node.children = group.members.map { SimilarityTreeNode(id: $0.id, name: $0.name, path: $0.path, file: $0) }
+            return node
+        }
+    }
+
+    func regroup(immediate: Bool = false) {
+        groupingTask?.cancel(); groupingID = UUID(); groupingError = nil
+        guard let index, let report else { return }
+        let key = identicalOnly ? "identical" : String(minimumScore)
+        if let cached = groupCache[key] { applyGroups(cached); return }
+        if identicalOnly || !hasSavedComparisons || configuration == nil {
+            let exact = index.exactGroups.sorted { $0.key < $1.key }.map { id, members in
+                SimilarityResultGroup(id: "group:" + id, members: members.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }, minimumScore: nil, identical: true)
+            }
+            applyGroups(exact); return
+        }
+        guard let configuration, let run = report.runId, let revision = report.resultRevision else { return }
+        let token = groupingID, cutoff = minimumScore
+        isGrouping = true
+        groupingTask = Task { [weak self] in
+            do {
+                if !immediate { try await Task.sleep(nanoseconds: 220_000_000) }
+                let input: [String: Any] = ["data_dir": configuration.dataDirectory.path, "run_id": run,
+                    "result_revision": revision, "minimum_score": cutoff, "include_identical": !index.exactGroups.isEmpty]
+                let output = try await SimilarityHelper.request(configuration: configuration, command: "similarity-groups",
+                    input: JSONSerialization.data(withJSONObject: input))
+                let groups = try await Task.detached(priority: .userInitiated) {
+                    let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+                    let saved = try decoder.decode(SimilaritySavedGroups.self, from: output)
+                    guard saved.runId == run, saved.resultRevision == revision, saved.minimumScore == cutoff else {
+                        throw CloudDriveError.message("The returned groups belong to a different scan or threshold.")
+                    }
+                    return saved.groups.compactMap { group -> SimilarityResultGroup? in
+                        let members = group.fileIds.compactMap { index.byScoreID[$0] }.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+                        guard members.count > 1 else { return nil }
+                        return .init(id: "group:" + group.id, members: members, minimumScore: group.minimumScore, identical: group.identical)
+                    }
+                }.value
+                guard let self, !Task.isCancelled, self.groupingID == token else { return }
+                self.groupCache[key] = groups; self.groupCacheOrder.append(key)
+                while self.groupCacheOrder.count > 5 { self.groupCache[self.groupCacheOrder.removeFirst()] = nil }
+                self.applyGroups(groups)
+            } catch {
+                guard let self, !Task.isCancelled, self.groupingID == token else { return }
+                self.isGrouping = false; self.groupingError = FileSearchIndex.redacted(error.localizedDescription)
+                self.groups = []; self.selectedGroupID = nil; self.filterTree()
+            }
+        }
+    }
+
+    private func applyGroups(_ groups: [SimilarityResultGroup]) {
+        let previousMember = selectedGroup?.members.first?.id
+        unfilteredGroups = groups
+        let groups = groups.compactMap { group -> SimilarityResultGroup? in
+            let members = group.members.filter { !trashedIDs.contains($0.id) }
+            guard members.count > 1 else { return nil }
+            return .init(id: group.id, members: members, minimumScore: group.minimumScore, identical: group.identical,
+                         hasRemovedMembers: members.count != group.members.count)
+        }
+        self.groups = groups; isGrouping = false; filterTree()
+        if selectedID == nil, !groups.contains(where: { $0.id == selectedGroupID }) {
+            selectedGroupID = browseGroups ? (previousMember.flatMap { file in groups.first { $0.members.contains { $0.id == file } } } ?? groups.first)?.id : nil
         }
     }
     #if FINDER_WORKSPACE_TESTS
     func setFixtureRow(_ row: SimilarityScoreRow) {
         rows[row.fileId] = row
         if let file = selectedFile, file.scoreID == row.fileId { apply(row, file: file) }
+    }
+    func setFixtureGroups(_ groups: [SimilarityResultGroup], at threshold: Double) {
+        groupCache[String(threshold)] = groups
+        if minimumScore == threshold { regroup(immediate: true) }
     }
     #endif
 }

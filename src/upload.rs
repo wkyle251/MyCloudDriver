@@ -6,6 +6,7 @@
 
 use std::io::SeekFrom;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -97,9 +98,24 @@ pub async fn upload_to_oss(
     multipart_concurrency: usize,
     progress: UploadProgress,
 ) -> Result<()> {
+    upload_to_oss_with_network(http, params, path, file_size, multipart_concurrency, progress,
+        Arc::new(AtomicU64::new(0))).await
+}
+
+/// Count bytes pulled by HTTP bodies, including retries, independently of
+/// logical progress, saved checkpoints, and instant uploads.
+pub async fn upload_to_oss_with_network(
+    http: &reqwest::Client,
+    params: &OssUploadParams,
+    path: &Path,
+    file_size: u64,
+    multipart_concurrency: usize,
+    progress: UploadProgress,
+    network_bytes: Arc<AtomicU64>,
+) -> Result<()> {
     validate_oss_params(params)?;
     if file_size <= SMALL_UPLOAD_LIMIT {
-        put_object(http, params, path, file_size, progress).await
+        put_object(http, params, path, file_size, progress, network_bytes).await
     } else {
         multipart_upload(
             http,
@@ -108,6 +124,7 @@ pub async fn upload_to_oss(
             file_size,
             multipart_concurrency.clamp(1, 8),
             progress,
+            network_bytes,
         )
         .await
     }
@@ -140,10 +157,11 @@ async fn put_object(
     path: &Path,
     file_size: u64,
     progress: UploadProgress,
+    network_bytes: Arc<AtomicU64>,
 ) -> Result<()> {
     let url = oss_object_url(params, &[])?;
     let canonical_resource = canonical_resource(params, &[]);
-    let monotonic_progress = MonotonicProgress::new(progress, file_size);
+    let monotonic_progress = MonotonicProgress::new(progress, file_size).with_network(network_bytes);
 
     for attempt in 1..=MAX_OSS_ATTEMPTS {
         let body = file_body(path, 0, file_size, 0, monotonic_progress.clone()).await?;
@@ -183,6 +201,26 @@ async fn put_object(
     unreachable!("bounded OSS upload loop always returns")
 }
 
+/// Cancelling a per-file future also discards its OSS multipart session.
+/// Credentials stay in this in-memory guard and are never written to disk.
+struct MultipartAbortGuard {
+    http: reqwest::Client,
+    params: OssUploadParams,
+    upload_id: String,
+    armed: bool,
+}
+impl Drop for MultipartAbortGuard {
+    fn drop(&mut self) {
+        if !self.armed { return; }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let http = self.http.clone();
+            let params = self.params.clone();
+            let upload_id = self.upload_id.clone();
+            runtime.spawn(async move { let _ = abort_multipart(&http, &params, &upload_id).await; });
+        }
+    }
+}
+
 async fn multipart_upload(
     http: &reqwest::Client,
     params: &OssUploadParams,
@@ -190,11 +228,14 @@ async fn multipart_upload(
     file_size: u64,
     concurrency: usize,
     progress: UploadProgress,
+    network_bytes: Arc<AtomicU64>,
 ) -> Result<()> {
     let upload_id = initiate_multipart(http, params).await?;
+    let mut abort_guard = MultipartAbortGuard { http: http.clone(), params: params.clone(), upload_id: upload_id.clone(), armed: true };
     let part_size = multipart_part_size(file_size);
     let part_count = file_size.div_ceil(part_size);
-    let multipart_progress = MultipartProgress::new(progress, part_count as usize, file_size);
+    let mut multipart_progress = MultipartProgress::new(progress, part_count as usize, file_size);
+    multipart_progress.network_bytes = Some(network_bytes);
     let mut completed_parts = Vec::with_capacity(part_count as usize);
     let upload_id_for_parts = upload_id.as_str();
 
@@ -247,6 +288,7 @@ async fn multipart_upload(
         let _ = abort_multipart(http, params, &upload_id).await;
         return Err(error);
     }
+    abort_guard.armed = false;
     multipart_progress.finish();
     Ok(())
 }
@@ -430,6 +472,9 @@ async fn file_body(
             buffer.truncate(read);
             state.remaining = state.remaining.saturating_sub(read as u64);
             state.sent = state.sent.saturating_add(read as u64);
+            if let Some(counter) = &state.progress.network_bytes {
+                counter.fetch_add(read as u64, Ordering::Relaxed);
+            }
             state.progress.emit(state.base.saturating_add(state.sent));
             Ok(Some((Bytes::from(buffer), state)))
         },
@@ -617,6 +662,7 @@ fn upload_retry_delay(attempt: u32) -> Duration {
 #[derive(Clone)]
 struct MultipartProgress {
     callback: UploadProgress,
+    network_bytes: Option<Arc<AtomicU64>>,
     state: Arc<Mutex<MultipartProgressState>>,
 }
 
@@ -631,6 +677,7 @@ impl MultipartProgress {
     fn new(callback: UploadProgress, part_count: usize, total: u64) -> Self {
         Self {
             callback,
+            network_bytes: None,
             state: Arc::new(Mutex::new(MultipartProgressState {
                 part_bytes: vec![0; part_count],
                 last_emitted: 0,
@@ -642,10 +689,12 @@ impl MultipartProgress {
 
     fn part_tracker(&self, part_index: usize, part_size: u64) -> MonotonicProgress {
         let aggregate = self.clone();
-        MonotonicProgress::new(
+        let mut tracker = MonotonicProgress::new(
             Arc::new(move |part_bytes| aggregate.emit_part(part_index, part_bytes)),
             part_size,
-        )
+        );
+        tracker.network_bytes = self.network_bytes.clone();
+        tracker
     }
 
     fn emit_part(&self, part_index: usize, part_bytes: u64) {
@@ -689,6 +738,7 @@ impl MultipartProgress {
 #[derive(Clone)]
 struct MonotonicProgress {
     callback: UploadProgress,
+    network_bytes: Option<Arc<AtomicU64>>,
     state: Arc<Mutex<MonotonicProgressState>>,
 }
 
@@ -703,6 +753,7 @@ impl MonotonicProgress {
     fn new(callback: UploadProgress, total: u64) -> Self {
         Self {
             callback,
+            network_bytes: None,
             state: Arc::new(Mutex::new(MonotonicProgressState {
                 highest: 0,
                 last_emitted: 0,
@@ -710,6 +761,11 @@ impl MonotonicProgress {
                 total,
             })),
         }
+    }
+
+    fn with_network(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.network_bytes = Some(counter);
+        self
     }
 
     fn emit(&self, value: u64) {
@@ -857,6 +913,64 @@ mod tests {
     #[test]
     fn fixed_http_date_matches_unix_epoch() {
         assert_eq!(http_date(UNIX_EPOCH), "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    #[tokio::test]
+    async fn network_counter_measures_retried_bodies_and_multipart_independently_of_progress() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let data = vec![0x5a; 512 * 1024];
+        let size = data.len() as u64;
+        let server = std::thread::spawn(move || {
+            let mut received = 0u64;
+            for attempt in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0]; socket.read_exact(&mut byte).unwrap(); headers.push(byte[0]);
+                }
+                let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+                let length: u64 = headers.lines().find_map(|line| line.strip_prefix("content-length: "))
+                    .unwrap().parse().unwrap();
+                let mut body = Vec::new();
+                (&mut socket).take(length).read_to_end(&mut body).unwrap();
+                assert_eq!(body.len() as u64, length);
+                assert!(body.iter().all(|byte| *byte == 0x5a));
+                received += length;
+                let status = if attempt == 0 { "503 Service Unavailable" } else { "200 OK" };
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            }
+            received
+        });
+        let directory = std::env::temp_dir().join(format!("pikpak-upload-network-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("fixture.bin");
+        std::fs::write(&path, data).unwrap();
+        let network = Arc::new(AtomicU64::new(0));
+        let logical = Arc::new(AtomicU64::new(0));
+        let callback = logical.clone();
+        let progress = MonotonicProgress::new(Arc::new(move |bytes| { callback.store(bytes, Ordering::Relaxed); }), size)
+            .with_network(network.clone());
+        let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap();
+        for _ in 0..2 {
+            let body = file_body(&path, 0, size, 0, progress.clone()).await.unwrap();
+            client.put(format!("http://{address}/fixture")).header(reqwest::header::CONTENT_LENGTH, size)
+                .body(body).send().await.unwrap();
+        }
+        assert_eq!(logical.load(Ordering::Relaxed), size);
+        assert_eq!(network.load(Ordering::Relaxed), size * 2, "Retransmitted bytes must be measured even when logical progress cannot advance");
+        let mut multipart = MultipartProgress::new(Arc::new(|_| {}), 2, size);
+        multipart.network_bytes = Some(network.clone());
+        for index in 0..2 {
+            let body = file_body(&path, index * size / 2, size / 2, 0, multipart.part_tracker(index as usize, size / 2)).await.unwrap();
+            client.put(format!("http://{address}/part")).header(reqwest::header::CONTENT_LENGTH, size / 2)
+                .body(body).send().await.unwrap();
+        }
+        assert_eq!(server.join().unwrap(), size * 3);
+        assert_eq!(network.load(Ordering::Relaxed), size * 3);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

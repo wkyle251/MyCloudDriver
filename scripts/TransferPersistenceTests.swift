@@ -27,6 +27,42 @@ struct TransferPersistenceTests {
         return SavedTransfers(version: 1, accountID: account, downloads: downloads, uploads: [upload])
     }
 
+    static func testSharedQueueMigration(_ root: URL) throws {
+        let store = TransferPersistenceStore(directory: root.appendingPathComponent("shared"))
+        let secondary = TransferPersistenceStore(directory: store.directory.appendingPathComponent("Sessions/secondary"))
+        let third = TransferPersistenceStore(directory: store.directory.appendingPathComponent("Sessions/workspace-3"))
+        let original = fixture(root)
+        try store.save(SavedTransfers(version: 1, accountID: account, downloads: [original.downloads[0]], uploads: []), accountID: account)
+        try secondary.save(original, accountID: account)
+        try third.save(original, accountID: account)
+        let journal = try secondary.uploadDirectory(accountID: account, batchID: uploadID)
+        let sentinel = Data("saved upload progress".utf8)
+        try sentinel.write(to: journal.appendingPathComponent("batch.json"))
+        let combined = try store.loadSharedTransfers(accountID: account)!
+        precondition(combined.downloads.count == 2 && combined.uploads == original.uploads)
+        precondition(Set(combined.importedWorkspaceSessions ?? []) == ["secondary", "workspace-3"])
+        let copied = try store.uploadDirectory(accountID: account, batchID: uploadID).appendingPathComponent("batch.json")
+        let copiedData = try Data(contentsOf: copied)
+        precondition(copiedData == sentinel, "Upload progress must survive session consolidation")
+        let legacy = try secondary.load(SavedTransfers.self, accountID: account)!
+        precondition(legacy.downloads.count == 2, "Keep legacy records intact for recovery")
+        let other = try store.loadSharedTransfers(accountID: "another-account")
+        precondition(other == nil, "Never import a different account's queue")
+        try store.save(SavedTransfers(version: 1, accountID: account, downloads: [], uploads: [],
+            importedWorkspaceSessions: combined.importedWorkspaceSessions), accountID: account)
+        let afterCompletion = try store.loadSharedTransfers(accountID: account)!
+        precondition(afterCompletion.downloads.isEmpty && afterCompletion.uploads.isEmpty,
+                     "Migration receipts must prevent completed work from reappearing")
+        let fourth = TransferPersistenceStore(directory: store.directory.appendingPathComponent("Sessions/workspace-4"))
+        let corrupt = try fourth.accountDirectory(account).appendingPathComponent("transfers-v1.json")
+        try Data("broken".utf8).write(to: corrupt)
+        let sharedFile = try store.accountDirectory(account).appendingPathComponent("transfers-v1.json")
+        let before = try Data(contentsOf: sharedFile)
+        do { _ = try store.loadSharedTransfers(accountID: account); preconditionFailure("Corrupt legacy data was accepted") }
+        catch { let after = try Data(contentsOf: sharedFile); precondition(after == before) }
+        print("PASS shared queue migration: deduplicated batches, copied upload journals, per-account receipts, no resurrection and corruption preservation")
+    }
+
     @MainActor static func main() throws {
         let arguments = CommandLine.arguments
         if arguments.count == 3 {
@@ -49,6 +85,7 @@ struct TransferPersistenceTests {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("pikpak-transfer-tests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        try testSharedQueueMigration(root.appendingPathComponent("migration"))
         for mode in ["--write", "--read"] {
             let child = Process()
             child.executableURL = URL(fileURLWithPath: arguments[0])

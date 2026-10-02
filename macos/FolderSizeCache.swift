@@ -40,6 +40,29 @@ struct FolderSizeIndex: Codable, Equatable {
         measurements.filter { !dirty.contains($0.key) }
     }
 
+    /// Clean measurements a scan of `rootID` can reuse: only its known
+    /// descendants, so a seed stays small however much of the account is cached.
+    func seedMeasurements(under rootID: String) -> [String: FolderMeasurement] {
+        var isDescendant = [rootID: true]
+        func reachesRoot(_ id: String) -> Bool {
+            var path: [String] = []
+            var next: String? = id
+            var result = false
+            while let current = next {
+                if let known = isDescendant[current] { result = known; break }
+                // A malformed parent cycle can never reach the root.
+                if path.contains(current) { break }
+                path.append(current)
+                next = parents[current]
+            }
+            for visited in path { isDescendant[visited] = result }
+            return result
+        }
+        return measurements.filter { id, _ in
+            id != rootID && !dirty.contains(id) && reachesRoot(id)
+        }
+    }
+
     func ancestors(of folderID: String) -> [String] {
         var result: [String] = []
         var seen = Set<String>()
@@ -192,13 +215,14 @@ struct FolderSizeIndex: Codable, Equatable {
         return true
     }
 
+    /// Every scanned entry's parent comes from `scannedListings`, which hold
+    /// the complete direct contents of each folder the scan listed.
     mutating func applyScan(
         rootID: String, folders: [String: FolderMeasurement],
-        scannedListings: [String: [FolderSizeEntry]], parentIDs: [String: String]
+        scannedListings: [String: [FolderSizeEntry]]
     ) {
         let previous = measurements[rootID]
         let wasDirty = dirty.contains(rootID)
-        parents.merge(parentIDs) { _, new in new }
         measurements.merge(folders) { _, new in new }
         dirty.subtract(folders.keys)
         for (folder, items) in scannedListings {

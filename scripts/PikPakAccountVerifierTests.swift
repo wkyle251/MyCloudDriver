@@ -9,7 +9,9 @@ struct PikPakAccountVerifierTests {
         let profile = try await verifier.verify(engineURL: engine, environment: [:])
         precondition(profile.sub == "offline-fixture" && profile.displayName == "Taylor Chen")
         precondition(verifier.processIdentifier == nil)
-        for (mode, expected) in [("expired", PikPakAccountError.needsSignIn), ("offline", .unavailable)] {
+        for (mode, expected) in [("expired", PikPakAccountError.needsSignIn), ("offline", .unavailable),
+                                 ("access-rejected", .unavailable), ("unrelated-number", .unavailable), ("invalid-client", .unavailable),
+                                 ("session-rejected", .needsSignIn)] {
             do {
                 _ = try await verifier.verify(engineURL: engine, environment: ["ACCOUNT_FIXTURE_MODE": mode])
                 preconditionFailure("failed account check accepted")
@@ -23,6 +25,10 @@ struct PikPakAccountVerifierTests {
         catch is CancellationError { }
         precondition(verifier.processIdentifier == nil)
         _ = try await verifier.verify(engineURL: engine, environment: [:])
-        print("PASS account verifier: real helper success, expired credentials, offline failure, cancellation, process cleanup and subsequent retry")
+        for rejected in [#"error: authentication failed: status 400: {"error": "invalid_grant"}"#,
+                         #"authentication failed: status 401: {"error_code":4126}"#] {
+            precondition(PikPakSessionFailure.requiresSignIn(rejected))
+        }
+        print("PASS account verifier: explicit credential rejection, recoverable access errors, offline/client errors, cancellation, process cleanup and retry")
     }
 }

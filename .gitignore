@@ -71,6 +71,7 @@ __pycache__/
 # FileTwin build outputs, native models and private similarity catalogs
 /vendor/FileTwin/target/
 .filetwin/
+filetwin-vectors.json
 *.onnx
 *.torchscript.pt
 *.dylib

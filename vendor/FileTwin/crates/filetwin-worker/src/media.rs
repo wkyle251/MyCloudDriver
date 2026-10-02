@@ -1,4 +1,4 @@
-use crate::raster::Sscd;
+use crate::raster;
 use filetwin_core::{
     Error, ErrorCode, Result, profile,
     worker_protocol::{Encoded, Request},
@@ -80,7 +80,19 @@ fn decoder(request: &Request, probe: bool) -> Result<Command> {
             "FFmpeg/ffprobe path missing",
         )
     })?);
-    c.stdin(Stdio::from(File::open(&request.path)?));
+    if let Some(memory) = &request.memory_input {
+        memory.address()?;
+        c.stdin(Stdio::null());
+        // Only local RAM transport, no redirects/proxies or disk cache. Do not
+        // permit playlist/manifest demuxers to initiate additional network I/O.
+        c.env_remove("http_proxy").env_remove("HTTP_PROXY").env_remove("ALL_PROXY");
+        c.args(["-protocol_whitelist", "http,tcp", "-rw_timeout", "30000000",
+            "-format_whitelist", "mov,matroska,webm,avi,mpeg,mpegts,mp3,flac,ogg,wav,aiff,caf,ape,wv,amr,au,mpc,mpc8,asf,flv,rm,aac,ac3,eac3,dts,mxf,mpegvideo",
+        ]);
+    } else {
+        c.stdin(Stdio::from(File::open(&request.path)?));
+        c.args(["-protocol_whitelist", "fd", "-fd", "0"]);
+    }
     if !probe {
         c.args([
             "-nostdin",
@@ -98,16 +110,16 @@ fn decoder(request: &Request, probe: bool) -> Result<Command> {
         &(request.memory_bytes / 4)
             .min(128 * 1024 * 1024)
             .to_string(),
-        "-protocol_whitelist",
-        "fd",
-        "-fd",
-        "0",
         "-probesize",
         "8388608",
         "-analyzeduration",
         "10000000",
     ]);
     Ok(c)
+}
+
+fn input_url(request: &Request) -> &str {
+    request.memory_input.as_ref().map_or("fd:", |m| m.url.as_str())
 }
 
 fn version(path: &Path) -> Result<String> {
@@ -150,7 +162,7 @@ fn probe(request: &Request) -> Result<(Value, String)> {
             .ok_or_else(|| decode_error("ffprobe missing"))?,
     )?;
     let mut c = decoder(request, true)?;
-    c.args(["-v", "error", "-show_entries", "format=duration,start_time,format_name:stream=index,codec_type,codec_name,duration,start_time,width,height,nb_frames,color_space,color_transfer,color_primaries,sample_aspect_ratio:stream_disposition=attached_pic", "-of", "json", "fd:"]);
+    c.args(["-v", "error", "-show_entries", "format=duration,start_time,format_name:stream=index,codec_type,codec_name,duration,start_time,width,height,nb_frames,color_space,color_transfer,color_primaries,sample_aspect_ratio:stream_disposition=attached_pic", "-of", "json", input_url(request)]);
     let (bytes, _) = capture(&mut c, 64 * 1024)?;
     let metadata: Value = serde_json::from_slice(&bytes).map_err(decode_error)?;
     Ok((metadata, ffmpeg))
@@ -182,7 +194,7 @@ pub fn still_image(request: &Request) -> Result<(image::RgbImage, Value)> {
         "-show_stream_groups",
         "-of",
         "json",
-        "fd:",
+        input_url(request),
     ]);
     let (bytes, _) = capture(&mut command, 1024 * 1024)?;
     let metadata: Value = serde_json::from_slice(&bytes).map_err(decode_error)?;
@@ -217,11 +229,13 @@ pub fn still_image(request: &Request) -> Result<(image::RgbImage, Value)> {
             .checked_mul(32)
             .is_none_or(|bytes| bytes > request.memory_bytes / 2)
     {
-        return Err(Error::new(
+        let mut error = Error::new(
             ErrorCode::ResourceBudgetTooSmall,
             "image",
             "HEIF/AVIF decoded image and tiles exceed memory allowance",
-        ));
+        );
+        error.details["required_memory_bytes"] = json!(pixels.saturating_mul(64));
+        return Err(error);
     }
     let output_limit = (request.memory_bytes / 8).min(128 * 1024 * 1024);
     let mut command = decoder(request, false)?;
@@ -229,7 +243,7 @@ pub fn still_image(request: &Request) -> Result<(image::RgbImage, Value)> {
         "-v",
         "error",
         "-i",
-        "fd:",
+        input_url(request),
         "-map",
         &target.mapping,
         "-frames:v",
@@ -475,7 +489,7 @@ fn audio_with_probe(request: &Request, metadata: Value, ffmpeg: String) -> Resul
             "-ss",
             &format!("{:.9}", start + offset),
             "-i",
-            "fd:",
+            input_url(request),
             "-map",
             &format!("0:{}", stream["index"]),
             "-vn",
@@ -638,113 +652,263 @@ fn video_with_probe(request: &Request, metadata: Value, ffmpeg: String) -> Resul
         return Err(decode_error("Invalid video dimensions"));
     }
     if width.saturating_mul(height).saturating_mul(32) > request.memory_bytes / 2 {
-        return Err(Error::new(
+        let mut error = Error::new(
             ErrorCode::ResourceBudgetTooSmall,
             "video",
             "Video decoder frame buffers exceed the memory allowance",
-        ));
+        );
+        error.details["required_memory_bytes"] = json!(width.saturating_mul(height).saturating_mul(64));
+        return Err(error);
     }
-    let mut model = Sscd::load(request)?;
-    let mut sum = vec![0.0f64; profile::IMAGE_DIMENSIONS];
-    let mut frames = Vec::new();
-    let mut seen = BTreeSet::new();
-    let origin = number(&stream["start_time"])
-        .or_else(|| number(&metadata["format"]["start_time"]))
-        .unwrap_or(0.0);
-    let offset = stream_offset(&metadata, stream);
-    let mut missing = Vec::new();
-    for i in 0..=profile::MAX_MEDIA_WINDOWS {
-        let fallback = i == profile::MAX_MEDIA_WINDOWS;
-        if fallback && !frames.is_empty() {
-            break;
-        }
-        let target = if fallback {
-            0.0
+    raster::with_model(request, |model| {
+        let mut sum = vec![0.0f64; profile::IMAGE_DIMENSIONS];
+        let mut frames = Vec::new();
+        let mut seen = BTreeSet::new();
+        let origin = number(&stream["start_time"])
+            .or_else(|| number(&metadata["format"]["start_time"]))
+            .unwrap_or(0.0);
+        let offset = stream_offset(&metadata, stream);
+        let mut missing = Vec::new();
+        let continuous = duration <= 60.0
+            && profile::inference_backend(&request.profile_id)? != profile::Backend::Reference;
+        let batch = if continuous {
+            Some(continuous_video_frames(request, stream, duration, origin)?)
         } else {
-            duration * (i as f64 + 0.5) / profile::MAX_MEDIA_WINDOWS as f64
+            None
         };
-        let mut c = decoder(request, false)?;
-        c.args([
-            "-v",
-            "info",
-            "-xerror",
-            "-ss",
-            &format!("{:.9}", target + offset),
-            "-copyts",
-            "-i",
-            "fd:",
-            "-map",
-            &format!("0:{}", stream["index"]),
-            "-an",
-            "-sn",
-            "-dn",
-            "-vf",
-            "scale=320:320:flags=bilinear,setsar=1,format=rgb24,showinfo",
-            "-frames:v",
-            "1",
-            "-fps_mode",
-            "passthrough",
-            "-threads",
-            "1",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-protocol_whitelist",
-            "pipe",
-            "pipe:1",
-        ]);
-        let (bytes, log) = capture(&mut c, 320 * 320 * 3)?;
-        if bytes.is_empty() {
-            missing.push(target);
-            continue;
+        for i in 0..=profile::MAX_MEDIA_WINDOWS {
+            let fallback = i == profile::MAX_MEDIA_WINDOWS;
+            if fallback && !frames.is_empty() {
+                break;
+            }
+            let target = if fallback {
+                0.0
+            } else {
+                duration * (i as f64 + 0.5) / profile::MAX_MEDIA_WINDOWS as f64
+            };
+            let decoded = if let Some(batch) = &batch {
+                if fallback {
+                    seek_video_frame(request, stream, offset)?
+                } else {
+                    batch.iter().find(|f| f.reaches(origin + target)).cloned()
+                }
+            } else {
+                seek_video_frame(request, stream, target + offset)?
+            };
+            let Some(DecodedFrame {
+                bytes,
+                pts,
+                time,
+                time_base,
+            }) = decoded
+            else {
+                missing.push(target);
+                continue;
+            };
+            if !seen.insert(pts.clone()) {
+                continue;
+            }
+            let rgb = image::RgbImage::from_raw(320, 320, bytes)
+                .ok_or_else(|| decode_error("Incomplete RGB frame"))?;
+            let vector = model.rgb(&rgb)?;
+            for (total, component) in sum.iter_mut().zip(vector) {
+                *total += f64::from(component);
+            }
+            frames.push(json!({"target_seconds":target,"decoder_seek_seconds":target+offset,"decoded_pts":pts,"decoded_pts_time_base":time_base,"decoded_pts_seconds":time,"relative_seconds":time-origin,"fallback":fallback}));
         }
-        let time_base = log
-            .lines()
-            .find_map(|line| {
-                line.split("config in time_base:")
-                    .nth(1)?
-                    .trim()
-                    .split(',')
-                    .next()
-            })
-            .ok_or_else(|| decode_error("Missing decoded frame time base"))?;
-        let (pts, time) = log
-            .lines()
-            .filter(|l| l.contains("Parsed_showinfo") && l.contains("pts_time:"))
-            .find_map(|line| parse_pts(line, time_base))
-            .ok_or_else(|| decode_error("Decoder did not report an actual frame timestamp"))?;
-        if !seen.insert(pts.clone()) {
-            continue;
+        if frames.is_empty() {
+            return Err(Error::new(
+                ErrorCode::InsufficientContent,
+                "video",
+                "No sampled video frames could be decoded",
+            ));
         }
-        let rgb = image::RgbImage::from_raw(320, 320, bytes)
-            .ok_or_else(|| decode_error("Incomplete RGB frame"))?;
-        let vector = model.rgb(&rgb)?;
-        for (total, component) in sum.iter_mut().zip(vector) {
-            *total += f64::from(component);
-        }
-        frames.push(json!({"target_seconds":target,"decoder_seek_seconds":target+offset,"decoded_pts":pts,"decoded_pts_time_base":time_base,"decoded_pts_seconds":time,"relative_seconds":time-origin,"fallback":fallback}));
-    }
-    if frames.is_empty() {
-        return Err(Error::new(
-            ErrorCode::InsufficientContent,
-            "video",
-            "No sampled video frames could be decoded",
-        ));
-    }
-    let mean: Vec<f64> = sum.into_iter().map(|n| n / frames.len() as f64).collect();
-    let vector = profile::normalized_f64(&mean)?;
-    Ok(Encoded {
-        family: "video".into(),
-        format: metadata["format"]["format_name"]
-            .as_str()
-            .unwrap_or("video")
-            .into(),
-        vector,
-        extraction: json!({"coverage":"sampled_visual_timeline","duration_seconds":duration,"stream_start_seconds":origin,"stream_index":stream["index"],"codec":stream["codec_name"],
+        let mean: Vec<f64> = sum.into_iter().map(|n| n / frames.len() as f64).collect();
+        let vector = profile::normalized_f64(&mean)?;
+        Ok(Encoded {
+            family: "video".into(),
+            format: metadata["format"]["format_name"]
+                .as_str()
+                .unwrap_or("video")
+                .into(),
+            vector,
+            extraction: json!({"coverage":"sampled_visual_timeline","duration_seconds":duration,"stream_start_seconds":origin,"stream_index":stream["index"],"codec":stream["codec_name"],
             "source_width":width,"source_height":height,"requested_frames":32,"distinct_frames":frames.len(),"frames":frames,"targets_without_frame":missing,
-            "audio":"ignored","decoder":ffmpeg,"orientation":"ffmpeg_autorotate","color":"ffmpeg_default_rgb24","source_color_space":stream["color_space"],"source_transfer":stream["color_transfer"],"source_primaries":stream["color_primaries"],"source_sample_aspect_ratio":stream["sample_aspect_ratio"],"hdr_tone_mapping":false,"pooling":"mean_normalized_sscd"}),
+            "audio":"ignored","decoder":ffmpeg,"decoder_strategy":if continuous {"continuous_midpoint_selection"} else {"sparse_midpoint_seeks"},"orientation":"ffmpeg_autorotate","color":"ffmpeg_default_rgb24","source_color_space":stream["color_space"],"source_transfer":stream["color_transfer"],"source_primaries":stream["color_primaries"],"source_sample_aspect_ratio":stream["sample_aspect_ratio"],"hdr_tone_mapping":false,"pooling":"mean_normalized_sscd"}),
+        })
     })
+}
+
+#[derive(Clone)]
+struct DecodedFrame {
+    bytes: Vec<u8>,
+    pts: String,
+    time: f64,
+    time_base: String,
+}
+
+impl DecodedFrame {
+    fn reaches(&self, target: f64) -> bool {
+        let (num, den) = self.time_base.split_once('/').expect("Validated time base");
+        let tick = num.trim().parse::<f64>().expect("Validated numerator")
+            / den.trim().parse::<f64>().expect("Validated denominator");
+        // FFmpeg's accurate seek rounds to the stream time base. Use the same
+        // boundary when selecting from a continuous decode, including targets
+        // just after a frame's nominal timestamp.
+        self.pts.parse::<f64>().expect("Validated PTS") >= (target / tick).round()
+    }
+}
+
+fn seek_video_frame(
+    request: &Request,
+    stream: &Value,
+    seek_seconds: f64,
+) -> Result<Option<DecodedFrame>> {
+    let mut c = decoder(request, false)?;
+    c.args([
+        "-v",
+        "info",
+        "-xerror",
+        "-ss",
+        &format!("{:.9}", seek_seconds),
+        "-copyts",
+        "-i",
+        input_url(request),
+        "-map",
+        &format!("0:{}", stream["index"]),
+        "-an",
+        "-sn",
+        "-dn",
+        "-vf",
+        "scale=320:320:flags=bilinear,setsar=1,format=rgb24,showinfo",
+        "-frames:v",
+        "1",
+        "-fps_mode",
+        "passthrough",
+        "-threads",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-protocol_whitelist",
+        "pipe",
+        "pipe:1",
+    ]);
+    let (bytes, log) = capture(&mut c, 320 * 320 * 3)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let time_base = log
+        .lines()
+        .find_map(|line| {
+            line.split("config in time_base:")
+                .nth(1)?
+                .trim()
+                .split(',')
+                .next()
+        })
+        .ok_or_else(|| decode_error("Missing decoded frame time base"))?;
+    let (pts, time) = log
+        .lines()
+        .filter(|l| l.contains("Parsed_showinfo") && l.contains("pts_time:"))
+        .find_map(|line| parse_pts(line, time_base))
+        .ok_or_else(|| decode_error("Decoder did not report an actual frame timestamp"))?;
+    Ok(Some(DecodedFrame {
+        bytes,
+        pts,
+        time,
+        time_base: time_base.to_owned(),
+    }))
+}
+
+/// Decode short clips once. Selection occurs before resize so only the same
+/// midpoint samples are converted to RGB. Long clips retain sparse seeking.
+fn continuous_video_frames(
+    request: &Request,
+    stream: &Value,
+    duration: f64,
+    origin: f64,
+) -> Result<Vec<DecodedFrame>> {
+    let crossings = (0..profile::MAX_MEDIA_WINDOWS)
+        .map(|i| {
+            let target = format!(
+                "{:.9}",
+                origin + duration * (i as f64 + 0.5) / profile::MAX_MEDIA_WINDOWS as f64
+            );
+            format!("gte(pts,round({target}/TB))*(isnan(prev_pts)+lt(prev_pts,round({target}/TB)))")
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    let filter = format!(
+        "select='gt({crossings},0)',scale=320:320:flags=bilinear,setsar=1,format=rgb24,showinfo"
+    );
+    let mut c = decoder(request, false)?;
+    c.args([
+        "-v",
+        "info",
+        "-xerror",
+        "-copyts",
+        "-i",
+        input_url(request),
+        "-map",
+        &format!("0:{}", stream["index"]),
+        "-an",
+        "-sn",
+        "-dn",
+        "-vf",
+        &filter,
+        "-frames:v",
+        "32",
+        "-fps_mode",
+        "passthrough",
+        "-threads",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-protocol_whitelist",
+        "pipe",
+        "pipe:1",
+    ]);
+    let (bytes, log) = capture(&mut c, 320 * 320 * 3 * profile::MAX_MEDIA_WINDOWS)?;
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let time_base = log
+        .lines()
+        .find_map(|line| {
+            line.split("config in time_base:")
+                .nth(1)?
+                .trim()
+                .split(',')
+                .next()
+        })
+        .ok_or_else(|| decode_error("Missing decoded frame time base"))?;
+    let stamps: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("Parsed_showinfo") && line.contains("pts_time:"))
+        .map(|line| {
+            parse_pts(line, time_base)
+                .ok_or_else(|| decode_error("Missing decoded frame timestamp"))
+        })
+        .collect::<Result<_>>()?;
+    if stamps.len() > profile::MAX_MEDIA_WINDOWS || bytes.len() != stamps.len() * 320 * 320 * 3 {
+        return Err(decode_error("Incomplete sampled RGB frame sequence"));
+    }
+    Ok(bytes
+        .as_chunks::<{ 320 * 320 * 3 }>()
+        .0
+        .iter()
+        .zip(stamps)
+        .map(|(bytes, (pts, time))| DecodedFrame {
+            bytes: bytes.to_vec(),
+            pts,
+            time,
+            time_base: time_base.to_owned(),
+        })
+        .collect())
 }
 
 fn parse_pts(line: &str, time_base: &str) -> Option<(String, f64)> {

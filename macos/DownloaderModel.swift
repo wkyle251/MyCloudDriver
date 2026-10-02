@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import AVFoundation
 import Combine
 import Foundation
@@ -594,6 +595,11 @@ struct AccountDownloadCachedFile: Codable {
     // FileInfo uses PikPak's string-encoded u64 wire representation.
     let size: String
     let kind: BrowserItemKind
+    var parentId: String? = nil
+    enum CodingKeys: String, CodingKey {
+        case id, name, size, kind
+        case parentId = "parent_id"
+    }
 }
 
 private struct AccountDownloadInput: Encodable {
@@ -640,6 +646,17 @@ struct SavedUploadBatch: Codable, Identifiable, Equatable {
     var completedFiles: Int = 0
     var totalBytes: UInt64 = 0
     var completedBytes: UInt64 = 0
+    var sourceVolumes: [String: String]? = nil
+    var sourceBookmarks: [String: Data]? = nil
+    var automaticallyResume: Bool? = nil
+    var pausedFileIDs: Set<String>? = nil
+    var cancelledFileIDs: Set<String>? = nil
+}
+
+struct SavedDownloadCancellation: Codable, Hashable {
+    let scope: String
+    let controlID: String
+    let remotePath: String
 }
 
 struct SavedTransfers: Codable {
@@ -647,6 +664,12 @@ struct SavedTransfers: Codable {
     let accountID: String
     let downloads: [PendingDownloadRequest]
     let uploads: [SavedUploadBatch]
+    var cancelledDownloads: [SavedDownloadCancellation]? = nil
+    var importedWorkspaceSessions: [String]? = nil
+    var downloadsPaused: Bool? = nil
+    var pausedDownloadIDs: Set<String>? = nil
+    var pausedPendingDownloadIDs: Set<UUID>? = nil
+    var pausedUploadIDs: Set<String>? = nil
 }
 
 private struct ShareDownloadInput: Codable {
@@ -678,8 +701,7 @@ struct PreviewSource: Codable, Hashable {
     let audioCodec: String?
 
     var contentURL: URL? {
-        guard let url = URL(string: url), url.scheme == "https" else { return nil }
-        return url
+        PreviewTransport.secureContentURL(url)
     }
 }
 
@@ -693,19 +715,35 @@ struct PreviewInfo: Codable {
     let sources: [PreviewSource]?
 
     var contentURL: URL? {
-        guard let url = URL(string: contentLink), url.scheme == "https" else { return nil }
-        return url
+        PreviewTransport.secureContentURL(contentLink)
     }
 }
 
-private struct FolderMeasurementReport: Codable {
+private struct FolderMeasurementReport: Decodable {
     let totalBytes: UInt64
     let fileCount: UInt64
     let folderCount: UInt64
     let folders: [String: FolderMeasurement]?
-    let parents: [String: String]?
     let listings: [String: [FolderSizeEntry]]?
     let reusedFolders: Int?
+    /// Each listed entry's folder, derived from `listings` when decoding.
+    private(set) var parentIDs: [String: String] = [:]
+
+    private enum CodingKeys: String, CodingKey {
+        case totalBytes, fileCount, folderCount, folders, listings, reusedFolders
+    }
+
+    /// A whole-tree report can hold every entry of a large account. Decode it
+    /// on the helper's termination thread, never on the main actor.
+    static func decode(_ output: String) throws -> Self {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        var report = try decoder.decode(Self.self, from: Data(output.utf8))
+        for (folder, entries) in report.listings ?? [:] {
+            for entry in entries { report.parentIDs[entry.id] = folder }
+        }
+        return report
+    }
 
     var rootMeasurement: FolderMeasurement {
         FolderMeasurement(
@@ -739,7 +777,22 @@ private enum FolderMeasurementCacheStore {
     private static let maximumAccounts = 4
     private static let filename = "folder-sizes-v1.json"
 
+    /// Identifies the file contents last read or written by this process.
+    private struct FileSignature: Equatable {
+        let path: String
+        let modified: Date?
+        let size: Int?
+    }
+
+    /// Every window saves through this store, so the lock serializes their
+    /// read-modify-write cycles. A save after browsing would otherwise decode
+    /// the whole file again just to keep the other accounts' entries.
+    private static let lock = NSLock()
+    private static var lastDocument: (document: FolderMeasurementCacheDocument, signature: FileSignature)?
+
     static func account(for accountID: String) throws -> FolderMeasurementCacheAccount? {
+        lock.lock()
+        defer { lock.unlock() }
         let document = try loadDocument()
         guard document.version == schemaVersion else { return nil }
         return document.accounts[accountID]
@@ -750,6 +803,8 @@ private enum FolderMeasurementCacheStore {
         index: FolderSizeIndex,
         for accountID: String
     ) throws {
+        lock.lock()
+        defer { lock.unlock() }
         var document = (try? loadDocument()) ?? FolderMeasurementCacheDocument(
             version: schemaVersion,
             accounts: [:]
@@ -773,12 +828,17 @@ private enum FolderMeasurementCacheStore {
     }
 
     static func removeMeasurements(for accountID: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
         guard var document = try? loadDocument(), document.version == schemaVersion else { return }
         document.accounts.removeValue(forKey: accountID)
         try write(document)
     }
 
     static func removeAll() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        lastDocument = nil
         let url = try cacheFileURL()
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
@@ -789,12 +849,15 @@ private enum FolderMeasurementCacheStore {
     }
 
     private static func loadDocument() throws -> FolderMeasurementCacheDocument {
-        let url = try cacheFileURL()
+        var url = try cacheFileURL()
+        // The signature below must describe the file now, not values a
+        // long-lived URL instance cached earlier.
+        url.removeAllCachedResourceValues()
         guard FileManager.default.fileExists(atPath: url.path) else {
             return FolderMeasurementCacheDocument(version: schemaVersion, accounts: [:])
         }
         let values = try url.resourceValues(
-            forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey]
         )
         guard
             values.isRegularFile == true,
@@ -804,10 +867,16 @@ private enum FolderMeasurementCacheStore {
             throw LocalCredentialStoreError.invalidStorageLocation
         }
         try protectFile(at: url)
-        return try JSONDecoder().decode(
+        let signature = FileSignature(path: url.path, modified: values.contentModificationDate, size: values.fileSize)
+        if let lastDocument, lastDocument.signature == signature {
+            return lastDocument.document
+        }
+        let document = try JSONDecoder().decode(
             FolderMeasurementCacheDocument.self,
             from: Data(contentsOf: url)
         )
+        lastDocument = (document, signature)
+        return document
     }
 
     private static func write(_ document: FolderMeasurementCacheDocument) throws {
@@ -818,14 +887,22 @@ private enum FolderMeasurementCacheStore {
                 throw LocalCredentialStoreError.invalidStorageLocation
             }
         }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(document)
+        // Unsorted keys: sorting every id of a large account costs more than
+        // the write, and nothing compares the file's bytes.
+        let data = try JSONEncoder().encode(document)
         guard data.count <= maximumBytes else {
             throw CocoaError(.fileWriteOutOfSpace)
         }
+        lastDocument = nil
         try data.write(to: url, options: .atomic)
         try protectFile(at: url)
+        var written = url
+        written.removeAllCachedResourceValues()
+        let values = try written.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        lastDocument = (
+            document,
+            FileSignature(path: url.path, modified: values.contentModificationDate, size: values.fileSize)
+        )
     }
 
     private static func cacheFileURL() throws -> URL {
@@ -1073,10 +1150,24 @@ struct DownloadTransfer: Identifiable, Equatable {
     var remotePath: String? = nil
     var outputDirectoryPath: String? = nil
     var isShared: Bool = false
+    var bytesPerSecond: Double = 0
+    var error: String? = nil
 
     var fraction: Double? {
         guard totalBytes > 0 else { return nil }
         return min(Double(downloadedBytes) / Double(totalBytes), 1)
+    }
+}
+
+fileprivate struct DownloadRetryTarget: Hashable {
+    let isShared: Bool
+    let shareURL: String?
+    let remotePath: String
+    let directory: String
+    init(isShared: Bool, remotePath: String, directory: URL, shareURL: String? = nil) {
+        self.isShared = isShared; self.remotePath = remotePath
+        self.shareURL = shareURL
+        self.directory = directory.standardizedFileURL.path
     }
 }
 
@@ -1086,9 +1177,13 @@ private struct DownloadQueueEntry: Decodable {
     let totalBytes: UInt64
     let remotePath: String?
     let outputDirectory: String?
+    let requestId: UUID?
+    let sourceFileId: String?
 }
 
 private struct DownloadProgressEvent: Decodable {
+    let requestId: UUID?
+    let success: Bool?
     let event: String
     let totalFiles: Int?
     let totalBytes: UInt64?
@@ -1102,6 +1197,8 @@ private struct DownloadProgressEvent: Decodable {
     let attempt: Int?
     let retryInMillis: UInt64?
     let files: [DownloadQueueEntry]?
+    let retryable: Bool?
+    let error: String?
 }
 
 enum UploadRunState: Equatable {
@@ -1318,8 +1415,8 @@ private enum SharedLinksStateStore {
     static let maximumLinks = 256
     private static let filename = "shared-links-v1.json"
 
-    static func load() throws -> PersistedSharedLinksDocument? {
-        let url = try stateFileURL()
+    static func load(workspaceSessionID: String = "primary") throws -> PersistedSharedLinksDocument? {
+        let url = try stateFileURL(workspaceSessionID: workspaceSessionID)
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let values = try url.resourceValues(
             forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
@@ -1338,8 +1435,8 @@ private enum SharedLinksStateStore {
         )
     }
 
-    static func save(_ document: PersistedSharedLinksDocument) throws {
-        let url = try stateFileURL()
+    static func save(_ document: PersistedSharedLinksDocument, workspaceSessionID: String = "primary") throws {
+        let url = try stateFileURL(workspaceSessionID: workspaceSessionID)
         if FileManager.default.fileExists(atPath: url.path) {
             let values = try url.resourceValues(
                 forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
@@ -1358,9 +1455,10 @@ private enum SharedLinksStateStore {
         try protectFile(at: url)
     }
 
-    private static func stateFileURL() throws -> URL {
-        let directory = try LocalCredentialStore.applicationSupportDirectoryURL()
+    private static func stateFileURL(workspaceSessionID: String) throws -> URL {
+        let base = try LocalCredentialStore.applicationSupportDirectoryURL()
             .appendingPathComponent("State", isDirectory: true)
+        let directory = PikPakWorkspaceStorage.directory(base, workspaceSessionID: workspaceSessionID)
         try ensurePrivateDirectory(directory)
         return directory.appendingPathComponent(filename, isDirectory: false)
     }
@@ -1419,10 +1517,32 @@ private struct BrowserMoveRequest {
     let destination: BrowserLocation
 }
 
-/// A Browser/Links click only adds roots to this pre-start queue. Once the user
-/// presses Start Download, compatible selections share one concurrent pool.
-/// Each root keeps a stable queue id so it can be removed before its batch is
-/// handed to the recursive engine.
+/// Durable selections retain their original layout and authorization. Roots
+/// enter the live queue independently, regardless of when they were selected.
+private struct LiveDownloadInbox: Encodable {
+    let version = 1
+    let requests: [LiveDownloadInput]
+    var contentMode: PikPakContentMode = .user
+    enum CodingKeys: String, CodingKey {
+        case version, requests
+        case contentMode = "content_mode"
+    }
+}
+private struct LiveDownloadInput: Encodable {
+    let id: String
+    let path: String
+    let file: AccountDownloadCachedFile?
+    let destination: String
+    let relativeParent: [String]
+    let proxyURL: String
+    let access: ShareAccessInput?
+    enum CodingKeys: String, CodingKey {
+        case id, path, file, destination, access
+        case relativeParent = "relative_parent"
+        case proxyURL = "proxy_url"
+    }
+}
+
 enum PendingDownloadRequest: Codable {
     case account(
         roots: [AccountDownloadRoot],
@@ -1437,6 +1557,22 @@ enum PendingDownloadRequest: Codable {
         jobs: Int,
         proxyURL: String
     )
+
+    var individualRequests: [PendingDownloadRequest] {
+        pendingItems.compactMap { keepingPendingItems([$0.id]) }
+    }
+
+    fileprivate var liveInputs: [LiveDownloadInput] {
+        switch self {
+        case .account(let roots, let destination, _, let proxy):
+            return roots.map { .init(id: $0.queueID.uuidString, path: $0.path, file: $0.file,
+                destination: destination.path, relativeParent: $0.relativeParent, proxyURL: proxy, access: nil) }
+        case .shared(let roots, let access, let destination, _, let proxy):
+            return roots.map { .init(id: $0.queueID.uuidString, path: $0.root.path,
+                file: .init(id: $0.root.id, name: $0.root.name, size: String($0.root.size), kind: $0.root.kind),
+                destination: destination.path, relativeParent: $0.root.relativeParent ?? [], proxyURL: proxy, access: access) }
+        }
+    }
 
     func withWorkerLimit(_ limit: Int) -> PendingDownloadRequest {
         let count = min(max(limit, 1), 64)
@@ -1484,12 +1620,43 @@ enum PendingDownloadRequest: Codable {
         }
     }
 
+    /// Scope cancellation to one provider selection destination. Keeping this
+    /// separate from root IDs preserves cancelled children of large resumed folders.
+    var cancellationScope: String {
+        switch self {
+        case .account(_, let destination, _, _):
+            return "account|\(destination.standardizedFileURL.path)"
+        case .shared(_, let access, let destination, _, _):
+            return "shared|\(access.url)|\(destination.standardizedFileURL.path)"
+        }
+    }
+
     var deduplicationKey: String {
         switch self {
         case .account(let roots, let destination, _, _):
             return "account|\(destination.path)|\(roots.map(\.path).sorted().joined(separator: "\u{1F}"))"
         case .shared(let roots, let access, let destination, _, _):
             return "shared|\(access.url)|\(destination.path)|\(roots.map { $0.item.id }.sorted().joined(separator: "\u{1F}"))"
+        }
+    }
+
+    /// A retried file replaces its exact interrupted selection. Keep folder
+    /// selections and unrelated descendants so a partial retry cannot lose work.
+    fileprivate func removingRetriedFiles(_ targets: Set<DownloadRetryTarget>) -> PendingDownloadRequest? {
+        switch self {
+        case .account(let roots, let destination, let jobs, let proxy):
+            let remaining = roots.filter { root in
+                let directory = root.relativeParent.reduce(destination) { $0.appendingPathComponent($1, isDirectory: true) }
+                return root.kind != .file || !targets.contains(.init(isShared: false, remotePath: root.path, directory: directory))
+            }
+            return remaining.isEmpty ? nil : .account(roots: remaining, destination: destination, jobs: jobs, proxyURL: proxy)
+        case .shared(let roots, let access, let destination, let jobs, let proxy):
+            let remaining = roots.filter { root in
+                let directory = (root.root.relativeParent ?? []).reduce(destination) { $0.appendingPathComponent($1, isDirectory: true) }
+                return root.item.kind != .file || !targets.contains(.init(isShared: true,
+                    remotePath: root.root.path, directory: directory, shareURL: access.url))
+            }
+            return remaining.isEmpty ? nil : .shared(roots: remaining, access: access, destination: destination, jobs: jobs, proxyURL: proxy)
         }
     }
 
@@ -1500,7 +1667,7 @@ enum PendingDownloadRequest: Codable {
             guard destination == otherDestination, jobs == otherJobs, proxy == otherProxy else { return nil }
             let existingPaths = Set(roots.map(\.path))
             let fresh = more.filter { !existingPaths.contains($0.path) }
-            guard !DownloadQueueBatching.destinationsOverlap(
+            guard !DownloadDestinationLayout.destinationsOverlap(
                 roots.map { $0.relativeParent + [$0.name] },
                 fresh.map { $0.relativeParent + [$0.name] }
             ) else { return nil }
@@ -1519,7 +1686,7 @@ enum PendingDownloadRequest: Codable {
                   access.passCodeToken == otherAccess.passCodeToken,
                   roots.count + more.count <= 2000 else { return nil }
             let existingIDs = Set(roots.map { $0.item.id })
-            guard !DownloadQueueBatching.destinationsOverlap(
+            guard !DownloadDestinationLayout.destinationsOverlap(
                 roots.map { ($0.root.relativeParent ?? []) + [$0.item.name] },
                 more.filter { !existingIDs.contains($0.item.id) }
                     .map { ($0.root.relativeParent ?? []) + [$0.item.name] }
@@ -1529,6 +1696,46 @@ enum PendingDownloadRequest: Codable {
                            access: access, destination: destination, jobs: jobs, proxyURL: proxy)
         default: return nil
         }
+    }
+
+    func fileID(for itemID: UUID) -> String? {
+        switch self {
+        case .account(let roots, _, _, _): return roots.first(where: { $0.queueID == itemID && $0.kind == .file })?.file?.id
+        case .shared(let roots, _, _, _, _): return roots.first(where: { $0.queueID == itemID && !$0.item.isFolder })?.item.id
+        }
+    }
+
+    func partialTreeURL(for itemID: UUID) -> URL? {
+        switch self {
+        case .account(let roots, let destination, _, _):
+            guard let root = roots.first(where: { $0.queueID == itemID && $0.kind == .folder }) else { return nil }
+            return (root.relativeParent + [root.name]).reduce(destination) { $0.appendingPathComponent(($1 as NSString).lastPathComponent, isDirectory: true) }
+        case .shared(let roots, _, let destination, _, _):
+            guard let root = roots.first(where: { $0.queueID == itemID && $0.item.isFolder }) else { return nil }
+            return ((root.root.relativeParent ?? []) + [root.item.name]).reduce(destination) { $0.appendingPathComponent(($1 as NSString).lastPathComponent, isDirectory: true) }
+        }
+    }
+
+    func partialURL(for itemID: UUID) -> URL? {
+        switch self {
+        case .account(let roots, let destination, _, _):
+            guard let root = roots.first(where: { $0.queueID == itemID && $0.kind == .file }) else { return nil }
+            return root.relativeParent.reduce(destination) { $0.appendingPathComponent(($1 as NSString).lastPathComponent, isDirectory: true) }
+                .appendingPathComponent((root.name as NSString).lastPathComponent + ".part")
+        case .shared(let roots, _, let destination, _, _):
+            guard let root = roots.first(where: { $0.queueID == itemID && !$0.item.isFolder }) else { return nil }
+            return (root.root.relativeParent ?? []).reduce(destination) { $0.appendingPathComponent(($1 as NSString).lastPathComponent, isDirectory: true) }
+                .appendingPathComponent((root.item.name as NSString).lastPathComponent + ".part")
+        }
+    }
+
+    func keepingPendingItems(_ ids: Set<UUID>) -> PendingDownloadRequest? {
+        removingPendingItems(Set(pendingItems.map(\.id)).subtracting(ids))
+    }
+    func removingPendingItems(_ ids: Set<UUID>) -> PendingDownloadRequest? {
+        var request: PendingDownloadRequest? = self
+        for id in ids { request = request?.removingPendingItem(id: id) }
+        return request
     }
 
     func removingPendingItem(id: UUID) -> PendingDownloadRequest? {
@@ -1744,7 +1951,7 @@ private final class CloudDownloadPromiseCoordinator {
             }
 
             guard process.terminationStatus == 0 else {
-                let detail = stderrBuffer.string()
+                let detail = FileSearchIndex.withoutStatusNotes(stderrBuffer.string())
                     .split(whereSeparator: \.isNewline)
                     .last
                     .map(String.init)
@@ -1956,6 +2163,7 @@ private final class BoundedTextPreviewLoader: NSObject, URLSessionDataDelegate, 
 
 @MainActor
 final class DownloaderModel: ObservableObject {
+    private(set) var workspaceSessionID = "primary"
     @Published private(set) var accountProfile: PikPakAccountProfile?
     var accountDisplayName: String? { accountProfile?.displayName ?? activeSavedAccount?.profile?.displayName }
     @Published private(set) var savedAccounts: [SavedPikPakAccount] = []
@@ -1965,8 +2173,38 @@ final class DownloaderModel: ObservableObject {
     @Published private(set) var isChangingAccount = false
     @Published private(set) var isCheckingAccount = false
     @Published private(set) var loginFromSettings = false
+    @Published private(set) var loginCredentialKind: PikPakCredentialKind = .desktopOAuth
+    let pikpakManagement = PikPakManagementModel()
+    @Published private(set) var isManagingCloudItems = false
+
+    func preparePikPakManagement() {
+        #if FINDER_WORKSPACE_TESTS
+        if isFinderWorkspaceFixture, pikpakManagement.fixture != nil { return }
+        #endif
+        guard !isClosingWindow, hasUsableSession, let identity = activeAccountID,
+              let accountID = activeSavedAccount?.profile?.sub ?? accountProfile?.sub,
+              let engine = Bundle.main.url(forResource: "pikpak", withExtension: nil),
+              var environment = try? engineEnvironment() else { pikpakManagement.configure(nil); return }
+        let proxy = proxyURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        environment["PIKPAK_PROXY"] = proxy.isEmpty ? nil : proxy
+        pikpakManagement.onMutationState = { [weak self] active in self?.isManagingCloudItems = active }
+        pikpakManagement.onFilesChanged = { [weak self] in
+            guard let self else { return }
+            // The account Browser may be parked behind Links. Invalidate its
+            // saved listing instead of refreshing the received share by mistake.
+            self.accountBrowserWorkspace = nil
+            self.attemptedInitialBrowse = false
+            if !self.isBrowsingSharedLink { self.refreshBrowser() }
+            self.refreshQuota()
+        }
+        pikpakManagement.configure(.init(identity: identity, accountID: accountID, engineURL: engine,
+            environment: environment, credentialKind: activeSavedAccount?.credentialKind ?? .desktopOAuth))
+    }
     private var accountStore: PikPakAccountStore?
+    private var accountStoreObservation: NSObjectProtocol?
     private let accountVerifier = PikPakAccountVerifier()
+    private let sessionRecoveryVerifier = PikPakAccountVerifier()
+    private var sessionRecoveryTask: Task<Void, Never>?
     private var accountCheckTask: Task<Void, Never>?
     private var accountCheckGeneration = UUID()
     private var accountLoginDeviceID: String?
@@ -1984,7 +2222,28 @@ final class DownloaderModel: ObservableObject {
         }
         return opener
     }()
-    private(set) var finderSettings = FinderSettings()
+    private var contentModeObservation: AnyCancellable?
+    private var previewRequestContentMode: PikPakContentMode = .user
+    private(set) var finderSettings = FinderSettings() {
+        didSet { observeContentMode() }
+    }
+    private func observeContentMode() {
+        contentModeObservation = finderSettings.$contentMode.dropFirst().removeDuplicates().sink { [weak self] _ in
+            self?.contentModeChanged()
+        }
+    }
+
+    private func contentModeChanged() {
+        // Discard already-issued URLs when the route changes, including
+        // sparse preview caches that could otherwise fetch more account bytes.
+        cancelAutomaticPreviewNavigation()
+        _ = cancelQuickLook()
+        clearPreview(); clearPreviewResourceCaches()
+        quickLookCopies.removeAll(); quickLookCopyOrder.removeAll()
+        fileOpenContext = UUID(); fileOpener.reset()
+        fileSimilarity.preview.close()
+    }
+    lazy var mediaPlayback = MediaPlaybackController(settings: finderSettings.playback)
     let fileSearch = FileSearchModel()
     lazy var fileSimilarity: FileSimilarityCoordinator = {
         let coordinator = FileSimilarityCoordinator(activity: taskActivity)
@@ -1997,18 +2256,35 @@ final class DownloaderModel: ObservableObject {
             guard let self else { throw CocoaError(.userCancelled) }
             return try self.similarityCloudScope(selection: selection)
         }
+        coordinator.chooseFolderScope = { [weak self] in self?.chooseSimilarityCloudFolder() }
         coordinator.openCloudFile = { [weak self] file in self?.openSimilarityCloudFile(file) }
+        coordinator.moveToTrash = { [weak self] file in
+            guard let self else { throw CancellationError() }
+            try await self.trashSimilarityFile(file)
+        }
+        coordinator.keepSmallest = { [weak self] plan in
+            guard let self else { throw CancellationError() }
+            try self.fileSimilarity.cloud.results.validateKeepSmallest(plan)
+            return try await self.trashSimilarityFiles(plan.removals, keeping: plan.keepers)
+        }
         coordinator.preparePreview = { [weak self] file, directory in
             guard let self else { throw CancellationError() }
             return try await self.prepareSimilarityPreview(file, directory: directory)
         }
         return coordinator
     }()
-    let imagePreview = ImagePreviewModel()
+    private(set) var thumbnailCache = ThumbnailCache.shared
+    private lazy var folderThumbnails = FolderThumbnailPrefetcher(cache: thumbnailCache)
+    private var thumbnailPageReader: PikPakAccountVerifier?
+    lazy var imagePreview = ImagePreviewModel(loadThumbnail: { [thumbnailCache] url, proxy in
+        try await thumbnailCache.image(at: url, proxyURL: proxy)
+    })
     var imagePreviewRequestGeneration: UUID { previewLoadGeneration }
     private var pendingFileSearchNavigation: FileSearchNavigation?
+    private var pendingSimilarityTrash: (files: [SimilarityFile], keepers: [SimilarityFile], session: UUID, completion: (Result<Set<String>, Error>) -> Void)?
     #if FINDER_WORKSPACE_TESTS
     private var isFinderWorkspaceFixture = false
+    var similarityTrashFixtureResponse: (exitCode: Int32, output: String, error: String)?
     private var finderFixtureFolders: [String: [BrowserItem]] = [:]
     private var quickLookFixtureURL: URL?
     private var quickLookFixtureURLs: [String: URL] = [:]
@@ -2018,12 +2294,14 @@ final class DownloaderModel: ObservableObject {
     private var fileUndoFixtureTrashed: Set<String> = []
     private var sharedSaveFixtureRequests: [PendingSharedSaveRequest] = []
     private var sharedLinkLoadFixture: ((UUID, ShareBrowseInput, Process) -> Void)?
+    private var downloadEngineFixture: (([String], Operation, AccountDownloadInput?) -> Void)?
     private init(finderFixture: Bool, defaults: UserDefaults) {
         outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("Offline Downloads")
         isFinderWorkspaceFixture = finderFixture
         finderSettings = FinderSettings(defaults: defaults)
         refreshToken = "offline-fixture-session"
         attemptedInitialBrowse = true
+        observeContentMode()
     }
     #endif
     #if FOLDER_EXPANSION_TESTS
@@ -2057,8 +2335,8 @@ final class DownloaderModel: ObservableObject {
         isFileSearchFixture = fileSearchFixture
     }
     #endif
-    var effectiveDownloadConcurrentJobs: Int { finderSettings.transferWorkers }
-    var effectiveUploadConcurrentJobs: Int { finderSettings.transferWorkers }
+    var effectiveDownloadConcurrentJobs: Int { TransferConcurrency.automaticLimit }
+    var effectiveUploadConcurrentJobs: Int { TransferConcurrency.automaticLimit }
 
     /// Describe work from the owning task's state, never command lines, tokens
     /// or signed URLs. Polling also notices helpers owned by nested models.
@@ -2106,12 +2384,21 @@ final class DownloaderModel: ObservableObject {
         for scan in fileSimilarity.runs {
             if let pid = scan.processIdentifier {
                 activities[pid] = .init(name: "Finding similar files · \(scan.source.title)",
-                    detail: "\(scan.scopeLabel)\n\(scan.message)\n\(scan.detail)", symbol: "doc.text.magnifyingglass")
+                    detail: "\(scan.scopeLabel)\n\(scan.message)\n\(scan.detail)", symbol: "doc.text.magnifyingglass", processing: scan.resourceProcessing)
             }
         }
         var inApp: [String] = []
         if let pid = accountVerifier.processIdentifier {
             activities[pid] = .init(name: "Checking account", detail: "PikPak login status and profile", symbol: "person.crop.circle")
+        }
+        if let pid = transferQuotaMonitor.processIdentifier {
+            activities[pid] = .init(name: "Refreshing quotas", detail: "PikPak storage and monthly traffic", symbol: "chart.bar")
+        }
+        for pid in pikpakManagement.processIdentifiers {
+            activities[pid] = .init(name: "Managing PikPak", detail: "Cloud downloads, shared links and Trash", symbol: "icloud")
+        }
+        if let pid = thumbnailPageReader?.processIdentifier {
+            activities[pid] = .init(name: "Loading folder thumbnails", detail: "Reading the folder's remaining pages", symbol: "photo.on.rectangle")
         }
         if previewPlayer != nil || isPreviewLoading || quickLookDownloadTask != nil || textPreviewLoader != nil {
             inApp.append("Preview: \(previewInfo?.name ?? "loading file")")
@@ -2130,13 +2417,9 @@ final class DownloaderModel: ObservableObject {
     }
 
     private var resourceDownloadSource: String {
-        guard let request = activePersistentDownload else { return "Current download batch" }
-        let names: [String]
-        switch request {
-        case .account(let roots, _, _, _): names = roots.prefix(2).map(\.name)
-        case .shared(let roots, _, _, _, _): names = roots.prefix(2).map { $0.item.name }
-        }
-        return names.joined(separator: ", ") + (request.itemCount > 2 ? " and \(request.itemCount - 2) more" : "")
+        let items = activeDownloadRequests.flatMap(\.pendingItems)
+        guard !items.isEmpty else { return "Download queue" }
+        return items.prefix(2).map(\.name).joined(separator: ", ") + (items.count > 2 ? " and \(items.count - 2) more" : "")
     }
 
     private func resourceLinkName(_ id: UUID) -> String {
@@ -2220,10 +2503,9 @@ final class DownloaderModel: ObservableObject {
 
     private static let previewUserAgent = PreviewTransport.userAgent
     private static let previewStartupTimeoutNanoseconds: UInt64 = 25_000_000_000
-    /// Ask AVFoundation to read substantially ahead instead of stopping after
-    /// the old four-second window. Once the item duration is known this is
-    /// replaced with the complete media duration.
-    private static let previewFallbackForwardBufferDuration: TimeInterval = 6 * 60 * 60
+    /// AVPlayer's buffer consumes memory. The separate disk prefetcher can keep
+    /// retaining the rest of a progressive stream without buffering hours in RAM.
+    private static let previewForwardBufferDuration: TimeInterval = 30
     private static let previewMetricsIntervalNanoseconds: UInt64 = 500_000_000
     /// A bitrate from AVPlayer's access log describes a completed historical
     /// transfer and remains populated after the network goes idle. Derive the
@@ -2312,16 +2594,6 @@ final class DownloaderModel: ObservableObject {
 
     @Published private(set) var refreshToken: String = ""
     @Published var outputURL: URL
-    // Compatibility accessors share the one Settings value; separate upload
-    // and download controls can no longer silently diverge.
-    var concurrentJobs: Int {
-        get { finderSettings.transferWorkers }
-        set { finderSettings.setTransferWorkers(newValue) }
-    }
-    var uploadConcurrentJobs: Int {
-        get { finderSettings.transferWorkers }
-        set { finderSettings.setTransferWorkers(newValue) }
-    }
     @Published var proxyURL: String = "" {
         didSet {
             UserDefaults.standard.set(proxyURL, forKey: "proxyURL")
@@ -2350,7 +2622,6 @@ final class DownloaderModel: ObservableObject {
     /// replay, so retrying one row does not make the other failures disappear.
     @Published private(set) var failedDownloadTransfers: [DownloadTransfer] = []
     @Published private(set) var pendingDownloadItems: [PendingDownloadItem] = []
-    @Published private(set) var pendingDownloadBatchCount = 0
     @Published private(set) var restoredDownloadQueue = false
     @Published private(set) var savedUploadBatches: [SavedUploadBatch] = []
     @Published private(set) var interruptedDownloadCount = 0
@@ -2381,6 +2652,7 @@ final class DownloaderModel: ObservableObject {
     @Published private(set) var loginReason = "Sign in to connect this app to your PikPak account."
     @Published private(set) var requiresDedicatedSignIn = false
     @Published private(set) var storageQuota: StorageQuota?
+    let transferQuotaMonitor = PikPakTransferQuotaMonitor()
     @Published private(set) var isQuotaLoading = false
     @Published private(set) var storageQuotaError: String?
 
@@ -2401,10 +2673,17 @@ final class DownloaderModel: ObservableObject {
     @Published private(set) var activeSharedLinkID: UUID?
     @Published private(set) var selectedSharedLinkRootID: UUID?
     private var sharedBrowserSelectionAnchor: SharedBrowserSelectionAnchor?
-    @Published private(set) var expandedSharedLinkIDs = Set<UUID>()
 
     @Published private(set) var browserItems: [BrowserItem] = [] {
         didSet { invalidateBrowserPresentation(itemsChanged: true) }
+    }
+    @Published var browserFileFilter: BrowserFileFilter = .all {
+        didSet {
+            guard oldValue != browserFileFilter else { return }
+            filteredBrowserEntriesCache = nil
+            filteredBrowserItemsCache = nil
+            if !isBrowsingSharedLink { clearBrowserSelectionFromCanvas() }
+        }
     }
     @Published private(set) var browserSortColumn: BrowserSortColumn = .name {
         didSet { browserSortRevision = UUID() }
@@ -2413,11 +2692,45 @@ final class DownloaderModel: ObservableObject {
         didSet { browserSortRevision = UUID() }
     }
     @Published private(set) var browserStack: [BrowserLocation] = [.root]
+    private var bookmarkNavigationTask: Task<Void, Never>?
+    var bookmarkScope: String? {
+        // Normal login and personal access tokens are two connections to the
+        // same owner's files, so bookmarks follow their shared account group.
+        if let activeSavedAccount { return activeSavedAccount.groupID }
+        if let activeAccountID { return activeAccountID.uuidString }
+        if let accountProfile, !accountProfile.sub.isEmpty { return accountProfile.sub }
+        #if FINDER_WORKSPACE_TESTS
+        if isFinderWorkspaceFixture { return "offline-fixture" }
+        #endif
+        return nil
+    }
+    #if FINDER_WORKSPACE_TESTS
+    static func testBookmarkAccountScope(defaults: UserDefaults) {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        defer { model.stopForWindowClose() }
+        let normal = UUID(), token = UUID(), other = UUID()
+        let owner = PikPakAccountProfile(sub: "bookmark-owner", name: "Synthetic Owner")
+        model.savedAccounts = [
+            .init(id: normal, profile: owner, needsSignIn: false, credentialKind: .desktopOAuth),
+            .init(id: token, profile: owner, needsSignIn: false, credentialKind: .personalAccessToken),
+            .init(id: other, profile: .init(sub: "another-owner", name: "Another Owner"), needsSignIn: false)
+        ]
+        model.activeAccountID = normal
+        precondition(model.bookmarkScope == "bookmark-owner")
+        model.activeAccountID = token
+        precondition(model.bookmarkScope == "bookmark-owner", "Normal/PAT connections share their owner's bookmarks")
+        model.activeAccountID = other
+        precondition(model.bookmarkScope == "another-owner", "different owners never see each other's bookmarks")
+        print("PASS bookmarks share the PikPak account owner across Normal/PAT connections and isolate other accounts")
+    }
+    #endif
     @Published private(set) var nextPageToken: String?
     @Published private(set) var browserScrollRestoreRequest: BrowserScrollRestoreRequest?
     @Published private(set) var expandedBrowserFolderIDs = Set<String>() {
         didSet { invalidateBrowserPresentation(itemsChanged: false) }
     }
+    private var collapsedBrowserFolderFocus: (folderID: String, itemID: String, context: UUID,
+        linkID: UUID?, locationID: String, reopening: Bool)?
     @Published private(set) var browserTreeChildren: [String: [BrowserItem]] = [:] {
         didSet { invalidateBrowserPresentation(itemsChanged: true) }
     }
@@ -2427,11 +2740,14 @@ final class DownloaderModel: ObservableObject {
     @Published private(set) var selectedBrowserItemID: String?
     @Published private(set) var selectedBrowserItemIDs = Set<String>()
     @Published private(set) var previewInfo: PreviewInfo?
-    @Published private(set) var previewPlayer: AVPlayer?
+    @Published private(set) var previewPlayer: AVPlayer? {
+        didSet { mediaPlayback.attach(previewPlayer) }
+    }
     @Published private(set) var previewFileID: String?
     @Published private(set) var previewPlaybackError: String?
     @Published private(set) var previewErrorDiagnostic: AppErrorDiagnostic?
     @Published private(set) var previewSourceLabel: String?
+    @Published private(set) var previewPreparationFraction: Double?
     @Published private(set) var previewText: String?
     @Published private(set) var previewTextEncodingName: String?
     @Published private(set) var previewTextLoadedBytes: UInt64 = 0
@@ -2549,9 +2865,33 @@ final class DownloaderModel: ObservableObject {
     private var operationInputURL: URL?
     private var requestedStop = false
     private var operation: Operation?
+    private var operationArguments: [String] = []
+    private var operationRetryTasks: [String: Task<Void, Never>] = [:]
+    private var operationRetryAttempts: [String: Int] = [:]
+    private var transferSaveRetry: Task<Void, Never>?
     /// Downloads own a utility-priority process instead of the foreground
     /// Browser process. The shared token file still serializes refresh-token
     /// rotation, while folder navigation and previews remain responsive.
+    @Published private(set) var pausedDownloadIDs = Set<String>()
+    @Published private(set) var cancelledDownloadIDs = Set<String>()
+    @Published private(set) var pausedUploadIDs = Set<String>()
+    @Published private(set) var cancelledUploadIDs = Set<String>()
+    @Published private(set) var pausedPendingDownloadIDs = Set<UUID>()
+    @Published private(set) var downloadsPaused = false
+    private var downloadControlURL: URL?
+    private var uploadControlURL: URL?
+    private var cancelAllDownloadsRequested = false
+    private var cancelAllUploadsRequested = false
+    private var automaticDownloadRetry: Task<Void, Never>?
+    private var automaticUploadRetry: Task<Void, Never>?
+    private var downloadRetryAttempt = 0
+    private var downloadFailureRetryable = false
+    private var downloadFailureRetryDelay: UInt64 = 0
+    private var uploadRetryAttempt = 0
+    @Published private(set) var automaticUploadBatchIDs = Set<UUID>()
+    private var pendingRootActions: [String: String] = [:]
+    private var savedDownloadCancellations = Set<SavedDownloadCancellation>()
+    private var importedTransferSessions: [String] = []
     private var downloadProcess: Process?
     private var downloadInputURL: URL?
     private var downloadRequestedStop = false
@@ -2559,9 +2899,29 @@ final class DownloaderModel: ObservableObject {
     private var pendingDownloadOutputLines: [String] = []
     private var downloadOutputFlushScheduled = false
     private var pendingDownloadRequests: [PendingDownloadRequest] = []
-    private var activePersistentDownload: PendingDownloadRequest?
+    private var activeDownloadRequests: [PendingDownloadRequest] = []
+    private var submittedDownloadRequests: [UUID: PendingDownloadRequest] = [:]
+    private var discoveringDownloadRequestIDs: Set<UUID> = []
+    private var downloadRequestIDsByFileID: [String: UUID] = [:]
+    private var downloadSourceFileIDs: [String: String] = [:]
+    private var downloadProxyByFileID: [String: String] = [:]
+    private var liveDownloadRun = false
+
+    #if FINDER_WORKSPACE_TESTS || TRANSFER_PERSISTENCE_TESTS
+    // Fixture convenience for legacy single-selection protocol tests.
+    private var activePersistentDownload: PendingDownloadRequest? {
+        get { activeDownloadRequests.reduce(nil) { combined, next in combined?.combining(next) ?? next } }
+        set { activeDownloadRequests = newValue.map { [$0] } ?? [] }
+    }
+    #endif
     private var interruptedDownloadRequests: [PendingDownloadRequest] = []
     private var activeUploadBatchID: UUID?
+    private var uploadFileAccess: [UUID: LocalFileAccessLease] = [:]
+    private var uploadVolumeObserver: NSObjectProtocol?
+    /// Set only while a batch is stopped waiting for its source disk to return.
+    private var uploadRemountObserver: NSObjectProtocol?
+    private var uploadBatchAwaitingVolume: UUID?
+    private var uploadSourceError: String?
     private var transferAccountID: String?
     private var transferStateReady = false
     private var transferPersistenceScheduled = false
@@ -2742,9 +3102,49 @@ final class DownloaderModel: ObservableObject {
         precondition(separate.folderMeasurements["child"]?.totalBytes == 40, "server mutation awaiting acknowledgement must not be counted twice")
         separate.operation = nil
         separate.isRunning = false
+
+        // Opening the measured folder while its scan runs records the listing
+        // but must not discard the scan (and force a full rescan) on finish.
+        let browsing = DownloaderModel(folderSizeTest: true)
+        browsing.folderMeasurementAccountID = "fixture-account"
+        let runningScan = browsing.folderSizeRevision
+        browsing.finishBrowserTreeBrowse(
+            output: #"{"files":[{"id":"child","name":"Child","size":0,"kind":"drive#folder"}],"next_page_token":""}"#,
+            folderID: "root", folderName: "Root", folderPath: "/Root", append: false,
+            sizeRevision: browsing.folderSizeRevision)
+        precondition(browsing.folderSizeIndex.listings["root"]?["child"] != nil, "first listing is indexed")
+        browsing.finishFolderMeasurement(output: report, folderID: "root", scanRevision: runningScan,
+                                         scanAccountID: "fixture-account", usedCachedSubfolders: false)
+        precondition(browsing.folderMeasurements["root"]?.totalBytes == 100, "first-time listing must not discard a scan")
+        precondition(browsing.automaticSizeRepairIDs.isEmpty && browsing.forceFullSizeRepairIDs.isEmpty,
+                     "a scan that saw no change must not be repeated")
+        // A listing that differs from the known one is a real change: the
+        // older scan result is still discarded and a repair is queued.
+        let changedScan = browsing.folderSizeRevision
+        browsing.finishBrowserTreeBrowse(
+            output: #"{"files":[{"id":"a","name":"a","size":40,"kind":"drive#file"}],"next_page_token":""}"#,
+            folderID: "child", folderName: "Child", folderPath: "/Root/Child", append: false,
+            sizeRevision: browsing.folderSizeRevision)
+        browsing.finishFolderMeasurement(output: report, folderID: "root", scanRevision: changedScan,
+                                         scanAccountID: "fixture-account", usedCachedSubfolders: true)
+        precondition(browsing.folderMeasurements["root"]?.totalBytes == 40, "a scan older than a changed listing is discarded")
+        precondition(browsing.automaticSizeRepairIDs == ["root"] && browsing.forceFullSizeRepairIDs.isEmpty)
+        browsing.folderSizeRepairTask?.cancel()
+
+        // The store reuses the document it last wrote, but a file replaced
+        // outside this process is read again.
+        try FolderMeasurementCacheStore.save([:], index: FolderSizeIndex(), for: "second-account")
+        let keptAccount = try FolderMeasurementCacheStore.account(for: "fixture-account")
+        let addedAccount = try FolderMeasurementCacheStore.account(for: "second-account")
+        precondition(keptAccount?.index == model.folderSizeIndex && addedAccount != nil)
+        try Data(#"{"version":1,"accounts":{}}"#.utf8).write(to: FolderMeasurementCacheStore.testFileURL!)
+        let replacedAccount = try FolderMeasurementCacheStore.account(for: "fixture-account")
+        precondition(replacedAccount == nil, "an externally replaced cache file must not be served from memory")
+
         separate.folderSizePersistTask?.cancel()
         reopened.folderSizePersistTask?.cancel()
         model.folderSizePersistTask?.cancel()
+        browsing.folderSizePersistTask?.cancel()
         print("PASS: native callbacks, private persistence/relaunch, account/link isolation, partial pagination and scan/browse mutation races")
     }
     #endif
@@ -2780,6 +3180,17 @@ final class DownloaderModel: ObservableObject {
     private var pendingSharedLinkLoads: [(linkID: UUID, request: ShareBrowseInput)] = []
     private let maximumConcurrentSharedLinkLoads = 4
     private var isStartingPendingSharedLinkLoads = false
+    /// Widening delays for work that stopped on its own and may succeed later.
+    /// Shared with scan recovery so every automatic wait in the app feels the
+    /// same. The final delay repeats for outages of any duration.
+    static let automaticRetryDelays = AutomaticRecovery.delays
+    private var automaticSharedLinkRetry: Task<Void, Never>?
+    private var sharedLinkRetryAttempt = 0
+    private var automaticArchiveRetries: [UUID: Task<Void, Never>] = [:]
+    private var archiveRetryAttempts: [UUID: Int] = [:]
+    private var automaticFolderMergeRetry: Task<Void, Never>?
+    private var folderMergeRetryAttempt = 0
+    private var folderMergeRetryBaseline = 0
     private var sharedLinkRetryBatchIDs = Set<UUID>()
     private var attemptedInitialBrowse = false
     private var shareAccess: ShareAccessInput?
@@ -2790,9 +3201,21 @@ final class DownloaderModel: ObservableObject {
     private var browserSortRevision = UUID()
     private var activeBrowserSortRevision: UUID?
     private var browserTreeEntriesCache: [BrowserTreeEntry]?
+    private var filteredBrowserEntriesCache: [BrowserTreeEntry]?
+    private var filteredBrowserItemsCache: [BrowserItem]?
+    private var browserFileExtensionsCache: [Bool: [String]] = [:]
+    /// Items per Browser page. PikPak accepts up to 500 for account and shared
+    /// listings (folder-tree loads already use it); each page costs one engine
+    /// launch and API round trip, so fewer, larger pages load folders faster.
+    static let browserPageSize = 500
+    private var browserFilterIncludesExpandedRows = true
+    private static let browserFolderLoadStopped = "Loading stopped before this folder's contents arrived."
 
     private func invalidateBrowserPresentation(itemsChanged: Bool) {
         browserTreeEntriesCache = nil
+        filteredBrowserEntriesCache = nil
+        filteredBrowserItemsCache = nil
+        browserFileExtensionsCache.removeAll()
         if itemsChanged { browserItemIndexCache = nil; activeBrowserSortRevision = nil }
     }
     private let sharedLinkStateQueue = DispatchQueue(
@@ -2803,6 +3226,14 @@ final class DownloaderModel: ObservableObject {
     private var automaticPreviewTargetID: String?
     private var pendingAutomaticPreviewID: String?
     private var previewSources: [PreviewSource] = []
+    private var compatiblePreviewTask: Task<Void, Never>?
+    private var compatiblePreviewCopy: VideoPreviewCopy?
+    private var previewFreshCacheRetries = Set<String>()
+    private var previewResumeRetries = Set<String>()
+    private var previewResumeSeconds: Double?
+    #if FINDER_WORKSPACE_TESTS
+    private var previewFixtureMediaURL: URL?
+    #endif
     private var previewSourceIndex = 0
     private var playerItemStatusObservation: NSKeyValueObservation?
     private var playerLoadedTimeRangesObservation: NSKeyValueObservation?
@@ -2856,6 +3287,7 @@ final class DownloaderModel: ObservableObject {
     private var downloadNetworkBaselines: [String: UInt64] = [:]
     private var downloadNetworkBytesByID: [String: UInt64] = [:]
     private var downloadFileTotalsByID: [String: UInt64] = [:]
+    private var downloadFileRates: [String: DownloadFileRate] = [:]
     private var downloadNetworkTransferredBytes: UInt64 = 0
     private var lastDownloadSpeedSampleDate: Date?
     private var lastDownloadSpeedSampleBytes: UInt64 = 0
@@ -2892,8 +3324,11 @@ final class DownloaderModel: ObservableObject {
     }
     #endif
 
-    init() {
+    init(workspaceSessionID: String = "primary", settings: FinderSettings? = nil) {
+        precondition(PikPakWorkspaceStorage.isValidSessionID(workspaceSessionID), "Invalid workspace session identifier")
+        self.workspaceSessionID = workspaceSessionID
         let defaults = UserDefaults.standard
+        finderSettings = settings ?? FinderSettings(defaults: defaults)
         let downloads = FileManager.default.urls(
             for: .downloadsDirectory,
             in: .userDomainMask
@@ -2901,9 +3336,10 @@ final class DownloaderModel: ObservableObject {
         let savedOutput = defaults.string(forKey: "outputPath")
         outputURL = savedOutput.map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? downloads.appendingPathComponent("PikPak Downloads", isDirectory: true)
-        // FinderSettings owns the unified 32-worker default. Preserve legacy
-        // preference keys on disk, but do not import conflicting old limits.
+        // Transfers choose concurrency automatically. Legacy limit preferences
+        // remain on disk for older builds but do not constrain transfers.
         proxyURL = defaults.string(forKey: "proxyURL") ?? ""
+        observeContentMode()
         shareURLInput = defaults.string(forKey: "lastShareURL") ?? ""
         browserSortColumn = defaults.string(forKey: "browserSortColumn")
             .flatMap(BrowserSortColumn.init(rawValue:)) ?? .name
@@ -2919,9 +3355,11 @@ final class DownloaderModel: ObservableObject {
             let storedSession = try SessionStore.loadIsolatedSession()
             let store = try PikPakAccountStore(directory: LocalCredentialStore.applicationSupportDirectoryURL()
                 .appendingPathComponent("Accounts", isDirectory: true))
-            let accounts = try store.migrateLegacySession(storedSession)
+            _ = try store.migrateLegacySession(storedSession)
+            let accounts = try store.registerWorkspace(self.workspaceSessionID)
             accountStore = store
             applyAccounts(accounts)
+            observeAccountStore()
             if let active = activeSavedAccount, !active.needsSignIn {
                 let session = try store.files(for: active.id).load()
                 refreshToken = session.token
@@ -2951,11 +3389,22 @@ final class DownloaderModel: ObservableObject {
         restorePersistedSharedLinks()
     }
 
+    deinit {
+        compatiblePreviewTask?.cancel()
+        if let accountStoreObservation { NotificationCenter.default.removeObserver(accountStoreObservation) }
+    }
+
     var canTestConnection: Bool {
         !isRunning && !hasExclusiveBackgroundTask
             && hasUsableSession
     }
     var isBrowsingSharedLink: Bool { browserSource == .sharedLink }
+    var showsSharedLinkOverview: Bool { isBrowsingSharedLink && browserStack.count <= 1 }
+    var browserPresentationIdentity: String {
+        if showsSharedLinkOverview { return "shared-links" }
+        let source = isBrowsingSharedLink ? "share:\(activeSharedLinkID?.uuidString ?? "")" : "account"
+        return "\(source)|\(currentBrowserPath)"
+    }
     var isMaintenanceScanRunning: Bool {
         isRemovingEmptyFolders || isRemovingDSStoreFiles
     }
@@ -3004,16 +3453,14 @@ final class DownloaderModel: ObservableObject {
     /// Extraction runs on PikPak and never occupies this local work lane.
     /// Source-specific checks protect an archive while unrelated work continues.
     private var hasExclusiveBackgroundTask: Bool {
-        hasOtherBackgroundActivity
+        isScanningDuplicates || isMaintenanceScanRunning || isMeasuringFolder || isMergingFolders
     }
 
     /// A running folder measurement may accept more independently keyed scans
     /// into its own queue. Other transfer/maintenance work still prevents a
     /// new recursive scan from being scheduled.
     private var hasNonMeasurementBackgroundTask: Bool {
-        isDownloading
-            || isUploading
-            || isScanningDuplicates
+        isScanningDuplicates
             || isMaintenanceScanRunning
             || isMergingFolders
     }
@@ -3077,23 +3524,15 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
-    func isSharedLinkExpanded(_ linkID: UUID) -> Bool {
+    /// Links are permanent section headers. Only real folders have disclosure
+    /// state; a legacy collapsed-link preference must never hide its contents.
+    func sharedLinkHasContents(_ linkID: UUID) -> Bool {
         guard
-            expandedSharedLinkIDs.contains(linkID),
             let entry = sharedLinks.first(where: { $0.id == linkID }),
             entry.state == .ready,
             sharedLinkSessions[linkID]?.workspace != nil
         else { return false }
         return true
-    }
-
-    func setSharedLinkExpanded(_ linkID: UUID, expanded: Bool) {
-        if expanded {
-            expandedSharedLinkIDs.insert(linkID)
-        } else {
-            expandedSharedLinkIDs.remove(linkID)
-        }
-        persistSharedLinkState()
     }
 
     /// Every added URL owns a complete cached Browser workspace. Returning a
@@ -3131,7 +3570,7 @@ final class DownloaderModel: ObservableObject {
         if section == 3 {
             if sharedLinks.count >= 50 { return true }
             var count = 0
-            for link in sharedLinks where expandedSharedLinkIDs.contains(link.id) {
+            for link in sharedLinks where sharedLinkHasContents(link.id) {
                 let workspace = sharedLinkSessions[link.id]?.workspace
                 count += workspace?.presentation.entries?.count ?? workspace?.items.count ?? 0
                 if count >= 2_000 { return true }
@@ -3272,6 +3711,11 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
+    private func accountPreviewArguments(for item: BrowserItem) -> [String] {
+        let parent = item.parentId ?? browserNavigationStack(opening: item).dropLast().last?.id ?? ""
+        return ["preview", "--id", item.id, "--parent-id", parent]
+    }
+
     private func fileOpenConfiguration(for item: BrowserItem) throws -> FinderFileOpenConfiguration {
         #if FINDER_WORKSPACE_TESTS
         if isFinderWorkspaceFixture {
@@ -3287,7 +3731,7 @@ final class DownloaderModel: ObservableObject {
         var environment = try engineEnvironment()
         let proxy = proxyURL.trimmingCharacters(in: .whitespacesAndNewlines)
         environment["PIKPAK_PROXY"] = proxy.isEmpty ? nil : proxy
-        var arguments = ["preview", "--id", item.id]
+        var arguments = accountPreviewArguments(for: item)
         var requestData: Data?
         if isBrowsingSharedLink {
             guard let shareAccess, shareLinkIsOpen else { throw CocoaError(.fileReadNoPermission) }
@@ -3342,7 +3786,7 @@ final class DownloaderModel: ObservableObject {
     var canUploadFiles: Bool {
         UploadAvailability.allowsStart(
             hasSession: hasUsableSession && transferStateReady && !isClosingWindow,
-            uploadActive: isUploading || uploadProcess?.isRunning == true,
+            uploadActive: false,
             conflictingMutation: isMergingFolders || isRemovingEmptyFolders
                 || isRemovingDSStoreFiles,
             foregroundAllows: foregroundOperationAllowsConcurrentUpload
@@ -3381,7 +3825,7 @@ final class DownloaderModel: ObservableObject {
 
     /// Downloads own a dedicated process. A valid row therefore remains
     /// actionable while browsing, previews, scans, uploads, or another download
-    /// are active; additional batches are serialized by the download queue.
+    /// are active; new selections enter the same continuous download queue.
     var canQueueBrowserDownload: Bool {
         hasActiveBrowserAccess && hasUsableSession
     }
@@ -3514,7 +3958,7 @@ final class DownloaderModel: ObservableObject {
     var browserDropAccountID: String? { transferAccountID }
 
     private var hasConflictingBrowserMoveTask: Bool {
-        isUploading || isMergingFolders || isMaintenanceScanRunning
+        isMergingFolders || isMaintenanceScanRunning
     }
 
     func browserDropDestination(for item: BrowserItem) -> BrowserLocation? {
@@ -3530,7 +3974,6 @@ final class DownloaderModel: ObservableObject {
         guard !isBrowsingSharedLink else { return "Shared links are read-only. Drop into the Browser instead." }
         guard !isClosingWindow, !isLoginPresented, hasUsableSession else { return "Sign in before dropping files into PikPak." }
         if payload == .upload {
-            if isUploading { return "An upload is already running. Wait for it to finish before adding another upload." }
             if !canUploadFiles { return "Uploads are temporarily unavailable while a folder change finishes." }
             return nil
         }
@@ -3672,8 +4115,15 @@ final class DownloaderModel: ObservableObject {
         pendingDownloadItems.count
     }
 
+    var preparingDownloadItems: [PendingDownloadItem] {
+        guard isDownloading else { return [] }
+        return activeDownloadRequests.flatMap(\.pendingItems).filter {
+            liveDownloadRun ? discoveringDownloadRequestIDs.contains($0.id) : downloadRunState == .scanning
+        }
+    }
+
     var canStartPendingDownloads: Bool {
-        !pendingDownloadRequests.isEmpty
+        (!pendingDownloadRequests.isEmpty || !interruptedDownloadRequests.isEmpty)
             && downloadProcess?.isRunning != true
             && !isDownloading
             && hasUsableSession
@@ -3803,13 +4253,64 @@ final class DownloaderModel: ObservableObject {
         return entries
     }
 
-    var visibleBrowserItemCount: Int {
-        browserTreeEntries.count
+    var activeBrowserFileFilter: BrowserFileFilter { isBrowsingSharedLink ? .all : browserFileFilter }
+
+    var displayedBrowserTreeEntries: [BrowserTreeEntry] {
+        guard activeBrowserFileFilter.isActive else { return browserTreeEntries }
+        if let filteredBrowserEntriesCache { return filteredBrowserEntriesCache }
+        let entries = browserTreeEntries.filter { browserFileFilter.matches($0.item) }
+        filteredBrowserEntriesCache = entries
+        return entries
+    }
+
+    var displayedBrowserItems: [BrowserItem] {
+        guard activeBrowserFileFilter.isActive else { return browserItems }
+        if let filteredBrowserItemsCache { return filteredBrowserItemsCache }
+        let items = browserItems.filter { browserFileFilter.matches($0) }
+        filteredBrowserItemsCache = items
+        return items
+    }
+
+    /// The filter bar asks on every Browser render. Recompute only when the
+    /// listing or the expanded outline changes, not for every progress tick.
+    func availableBrowserFileExtensions(includingExpanded: Bool) -> [String] {
+        if let cached = browserFileExtensionsCache[includingExpanded] { return cached }
+        let items = includingExpanded ? browserTreeEntries.map(\.item) : browserItems
+        let extensions = Array(Set(items.filter { !$0.isFolder }.map(\.normalizedFileExtension))).sorted()
+        browserFileExtensionsCache[includingExpanded] = extensions
+        return extensions
+    }
+
+    var visibleBrowserItemCount: Int { displayedBrowserTreeEntries.count }
+
+    /// Folders stay visible under a filter, so the filter bar counts the files
+    /// that actually matched rather than every row on screen.
+    func displayedBrowserFileCount(includingExpanded: Bool) -> Int {
+        let items = includingExpanded ? displayedBrowserTreeEntries.map(\.item) : displayedBrowserItems
+        return items.lazy.filter { !$0.isFolder }.count
+    }
+
+    func setBrowserFilterViewMode(includingExpanded: Bool) {
+        guard browserFilterIncludesExpandedRows != includingExpanded else { return }
+        browserFilterIncludesExpandedRows = includingExpanded
+        if activeBrowserFileFilter.isActive { clearBrowserSelectionFromCanvas() }
+    }
+
+    private var browserFilterSelectionItems: [BrowserItem] {
+        activeBrowserFileFilter.isActive && !browserFilterIncludesExpandedRows
+            ? displayedBrowserItems : displayedBrowserTreeEntries.map(\.item)
+    }
+
+    private func isBrowserFilterSelectionVisible(_ item: BrowserItem) -> Bool {
+        guard activeBrowserFileFilter.isActive else { return true }
+        return browserFileFilter.matches(item)
+            && (browserFilterIncludesExpandedRows || browserItems.contains { $0.id == item.id })
     }
 
     var selectedBrowserItem: BrowserItem? {
         guard let selectedBrowserItemID else { return nil }
-        return browserItem(withID: selectedBrowserItemID)
+        guard let item = browserItem(withID: selectedBrowserItemID), isBrowserFilterSelectionVisible(item) else { return nil }
+        return item
     }
 
     /// The footer follows selection through expanded rows, not just folders
@@ -3825,7 +4326,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     var selectedBrowserItems: [BrowserItem] {
-        selectedBrowserItemIDs.compactMap { browserItem(withID: $0) }
+        selectedBrowserItemIDs.compactMap { browserItem(withID: $0) }.filter { isBrowserFilterSelectionVisible($0) }
     }
 
     /// A folder selection is one recursive action root. Any explicitly selected
@@ -3923,6 +4424,7 @@ final class DownloaderModel: ObservableObject {
     /// scrolling must not flatten every expanded tree to count a selection.
     private var sharedBrowserSelectionGroups: [SharedBrowserSelectionGroup] {
         sharedLinks.compactMap { link in
+            if isBrowsingSharedLink, !showsSharedLinkOverview, activeSharedLinkID != link.id { return nil }
             if isBrowsingSharedLink, activeSharedLinkID == link.id {
                 let items = browserItemActionRoots
                 return items.isEmpty ? nil : .init(linkID: link.id, items: items)
@@ -3975,7 +4477,7 @@ final class DownloaderModel: ObservableObject {
         guard let linkID = activeSharedLinkID else { return }
         let target = SharedBrowserSelectionAnchor(linkID: linkID, itemID: item.id)
         let anchor = sharedBrowserSelectionAnchor ?? target
-        let visible = sortedSharedLinks.filter { isSharedLinkExpanded($0.id) }.flatMap { link in
+        let visible = sortedSharedLinks.filter { sharedLinkHasContents($0.id) }.flatMap { link in
             sharedLinkTreeEntries(for: link.id).map {
                 SharedBrowserSelectionAnchor(linkID: link.id, itemID: $0.item.id)
             }
@@ -4052,6 +4554,59 @@ final class DownloaderModel: ObservableObject {
         BrowserLocation(id: item.id, name: item.name, path: browserPath(for: item))
     }
 
+    func bookmarkLocations(for item: BrowserItem) -> [FinderBookmarkLocation] {
+        browserNavigationStack(opening: item).dropFirst().dropLast().map {
+            .init(id: $0.id, name: $0.name, path: $0.path)
+        }
+    }
+
+    /// Opening a file bookmark reveals the real current listing and selects
+    /// the file. It does not request a preview or download the file's contents.
+    @discardableResult
+    func openBookmark(_ bookmark: FinderBookmark, store requestedStore: FinderBookmarkStore? = nil) -> Bool {
+        guard bookmark.provider == "pikpak", bookmark.scope == bookmarkScope,
+              canOpenBookmarks, !isLoginPresented, !isClosingWindow,
+              activateAccountBrowser() else { return false }
+        let store = requestedStore ?? .shared
+        bookmarkNavigationTask?.cancel()
+        _ = cancelQuickLook()
+        cancelAutomaticPreviewNavigation()
+        clearPreview()
+        browserFileFilter = .all
+        var stack = [BrowserLocation.root] + bookmark.parents.map { BrowserLocation(id: $0.id, name: $0.name, path: $0.path) }
+        if bookmark.isFolder {
+            stack.append(.init(id: bookmark.itemID, name: bookmark.name, path: bookmark.path))
+        }
+        if let item = selectedBrowserItem { rememberBrowserPosition(beforeOpening: item) }
+        loadFolder(stack: stack, append: false)
+        guard !bookmark.isFolder else { return true }
+        let parentID = stack.last?.id ?? ""
+        bookmarkNavigationTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                var pages = Set<String>()
+                while true {
+                    while self.isRunning { try await Task.sleep(nanoseconds: 40_000_000) }
+                    try Task.checkCancellation()
+                    guard self.bookmarkScope == bookmark.scope, !self.isBrowsingSharedLink,
+                          self.browserStack.last?.id == parentID, !self.isClosingWindow else { return }
+                    if let item = self.browserItems.first(where: { $0.id == bookmark.itemID }) {
+                        self.updateBrowserSelection(to: item, requestsPreview: false)
+                        self.browserScrollRestoreRequest = BrowserScrollRestoreRequest(itemID: item.id, focusesBrowser: true)
+                        if let updated = self.bookmark(item) { store.add(updated) }
+                        return
+                    }
+                    guard !self.statusIsError, let token = self.nextPageToken, !token.isEmpty, pages.insert(token).inserted else {
+                        if !self.statusIsError { self.setError("This bookmarked file is no longer in its saved folder. Find it in Browser to update the bookmark, or remove it from Bookmarks.") }
+                        return
+                    }
+                    self.loadMoreBrowserItems()
+                }
+            } catch { }
+        }
+        return true
+    }
+
     /// Selecting a new Finder-style header sorts ascending. Clicking the
     /// active header reverses it. The preference is shared by account and
     /// link browsers and survives relaunches.
@@ -4076,9 +4631,10 @@ final class DownloaderModel: ObservableObject {
         toggling: Bool = false,
         visibleItems: [BrowserItem]? = nil
     ) {
-        guard canChangeBrowserSelection else { return }
+        guard canChangeBrowserSelection, isBrowserFilterSelectionVisible(item) else { return }
+        prefetchFolderThumbnails(for: item)
         if extending {
-            if isBrowsingSharedLink { extendSharedBrowserSelection(to: item) }
+            if showsSharedLinkOverview { extendSharedBrowserSelection(to: item) }
             else { extendBrowserSelection(to: item, visibleItems: visibleItems) }
         } else if toggling {
             toggleBrowserSelection(of: item)
@@ -4091,7 +4647,8 @@ final class DownloaderModel: ObservableObject {
     /// without holding Command. A checked folder represents its complete remote
     /// subtree, including descendants that have not been loaded into the UI.
     func toggleBrowserCheckbox(_ item: BrowserItem) {
-        guard canChangeBrowserSelection else { return }
+        guard canChangeBrowserSelection, isBrowserFilterSelectionVisible(item) else { return }
+        prefetchFolderThumbnails(for: item)
         if let containingSelectionID = selectionRootID(containing: item.id) {
             // A folder is one recursive selection root. Remove the complete
             // explicit subtree as well, including any stale child roots that
@@ -4122,12 +4679,58 @@ final class DownloaderModel: ObservableObject {
         setBrowserSelectionStatus()
     }
 
+    private var focusedBrowserToggleFolder: BrowserItem? {
+        guard canChangeBrowserSelection, let selectedBrowserItem,
+              displayedBrowserTreeEntries.contains(where: { $0.id == selectedBrowserItem.id }) else { return nil }
+        if selectedBrowserItem.isFolder { return selectedBrowserItem }
+        guard let parentID = browserItemParentIDs[selectedBrowserItem.id],
+              expandedBrowserFolderIDs.contains(parentID),
+              displayedBrowserTreeEntries.contains(where: { $0.id == parentID }) else { return nil }
+        return browserItem(withID: parentID)
+    }
+
+    var canToggleFocusedBrowserFolder: Bool { focusedBrowserToggleFolder != nil }
+    var focusedBrowserFolderToggleTitle: String {
+        guard let folder = focusedBrowserToggleFolder else { return "Expand or Collapse Folder" }
+        return expandedBrowserFolderIDs.contains(folder.id) ? "Collapse Folder" : "Expand Folder"
+    }
+
+    func toggleFocusedBrowserFolder() {
+        guard let folder = focusedBrowserToggleFolder else { return }
+        toggleBrowserFolderExpansion(folder)
+        if let selectedBrowserItemID {
+            browserScrollRestoreRequest = BrowserScrollRestoreRequest(itemID: selectedBrowserItemID)
+        }
+    }
+
+    private func restoreCollapsedBrowserFolderFocus() {
+        guard let remembered = collapsedBrowserFolderFocus, remembered.reopening else { return }
+        guard remembered.context == fileOpenContext, remembered.linkID == activeSharedLinkID,
+              remembered.locationID == browserStack.last?.id, selectedBrowserItemID == remembered.folderID,
+              expandedBrowserFolderIDs.contains(remembered.folderID) else {
+            collapsedBrowserFolderFocus = nil
+            return
+        }
+        if let item = displayedBrowserTreeEntries.first(where: { $0.id == remembered.itemID })?.item {
+            updateBrowserSelection(to: item)
+            browserScrollRestoreRequest = BrowserScrollRestoreRequest(itemID: item.id)
+        } else if browserTreeChildren[remembered.folderID] != nil,
+                  browserItem(withID: remembered.itemID) == nil {
+            collapsedBrowserFolderFocus = nil
+        }
+    }
+
     func toggleBrowserFolderExpansion(_ item: BrowserItem) {
         guard item.isFolder else { return }
 
         if expandedBrowserFolderIDs.contains(item.id) {
+            let focusedChild = selectedBrowserItem.flatMap { selected in
+                isBrowserItem(selected.id, descendantOf: item.id) ? selected : nil
+            }
+            collapsedBrowserFolderFocus = nil
             if let expansion = browserFolderExpansion,
-               expansion.contains(item.id) || isBrowserItem(expansion.rootID, descendantOf: item.id) {
+               expansion.contains(item.id)
+                   || expansion.rootIDs.contains(where: { isBrowserItem($0, descendantOf: item.id) }) {
                 cancelBrowserFolderExpansion(announcesResult: false)
             }
             setBrowserFolderExpanded(item.id, expanded: false)
@@ -4137,6 +4740,12 @@ final class DownloaderModel: ObservableObject {
             }
             cancelAutomaticPreviewNavigation()
             clearFolderMeasurement()
+            if let focusedChild {
+                updateBrowserSelection(to: item)
+                browserScrollRestoreRequest = BrowserScrollRestoreRequest(itemID: item.id)
+                collapsedBrowserFolderFocus = (item.id, focusedChild.id, fileOpenContext,
+                    activeSharedLinkID, browserStack.last?.id ?? "", false)
+            }
             setStatus("Collapsed \(item.name)")
             if isBrowsingSharedLink {
                 saveActiveBrowserWorkspace()
@@ -4144,15 +4753,61 @@ final class DownloaderModel: ObservableObject {
             return
         }
 
+        if collapsedBrowserFolderFocus?.folderID == item.id {
+            collapsedBrowserFolderFocus?.reopening = true
+        } else {
+            collapsedBrowserFolderFocus = nil
+        }
         setBrowserFolderExpanded(item.id, expanded: true)
         if browserTreeChildren[item.id] != nil {
             setStatus("Expanded \(item.name)")
         } else {
-            requestBrowserTreeLoad(item, append: false)
+            if !requestBrowserTreeLoad(item, append: false) {
+                browserTreeLoadErrors[item.id] = browserTreeLoadErrors[item.id] ?? "This folder could not be opened."
+            }
         }
+        resumeUnloadedBrowserFolders(in: item, retryStopped: true)
+        restoreCollapsedBrowserFolderFocus()
         if isBrowsingSharedLink {
             saveActiveBrowserWorkspace()
         }
+    }
+
+    /// Command-A checks every folder in the folder on screen and leaves the
+    /// files alone, so the selection can feed Expand All Levels and the other
+    /// folder-only actions. Folders nested inside expanded rows keep their own
+    /// selection state; this is the listing the user is looking at.
+    @discardableResult
+    func selectAllBrowserFolders() -> Int {
+        guard canChangeBrowserSelection, !showsSharedLinkOverview else { return 0 }
+        let folders = displayedBrowserItems.filter(\.isFolder)
+        guard let first = folders.first else {
+            setStatus("No folders in \(browserStack.last?.name ?? "this folder")")
+            return 0
+        }
+        selectedBrowserItemIDs = Set(folders.map(\.id))
+        browserSelectionAnchorID = first.id
+        if isBrowsingSharedLink, let linkID = activeSharedLinkID {
+            sharedBrowserSelectionAnchor = .init(linkID: linkID, itemID: first.id)
+        }
+        updateBrowserSelection(to: first, replacingSelection: false)
+        setBrowserSelectionStatus()
+        return folders.count
+    }
+
+    /// Up and Down inside the preview pane step one file at a time, in the
+    /// order on screen, the way Quick Look's arrows do — the same step in List
+    /// and in Thumbnails, where the grid's own arrows move by a whole row.
+    /// Selection drives the pane, so the file stepped to starts loading on its
+    /// own. Deliberately not gated on a preview being on screen: selecting the
+    /// next file clears the old preview before the new one loads, and a folder
+    /// in the way loads none at all, so either gate would strand the arrows
+    /// after a single press.
+    @discardableResult
+    func movePreviewSelection(by offset: Int) -> String? {
+        guard let target = selectAdjacentBrowserItem(by: offset) else { return nil }
+        browserScrollRestoreRequest = BrowserScrollRestoreRequest(itemID: target)
+        return target
     }
 
     func retryBrowserTreeFolder(_ item: BrowserItem) {
@@ -4177,9 +4832,18 @@ final class DownloaderModel: ObservableObject {
     /// One level opens the selected folder and its immediate subfolders.
     /// nil means all levels. Existing deeper disclosures are never collapsed.
     func expandBrowserSubfolders(_ item: BrowserItem, levels: Int? = 1) {
-        guard item.isFolder, hasActiveBrowserAccess, levels.map({ $0 > 0 }) ?? true else { return }
+        expandBrowserSubfolders([item], levels: levels)
+    }
+
+    /// Every selected folder expands under one plan, so the progress bar,
+    /// Cancel and the bounded helper lane stay shared. A folder already
+    /// reached as another root's descendant is opened once, not twice.
+    func expandBrowserSubfolders(_ items: [BrowserItem], levels: Int? = 1) {
+        var seen = Set<String>()
+        let roots = items.filter { $0.isFolder && seen.insert($0.id).inserted }
+        guard !roots.isEmpty, hasActiveBrowserAccess, levels.map({ $0 > 0 }) ?? true else { return }
         cancelBrowserFolderExpansion(announcesResult: false)
-        let plan = BrowserFolderExpansionPlan(rootID: item.id, rootName: item.name, levels: levels)
+        let plan = BrowserFolderExpansionPlan(roots: roots.map { ($0.id, $0.name) }, levels: levels)
         browserFolderExpansion = plan
         browserFolderExpansionProgress = plan.progress
         setStatus(plan.progress.summary)
@@ -4197,6 +4861,9 @@ final class DownloaderModel: ObservableObject {
         for folderID in activeIDs { cancelBrowserTreeLoad(folderID) }
         for folderID in queuedIDs where !isActivelyLoadingBrowserTreeFolder(folderID) {
             browserTreeLoadingFolderIDs.remove(folderID)
+        }
+        for folderID in Set(queuedIDs + activeIDs) where browserTreeChildren[folderID] == nil {
+            browserTreeLoadErrors[folderID] = Self.browserFolderLoadStopped
         }
         browserFolderExpansionProgress = nil
         if announcesResult {
@@ -4326,6 +4993,21 @@ final class DownloaderModel: ObservableObject {
     var loginDeviceID: String { accountLoginDeviceID ?? deviceID }
 
     var activeSavedAccount: SavedPikPakAccount? { savedAccounts.first { $0.id == activeAccountID } }
+    var activeCredentialKind: PikPakCredentialKind { activeSavedAccount?.connectionKind ?? .desktopOAuth }
+    var savedAccountGroups: [PikPakAccountGroup] { PikPakAccountGroup.grouped(savedAccounts) }
+    var activeAccountGroup: PikPakAccountGroup? { savedAccountGroups.first { $0.id == activeSavedAccount?.groupID } }
+
+    func selectPikPakConnection(_ kind: PikPakCredentialKind, accountID: UUID? = nil, fromSettings: Bool = false) {
+        let targetID = accountID ?? activeAccountID
+        let group = savedAccountGroups.first { $0.connections.contains { $0.id == targetID } }
+        if let saved = group?.connection(kind) {
+            if saved.needsSignIn || (saved.id == activeAccountID && !hasAccountSession) {
+                beginAccountLogin(accountID: saved.id, credentialKind: kind, fromSettings: fromSettings)
+            } else { switchAccount(to: saved.id, fromSettings: fromSettings) }
+        } else {
+            beginAccountLogin(accountID: targetID, credentialKind: kind, fromSettings: fromSettings)
+        }
+    }
     var hasAccountSession: Bool { hasToken && !requiresDedicatedSignIn }
     var canChangeAccount: Bool { accountStore != nil && !isClosingWindow && !accountWorkIsActive && !isCheckingAccount && !isChangingAccount && !isLoginPresented }
     var canCheckAccountStatus: Bool { hasAccountSession && !isClosingWindow && !isCheckingAccount && !isChangingAccount && !isLoginPresented }
@@ -4333,11 +5015,13 @@ final class DownloaderModel: ObservableObject {
         if isClosingWindow { return "Reopen MyCloudDriver to manage accounts." }
         if accountWorkIsActive { return "Finish or stop active transfers, scans and file requests before changing accounts." }
         if isChangingAccount { return "Checking the account before switching…" }
+        if isCheckingAccount { return "Checking your connection…" }
+        if isLoginPresented { return "Finish or cancel the current sign-in first." }
         return nil
     }
 
     private var accountWorkIsActive: Bool {
-        isRunning || hasBackgroundActivity || isSavingSharedItems
+        isManagingCloudItems || isRunning || hasBackgroundActivity || isSavingSharedItems
             || !sharedLinkLoadProcesses.isEmpty || !sharedSaveProcesses.isEmpty || !browserTreeLoadProcesses.isEmpty
             || !pendingSharedLinkLoads.isEmpty || sharedLinkRetryProgress != nil
             || !archiveProcesses.isEmpty || !pendingBrowserMoves.isEmpty || !pendingSharedSaveRequests.isEmpty
@@ -4347,7 +5031,60 @@ final class DownloaderModel: ObservableObject {
 
     private func applyAccounts(_ document: PikPakAccountsDocument) {
         savedAccounts = document.accounts
-        activeAccountID = document.activeID
+        activeAccountID = document.activeID(for: workspaceSessionID)
+    }
+
+    private func observeAccountStore() {
+        guard accountStoreObservation == nil else { return }
+        accountStoreObservation = NotificationCenter.default.addObserver(forName: PikPakAccountStore.didChange,
+            object: nil, queue: .main) { [weak self] notification in
+            guard let changed = notification.object as? PikPakAccountStore else { return }
+            let directory = changed.directory
+            Task { @MainActor [weak self] in
+                guard let self, !self.isClosingWindow, let store = self.accountStore,
+                      store.directory == directory, let document = try? store.load() else { return }
+                self.refreshWorkspaceAccountMetadata(document)
+            }
+        }
+    }
+
+    private func refreshWorkspaceAccountMetadata(_ document: PikPakAccountsDocument) {
+        let previous = activeAccountID
+        savedAccounts = document.accounts
+        let selectedID = document.activeID(for: workspaceSessionID)
+        guard selectedID != previous else {
+            if let selected = activeSavedAccount {
+                if selected.needsSignIn {
+                    pikpakManagement.clear()
+                    requiresDedicatedSignIn = true
+                    accountLoginStatus = .needsSignIn
+                    transferQuotaMonitor.clear()
+                } else if selected.profile?.sub == accountProfile?.sub {
+                    accountProfile = selected.profile
+                }
+            }
+            return
+        }
+        // Another workspace may reauthenticate or log out this same account.
+        // Refresh future request credentials without stopping captured helper
+        // processes or replacing another workspace's browser/transfer state.
+        activeAccountID = selectedID
+        pikpakManagement.clear()
+        transferQuotaMonitor.clear()
+        if let selected = activeSavedAccount, !selected.needsSignIn,
+           let session = try? accountStore?.files(for: selected.id).load() {
+            refreshToken = session.token
+            deviceID = session.deviceID
+            accountProfile = selected.profile
+            requiresDedicatedSignIn = false
+            accountLoginStatus = .unverified
+        } else {
+            refreshToken = ""
+            deviceID = ""
+            accountProfile = nil
+            requiresDedicatedSignIn = activeSavedAccount?.needsSignIn == true
+            accountLoginStatus = requiresDedicatedSignIn ? .needsSignIn : .signedOut
+        }
     }
 
     private func rememberVerifiedAccount(_ profile: PikPakAccountProfile) {
@@ -4400,25 +5137,35 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
-    func beginAccountLogin(accountID: UUID? = nil) {
+    func beginAccountLogin(accountID: UUID? = nil, credentialKind: PikPakCredentialKind? = nil, fromSettings: Bool = true) {
         guard canChangeAccount else { accountSettingsError = accountChangeBlockedReason; return }
+        loginCredentialKind = credentialKind ?? savedAccounts.first(where: { $0.id == accountID })?.credentialKind ?? .desktopOAuth
         accountSettingsError = nil
         accountLoginTargetID = accountID
         // A fresh device identity belongs to the new desktop authorization.
         accountLoginDeviceID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        loginFromSettings = true
+        loginFromSettings = fromSettings
+        if loginCredentialKind == .personalAccessToken {
+            presentLogin(reason: "Connect with a token you create in PikPak’s Connected Apps page.", fromSettings: fromSettings, preserveConnectionChoice: true)
+            return
+        }
+        let loginDevice = accountLoginDeviceID
         isChangingAccount = true
         PikPakLoginDataStore.clearPikPakWebsiteData { [weak self] in
-            guard let self, !self.isClosingWindow else { return }
+            guard let self, !self.isClosingWindow, self.accountLoginDeviceID == loginDevice else { return }
             self.isChangingAccount = false
-            self.presentLogin(reason: accountID == nil ? "Sign in to add a PikPak account to this Mac." : "Sign in to reconnect this PikPak account.", fromSettings: true)
+            self.presentLogin(reason: accountID == nil ? "Sign in to add a PikPak account to this Mac." : "Sign in to connect normal login for this PikPak account. Your saved token is kept.", fromSettings: fromSettings, preserveConnectionChoice: true)
         }
     }
 
-    func switchAccount(to id: UUID) {
+    func beginPersonalAccessTokenLogin() {
+        beginAccountLogin(accountID: activeAccountID, credentialKind: .personalAccessToken)
+    }
+
+    func switchAccount(to id: UUID, fromSettings: Bool = true) {
         guard id != activeAccountID, canChangeAccount, let store = accountStore,
               let selected = savedAccounts.first(where: { $0.id == id }) else { return }
-        if selected.needsSignIn { beginAccountLogin(accountID: id); return }
+        if selected.needsSignIn { beginAccountLogin(accountID: id, fromSettings: fromSettings); return }
         accountSettingsError = nil
         isCheckingAccount = true
         isChangingAccount = true
@@ -4439,7 +5186,7 @@ final class DownloaderModel: ObservableObject {
                 if let expected = selected.profile?.sub, expected != profile.sub { throw PikPakAccountError.accountMismatch }
                 _ = try store.updateProfile(profile, for: id)
                 let session = try files.load() // Includes any token rotated by verification.
-                let document = try store.activate(id)
+                let document = try store.activate(id, workspaceSessionID: self.workspaceSessionID)
                 self.finishAccountChange(document, session: session, profile: profile)
             } catch {
                 guard !Task.isCancelled, !self.isClosingWindow else { return }
@@ -4464,27 +5211,29 @@ final class DownloaderModel: ObservableObject {
             setStatus("Logged out of PikPak on this Mac")
         } catch {
             accountSettingsError = error.localizedDescription
-            if let updated = try? store.load(), updated.activeID != id {
+            if let updated = try? store.load(), updated.activeID(for: workspaceSessionID) != id {
                 clearAccountWorkspace(); applyAccounts(updated)
                 refreshToken = ""; requiresDedicatedSignIn = false; accountLoginStatus = .signedOut
             }
         }
     }
 
-    private func verifyAccount(_ files: PikPakAccountSessionFiles) async throws -> PikPakAccountProfile {
+    private func verifyAccount(_ files: PikPakAccountSessionFiles, using verifier: PikPakAccountVerifier? = nil) async throws -> PikPakAccountProfile {
         #if FINDER_WORKSPACE_TESTS
         if let accountProfileLoader { return try await accountProfileLoader(files) }
         #endif
         guard let engine = Bundle.main.url(forResource: "pikpak", withExtension: nil) else { throw PikPakAccountError.unavailable }
         let session = try files.load()
-        var environment = desktopEngineEnvironment(tokenURL: files.tokenURL, lockURL: files.lockURL, deviceID: session.deviceID)
+        var environment = desktopEngineEnvironment(tokenURL: files.tokenURL, lockURL: files.lockURL, deviceID: session.deviceID, credentialKind: session.credentialKind)
         let proxy = proxyURL.trimmingCharacters(in: .whitespacesAndNewlines)
         environment["PIKPAK_PROXY"] = proxy.isEmpty ? nil : proxy
-        return try await accountVerifier.verify(engineURL: engine, environment: environment)
+        return try await (verifier ?? accountVerifier).verify(engineURL: engine, environment: environment)
     }
 
     private func clearAccountWorkspace() {
+        pikpakManagement.clear()
         pendingSharedLinkLoads = []
+        cancelAutomaticSharedLinkRetry(resettingAttempts: true)
         sharedLinkRetryBatchIDs = []
         sharedLinkRetryProgress = nil
         sharedBrowserSelectionAnchor = nil
@@ -4494,7 +5243,11 @@ final class DownloaderModel: ObservableObject {
         lastAccountDownloadPaths = []; lastSharedDownloadItems = []
         lastSharedDownloadAccess = nil; lastDownloadUsedSharedLink = false
         downloadSharedAccessByFileID = [:]
+        downloadRequestIDsByFileID = [:]
+        downloadSourceFileIDs = [:]
+        downloadProxyByFileID = [:]
         resetUploadProgress(destination: .root); uploadRunState = .ready; uploadDestination = nil
+        cancelAutomaticRecoveryTasks()
         mergeRequestedFolders = []; mergeDestination = nil; mergeCompletedSourceIDs = []
         resetFolderMergeProgress(sourceCount: 0, status: "No folder merge has been started.")
         duplicateScannedFiles = 0; duplicateScannedFolders = 0; duplicateDiscoveredFolders = 0
@@ -4515,13 +5268,14 @@ final class DownloaderModel: ObservableObject {
         extractionActivity.showsActivity = false
         extractionActivity.passwordPresentationIsClosing = false
         fileSearch.reset(); pendingFileSearchNavigation = nil
+        bookmarkNavigationTask?.cancel(); bookmarkNavigationTask = nil
         cancelBrowserTreeLoads(); cancelAutomaticPreviewNavigation()
         clearPreview(); clearPreviewResourceCaches()
         accountBrowserWorkspace = nil; sharedBrowserWorkspace = nil
         browserSource = .account
         resetBrowserWorkspace(root: .root)
         shareAccess = nil; shareLinkIsOpen = false
-        expandedSharedLinkIDs = []; selectedSharedLinkRootID = nil
+        selectedSharedLinkRootID = nil
         for index in sharedLinks.indices {
             let id = sharedLinks[index].id
             sharedLinks[index].savedItemCount = 0
@@ -4533,11 +5287,12 @@ final class DownloaderModel: ObservableObject {
         }
         persistSharedLinkStateSynchronously()
         storageQuota = nil; storageQuotaError = nil; isQuotaLoading = false; quotaRefreshPending = false
+        transferQuotaMonitor.clear()
         duplicateScan = nil; selectedDuplicateFileIDs = []
         attemptedInitialBrowse = false
     }
 
-    private func finishAccountChange(_ document: PikPakAccountsDocument, session: (token: String, deviceID: String), profile: PikPakAccountProfile) {
+    private func finishAccountChange(_ document: PikPakAccountsDocument, session: PikPakAccountSession, profile: PikPakAccountProfile) {
         clearAccountWorkspace()
         applyAccounts(document)
         refreshToken = session.token; deviceID = session.deviceID
@@ -4682,6 +5437,10 @@ final class DownloaderModel: ObservableObject {
         resumingBatch: SavedUploadBatch? = nil
     ) -> Bool {
         guard canUploadFiles, !files.isEmpty else { return false }
+        let access = LocalFileAccessLease(files, bookmarks: resumingBatch?.sourceBookmarks ?? [:])
+        let sourceVolumes: [String: String]
+        do { sourceVolumes = try LocalFileAccess.validateUploadSources(files, volumes: resumingBatch?.sourceVolumes ?? [:]) }
+        catch { setError(error.localizedDescription); return false }
         #if BROWSER_DROP_TESTS
         if isBrowserDropFixture {
             recordedDropUploads.append((files, destination))
@@ -4696,8 +5455,11 @@ final class DownloaderModel: ObservableObject {
             workers: resolvedUploadConcurrentJobs, createdAt: Date()
         )
         // A resumed process is a new run. Keep its identity/checkpoints but use
-        // the current shared limit, just like a waiting download batch.
+        // the current automatic transfer limit.
         batch.workers = resolvedUploadConcurrentJobs
+        batch.automaticallyResume = true
+        batch.sourceVolumes = sourceVolumes
+        batch.sourceBookmarks = (batch.sourceBookmarks ?? [:]).merging(LocalFileAccess.uploadBookmarks(files), uniquingKeysWith: { _, new in new })
         let checkpointDirectory: URL
         do {
             checkpointDirectory = try transferStore().uploadDirectory(accountID: accountID, batchID: batch.id)
@@ -4709,6 +5471,13 @@ final class DownloaderModel: ObservableObject {
             savedUploadBatches[index] = batch
         } else { savedUploadBatches.append(batch) }
         guard persistTransfersSynchronously() else { return false }
+        uploadFileAccess[batch.id] = access
+        if isUploading || uploadProcess?.isRunning == true {
+            automaticUploadBatchIDs.insert(batch.id)
+            setStatus("Upload queued. It will start after the current upload batch.")
+            return true
+        }
+        automaticUploadBatchIDs.remove(batch.id)
         activeUploadBatchID = batch.id
         resetUploadProgress(
             destination: destination,
@@ -4760,7 +5529,10 @@ final class DownloaderModel: ObservableObject {
         )
     }
 
-    func stopUpload() {
+    func stopUpload() { stopUpload(automatic: false) }
+    private func stopUpload(automatic: Bool) {
+        automaticUploadRetry?.cancel(); automaticUploadRetry = nil
+        if !automatic, let id = activeUploadBatchID { setUploadResumeIntent(id, enabled: false) }
         guard isUploading, let uploadProcess, uploadProcess.isRunning else { return }
         uploadRequestedStop = true
         if isUploadPaused {
@@ -4776,36 +5548,83 @@ final class DownloaderModel: ObservableObject {
         uploadProcess.terminate()
     }
 
-    func pauseUpload() {
-        guard canPauseUpload, let uploadProcess else { return }
-        uploadStateBeforePause = effectiveActiveUploadState()
-        guard uploadProcess.suspend() else {
-            setError("The upload could not be paused. It is still running.")
-            return
-        }
-        isUploadPaused = true
-        uploadRunState = .paused
-        uploadBytesPerSecond = 0
-        uploadHashBytesPerSecond = 0
-        resetUploadSpeedBaseline()
-        if !isRunning {
-            setStatus("Upload paused. You can continue browsing your PikPak files.")
+    private func watchUploadDisk() {
+        stopWatchingUploadDisk()
+        // An upload that is running supersedes any wait for a reconnected disk.
+        stopWatchingUploadRemount()
+        uploadSourceError = nil
+        uploadVolumeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didUnmountNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.checkUploadDisk() }
         }
     }
 
+    private func checkUploadDisk() {
+        guard isUploading, let batch = savedUploadBatches.first(where: { $0.id == activeUploadBatchID }) else { return }
+        do {
+            _ = try LocalFileAccess.validateUploadSources(batch.sources.map { URL(fileURLWithPath: $0) }, volumes: batch.sourceVolumes ?? [:])
+        } catch {
+            uploadSourceError = error.localizedDescription
+            let interrupted = activeUploadBatchID
+            stopUpload(automatic: true)
+            if let interrupted { watchUploadRemount(batchID: interrupted) }
+            setError("Upload paused. \(error.localizedDescription) It continues on its own once the disk is reconnected.")
+        }
+    }
+
+    /// A batch stopped by a disconnected source waits for that disk to return
+    /// rather than for a click. Only the interrupted batch resumes, and only
+    /// once its own sources validate, so an unrelated disk changes nothing.
+    private func watchUploadRemount(batchID: UUID) {
+        uploadBatchAwaitingVolume = batchID
+        guard uploadRemountObserver == nil else { return }
+        uploadRemountObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didMountNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.resumeUploadAfterRemount() }
+        }
+    }
+
+    private func stopWatchingUploadRemount() {
+        if let observer = uploadRemountObserver { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        uploadRemountObserver = nil
+        uploadBatchAwaitingVolume = nil
+    }
+
+    private func resumeUploadAfterRemount() {
+        guard let batchID = uploadBatchAwaitingVolume, !isUploading, uploadProcess?.isRunning != true,
+              let batch = savedUploadBatches.first(where: { $0.id == batchID }) else { return }
+        do {
+            _ = try LocalFileAccess.validateUploadSources(batch.sources.map { URL(fileURLWithPath: $0) },
+                                                          volumes: batch.sourceVolumes ?? [:])
+        } catch { return }
+        stopWatchingUploadRemount()
+        uploadSourceError = nil
+        setStatus("Upload source reconnected. Continuing the saved upload.")
+        resumeSavedUpload(batchID)
+    }
+
+    private func stopWatchingUploadDisk() {
+        if let observer = uploadVolumeObserver { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        uploadVolumeObserver = nil
+    }
+
+    func pauseUpload() {
+        guard canPauseUpload else { return }
+        uploadStateBeforePause = effectiveActiveUploadState()
+        isUploadPaused = true; uploadRunState = .paused
+        if let id = activeUploadBatchID { setUploadResumeIntent(id, enabled: false) }
+        uploadBytesPerSecond = 0; uploadHashBytesPerSecond = 0
+        writeUploadControls(); resetUploadSpeedBaseline()
+        setStatus("Upload paused. You can continue browsing.")
+    }
     func resumeUpload() {
-        guard canResumeUpload, let uploadProcess else { return }
-        guard uploadProcess.resume() else {
-            setError("The paused upload could not be resumed.")
-            return
-        }
-        isUploadPaused = false
+        guard canResumeUpload else { return }
+        isUploadPaused = false; writeUploadControls()
+        if let id = activeUploadBatchID { setUploadResumeIntent(id, enabled: true) }
         uploadRunState = uploadStateBeforePause == .uploading ? .uploading : effectiveActiveUploadState()
-        resetUploadSpeedBaseline()
-        ensureTransferMetricsTask()
-        if !isRunning {
-            setStatus(uploadRunState == .uploading ? "Upload resumed" : "Preparing files after pause…")
-        }
+        resetUploadSpeedBaseline(); ensureTransferMetricsTask()
     }
 
     func testConnection() {
@@ -4826,6 +5645,32 @@ final class DownloaderModel: ObservableObject {
         isQuotaLoading = true
         quotaRefreshPending = true
         startPendingQuotaRefreshIfNeeded()
+    }
+
+    /// Traffic polling is independent of foreground work and never starts a
+    /// sign-in flow or replaces a transfer's progress/error message.
+    func refreshTransferQuota(force: Bool = false) async {
+        #if FINDER_WORKSPACE_TESTS
+        if isFinderWorkspaceFixture { return }
+        #endif
+        guard hasUsableSession, !isChangingAccount, !isLoginPresented, !isClosingWindow,
+              let accountID = activeSavedAccount?.profile?.sub ?? accountProfile?.sub else { return }
+        guard let engine = Bundle.main.url(forResource: "pikpak", withExtension: nil) else {
+            transferQuotaMonitor.unavailable()
+            return
+        }
+        do {
+            var environment = try engineEnvironment()
+            let proxy = proxyURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            environment["PIKPAK_PROXY"] = proxy.isEmpty ? nil : proxy
+            if let snapshot = await transferQuotaMonitor.refresh(engineURL: engine, environment: environment,
+                                                                  accountID: accountID, connectionID: activeAccountID, force: force) {
+                storageQuota = snapshot.storage
+                storageQuotaError = nil
+            }
+        } catch {
+            transferQuotaMonitor.unavailable()
+        }
     }
 
     /// Switch between the account browser and the read-only public-link
@@ -4913,7 +5758,6 @@ final class DownloaderModel: ObservableObject {
         )
         activeSharedLinkID = linkID
         selectedSharedLinkRootID = linkID
-        expandedSharedLinkIDs.insert(linkID)
         shareAccess = access
         shareLinkIsOpen = false
         pendingSharedLinkOpenAfterLogin = false
@@ -4929,7 +5773,7 @@ final class DownloaderModel: ObservableObject {
             access: access,
             parentId: nil,
             pageToken: nil,
-            limit: 200
+            limit: Self.browserPageSize
         )
         runInitialSharedLinkLoad(linkID: linkID, request: request)
     }
@@ -4961,7 +5805,6 @@ final class DownloaderModel: ObservableObject {
         }
 
         activeSharedLinkID = linkID
-        expandedSharedLinkIDs.insert(linkID)
         shareAccess = session.access
         sharedBrowserWorkspace = session.workspace
         shareLinkIsOpen = entry.state == .ready && session.workspace != nil
@@ -5005,6 +5848,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     func retrySharedLink(_ linkID: UUID) {
+        cancelAutomaticSharedLinkRetry(resettingAttempts: true)
         guard !isRunning, !isClosingWindow, !isChangingAccount,
               sharedLinkLoadProcesses[linkID] == nil,
               !pendingSharedLinkLoads.contains(where: { $0.linkID == linkID }),
@@ -5020,7 +5864,6 @@ final class DownloaderModel: ObservableObject {
         }
         session.workspace = nil
         sharedLinkSessions[linkID] = session
-        expandedSharedLinkIDs.insert(linkID)
         sharedBrowserWorkspace = nil
         shareAccess = session.access
         shareLinkIsOpen = false
@@ -5032,14 +5875,16 @@ final class DownloaderModel: ObservableObject {
             access: session.access,
             parentId: nil,
             pageToken: nil,
-            limit: 200
+            limit: Self.browserPageSize
         )
         runInitialSharedLinkLoad(linkID: linkID, request: request)
     }
 
     /// Snapshot failed roots once. Preparing their requests together preserves
     /// the active workspace and prevents another click from enqueuing duplicates.
-    func retryAllFailedSharedLinks() {
+    func retryAllFailedSharedLinks(automatic: Bool = false) {
+        // Clicking Retry is the user taking over, which returns the budget.
+        if !automatic { cancelAutomaticSharedLinkRetry(resettingAttempts: true) }
         guard canRetryFailedSharedLinks else { return }
         guard hasUsableSession else {
             setShareLinkFeedback("Sign in, then choose Retry Failed Links.", tone: .info)
@@ -5063,9 +5908,8 @@ final class DownloaderModel: ObservableObject {
             session.workspace = nil
             sharedLinkSessions[id] = session
             sharedLinks[index].state = .loading
-            expandedSharedLinkIDs.insert(id)
             pendingSharedLinkLoads.append((id, ShareBrowseInput(
-                access: session.access, parentId: nil, pageToken: nil, limit: 200
+                access: session.access, parentId: nil, pageToken: nil, limit: Self.browserPageSize
             )))
         }
         if isBrowsingSharedLink, let activeSharedLinkID, sharedLinkRetryBatchIDs.contains(activeSharedLinkID) {
@@ -5096,6 +5940,10 @@ final class DownloaderModel: ObservableObject {
         sharedLinkRetryBatchIDs = []
         sharedLinkRetryProgress = nil
         guard !isClosingWindow else { return }
+        // Any link that opened proves the connection came back, so the budget
+        // returns; whatever is still failing gets the next wait.
+        if opened > 0 { sharedLinkRetryAttempt = 0 }
+        if failed > 0 { scheduleAutomaticSharedLinkRetry() }
         var message = "Retry complete: \(opened.formatted()) opened, \(failed.formatted()) still failed."
         if removed > 0 { message += " \(removed.formatted()) disconnected." }
         setShareLinkFeedback(message, tone: failed > 0 ? .error : .success)
@@ -5207,7 +6055,6 @@ final class DownloaderModel: ObservableObject {
         pendingSharedSaveRequests.removeAll { $0.linkID == linkID }
         savingSharedItemIDsByLinkID.removeValue(forKey: linkID)
         removeSharedLinkMeasurements(linkID)
-        expandedSharedLinkIDs.remove(linkID)
         if selectedSharedLinkRootID == linkID {
             selectedSharedLinkRootID = nil
         }
@@ -5254,8 +6101,8 @@ final class DownloaderModel: ObservableObject {
 
     private func restorePersistedSharedLinks() {
         do {
-            guard let document = try SharedLinksStateStore.load() else {
-                restorePendingSharedLinkURLMigration()
+            guard let document = try SharedLinksStateStore.load(workspaceSessionID: workspaceSessionID) else {
+                if workspaceSessionID == "primary" { restorePendingSharedLinkURLMigration() }
                 return
             }
             guard document.version == SharedLinksStateStore.schemaVersion else { return }
@@ -5297,7 +6144,6 @@ final class DownloaderModel: ObservableObject {
             sharedLinks = restoredEntries
             sharedLinkSessions = restoredSessions
             let restoredIDs = Set(restoredEntries.map(\.id))
-            expandedSharedLinkIDs = document.expandedLinkIDs.intersection(restoredIDs)
             activeSharedLinkID = document.activeLinkID.flatMap {
                 restoredIDs.contains($0) ? $0 : nil
             } ?? restoredEntries.first?.id
@@ -5319,6 +6165,10 @@ final class DownloaderModel: ObservableObject {
                     "Restored \(restoredEntries.count.formatted()) saved shared link(s) from local state.\n"
                 )
             }
+            // Links that were open before the app closed reload on their own.
+            // Their saved access codes came back with them, so no prompt is
+            // needed; links migrated without a code keep their manual Retry.
+            scheduleAutomaticSharedLinkRetry()
         } catch {
             appendOutput(
                 "Warning: saved shared links could not be restored: \(error.localizedDescription)\n"
@@ -5402,7 +6252,7 @@ final class DownloaderModel: ObservableObject {
             selectedRootLinkID: selectedSharedLinkRootID.flatMap {
                 persistedIDs.contains($0) ? $0 : nil
             },
-            expandedLinkIDs: expandedSharedLinkIDs.intersection(persistedIDs),
+            expandedLinkIDs: persistedIDs,
             records: records,
             usesUnifiedSelection: true
         )
@@ -5419,9 +6269,10 @@ final class DownloaderModel: ObservableObject {
         if isFileSearchFixture { return }
         #endif
         let document = persistedSharedLinksDocument()
+        let workspaceSessionID = self.workspaceSessionID
         sharedLinkStateQueue.async { [weak self] in
             do {
-                try SharedLinksStateStore.save(document)
+                try SharedLinksStateStore.save(document, workspaceSessionID: workspaceSessionID)
             } catch {
                 Task { @MainActor [weak self] in
                     self?.appendOutput(
@@ -5445,7 +6296,7 @@ final class DownloaderModel: ObservableObject {
         let document = persistedSharedLinksDocument()
         do {
             try sharedLinkStateQueue.sync {
-                try SharedLinksStateStore.save(document)
+                try SharedLinksStateStore.save(document, workspaceSessionID: workspaceSessionID)
             }
         } catch {
             appendOutput(
@@ -5566,6 +6417,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func restoreBrowserWorkspace(_ snapshot: BrowserWorkspaceSnapshot) {
+        collapsedBrowserFolderFocus = nil
         cancelBrowserTreeLoads()
         browserItems = snapshot.items
         browserStack = snapshot.stack
@@ -5584,6 +6436,13 @@ final class DownloaderModel: ObservableObject {
         browserItemIndexCache = snapshot.presentation.itemIndex
         browserTreeEntriesCache = snapshot.presentation.entriesSortRevision == browserSortRevision ? snapshot.presentation.entries : nil
         normalizeBrowserSelectionRoots()
+        if activeBrowserFileFilter.isActive {
+            selectedBrowserItemIDs = Set(selectedBrowserItems.map(\.id))
+            if selectedBrowserItemID != nil, selectedBrowserItem == nil {
+                self.selectedBrowserItemID = selectedBrowserItems.first?.id
+                browserSelectionAnchorID = self.selectedBrowserItemID
+            }
+        }
         if snapshot.presentation.sortRevision == browserSortRevision {
             activeBrowserSortRevision = browserSortRevision
         } else {
@@ -5591,6 +6450,7 @@ final class DownloaderModel: ObservableObject {
         }
         browserScrollRestoreRequest = nil
         pendingBrowserTreeLoads = []
+        resumeUnloadedBrowserFolders()
     }
 
     private func resetBrowserWorkspace(root: BrowserLocation) {
@@ -5626,6 +6486,7 @@ final class DownloaderModel: ObservableObject {
             return
         }
         loginFromSettings = false
+        loginCredentialKind = activeSavedAccount?.credentialKind ?? .desktopOAuth
         accountLoginTargetID = activeAccountID
         accountLoginDeviceID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         let reason: String
@@ -5642,9 +6503,9 @@ final class DownloaderModel: ObservableObject {
     func completeWebLogin(with session: PikPakWebSession) {
         guard !isClosingWindow, !isCheckingAccount, !isChangingAccount, let store = accountStore else { return }
         do {
-            let parsed = try CredentialParser.refreshToken(from: session.refreshToken)
+            let parsed = try session.credentialKind.parse(session.refreshToken)
             let newDeviceID = session.deviceID.isEmpty ? loginDeviceID : session.deviceID
-            let files = try store.stage(token: parsed, deviceID: newDeviceID)
+            let files = try store.stage(token: parsed, deviceID: newDeviceID, credentialKind: session.credentialKind)
             let expected = savedAccounts.first { $0.id == accountLoginTargetID }?.profile?.sub
             let generation = UUID()
             accountCheckGeneration = generation
@@ -5669,7 +6530,7 @@ final class DownloaderModel: ObservableObject {
                     guard self.accountCheckGeneration == generation, !self.isClosingWindow else { return }
                     if let expected, profile.sub != expected { throw PikPakAccountError.accountMismatch }
                     let freshSession = try files.load()
-                    let document = try store.commit(files, profile: profile, checkedAt: Date())
+                    let document = try store.commit(files, profile: profile, checkedAt: Date(), workspaceSessionID: self.workspaceSessionID)
                     committed = true
                     self.finishAccountChange(document, session: freshSession, profile: profile)
                     PikPakLoginDataStore.clearPikPakWebsiteData()
@@ -5689,6 +6550,9 @@ final class DownloaderModel: ObservableObject {
         isLoginPresented = false
         accountLoginDeviceID = nil
         accountLoginTargetID = nil
+        // Preparing WebKit has no verification task to release this state.
+        // Its delayed callback is invalidated by clearing the device above.
+        if accountCheckTask == nil { isChangingAccount = false }
         cancelAccountCheck()
         if pendingSharedLinkOpenAfterLogin {
             pendingSharedLinkOpenAfterLogin = false
@@ -5702,6 +6566,8 @@ final class DownloaderModel: ObservableObject {
     func cancelAccountCheck() {
         accountCheckTask?.cancel()
         accountVerifier.cancel()
+        sessionRecoveryTask?.cancel()
+        sessionRecoveryVerifier.cancel()
         if accountLoginStatus == .checking { accountLoginStatus = hasAccountSession ? .unverified : .signedOut }
     }
 
@@ -5711,8 +6577,12 @@ final class DownloaderModel: ObservableObject {
         loadFolder(stack: [.root], append: false, includeQuota: true)
     }
 
+    /// A refresh re-reads the folder already on screen. Uploads, Undo and
+    /// background file changes all land here, so tearing the outline down
+    /// would collapse every folder the user had opened. Only a move to
+    /// another location resets it.
     func refreshBrowser() {
-        loadFolder(stack: browserStack, append: false, includeQuota: true)
+        loadFolder(stack: browserStack, append: false, includeQuota: true, preserveOutline: true)
     }
 
     /// Command-F uses only the rendered outline (including all expanded links).
@@ -5722,9 +6592,9 @@ final class DownloaderModel: ObservableObject {
         if scope == .expanded {
             fileSearch.present(scope: .expanded,
                 expandedItems: currentExpandedSearchItems(
-                    includesExpandedChildren: isBrowsingSharedLink
-                        || UserDefaults.standard.integer(forKey: "browserViewMode") != 1),
-                contextName: isBrowsingSharedLink ? "Expanded links" : "Browser · \(currentBrowserPath)")
+                    includesExpandedChildren: showsSharedLinkOverview
+                        || UserDefaults.standard.integer(forKey: isBrowsingSharedLink ? "linksViewMode" : "browserViewMode") != 1),
+                contextName: showsSharedLinkOverview ? "Links" : "\(isBrowsingSharedLink ? "Links" : "Browser") · \(currentBrowserPath)")
             return
         }
         guard hasUsableSession else {
@@ -5771,10 +6641,13 @@ final class DownloaderModel: ObservableObject {
             }
         }
         if isBrowsingSharedLink {
-            return sharedLinks.filter { isSharedLinkExpanded($0.id) }.flatMap { link in
+            return sharedLinks.filter { sharedLinkHasContents($0.id) && (showsSharedLinkOverview || $0.id == activeSharedLinkID) }.flatMap { link in
                 let stack = activeSharedLinkID == link.id
                     ? browserStack : (sharedLinkSessions[link.id]?.workspace?.stack ?? [.sharedRoot])
-                return matches(sharedLinkTreeEntries(for: link.id), stack: stack,
+                let entries = !showsSharedLinkOverview && !includesExpandedChildren
+                    ? browserItems.map { BrowserTreeEntry(item: $0, depth: 0) }
+                    : sharedLinkTreeEntries(for: link.id)
+                return matches(entries, stack: stack,
                                linkID: link.id, sourceName: link.url)
             }
         }
@@ -5791,6 +6664,7 @@ final class DownloaderModel: ObservableObject {
             return
         }
         pendingFileSearchNavigation = nil
+        browserFileFilter = .all
         if let linkID = navigation.match.linkID {
             guard sharedLinkSessions[linkID]?.workspace != nil,
                   sharedLinks.contains(where: { $0.id == linkID }) else {
@@ -5800,7 +6674,6 @@ final class DownloaderModel: ObservableObject {
             // Avoid restoring a stale saved snapshot over the active link's
             // live tree. Other expanded link roots remain untouched.
             if !isBrowsingSharedLink || activeSharedLinkID != linkID { activateSharedLink(linkID) }
-            expandedSharedLinkIDs.insert(linkID)
         } else if isBrowsingSharedLink {
             saveActiveBrowserWorkspace()
             _ = cancelQuickLook()
@@ -5900,6 +6773,7 @@ final class DownloaderModel: ObservableObject {
 
     func openFolder(_ item: BrowserItem) {
         guard item.isFolder, !isRunning else { return }
+        if isBrowsingSharedLink { clearInactiveSharedBrowserSelections() }
         let targetStack = browserNavigationStack(opening: item)
         rememberBrowserPosition(beforeOpening: item)
         rememberIntermediateBrowserPositions(in: targetStack)
@@ -5928,6 +6802,10 @@ final class DownloaderModel: ObservableObject {
     }
 
     func browserSelectionChanged() {
+        if selectedBrowserItemID != nil && selectedBrowserItem == nil && activeBrowserFileFilter.isActive {
+            clearBrowserSelection()
+            return
+        }
         if let selectedBrowserItemID {
             if !isBrowserItemSelected(selectedBrowserItemID) {
                 selectedBrowserItemIDs = [selectedBrowserItemID]
@@ -5968,7 +6846,7 @@ final class DownloaderModel: ObservableObject {
     ) -> String? {
         guard offset != 0, canChangeBrowserSelection else { return nil }
 
-        let visibleItems = suppliedVisibleItems ?? browserTreeEntries.map(\.item)
+        let visibleItems = suppliedVisibleItems ?? browserFilterSelectionItems
         guard !visibleItems.isEmpty else { return nil }
         let startIndex: Int
         if let selectedBrowserItemID,
@@ -5983,7 +6861,7 @@ final class DownloaderModel: ObservableObject {
 
         let item = visibleItems[index]
         if extendingSelection {
-            if isBrowsingSharedLink { extendSharedBrowserSelection(to: item) }
+            if showsSharedLinkOverview { extendSharedBrowserSelection(to: item) }
             else { extendBrowserSelection(to: item, visibleItems: visibleItems) }
         } else {
             updateBrowserSelection(to: item)
@@ -6004,6 +6882,7 @@ final class DownloaderModel: ObservableObject {
         }
         #endif
         guard !item.isFolder, !isRunning else { return }
+        previewRequestContentMode = finderSettings.contentMode
         cancelAutomaticPreviewNavigation()
         clearPreview(preservingResourceCacheFor: item.id)
         // Keep the requested item associated with any engine/API failure so
@@ -6021,7 +6900,7 @@ final class DownloaderModel: ObservableObject {
             )
         } else {
             runEngine(
-                arguments: ["preview", "--id", item.id],
+                arguments: accountPreviewArguments(for: item),
                 operation: .preview(fileID: item.id)
             )
         }
@@ -6389,14 +7268,18 @@ final class DownloaderModel: ObservableObject {
                 )
             )
         } else {
+            // "Calculate" reuses clean cached subfolder sizes, which the Browser
+            // already shows; "Recalculate" (a size exists) relists everything.
+            let reusesCachedSubfolders = cachedFolderMeasurement(for: item.id) == nil
             runFolderMeasurementEngine(
-                arguments: ["measure", "--id", item.id],
+                arguments: ["measure", "--id", item.id] + (reusesCachedSubfolders ? ["--use-size-cache"] : []),
                 operation: .measure(folderID: item.id)
             )
         }
     }
 
     func cancelFolderMeasurement() {
+        cancelOperationRetries(prefix: "measure:")
         guard isMeasuringFolder,
               let folderMeasurementProcess,
               folderMeasurementProcess.isRunning
@@ -6435,6 +7318,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     func cancelDuplicateScan() {
+        cancelOperationRetries(prefix: "duplicates")
         #if FINDER_WORKSPACE_TESTS
         if isFinderWorkspaceFixture, isScanningDuplicates {
             isScanningDuplicates = false
@@ -6504,9 +7388,54 @@ final class DownloaderModel: ObservableObject {
         )
     }
 
+    func trashSimilarityFile(_ file: SimilarityFile) async throws {
+        let confirmed = try await trashSimilarityFiles([file], keeping: [])
+        guard confirmed.contains(file.id) else {
+            throw CloudDriveError.message("PikPak did not confirm that this file was moved to Trash.")
+        }
+    }
+    private func trashSimilarityFiles(_ files: [SimilarityFile], keeping keepers: [SimilarityFile]) async throws -> Set<String> {
+        guard !files.isEmpty, (files + keepers).allSatisfy({ file in
+            guard let id = file.cloudId, !id.isEmpty else { return false }
+            return fileSimilarity.cloud.results.index?.byID[file.id]?.cloudId == id
+        }), Set(files.compactMap(\.cloudId)).isDisjoint(with: Set(keepers.compactMap(\.cloudId))) else {
+            throw CloudDriveError.message("This result no longer belongs to the current PikPak scan. Open the file’s account and scan again.")
+        }
+        let ids = files.compactMap(\.cloudId)
+        guard canPerformFileUndo, pendingSimilarityTrash == nil else {
+            throw CloudDriveError.message("Wait for the current PikPak file change to finish, then try again. Check that this account is signed in.")
+        }
+        fileSimilarity.preview.close(); cancelAutomaticPreviewNavigation(); _ = cancelQuickLook()
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Set<String>, Error>) in
+            pendingSimilarityTrash = (files, keepers, fileSimilarity.cloud.results.sessionToken, { continuation.resume(with: $0) })
+            #if FINDER_WORKSPACE_TESTS
+            if isFinderWorkspaceFixture {
+                operation = .trashBrowserItems(ids: ids); isRunning = true
+                let output = try! JSONSerialization.data(withJSONObject: ["trashed_ids": ids])
+                let response = similarityTrashFixtureResponse
+                finishProcess(exitCode: response?.exitCode ?? 0, structuredOutput: response?.output ?? String(decoding: output, as: UTF8.self),
+                              errorOutput: response?.error ?? "")
+                return
+            }
+            #endif
+            runEngine(arguments: ["trash", "--yes"], operation: .trashBrowserItems(ids: ids))
+            if !isRunning { completeSimilarityTrash(.failure(CloudDriveError.message(statusIsError ? status : "PikPak could not start this file change. Try again."))) }
+        }
+    }
+    private func completeSimilarityTrash(_ result: Result<Set<String>, Error>) {
+        let completion = pendingSimilarityTrash?.completion
+        pendingSimilarityTrash = nil
+        completion?(result)
+    }
+    private func synchronizeSimilarityTrash(_ changes: [FinderFileMutation]) {
+        let trash = changes.filter { $0.kind == .trash }
+        fileSimilarity.cloud.results.setCloudFilesTrashed(Set(trash.filter { $0.after == "true" }.map(\.fileId)), true)
+        fileSimilarity.cloud.results.setCloudFilesTrashed(Set(trash.filter { $0.after == "false" }.map(\.fileId)), false)
+    }
+
     private var canPerformFileUndo: Bool {
-        hasUsableSession && !isRunning && !isUploading && !isChangingAccount
-            && !isClosingWindow && !isLoginPresented && !hasExclusiveBackgroundTask
+        hasUsableSession && !isRunning && !isChangingAccount
+            && !isClosingWindow && !isLoginPresented && !isManagingCloudItems && !hasExclusiveBackgroundTask
             && !hasConflictingBrowserMoveTask && pendingBrowserMoves.isEmpty
             && !archiveTasks.contains(where: \.isBusy)
             && fileUndoHistory.active == nil
@@ -6536,10 +7465,13 @@ final class DownloaderModel: ObservableObject {
     private func recordTrashUndo(ids: [String], title: String = "Move to Trash") {
         let mutations = ids.map { id in
             let item = browserItem(withID: id)
+            let scanned = pendingSimilarityTrash?.files.first { $0.cloudId == id }
             return FinderFileMutation(fileId: id, kind: .trash, before: "false", after: "true",
-                parentId: item.flatMap { accountSizeParent(of: $0) }, name: item?.name)
+                parentId: scanned.map { $0.ancestors.last?.id ?? "" } ?? item.flatMap { accountSizeParent(of: $0) },
+                name: scanned?.name ?? item?.name)
         }
         fileUndoHistory.record(FinderUndoEntry(title: title, mutations: mutations))
+        pikpakManagement.fileTrashChanged(mutations)
     }
 
     private func recordCreatedUploadItem(id: String, parentID: String, name: String?, folder: Bool) {
@@ -6557,10 +7489,12 @@ final class DownloaderModel: ObservableObject {
                 throw CocoaError(.fileReadCorruptFile)
             }
             let applied = fileUndoHistory.finish(completed: result.completed)
+            pikpakManagement.fileTrashChanged(applied)
+            synchronizeSimilarityTrash(applied)
             let removed = Set(applied.filter { $0.kind == .trash && $0.after == "true" }.map(\.fileId))
             var parents = Set(applied.compactMap(\.parentId))
             for change in applied where change.kind == .move { parents.formUnion([change.before, change.after]) }
-            removeCachedAccountBrowserItems(withIDs: removed, invalidatingFolders: parents)
+            removeCachedAccountBrowserItems(withIDs: removed, invalidatingFolders: parents, preservingExpansion: true)
             recordFolderSizeChange(in: parents)
             duplicateScan = nil; selectedDuplicateFileIDs = []
             if let error = result.error {
@@ -6784,6 +7718,7 @@ final class DownloaderModel: ObservableObject {
         guard folders.contains(where: { $0.id != destination.id }) else { return false }
 
         cancelAutomaticPreviewNavigation()
+        cancelAutomaticFolderMergeRetry(resettingAttempts: true)
         mergeRequestedFolders = folders
         mergeDestination = destination
         mergeCompletedSourceIDs = []
@@ -6795,7 +7730,43 @@ final class DownloaderModel: ObservableObject {
         return true
     }
 
-    func retryFolderMerge() {
+    /// A merge that stopped on a transient PikPak error picks up the folders it
+    /// has not moved yet. Progress between failures returns the budget, so a
+    /// long merge that stumbles repeatedly still finishes on its own.
+    private func scheduleAutomaticFolderMergeRetry() {
+        guard !isClosingWindow, automaticFolderMergeRetry == nil else { return }
+        if mergeCompletedSourceIDs.count > folderMergeRetryBaseline { folderMergeRetryAttempt = 0 }
+        folderMergeRetryBaseline = mergeCompletedSourceIDs.count
+        let delay = AutomaticRecovery.delay(attempt: folderMergeRetryAttempt)
+        folderMergeRetryAttempt = AutomaticRecovery.nextAttempt(folderMergeRetryAttempt)
+        automaticFolderMergeRetry = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            self.automaticFolderMergeRetry = nil
+            guard !self.isClosingWindow else { return }
+            guard self.hasUsableSession, self.canRetryFolderMerge else {
+                self.scheduleAutomaticFolderMergeRetry(); return
+            }
+            self.retryFolderMerge(automatic: true)
+        }
+    }
+
+    private func cancelAutomaticFolderMergeRetry(resettingAttempts: Bool) {
+        automaticFolderMergeRetry?.cancel(); automaticFolderMergeRetry = nil
+        if resettingAttempts { folderMergeRetryAttempt = 0; folderMergeRetryBaseline = 0 }
+    }
+
+    private func cancelAutomaticRecoveryTasks() {
+        cancelOperationRetries(prefix: "")
+        transferSaveRetry?.cancel(); transferSaveRetry = nil
+        for task in automaticArchiveRetries.values { task.cancel() }
+        automaticArchiveRetries.removeAll(); archiveRetryAttempts.removeAll()
+        cancelAutomaticFolderMergeRetry(resettingAttempts: true)
+    }
+
+    func retryFolderMerge(automatic: Bool = false) {
+        // Clicking Retry Remaining is the user taking over, budget and all.
+        if !automatic { cancelAutomaticFolderMergeRetry(resettingAttempts: true) }
         guard canRetryFolderMerge, let destination = mergeDestination else { return }
         let remainingSources = mergeRequestedFolders.filter {
             $0.id != destination.id && !mergeCompletedSourceIDs.contains($0.id)
@@ -6812,6 +7783,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     func cancelFolderMerge() {
+        cancelAutomaticFolderMergeRetry(resettingAttempts: true)
         guard isMergingFolders, let mergeProcess, mergeProcess.isRunning else { return }
         mergeWasCancelled = true
         taskActivity.stopping(.folderMerge, message: "Cancelling folder merge…")
@@ -7003,6 +7975,38 @@ final class DownloaderModel: ObservableObject {
     private func updateArchiveTask(_ id: UUID, _ update: (inout CloudExtractionTask) -> Void) {
         guard let index = archiveTasks.firstIndex(where: { $0.id == id }) else { return }
         update(&archiveTasks[index])
+        let task = archiveTasks[index]
+        if task.error != nil { scheduleAutomaticArchiveRetry(id) }
+        else if task.isBusy || task.isComplete {
+            cancelAutomaticArchiveRetry(id, resettingAttempts: task.isComplete)
+        }
+    }
+
+    /// An extraction that failed on a transient PikPak error retries on its own.
+    /// A task waiting for a password is never retried — only the user can supply
+    /// that. Other interrupted inspections keep a capped retry delay.
+    private func scheduleAutomaticArchiveRetry(_ id: UUID) {
+        guard !isClosingWindow, automaticArchiveRetries[id] == nil,
+              let task = archiveTasks.first(where: { $0.id == id }),
+              task.error != nil, !task.isBusy, !task.needsPassword, !task.isComplete else { return }
+        let attempt = archiveRetryAttempts[id] ?? 0
+        archiveRetryAttempts[id] = AutomaticRecovery.nextAttempt(attempt)
+        let delay = AutomaticRecovery.delay(attempt: attempt)
+        automaticArchiveRetries[id] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            self.automaticArchiveRetries[id] = nil
+            guard !self.isClosingWindow,
+                  let current = self.archiveTasks.first(where: { $0.id == id }),
+                  current.error != nil, !current.isBusy, !current.needsPassword, !current.isComplete else { return }
+            guard self.hasUsableSession else { self.scheduleAutomaticArchiveRetry(id); return }
+            self.retryArchiveTask(id, automatic: true)
+        }
+    }
+
+    private func cancelAutomaticArchiveRetry(_ id: UUID, resettingAttempts: Bool) {
+        automaticArchiveRetries[id]?.cancel(); automaticArchiveRetries[id] = nil
+        if resettingAttempts { archiveRetryAttempts[id] = nil }
     }
 
     /// Each inspection gets its own helper and private password request.
@@ -7140,7 +8144,9 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
-    func retryArchiveTask(_ id: UUID) {
+    func retryArchiveTask(_ id: UUID, automatic: Bool = false) {
+        // Clicking Retry is the user taking over, which returns the budget.
+        if !automatic { cancelAutomaticArchiveRetry(id, resettingAttempts: true) }
         guard let task = archiveTasks.first(where: { $0.id == id }), !task.isBusy else { return }
         if task.needsPassword { requestArchivePassword(id); return }
         // Re-inspect after failures because an archive may need its password
@@ -7158,12 +8164,14 @@ final class DownloaderModel: ObservableObject {
 
     func removeArchiveTask(_ id: UUID) {
         guard let task = archiveTasks.first(where: { $0.id == id }), !task.isInspecting, !task.isExtracting else { return }
+        cancelAutomaticArchiveRetry(id, resettingAttempts: true)
         if extractionActivity.passwordRequest?.taskID == id { extractionActivity.passwordRequest = nil }
         archiveTasks.removeAll { $0.id == id }
         if selectedArchiveTaskID == id { selectedArchiveTaskID = archiveTasks.last?.id }
     }
 
     func cancelArchiveInspection(_ id: UUID) {
+        cancelAutomaticArchiveRetry(id, resettingAttempts: true)
         if archiveTasks.first(where: { $0.id == id })?.queuedAction != nil {
             updateArchiveTask(id) {
                 $0.queuedAction = nil; $0.extractWhenReady = false; $0.phase = "Cancelled"
@@ -7211,6 +8219,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     func cancelMaintenanceScan() {
+        cancelOperationRetries(prefix: "maintenance")
         guard isMaintenanceScanRunning,
               let maintenanceProcess,
               maintenanceProcess.isRunning
@@ -7312,7 +8321,7 @@ final class DownloaderModel: ObservableObject {
         for item in requestedItems {
             itemsByPath[browserPath(for: item)] = item
         }
-        let relativeParents = DownloadQueueBatching.relativeParents(for: paths)
+        let relativeParents = DownloadDestinationLayout.relativeParents(for: paths)
         let roots = paths.enumerated().map { index, path in
             let item = itemsByPath[path]
             let inferredName = (path as NSString).lastPathComponent
@@ -7321,7 +8330,7 @@ final class DownloaderModel: ObservableObject {
                 path: path,
                 name: item?.name ?? (inferredName.isEmpty ? path : inferredName),
                 kind: item?.kind ?? .file,
-                file: item.map { AccountDownloadCachedFile(id: $0.id, name: $0.name, size: String($0.size), kind: $0.kind) },
+                file: item.map { AccountDownloadCachedFile(id: $0.id, name: $0.name, size: String($0.size), kind: $0.kind, parentId: $0.parentId) },
                 relativeParent: relativeParents[index]
             )
         }
@@ -7353,7 +8362,7 @@ final class DownloaderModel: ObservableObject {
         UserDefaults.standard.set(proxyURL, forKey: "proxyURL")
         UserDefaults.standard.set(outputURL.path, forKey: "outputPath")
         let paths = items.map { pathOverrides[$0.id] ?? browserPath(for: $0) }
-        let relativeParents = DownloadQueueBatching.relativeParents(for: paths)
+        let relativeParents = DownloadDestinationLayout.relativeParents(for: paths)
         let roots = items.enumerated().map { index, item in
             SharedPendingDownloadRoot(
                 queueID: UUID(),
@@ -7391,6 +8400,7 @@ final class DownloaderModel: ObservableObject {
         }
         let key = request.deduplicationKey
         guard activeDownloadRequestKey != key,
+              !activeDownloadRequests.contains(where: { $0.deduplicationKey == key }),
               !activeDownloadSelectionKeys.contains(key),
               !pendingDownloadRequests.contains(where: {
                   $0.deduplicationKey == key
@@ -7398,130 +8408,95 @@ final class DownloaderModel: ObservableObject {
             setStatus("That download selection is already queued or running")
             return
         }
+        // Explicitly adding the selection again is a new user request. Automatic
+        // resume bypasses this entry point and retains its cancellation exclusions.
+        savedDownloadCancellations = savedDownloadCancellations.filter { record in
+            record.scope != request.cancellationScope || !request.pendingItems.contains {
+                record.remotePath == $0.remotePath || record.remotePath.hasPrefix($0.remotePath + "/")
+            }
+        }
         pendingDownloadRequests.append(request)
         synchronizePendingDownloadQueue()
         guard persistTransfersSynchronously() else { return }
         let noun = request.itemCount == 1 ? "item" : "items"
-        setStatus("Added \(request.itemCount.formatted()) \(noun) to the download queue • "
-            + (isDownloading ? "will join the next compatible worker batch automatically"
-                             : "press Start Download in Transfers when ready"))
-        if startImmediately {
+        setStatus("Added \(request.itemCount.formatted()) \(noun) to downloads" + (downloadsPaused ? " • paused" : ""))
+        // Explicit selections auto-start; a user pause and restored queues
+        // remain under the user's Resume control.
+        if startImmediately || (!downloadsPaused && !restoredDownloadQueue) || isDownloading {
             _ = startNextPendingDownloadIfNeeded()
         }
     }
 
-    private func beginDownload(_ request: PendingDownloadRequest) {
-        let destination: URL
-        let proxy: String
-        switch request {
-        case .account(_, let requestDestination, _, let requestProxy),
-             .shared(_, _, let requestDestination, _, let requestProxy):
-            destination = requestDestination
-            proxy = requestProxy
-        }
+    private var liveDownloadInbox: LiveDownloadInbox {
+        LiveDownloadInbox(requests: submittedDownloadRequests.values.flatMap(\.liveInputs).sorted { $0.id < $1.id },
+                          contentMode: finderSettings.contentMode)
+    }
 
-        do {
-            try FileManager.default.createDirectory(
-                at: destination,
-                withIntermediateDirectories: true
-            )
-        } catch {
-            activeDownloadRequestKey = nil
-            retainInterruptedDownload()
-            setError("Cannot create the download folder: \(error.localizedDescription)")
-            startNextPendingDownloadIfNeeded()
-            return
-        }
-
-        resetDownloadProgress()
-        switch request {
-        case .account(let roots, _, let jobs, _):
-            let paths = roots.map(\.path)
-            lastAccountDownloadPaths = paths
-            lastSharedDownloadItems = []
-            lastSharedDownloadAccess = nil
-            lastDownloadUsedSharedLink = false
-
-            let arguments = ["download",
-                "--output", destination.path,
-                "--jobs", String(jobs),
-                "--progress-json",
-            ]
-            runDownloadEngine(
-                arguments: arguments,
-                operation: .download,
-                proxyOverride: proxy,
-                accountRequest: AccountDownloadInput(roots: roots.map {
-                    .init(path: $0.path, file: $0.file, relativeParent: $0.relativeParent)
-                })
-            )
-
-        case .shared(let pendingRoots, let access, _, let jobs, _):
-            let items = pendingRoots.map(\.item)
-            let roots = pendingRoots.map(\.root)
-            lastSharedDownloadItems = items
-            lastSharedDownloadAccess = access
-            lastAccountDownloadPaths = []
-            lastDownloadUsedSharedLink = true
-            let input = ShareDownloadInput(access: access, roots: roots)
-            runDownloadEngine(
-                arguments: [
-                    "share-download",
-                    "--output", destination.path,
-                    "--jobs", String(jobs),
-                    "--progress-json",
-                ],
-                operation: .shareDownload(request: input),
-                proxyOverride: proxy
-            )
-        }
+    private func publishLiveDownloads() throws {
+        guard let url = downloadInputURL else { return }
+        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+        try encoder.encode(liveDownloadInbox).write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
     @discardableResult
     private func startNextPendingDownloadIfNeeded() -> Bool {
-        guard downloadProcess?.isRunning != true,
-              !isDownloading,
-              hasUsableSession,
-              transferStateReady, !isClosingWindow,
-              !pendingDownloadRequests.isEmpty
-        else { return false }
-        // A settings change applies to waiting batches too, without touching
-        // the allocation of an already running engine or its checkpoint.
-        pendingDownloadRequests = pendingDownloadRequests.map { $0.withWorkerLimit(effectiveDownloadConcurrentJobs) }
-        var selectionKeys = Set<String>()
-        if let first = pendingDownloadRequests.first { selectionKeys.insert(first.deduplicationKey) }
-        guard let request = DownloadQueueBatching.takeNext(from: &pendingDownloadRequests, combining: { batch, next in
-            guard let combined = batch.combining(next) else { return nil }
-            selectionKeys.insert(next.deduplicationKey)
-            return combined
-        }) else { return false }
-        activePersistentDownload = request
+        guard hasUsableSession, transferStateReady, !isClosingWindow,
+              !downloadRequestedStop, !downloadsPaused, !pendingDownloadRequests.isEmpty else { return false }
+        let waiting = pendingDownloadRequests
+        let available = waiting.compactMap { $0.removingPendingItems(pausedPendingDownloadIDs) }
+            .flatMap(\.individualRequests).map { $0.withWorkerLimit(effectiveDownloadConcurrentJobs) }
+        guard !available.isEmpty else { return false }
+        let starting = !isDownloading
+        if starting {
+            resetDownloadProgress()
+            lastDownloadUsedSharedLink = false
+            lastSharedDownloadAccess = nil
+            submittedDownloadRequests = [:]
+            discoveringDownloadRequestIDs = []
+            liveDownloadRun = true
+        }
+        pendingDownloadRequests = waiting.compactMap { $0.keepingPendingItems(pausedPendingDownloadIDs) }
+        activeDownloadRequests.append(contentsOf: available)
+        for request in available {
+            for item in request.pendingItems {
+                submittedDownloadRequests[item.id] = request
+                discoveringDownloadRequestIDs.insert(item.id)
+            }
+        }
         synchronizePendingDownloadQueue()
         guard persistTransfersSynchronously() else {
-            activePersistentDownload = nil
-            pendingDownloadRequests.insert(request, at: 0)
+            let ids = Set(available.flatMap(\.pendingItems).map(\.id))
+            activeDownloadRequests = activeDownloadRequests.compactMap { $0.removingPendingItems(ids) }
+            for id in ids { submittedDownloadRequests[id] = nil; discoveringDownloadRequestIDs.remove(id) }
+            pendingDownloadRequests = waiting
             synchronizePendingDownloadQueue()
             return false
         }
-        activeDownloadRequestKey = request.deduplicationKey
-        activeDownloadSelectionKeys = selectionKeys
-        beginDownload(request)
-        if !isDownloading { retainInterruptedDownload() }
+        activeDownloadSelectionKeys.formUnion(available.map(\.deduplicationKey))
+        activeDownloadSelectionKeys.formUnion(waiting.map(\.deduplicationKey))
+        if starting {
+            runDownloadEngine(arguments: ["download-queue"], operation: .download, liveQueue: true)
+            if !isDownloading { retainInterruptedDownload() }
+        } else {
+            do { try publishLiveDownloads(); writeDownloadControls() }
+            catch {
+                // Keep the new roots durable, but stop safely so Resume can
+                // resubmit them after an inbox-write failure.
+                stop(automatic: true)
+                setError("Could not update the download queue: \(error.localizedDescription)")
+            }
+        }
         return isDownloading
     }
 
-    /// Compatible user-prepared selections run together with the chosen worker
-    /// count. Other destinations/sessions continue automatically afterward;
-    /// adding a Browser/Links selection while idle
-    /// never starts network transfer by itself.
     func startPendingDownloads() {
-        guard canStartPendingDownloads else {
-            if pendingDownloadRequests.isEmpty {
-                setStatus("The download queue is empty")
-            }
-            return
+        downloadsPaused = false
+        if !interruptedDownloadRequests.isEmpty { requeueInterruptedDownloads() }
+        writeDownloadControls()
+        if !startNextPendingDownloadIfNeeded() && !isDownloading && pendingDownloadRequests.isEmpty {
+            setStatus("The download queue is empty")
         }
-        _ = startNextPendingDownloadIfNeeded()
     }
 
     func removePendingDownloadItem(_ itemID: UUID) {
@@ -7553,21 +8528,23 @@ final class DownloaderModel: ObservableObject {
 
     private func synchronizePendingDownloadQueue() {
         pendingDownloadItems = pendingDownloadRequests.flatMap(\.pendingItems)
-        pendingDownloadBatchCount = pendingDownloadRequests.count
         if pendingDownloadRequests.isEmpty { restoredDownloadQueue = false }
     }
 
-    // MARK: Durable transfer batches
+    // MARK: Durable transfers
 
     private func transferStore() throws -> TransferPersistenceStore {
         #if FINDER_WORKSPACE_TESTS
-        if let accountFixtureTransferDirectory { return TransferPersistenceStore(directory: accountFixtureTransferDirectory) }
+        if let accountFixtureTransferDirectory {
+            return TransferPersistenceStore(directory: PikPakWorkspaceStorage.directory(accountFixtureTransferDirectory, workspaceSessionID: workspaceSessionID))
+        }
         #endif
         #if TRANSFER_PERSISTENCE_TESTS
         if let transferTestDirectory { return TransferPersistenceStore(directory: transferTestDirectory) }
         #endif
-        return TransferPersistenceStore(directory: try LocalCredentialStore.applicationSupportDirectoryURL()
-            .appendingPathComponent("Transfers", isDirectory: true))
+        let base = try LocalCredentialStore.applicationSupportDirectoryURL()
+            .appendingPathComponent("Transfers", isDirectory: true)
+        return TransferPersistenceStore(directory: PikPakWorkspaceStorage.directory(base, workspaceSessionID: workspaceSessionID))
     }
 
     private func adoptTransferAccount(_ rawAccountID: String) {
@@ -7578,7 +8555,8 @@ final class DownloaderModel: ObservableObject {
         do {
             let store = try transferStore()
             let saved = try transferPersistenceQueue.sync {
-                try store.load(SavedTransfers.self, accountID: accountID)
+                try workspaceSessionID == "primary" ? store.loadSharedTransfers(accountID: accountID)
+                    : store.load(SavedTransfers.self, accountID: accountID)
             }
             if let saved {
                 guard saved.version == 1, saved.accountID == accountID else {
@@ -7587,13 +8565,23 @@ final class DownloaderModel: ObservableObject {
                 var seen = Set<String>()
                 pendingDownloadRequests = saved.downloads.filter { seen.insert($0.deduplicationKey).inserted }
                 savedUploadBatches = saved.uploads
+                savedDownloadCancellations = Set(saved.cancelledDownloads ?? [])
+                importedTransferSessions = saved.importedWorkspaceSessions ?? []
                 restoredDownloadQueue = !pendingDownloadRequests.isEmpty
+                // Transfers that were under way when the app last closed did not
+                // stop by choice, so they continue on their own. Pause in
+                // Status → Transfers is how the user holds them.
+                downloadsPaused = saved.downloadsPaused ?? false
+                pausedDownloadIDs = saved.pausedDownloadIDs ?? []
+                pausedPendingDownloadIDs = saved.pausedPendingDownloadIDs ?? []
+                pausedUploadIDs = saved.pausedUploadIDs ?? []
                 synchronizePendingDownloadQueue()
                 if !saved.downloads.isEmpty || !saved.uploads.isEmpty {
-                    appendOutput("Restored unfinished transfers. Open Transfers and choose Resume; no transfer starts automatically.\n")
+                    appendOutput("Restored unfinished transfers. They continue automatically; use Pause in Status → Transfers to hold them.\n")
                 }
             }
             transferStateReady = true
+            resumeRestoredTransfers()
         } catch {
             // Keep the unreadable file intact instead of silently replacing a
             // potentially recoverable queue with an empty snapshot.
@@ -7603,6 +8591,11 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func clearTransferAccountContext() {
+        transferSaveRetry?.cancel(); transferSaveRetry = nil
+        automaticDownloadRetry?.cancel(); automaticDownloadRetry = nil
+        automaticUploadRetry?.cancel(); automaticUploadRetry = nil
+        automaticUploadBatchIDs.removeAll()
+        stopWatchingUploadRemount()
         fileUndoRefreshFeedback = nil; undoMoveOrigins.removeAll()
         fileUndoHistory.reset()
         uploadUndoMutations.removeAll()
@@ -7616,10 +8609,20 @@ final class DownloaderModel: ObservableObject {
         transferAccountID = nil
         transferStateReady = false
         pendingDownloadRequests = []
+        savedDownloadCancellations = []
+        importedTransferSessions = []
         interruptedDownloadRequests = []
-        activePersistentDownload = nil
+        activeDownloadRequests = []
+        submittedDownloadRequests = [:]
+        discoveringDownloadRequestIDs = []
+        liveDownloadRun = false
+        downloadsPaused = false
+        pausedDownloadIDs.removeAll(); pausedPendingDownloadIDs.removeAll(); pausedUploadIDs.removeAll()
+        activeDownloadSelectionKeys = []
         activeUploadBatchID = nil
         savedUploadBatches = []
+        uploadFileAccess.removeAll()
+        stopWatchingUploadDisk()
         interruptedDownloadCount = 0
         restoredDownloadQueue = false
         synchronizePendingDownloadQueue()
@@ -7628,10 +8631,13 @@ final class DownloaderModel: ObservableObject {
     private func transferSnapshot() -> SavedTransfers? {
         guard transferStateReady, let accountID = transferAccountID else { return nil }
         var downloads = interruptedDownloadRequests
-        if let activePersistentDownload { downloads.append(activePersistentDownload) }
+        downloads.append(contentsOf: activeDownloadRequests)
         downloads.append(contentsOf: pendingDownloadRequests)
         return SavedTransfers(version: 1, accountID: accountID,
-                             downloads: downloads, uploads: savedUploadBatches)
+                             downloads: downloads, uploads: savedUploadBatches,
+                             cancelledDownloads: Array(savedDownloadCancellations), importedWorkspaceSessions: importedTransferSessions,
+                             downloadsPaused: downloadsPaused, pausedDownloadIDs: pausedDownloadIDs,
+                             pausedPendingDownloadIDs: pausedPendingDownloadIDs, pausedUploadIDs: pausedUploadIDs)
     }
 
     @discardableResult
@@ -7641,10 +8647,24 @@ final class DownloaderModel: ObservableObject {
         do {
             let store = try transferStore()
             try transferPersistenceQueue.sync { try store.save(snapshot, accountID: snapshot.accountID) }
+            transferSaveRetry?.cancel(); transferSaveRetry = nil
             return true
         } catch {
             setError("Could not save unfinished transfers for resume: \(error.localizedDescription)")
+            scheduleTransferSaveRetry()
             return false
+        }
+    }
+
+    private func scheduleTransferSaveRetry() {
+        guard transferSaveRetry == nil, transferStateReady, !isClosingWindow else { return }
+        let account = transferAccountID
+        transferSaveRetry = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
+            guard let self else { return }
+            self.transferSaveRetry = nil
+            guard !self.isClosingWindow, self.transferAccountID == account else { return }
+            _ = self.persistTransfersSynchronously()
         }
     }
 
@@ -7663,19 +8683,34 @@ final class DownloaderModel: ObservableObject {
                     catch {
                         Task { @MainActor [weak self] in
                             self?.setError("Could not update the saved transfer state: \(error.localizedDescription)")
+                            self?.scheduleTransferSaveRetry()
                         }
                     }
                 }
-            } catch { self.setError("Could not save transfers: \(error.localizedDescription)") }
+            } catch { self.setError("Could not save transfers: \(error.localizedDescription)"); self.scheduleTransferSaveRetry() }
         }
     }
 
     private func retainInterruptedDownload() {
-        if let request = activePersistentDownload,
-           !interruptedDownloadRequests.contains(where: { $0.deduplicationKey == request.deduplicationKey }) {
-            interruptedDownloadRequests.append(request)
+        if !activeDownloadRequests.isEmpty {
+            var unfinishedRequests = activeDownloadRequests
+            // A complete, bounded plan lets a stopped folder resume the exact
+            // remaining files, including those still waiting for a worker.
+            // Before planning finishes, retain the original roots instead.
+            if isDownloading, (!liveDownloadRun || discoveringDownloadRequestIDs.isEmpty), downloadTotalFiles > 0, downloadTotalFiles <= 2_000,
+               downloadQueueTransfers.count == downloadTotalFiles,
+               queuedDownloadCount + activeDownloadTransfers.count + completedDownloadTransfers.count == downloadTotalFiles {
+                let activeIDs = Set(activeDownloadRequests.flatMap(\.pendingItems).map(\.id))
+                let unfinished = (Array(queuedDownloadTransfers) + Array(activeDownloadTransfers.values)
+                    + completedDownloadTransfers.filter { ($0.state == .failed || $0.state == .stopped) && !cancelledDownloadIDs.contains($0.id) })
+                    .filter { !liveDownloadRun || downloadRequestIDsByFileID[$0.id].map(activeIDs.contains) == true }
+                let files = unfinished.compactMap(downloadRequestForKnownFile)
+                if files.count == unfinished.count { unfinishedRequests = files }
+            }
+            var existing = Set(interruptedDownloadRequests.map(\.deduplicationKey))
+            interruptedDownloadRequests.append(contentsOf: unfinishedRequests.filter { existing.insert($0.deduplicationKey).inserted })
         }
-        activePersistentDownload = nil
+        activeDownloadRequests = []
         interruptedDownloadCount = interruptedDownloadRequests.reduce(0) { $0 + $1.itemCount }
         _ = persistTransfersSynchronously()
     }
@@ -7691,7 +8726,26 @@ final class DownloaderModel: ObservableObject {
         restoredDownloadQueue = true
         synchronizePendingDownloadQueue()
         _ = persistTransfersSynchronously()
-        setStatus("Interrupted downloads returned to the queue. Press Resume Downloads when ready.")
+        setStatus(downloadsPaused
+            ? "Interrupted downloads returned to the queue. Press Resume Downloads when ready."
+            : "Interrupted downloads returned to the queue.")
+    }
+
+    /// Transfers that were under way when the app last closed did not stop by
+    /// choice, so they pick up again once the account is ready. A queue the
+    /// user paused stays held through its persisted resume intent.
+    private func resumeRestoredTransfers() {
+        guard transferStateReady, !isClosingWindow, hasUsableSession else { return }
+        if !interruptedDownloadRequests.isEmpty { requeueInterruptedDownloads() }
+        _ = startNextPendingDownloadIfNeeded()
+        // Links may have been restored before the account was usable, in which
+        // case their first automatic attempt found no session and gave up.
+        scheduleAutomaticSharedLinkRetry()
+        // Saved batches chain: the first runs now, the rest follow it in turn.
+        let automaticBatches = resumableUploadBatches.filter { $0.automaticallyResume != false }
+        guard !isUploading, uploadProcess?.isRunning != true, let next = automaticBatches.first else { return }
+        for batch in automaticBatches.dropFirst() { automaticUploadBatchIDs.insert(batch.id) }
+        resumeSavedUpload(next.id)
     }
 
     var resumableUploadBatches: [SavedUploadBatch] {
@@ -7708,15 +8762,36 @@ final class DownloaderModel: ObservableObject {
         if savedUploadBatches[index] != batch { savedUploadBatches[index] = batch }
     }
 
+    func pauseSavedUpload(_ batchID: UUID) {
+        setUploadResumeIntent(batchID, enabled: false)
+        automaticUploadBatchIDs.remove(batchID)
+        if uploadBatchAwaitingVolume == batchID { stopWatchingUploadRemount() }
+        if !isUploading { automaticUploadRetry?.cancel(); automaticUploadRetry = nil }
+        setStatus("Upload paused in the queue.")
+    }
+
+    private func setUploadResumeIntent(_ id: UUID, enabled: Bool) {
+        guard let index = savedUploadBatches.firstIndex(where: { $0.id == id }) else { return }
+        savedUploadBatches[index].automaticallyResume = enabled
+        _ = persistTransfersSynchronously()
+    }
+
     func resumeSavedUpload(_ batchID: UUID) {
-        guard canUploadFiles, let batch = savedUploadBatches.first(where: { $0.id == batchID }) else { return }
-        _ = startUpload(files: batch.sources.map { URL(fileURLWithPath: $0) },
-                        destination: batch.destination, resumingBatch: batch)
+        guard let batch = savedUploadBatches.first(where: { $0.id == batchID }) else { return }
+        setUploadResumeIntent(batchID, enabled: true)
+        guard canUploadFiles,
+              startUpload(files: batch.sources.map { URL(fileURLWithPath: $0) },
+                          destination: batch.destination, resumingBatch: batch) else {
+            scheduleAutomaticUploadRetry(batchID); return
+        }
     }
 
     func discardSavedUpload(_ batchID: UUID) {
         guard batchID != activeUploadBatchID else { return }
+        automaticUploadBatchIDs.remove(batchID)
+        if uploadBatchAwaitingVolume == batchID { stopWatchingUploadRemount() }
         savedUploadBatches.removeAll { $0.id == batchID }
+        uploadFileAccess.removeValue(forKey: batchID)
         if persistTransfersSynchronously() { removeUploadCheckpoint(batchID) }
         setStatus("Removed saved upload. Local files and uploaded cloud files were not deleted.")
     }
@@ -7779,16 +8854,409 @@ final class DownloaderModel: ObservableObject {
     }
     #endif
 
-    func retryFailedDownloads() {
-        let retryableTransfers = failedDownloadTransfers.filter(canRetryFailedDownload)
-        guard !retryableTransfers.isEmpty else { return }
-        for transfer in retryableTransfers {
-            retryFailedDownload(transfer)
+    #if FINDER_WORKSPACE_TESTS
+    static func downloadRetryFixture(defaults: UserDefaults, directory: URL) -> DownloaderModel {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        model.accountFixtureTransferDirectory = directory.appendingPathComponent("state")
+        model.transferAccountID = "synthetic-download-account"
+        model.transferStateReady = true
+        model.outputURL = directory.appendingPathComponent("downloads")
+        model.downloadEngineFixture = { [weak model] _, operation, _ in
+            model?.isDownloading = true
+            model?.downloadRunState = .scanning
+            model?.downloadOperation = operation
+            model?.downloadRequestedStop = false
+            model?.status = "Preparing queued downloads…"
+        }
+        model.failedDownloadTransfers = (1...6).map { index in
+            DownloadTransfer(id: "file-\(index)", name: "\(index).mp4", downloadedBytes: 512,
+                totalBytes: 20_000_000, state: .failed, remotePath: "/Nested/\(index).mp4",
+                outputDirectoryPath: model.outputURL.path)
+        }
+        return model
+    }
+
+    private func downloadFixtureEvent(_ value: [String: Any]) {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let event = try! decoder.decode(DownloadProgressEvent.self, from: JSONSerialization.data(withJSONObject: value))
+        applyDownloadProgressEvent(event)
+    }
+
+    func showDownloadRetryFixtureProgress() {
+        guard case .account(let roots, let destination, _, _) = activePersistentDownload else { return }
+        resetDownloadProgress()
+        downloadFixtureEvent(["event": "queue_append", "files": roots.map { root in
+            ["file_id": root.file!.id, "source_file_id": root.file!.id, "request_id": root.queueID.uuidString,
+             "name": root.name, "total_bytes": 20_000_000,
+             "remote_path": root.path, "output_directory": destination.path] as [String: Any]
+        }])
+        for root in roots { downloadFixtureEvent(["event":"request_discovered", "request_id":root.queueID.uuidString]) }
+        for (index, root) in roots.prefix(2).enumerated() {
+            let id = root.file!.id
+            downloadFixtureEvent(["event": "file_dequeued", "file_id": id, "name": root.name, "total_bytes": 20_000_000])
+            downloadFixtureEvent(["event": "file_started", "file_id": id, "name": root.name,
+                "downloaded_bytes": 5_000_000, "transferred_bytes": 0, "total_bytes": 20_000_000])
+            var sample = DownloadFileRate()
+            _ = sample.sample(networkBytes: 0, at: Date().addingTimeInterval(-1), transferring: true)
+            downloadFileRates[id] = sample
+            let bytes = (index + 1) * 256_000
+            downloadFixtureEvent(["event": "file_progress", "file_id": id, "name": root.name,
+                "downloaded_bytes": 5_000_000 + bytes, "transferred_bytes": bytes, "total_bytes": 20_000_000])
         }
     }
 
+    func stopDownloadRetryFixture() {
+        guard isDownloading else { return }
+        downloadRequestedStop = true
+        finishDownloadProcess(exitCode: 15, errorOutput: "", operation: .download)
+    }
+
+    static func testTransferControls() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("Transfer-Controls-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let defaults = UserDefaults(suiteName: "Transfer-Controls-\(UUID().uuidString)")!
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        let control = directory.appendingPathComponent("control.json")
+        model.downloadControlURL = control; model.isDownloading = true
+        let file = DownloadTransfer(id: "file-A", name: "A.bin", downloadedBytes: 10, totalBytes: 100,
+            state: .downloading, remotePath: "/A.bin", outputDirectoryPath: directory.path)
+        model.pauseDownloadFile(file)
+        let paused = try JSONSerialization.jsonObject(with: Data(contentsOf: control)) as! [String: [String: String]]
+        precondition(paused["actions"]?[file.id] == "pause")
+        model.resumeDownloadFile(file)
+        let resumed = try JSONSerialization.jsonObject(with: Data(contentsOf: control)) as! [String: [String: String]]
+        precondition(resumed["actions"]?[file.id] == nil)
+        let partial = directory.appendingPathComponent("A.bin.part")
+        try Data("unfinished".utf8).write(to: partial)
+        model.cancelDownloadFile(file)
+        precondition(FileManager.default.fileExists(atPath: partial.path), "UI must never delete while helper may still write")
+        let cancelled = try JSONSerialization.jsonObject(with: Data(contentsOf: control)) as! [String: [String: String]]
+        precondition(cancelled["actions"]?[file.id] == "cancel" && !model.canRetryFailedDownload(file))
+        precondition(model.canBrowse && model.canUploadFiles, "downloads must not block unrelated browser/uploads")
+        // A large original folder root must not resurrect a cancelled child on
+        // restart, even when the plan is too large to flatten into saved files.
+        let folder = PendingDownloadRequest.account(roots: [.init(queueID: UUID(), path: "/Large", name: "Large", kind: .folder, file: nil, relativeParent: [])], destination: directory, jobs: 4, proxyURL: "")
+        model.activePersistentDownload = folder
+        model.downloadTotalFiles = 3001
+        let child = DownloadTransfer(id: "large-child", name: "child.bin", downloadedBytes: 0, totalBytes: 100,
+            state: .queued, remotePath: "/Large/child.bin", outputDirectoryPath: directory.appendingPathComponent("Large").path)
+        model.cancelDownloadFile(child)
+        model.retainInterruptedDownload()
+        let saved = try JSONDecoder().decode(SavedTransfers.self, from: JSONEncoder().encode(model.transferSnapshot()!))
+        precondition(saved.downloads.contains { $0.itemCount == 1 } && saved.cancelledDownloads?.contains { $0.controlID == child.id } == true)
+        model.savedDownloadCancellations = Set(saved.cancelledDownloads ?? [])
+        model.activePersistentDownload = folder
+        precondition(model.restoredDownloadControls()[child.id] == "cancel")
+        model.activePersistentDownload = PendingDownloadRequest.account(roots: [], destination: directory.appendingPathComponent("other"), jobs: 4, proxyURL: "")
+        precondition(model.restoredDownloadControls()[child.id] == nil, "cancel must not affect another destination")
+        model.activePersistentDownload = nil; model.interruptedDownloadRequests = []
+        model.isDownloading = false
+        model.queueDownload(folder)
+        precondition(!model.savedDownloadCancellations.contains { $0.controlID == child.id }, "explicit new selection should allow downloading the file again")
+        model.isClosingWindow = true
+        print("PASS large folder cancellation: durable resume exclusions, destination isolation, explicit new selection clears exclusions")
+        print("PASS per-file controls: atomic pause/resume/cancel messages, no UI deletion of active writers, unrelated work stays enabled")
+    }
+
+    static func testGuestMode() throws {
+        let suite = "ContentMode-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        precondition(FinderSettings(defaults: defaults).contentMode == .user)
+        defaults.removeObject(forKey: "pikpakContentMode")
+        defaults.set(true, forKey: "pikpakGuestMode")
+        precondition(FinderSettings(defaults: defaults).contentMode == .guest, "upgrade preserves Guest Mode")
+        defaults.set("dynamic", forKey: "pikpakContentMode")
+        precondition(FinderSettings(defaults: defaults).contentMode == .dynamic, "new selection takes precedence over legacy toggle")
+        defaults.removeObject(forKey: "pikpakContentMode")
+        defaults.set(false, forKey: "pikpakGuestMode")
+        let model = finderWorkspaceFixture(defaults: defaults)
+        defer { model.stopForWindowClose() }
+        precondition(model.finderSettings.contentMode == .user && model.liveDownloadInbox.contentMode == .user)
+        let token = URL(fileURLWithPath: "/tmp/content-mode-unused-token")
+        func environment() -> [String: String] {
+            model.desktopEngineEnvironment(tokenURL: token, lockURL: token, deviceID: "fixture-device")
+        }
+        let runningHelperEnvironment = environment()
+        for mode in [PikPakContentMode.guest, .dynamic, .user] {
+            model.previewFileID = "old-preview"
+            model.finderSettings.contentMode = mode
+            precondition(model.previewFileID == nil, "every mode change invalidates issued preview URLs")
+            precondition(FinderSettings(defaults: defaults).contentMode == mode, "each mode survives relaunch")
+            precondition(environment()["PIKPAK_CONTENT_MODE"] == mode.rawValue, "downloads, previews, Open, Quick Look and scans share the engine policy")
+            precondition(environment()["PIKPAK_GUEST_MODE"] == nil, "legacy shell preferences cannot override the selected mode")
+            let inbox = try JSONSerialization.jsonObject(with: JSONEncoder().encode(model.liveDownloadInbox)) as! [String: Any]
+            precondition(inbox["content_mode"] as? String == mode.rawValue && inbox["guest_mode"] == nil,
+                         "new and retried requests in an existing queue use the current mode")
+        }
+        precondition(runningHelperEnvironment["PIKPAK_CONTENT_MODE"] == "user", "running scans keep their captured mode")
+        let file = AccountDownloadCachedFile(id: "id", name: "Saved", size: "8", kind: .file, parentId: "folder")
+        let data = try JSONEncoder().encode(file)
+        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        precondition(json["parent_id"] as? String == "folder")
+        let decoded = try JSONDecoder().decode(AccountDownloadCachedFile.self, from: data)
+        precondition(decoded.parentId == "folder")
+        let old = Data(#"{"id":"id","name":"Saved","size":"8","kind":"drive#file"}"#.utf8)
+        let legacy = try JSONDecoder().decode(AccountDownloadCachedFile.self, from: old)
+        precondition(legacy.parentId == nil, "older saved queues remain readable")
+        model.finderSettings.contentMode = .dynamic
+        model.finderSettings.resetLayout()
+        precondition(model.finderSettings.contentMode == .dynamic, "layout reset preserves the content preference")
+        print("PASS User/Guest/Dynamic: legacy migration, persistence, helper environments, live inbox, preview invalidation, running-helper snapshots, legacy queues and layout isolation")
+    }
+
+    static func testLiveDownloadQueue() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("live-download-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let suite = "LiveDownloadQueue-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        model.failedDownloadTransfers = []
+        var launches = 0
+        model.downloadEngineFixture = { arguments, _, _ in
+            precondition(arguments == ["download-queue"])
+            launches += 1
+            model.isDownloading = true; model.downloadRunState = .scanning
+        }
+        func request(_ name: String, destination: String, folder: Bool = false) -> PendingDownloadRequest {
+            .account(roots: [.init(queueID: UUID(), path: "/\(name)", name: name, kind: folder ? .folder : .file,
+                file: .init(id: folder ? "folder-source" : "same-cloud-file", name: name, size: "100", kind: folder ? .folder : .file), relativeParent: [])],
+                destination: directory.appendingPathComponent(destination), jobs: 1, proxyURL: "")
+        }
+        let folder = request("Folder", destination: "first", folder: true)
+        model.queueDownload(folder)
+        precondition(launches == 1 && model.isDownloading && model.pendingDownloadItems.isEmpty,
+                     "a new selection starts without a Start or batch boundary")
+        let firstID = folder.pendingItems[0].id
+        func append(_ id: UUID, _ transferID: String, path: String, destination: String) {
+            model.downloadFixtureEvent(["event":"queue_append", "files":[[
+                "file_id":transferID, "source_file_id":"same-cloud-file", "request_id":id.uuidString,
+                "name":"one.bin", "total_bytes":100, "remote_path":path, "output_directory":destination]]])
+        }
+        append(firstID, "transfer-A", path: "/Folder/one.bin", destination: directory.appendingPathComponent("first/Folder").path)
+        model.downloadFixtureEvent(["event":"file_dequeued", "file_id":"transfer-A", "name":"one.bin", "total_bytes":100])
+        model.downloadFixtureEvent(["event":"file_progress", "file_id":"transfer-A", "name":"one.bin", "total_bytes":100, "downloaded_bytes":25, "transferred_bytes":25])
+        precondition(model.preparingDownloadItems.count == 1, "folder discovery stays visible while its first file downloads")
+        let inbox = directory.appendingPathComponent("inbox.json")
+        let initial = try model.writePrivateRequest(model.liveDownloadInbox, named: "initial", in: directory)
+        let initialJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: initial)) as! [String: Any]
+        let initialRequest = (initialJSON["requests"] as! [[String: Any]])[0]
+        precondition(initialRequest["relative_parent"] != nil && initialRequest["proxy_url"] != nil,
+                     "initial launch and later inbox updates must use the same wire format")
+        model.downloadInputURL = inbox
+        try model.publishLiveDownloads()
+        model.downloadControlURL = directory.appendingPathComponent("control.json")
+        model.pausePendingDownload(folder.pendingItems[0])
+        let later = request("one.bin", destination: "second")
+        model.queueDownload(later)
+        precondition(launches == 1 && model.activeDownloadRequests.count == 2 && model.pendingDownloadItems.isEmpty,
+                     "a second destination must enter the current process")
+        let json = try JSONSerialization.jsonObject(with: Data(contentsOf: inbox)) as! [String: Any]
+        precondition((json["requests"] as! [[String: Any]]).count == 2)
+        let inboxMode = try FileManager.default.attributesOfItem(atPath: inbox.path)[.posixPermissions] as! NSNumber
+        precondition(inboxMode.intValue & 0o777 == 0o600)
+        let secondID = later.pendingItems[0].id
+        append(secondID, "transfer-B", path: "/one.bin", destination: directory.appendingPathComponent("second").path)
+        precondition(model.downloadTotalFiles == 2 && model.downloadTotalBytes == 200 && model.activeDownloadTransfers["transfer-A"]?.downloadedBytes == 25,
+                     "appending files must preserve progress and add totals once")
+        precondition(model.pausedDownloadIDs.contains("transfer-A") && !model.pausedDownloadIDs.contains("transfer-B"),
+                     "a paused folder must not pause another selection for the same cloud ID")
+        model.downloadFixtureEvent(["event":"file_dequeued", "file_id":"transfer-B", "name":"one.bin", "total_bytes":100])
+        model.downloadFixtureEvent(["event":"file_failed", "file_id":"transfer-B", "name":"one.bin", "error":"Synthetic disk error"])
+        let failed = model.failedDownloadTransfers.first!
+        precondition(model.downloadRequestForKnownFile(failed)?.liveInputs.first?.file?.id == "same-cloud-file",
+                     "retries use the cloud identity instead of the transfer ID")
+        model.downloadFixtureEvent(["event":"request_finished", "request_id":secondID.uuidString, "success":false, "error":"Synthetic disk error"])
+        precondition(model.activeDownloadRequests.count == 1 && model.interruptedDownloadCount == 1)
+        model.retryFailedDownload(failed)
+        precondition(launches == 1 && model.activeDownloadRequests.count == 2 && model.interruptedDownloadCount == 0,
+                     "manual retry joins the current queue even while a folder is paused")
+        model.resumePendingDownload(folder.pendingItems[0])
+        precondition(!model.pausedDownloadIDs.contains("transfer-A"))
+        model.downloadFixtureEvent(["event":"request_discovered", "request_id":firstID.uuidString])
+        model.downloadFixtureEvent(["event":"file_completed", "file_id":"transfer-A", "name":"one.bin", "total_bytes":100, "downloaded_bytes":100])
+        model.downloadFixtureEvent(["event":"request_finished", "request_id":firstID.uuidString, "success":true])
+        precondition(model.activeDownloadRequests.count == 1 && model.interruptedDownloadCount == 0)
+        let saved = try model.transferStore().load(SavedTransfers.self, accountID: "synthetic-download-account")!
+        precondition(saved.downloads.reduce(0) { $0 + $1.itemCount } == 1, "only unacknowledged work remains durable")
+        // Simulate an inbox append after the helper's final poll. A clean exit
+        // must resubmit that root instead of treating it as completed.
+        model.finishDownloadProcess(exitCode: 0, errorOutput: "", operation: .download)
+        precondition(launches == 2 && model.activeDownloadRequests.count == 1 && model.isDownloading)
+        model.downloadRequestedStop = true
+        model.finishDownloadProcess(exitCode: 15, errorOutput: "", operation: .download)
+        precondition(model.interruptedDownloadCount == 1 && !model.isDownloading)
+        model.downloadsPaused = true
+        model.queueDownload(request("paused.bin", destination: "third"))
+        precondition(launches == 2 && model.pendingDownloadItemCount == 1, "explicit pause must hold new selections")
+        model.isClosingWindow = true
+        let cancellation = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent("cancellation"))
+        cancellation.failedDownloadTransfers = []
+        let failedRequest = request("failed.bin", destination: "failed-output")
+        cancellation.queueDownload(failedRequest)
+        let failedID = failedRequest.pendingItems[0].id
+        cancellation.downloadFixtureEvent(["event":"queue_append", "files":[[
+            "file_id":"cancel-failed", "source_file_id":"same-cloud-file", "request_id":failedID.uuidString,
+            "name":"failed.bin", "total_bytes":100, "remote_path":"/failed.bin", "output_directory":directory.path]]])
+        cancellation.downloadFixtureEvent(["event":"file_dequeued", "file_id":"cancel-failed", "name":"failed.bin", "total_bytes":100])
+        cancellation.downloadFixtureEvent(["event":"file_failed", "file_id":"cancel-failed", "name":"failed.bin", "error":"Synthetic failure"])
+        cancellation.downloadFixtureEvent(["event":"request_finished", "request_id":failedID.uuidString, "success":false])
+        cancellation.queueDownload(request("other.bin", destination: "other-output"))
+        precondition(cancellation.failedDownloadTransfers.count == 1 && cancellation.interruptedDownloadCount == 1)
+        cancellation.cancelAllDownloads()
+        cancellation.downloadRequestedStop = true // Simulate the helper's termination callback.
+        cancellation.finishDownloadProcess(exitCode: 15, errorOutput: "", operation: .download)
+        precondition(cancellation.cancelledDownloadIDs.contains("cancel-failed") && cancellation.failedDownloadTransfers.isEmpty
+            && cancellation.interruptedDownloadCount == 0, "Cancel All must also clear earlier failures while other requests run")
+        cancellation.isClosingWindow = true
+        print("PASS live cancellation: earlier failed files and active selections are both cancelled")
+        print("PASS live queue: auto-start, live inbox updates, scoped controls, incremental totals, real retry IDs, durable acknowledgements, exit race and explicit pause")
+    }
+
+    static func testDownloadRetries() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("download-retry-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let suite = "com.wky.DownloadRetryTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        func fixture(_ name: String) -> DownloaderModel { downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent(name)) }
+        let model = fixture("batch")
+        let originals = model.failedDownloadTransfers
+        model.retryFailedDownloads()
+        guard case .account(let roots, let destination, let workers, _) = model.activePersistentDownload else { preconditionFailure("retry did not launch") }
+        precondition(roots.count == 6 && model.pendingDownloadItemCount == 0 && workers == TransferConcurrency.automaticLimit)
+        precondition(roots.map { $0.file!.id } == originals.map(\.id))
+        precondition(roots.allSatisfy { $0.relativeParent.isEmpty && $0.file?.size == "20000000" })
+        precondition(destination.standardizedFileURL.path == model.outputURL.standardizedFileURL.path,
+                     "retry must retain the original local directory")
+        precondition(model.failedDownloadTransfers.isEmpty, "accepted retries must leave failure history")
+        precondition(model.preparingDownloadItems.count == 6, "retry rows must remain visible before the plan arrives")
+        model.retryFailedDownload(originals[0])
+        precondition(model.pendingDownloadItemCount == 0 && model.activePersistentDownload?.itemCount == 6, "a repeated click must not add another writer")
+        print("PASS retry-all: six files in the live queue, saved file IDs and destinations, visible preparation, repeated-click deduplication")
+
+        model.showDownloadRetryFixtureProgress()
+        precondition(model.preparingDownloadItems.isEmpty && model.downloadingTransfers.count == 2 && model.queuedDownloadCount == 4)
+        let rates = model.downloadingTransfers.map(\.bytesPerSecond)
+        precondition(rates[0] > 200_000 && rates[0] < 300_000 && rates[1] > 400_000 && rates[1] < 600_000,
+                     "rates must be per-file network deltas, excluding the 5 MB partial prefix")
+        model.sampleDownloadFileRates(at: Date().addingTimeInterval(3))
+        precondition(model.activeDownloadTransfers.values.allSatisfy { $0.bytesPerSecond == 0 }, "stalled file rates must expire")
+        model.showDownloadRetryFixtureProgress()
+        model.downloadFixtureEvent(["event": "file_retrying", "file_id": roots[0].file!.id, "name": roots[0].name, "attempt": 2])
+        precondition(model.activeDownloadTransfers[roots[0].file!.id]?.bytesPerSecond == 0)
+        print("PASS file speeds: independent network rates, resume exclusion, stalled-rate expiry and retry backoff")
+
+        model.stopDownloadRetryFixture()
+        precondition(model.interruptedDownloadCount == 6 && model.failedDownloadTransfers.count == 2 && model.queuedDownloadCount == 4)
+        precondition(model.canStartPendingDownloads, "Resume must be available without a separate return-to-queue step")
+        let saved = try model.transferStore().load(SavedTransfers.self, accountID: "synthetic-download-account")!
+        precondition(saved.downloads.reduce(0) { $0 + $1.itemCount } == 6)
+        model.retryFailedDownloads()
+        precondition(model.activePersistentDownload?.itemCount == 6 && model.preparingDownloadItems.count == 6)
+        precondition(model.interruptedDownloadCount == 0 && model.failedDownloadTransfers.isEmpty)
+        model.showDownloadRetryFixtureProgress(); model.stopDownloadRetryFixture(); model.startPendingDownloads()
+        precondition(model.activePersistentDownload?.itemCount == 6 && model.preparingDownloadItems.count == 6 && model.interruptedDownloadCount == 0)
+        print("PASS stop/retry/resume: active and waiting files retained, persisted once, resumed together and visible during preparation")
+
+        let folder = fixture("folder")
+        folder.failedDownloadTransfers = []
+        let parent = AccountDownloadRoot(queueID: UUID(), path: "/Nested", name: "Nested", kind: .folder,
+            file: .init(id: "folder", name: "Nested", size: "0", kind: .folder), relativeParent: [])
+        folder.queueDownload(.account(roots: [parent], destination: folder.outputURL, jobs: 32, proxyURL: ""), startImmediately: true)
+        folder.stopDownloadRetryFixture()
+        precondition(folder.interruptedDownloadCount == 1 && folder.canStartPendingDownloads)
+        folder.startPendingDownloads()
+        precondition(folder.preparingDownloadItems.first?.isFolder == true, "stopping during discovery must preserve the original folder")
+        print("PASS early stop: an unfinished folder scan remains resumable and visible")
+
+        let blocked = fixture("blocked")
+        blocked.transferStateReady = false
+        blocked.retryFailedDownloads()
+        precondition(blocked.failedDownloadTransfers.count == 6 && blocked.pendingDownloadItemCount == 0)
+        blocked.transferStateReady = true
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let badStore = directory.appendingPathComponent("not-a-directory")
+        try Data("fixture".utf8).write(to: badStore)
+        blocked.accountFixtureTransferDirectory = badStore
+        blocked.retryFailedDownloads()
+        precondition(blocked.failedDownloadTransfers.count == 6 && blocked.pendingDownloadItemCount == 0 && !blocked.isDownloading)
+        print("PASS rejected retry: unavailable state or a failed save never removes the failure rows")
+
+        let isolated = fixture("isolation")
+        let single = isolated.failedDownloadTransfers[0]
+        let alternate = DownloadTransfer(id: "alternate", name: single.name, downloadedBytes: 0,
+            totalBytes: single.totalBytes, state: .failed, remotePath: "/Other/1.mp4",
+            outputDirectoryPath: directory.appendingPathComponent("another-output").path)
+        let shared = DownloadTransfer(id: "shared-file", name: single.name, downloadedBytes: 0,
+            totalBytes: single.totalBytes, state: .failed, remotePath: single.remotePath,
+            outputDirectoryPath: single.outputDirectoryPath, isShared: true)
+        isolated.downloadSharedAccessByFileID[shared.id] = .init(url: "https://fixture.invalid/share", passCode: "fixture-code", passCodeToken: "")
+        let otherShared = DownloadTransfer(id: "other-shared-file", name: shared.name, downloadedBytes: 0,
+            totalBytes: shared.totalBytes, state: .stopped, remotePath: shared.remotePath,
+            outputDirectoryPath: shared.outputDirectoryPath, isShared: true)
+        isolated.downloadSharedAccessByFileID[otherShared.id] = .init(url: "https://fixture.invalid/other-share", passCode: "", passCodeToken: "")
+        isolated.interruptedDownloadRequests = [isolated.downloadRequestForKnownFile(shared)!,
+            isolated.downloadRequestForKnownFile(otherShared)!]
+        isolated.failedDownloadTransfers = [single, alternate, shared]
+        isolated.retryFailedDownloads()
+        precondition(isolated.activeDownloadRequests.count == 3 && isolated.pendingDownloadItemCount == 0)
+        guard case .shared(let retained, let retainedAccess, _, _, _) = isolated.interruptedDownloadRequests.first,
+              isolated.interruptedDownloadCount == 1 else { preconditionFailure("unrelated interrupted share was removed") }
+        precondition(retained[0].item.id == otherShared.id && retainedAccess.url == "https://fixture.invalid/other-share")
+        let inputs = isolated.liveDownloadInbox.requests
+        precondition(inputs.first { $0.file?.id == "alternate" }?.destination == alternate.outputDirectoryPath)
+        precondition(inputs.first { $0.file?.id == "shared-file" }?.access?.passCode == "fixture-code")
+        precondition(inputs.first { $0.file?.id == "shared-file" }?.relativeParent == [])
+        print("PASS retry isolation: all destinations and shared links enter the same running queue with their own access")
+
+        let permanent = fixture("permanent")
+        permanent.retryFailedDownloads()
+        permanent.showDownloadRetryFixtureProgress()
+        permanent.downloadFixtureEvent(["event":"file_failed", "file_id":"file-1", "name":"1.mp4", "error":"Disk is full"])
+        precondition(permanent.failedDownloadTransfers.contains { $0.error == "Disk is full" })
+        permanent.downloadFixtureEvent(["event":"batch_failed", "retryable":false])
+        permanent.finishDownloadProcess(exitCode:1, errorOutput:"Disk is full", operation:.download)
+        precondition(permanent.automaticDownloadRetry != nil && permanent.interruptedDownloadCount > 0,
+            "A full disk must retain the work and retry when space becomes available")
+        permanent.stop()
+        permanent.isClosingWindow = true
+        let temporary = fixture("temporary")
+        temporary.retryFailedDownloads()
+        temporary.downloadFixtureEvent(["event":"batch_failed", "retryable":true, "retry_in_millis":120_000])
+        temporary.finishDownloadProcess(exitCode:1, errorOutput:"Temporary connection failure", operation:.download)
+        precondition(temporary.automaticDownloadRetry != nil && temporary.downloadFailureRetryDelay == 120_000)
+        temporary.stop(); temporary.isClosingWindow = true
+        let crashed = fixture("crashed")
+        crashed.retryFailedDownloads()
+        crashed.finishDownloadProcess(exitCode: 9, errorOutput: "", operation: .download)
+        precondition(crashed.automaticDownloadRetry != nil && crashed.interruptedDownloadCount > 0,
+                     "An unexpected helper exit without a batch_failed event must recover")
+        crashed.stop()
+        precondition(crashed.automaticDownloadRetry == nil && crashed.transferSnapshot()?.downloadsPaused == true)
+        crashed.isClosingWindow = true
+        print("PASS failure policy: full disk and unexpected exits retry, provider cooldowns are preserved, Pause is durable")
+    }
+    #endif
+
+    func retryFailedDownloads() {
+        var transfers = failedDownloadTransfers
+        if !isDownloading, downloadRunState == .stopped || downloadRunState == .failed {
+            // Stopping the engine also interrupts its waiting worker queue.
+            // Keep those files with the stopped/failed rows when resuming.
+            transfers += queuedDownloadTransfers.map { var transfer = $0; transfer.state = .stopped; return transfer }
+        }
+        enqueueDownloadRetries(transfers)
+    }
+
     func canRetryFailedDownload(_ transfer: DownloadTransfer) -> Bool {
-        guard transfer.state == .failed || transfer.state == .stopped,
+        guard !cancelledDownloadIDs.contains(transfer.id),
+              transfer.state == .failed || transfer.state == .stopped,
+              transferStateReady, !isClosingWindow, !downloadRequestedStop,
+              downloadRunState != .stopping,
               hasUsableSession,
               let remotePath = transfer.remotePath,
               !remotePath.isEmpty,
@@ -7802,17 +9270,60 @@ final class DownloaderModel: ObservableObject {
     /// shared-link authorization (when applicable), and nested local output
     /// directory. Other failed rows stay available for independent retry.
     func retryFailedDownload(_ transfer: DownloadTransfer) {
-        guard canRetryFailedDownload(transfer),
-              let remotePath = transfer.remotePath,
-              let outputDirectoryPath = transfer.outputDirectoryPath
-        else { return }
+        enqueueDownloadRetries([transfer])
+    }
 
-        removeFailedDownloadFromHistory(transfer)
+    private func enqueueDownloadRetries(_ transfers: [DownloadTransfer]) {
+        var keys = Set(pendingDownloadRequests.map(\.deduplicationKey))
+        keys.formUnion(activeDownloadSelectionKeys)
+        if let activeDownloadRequestKey { keys.insert(activeDownloadRequestKey) }
+        var accepted: [(DownloadTransfer, PendingDownloadRequest)] = []
+        for transfer in transfers {
+            guard canRetryFailedDownload(transfer), let request = downloadRequestForKnownFile(transfer),
+                  keys.insert(request.deduplicationKey).inserted else { continue }
+            accepted.append((transfer, request))
+        }
+        guard !accepted.isEmpty else { return }
+
+        // Publish and save the whole retry action before launching a worker.
+        // Launching inside this loop used to leave all but the first file waiting.
+        let previousPending = pendingDownloadRequests
+        let previousInterrupted = interruptedDownloadRequests
+        pendingDownloadRequests.append(contentsOf: accepted.map { $0.1 })
+        let targets = Set(accepted.compactMap { transfer, _ -> DownloadRetryTarget? in
+            guard let path = transfer.remotePath, let directory = transfer.outputDirectoryPath else { return nil }
+            return .init(isShared: transfer.isShared, remotePath: path, directory: URL(fileURLWithPath: directory),
+                shareURL: transfer.isShared ? downloadSharedAccessByFileID[transfer.id]?.url : nil)
+        })
+        interruptedDownloadRequests = interruptedDownloadRequests.compactMap { $0.removingRetriedFiles(targets) }
+        interruptedDownloadCount = interruptedDownloadRequests.reduce(0) { $0 + $1.itemCount }
+        synchronizePendingDownloadQueue()
+        guard persistTransfersSynchronously() else {
+            pendingDownloadRequests = previousPending
+            interruptedDownloadRequests = previousInterrupted
+            interruptedDownloadCount = previousInterrupted.reduce(0) { $0 + $1.itemCount }
+            synchronizePendingDownloadQueue()
+            return
+        }
+        // A rejected or unsaved retry must remain in the failure history.
+        for (transfer, _) in accepted { removeFailedDownloadFromHistory(transfer) }
+        setStatus("Added \(accepted.count.formatted()) file(s) to retry")
+        _ = startNextPendingDownloadIfNeeded()
+    }
+
+    private func downloadRequestForKnownFile(_ transfer: DownloadTransfer) -> PendingDownloadRequest? {
+        guard !transfer.id.isEmpty,
+              let remotePath = transfer.remotePath, !remotePath.isEmpty,
+              let outputDirectoryPath = transfer.outputDirectoryPath, !outputDirectoryPath.isEmpty
+        else { return nil }
+
         let destination = URL(fileURLWithPath: outputDirectoryPath, isDirectory: true)
+        let sourceID = downloadSourceFileIDs[transfer.id] ?? transfer.id
+        let sourceProxy = downloadProxyByFileID[transfer.id] ?? proxyURL
         if transfer.isShared {
-            guard let access = downloadSharedAccessByFileID[transfer.id] else { return }
+            guard let access = downloadSharedAccessByFileID[transfer.id] else { return nil }
             let item = BrowserItem(
-                id: transfer.id,
+                id: sourceID,
                 name: transfer.name,
                 size: transfer.totalBytes,
                 kind: .file,
@@ -7827,19 +9338,19 @@ final class DownloaderModel: ObservableObject {
                 hash: nil,
                 md5Checksum: nil
             )
-            startSharedDownload(
-                items: [item],
-                using: access,
-                destination: destination,
-                pathOverrides: [transfer.id: remotePath],
-                startImmediately: true
-            )
+            let root = SharedPendingDownloadRoot(queueID: UUID(), item: item,
+                root: .init(id: item.id, name: item.name, size: item.size, kind: .file, path: remotePath, relativeParent: []))
+            return .shared(roots: [root], access: access, destination: destination,
+                jobs: effectiveDownloadConcurrentJobs, proxyURL: sourceProxy)
         } else {
-            startDownload(
-                paths: [remotePath],
-                destination: destination,
-                startImmediately: true
-            )
+            // The file's ID is already known. Supplying it avoids walking the
+            // cloud path again and keeps a retry independent of Browser state.
+            let root = AccountDownloadRoot(queueID: UUID(), path: remotePath,
+                name: transfer.name, kind: .file,
+                file: .init(id: sourceID, name: transfer.name, size: String(transfer.totalBytes), kind: .file),
+                relativeParent: [])
+            return .account(roots: [root], destination: destination,
+                jobs: effectiveDownloadConcurrentJobs, proxyURL: sourceProxy)
         }
     }
 
@@ -8132,20 +9643,260 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
-    func stop() {
+    private var transferOwnerKey: String {
+        transferOwnerKey(for: workspaceSessionID)
+    }
+    private var importedTransferOwnerKeys: Set<String> {
+        Set(importedTransferSessions.filter(PikPakWorkspaceStorage.isValidSessionID).map { transferOwnerKey(for: $0) })
+    }
+    private func transferOwnerKey(for session: String) -> String {
+        let value = "\(session)|\(transferAccountID ?? "unverified")"
+        return SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func writeTransferControls(to url: URL, actions: [String: String]) throws {
+        try JSONEncoder().encode(["actions": actions]).write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+    private func rememberDownloadCancellation(controlID: String, remotePath: String, destinationDirectory: String?, requestID: UUID? = nil) {
+        let requests = activeDownloadRequests + pendingDownloadRequests + interruptedDownloadRequests
+        for request in requests where request.pendingItems.contains(where: {
+            (requestID == nil || $0.id == requestID) &&
+            (remotePath == $0.remotePath || remotePath.hasPrefix($0.remotePath + "/")) &&
+            (destinationDirectory == nil || destinationDirectory == $0.destinationPath || destinationDirectory?.hasPrefix($0.destinationPath + "/") == true)
+        }) {
+            savedDownloadCancellations.insert(.init(scope: request.cancellationScope, controlID: controlID, remotePath: remotePath))
+        }
+        _ = persistTransfersSynchronously()
+    }
+
+    private func restoredDownloadControls() -> [String: String] {
+        var actions: [String: String] = [:]
+        for request in activeDownloadRequests {
+            let records = savedDownloadCancellations.filter { $0.scope == request.cancellationScope }
+            for item in request.pendingItems {
+                for record in records where record.remotePath == item.remotePath || record.remotePath.hasPrefix(item.remotePath + "/") {
+                    actions[liveDownloadRun ? "path:\(item.id.uuidString):\(record.remotePath)" : record.controlID] = "cancel"
+                }
+            }
+        }
+        return actions
+    }
+
+    private func writeDownloadControls() {
+        _ = persistTransfersSynchronously()
+        guard let url = downloadControlURL else { return }
+        var actions = restoredDownloadControls()
+        for id in pausedDownloadIDs where actions[id] != "cancel" { actions[id] = "pause" }
+        for id in cancelledDownloadIDs { actions[id] = "cancel" }
+        for (path, action) in pendingRootActions { actions["path:" + path] = action }
+        if liveDownloadRun {
+            for id in pausedPendingDownloadIDs { actions["root:" + id.uuidString] = "pause" }
+        }
+        if downloadsPaused { actions["*"] = "pause" }
+        if cancelAllDownloadsRequested { actions["*"] = "cancel" }
+        do { try writeTransferControls(to: url, actions: actions); cancelOperationRetries(prefix: "download-control") }
+        catch {
+            setError("Could not update download controls. Retrying automatically: \(error.localizedDescription)")
+            scheduleTransferControlRetry(url, upload: false)
+        }
+    }
+    private func writeUploadControls() {
+        if let index = savedUploadBatches.firstIndex(where: { $0.id == activeUploadBatchID }) {
+            savedUploadBatches[index].pausedFileIDs = pausedUploadIDs
+            savedUploadBatches[index].cancelledFileIDs = cancelledUploadIDs
+        }
+        _ = persistTransfersSynchronously()
+        guard let url = uploadControlURL else { return }
+        var actions = Dictionary(uniqueKeysWithValues: pausedUploadIDs.map { ($0, "pause") })
+        for id in cancelledUploadIDs { actions[id] = "cancel" }
+        if isUploadPaused { actions["*"] = "pause" }
+        if cancelAllUploadsRequested { actions["*"] = "cancel" }
+        do { try writeTransferControls(to: url, actions: actions); cancelOperationRetries(prefix: "upload-control") }
+        catch {
+            setError("Could not update upload controls. Retrying automatically: \(error.localizedDescription)")
+            scheduleTransferControlRetry(url, upload: true)
+        }
+    }
+
+    private func scheduleTransferControlRetry(_ url: URL, upload: Bool) {
+        let key = upload ? "upload-control" : "download-control", context = fileOpenContext
+        guard !isClosingWindow, operationRetryTasks[key] == nil else { return }
+        operationRetryTasks[key] = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
+            guard let self else { return }
+            self.operationRetryTasks[key] = nil
+            guard !Task.isCancelled, !self.isClosingWindow, self.fileOpenContext == context,
+                  url == (upload ? self.uploadControlURL : self.downloadControlURL) else { return }
+            if upload { self.writeUploadControls() } else { self.writeDownloadControls() }
+        }
+    }
+
+    #if FINDER_WORKSPACE_TESTS
+    static func testAutomaticTransferControls() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("control-recovery-\(UUID())")
+        let suite = "control-recovery-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { try? FileManager.default.removeItem(at: root); defaults.removePersistentDomain(forName: suite) }
+        let model = downloadRetryFixture(defaults: defaults, directory: root)
+        defer { model.stopForWindowClose() }
+        model.downloadControlURL = root.appendingPathComponent("missing/download.json")
+        model.uploadControlURL = root.appendingPathComponent("missing/upload.json")
+        model.pausedDownloadIDs = ["paused-download"]
+        model.pausedUploadIDs = ["paused-upload"]; model.cancelledUploadIDs = ["cancelled-upload"]
+        model.writeDownloadControls(); model.writeUploadControls()
+        precondition(model.operationRetryTasks["download-control"] != nil && model.operationRetryTasks["upload-control"] != nil)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("missing"), withIntermediateDirectories: true)
+        let deadline = Date().addingTimeInterval(8)
+        while model.operationRetryTasks["download-control"] != nil || model.operationRetryTasks["upload-control"] != nil {
+            precondition(Date() < deadline, "Control files were not retried")
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let download = try JSONDecoder().decode([String: [String: String]].self, from: Data(contentsOf: model.downloadControlURL!))
+        let upload = try JSONDecoder().decode([String: [String: String]].self, from: Data(contentsOf: model.uploadControlURL!))
+        precondition(download["actions"]?["paused-download"] == "pause")
+        precondition(upload["actions"]?["paused-upload"] == "pause" && upload["actions"]?["cancelled-upload"] == "cancel")
+        print("PASS control recovery: failed writes retry automatically and preserve the latest Pause/Cancel actions")
+    }
+    #endif
+    func cancelAllDownloads() {
+        automaticDownloadRetry?.cancel(); automaticDownloadRetry = nil
+        for item in pendingDownloadItems { cancelPendingDownload(item) }
+        cancelAllDownloadsRequested = true
+        if isDownloading { stop() }
+        else {
+            for transfer in failedDownloadTransfers + Array(queuedDownloadTransfers) { cancelDownloadFile(transfer) }
+            interruptedDownloadRequests = []; interruptedDownloadCount = 0
+            _ = persistTransfersSynchronously(); cancelAllDownloadsRequested = false
+        }
+    }
+    func cancelAllUploads() {
+        automaticUploadRetry?.cancel(); automaticUploadRetry = nil
+        cancelAllUploadsRequested = true; isUploadPaused = false
+        for batch in resumableUploadBatches { discardSavedUpload(batch.id) }
+        writeUploadControls()
+        if uploadTotalFiles == 0 { stopUpload() }
+    }
+    func pauseDownloadFile(_ transfer: DownloadTransfer) {
+        guard !cancelledDownloadIDs.contains(transfer.id) else { return }
+        pausedDownloadIDs.insert(transfer.id); writeDownloadControls()
+    }
+    func resumeDownloadFile(_ transfer: DownloadTransfer) {
+        pausedDownloadIDs.remove(transfer.id); downloadsPaused = false; writeDownloadControls()
+        if !isDownloading { retryFailedDownload(transfer) }
+    }
+    func cancelDownloadFile(_ transfer: DownloadTransfer) {
+        if let path = transfer.remotePath { rememberDownloadCancellation(controlID: transfer.id, remotePath: path, destinationDirectory: transfer.outputDirectoryPath, requestID: downloadRequestIDsByFileID[transfer.id]) }
+        cancelledDownloadIDs.insert(transfer.id); pausedDownloadIDs.remove(transfer.id); writeDownloadControls()
+        if !isDownloading {
+            removeFailedDownloadFromHistory(transfer)
+            if let path = transfer.remotePath, let directory = transfer.outputDirectoryPath {
+                let target = DownloadRetryTarget(isShared: transfer.isShared, remotePath: path,
+                    directory: URL(fileURLWithPath: directory), shareURL: transfer.isShared ? downloadSharedAccessByFileID[transfer.id]?.url : nil)
+                pendingDownloadRequests = pendingDownloadRequests.compactMap { $0.removingRetriedFiles([target]) }
+                interruptedDownloadRequests = interruptedDownloadRequests.compactMap { $0.removingRetriedFiles([target]) }
+                interruptedDownloadCount = interruptedDownloadRequests.reduce(0) { $0 + $1.itemCount }
+                synchronizePendingDownloadQueue(); _ = persistTransfersSynchronously()
+                let partial = URL(fileURLWithPath: directory).appendingPathComponent((transfer.name as NSString).lastPathComponent + ".part")
+                let owner = transferOwnerKey, fileID = downloadSourceFileIDs[transfer.id] ?? transfer.id, importedOwners = importedTransferOwnerKeys
+                Task { [weak self] in
+                    do { try await Task.detached(priority: .utility) { try TransferPartialCleanup.remove(partial, owner: owner, fileID: fileID, importedOwners: importedOwners) }.value }
+                    catch { self?.setError("Could not remove the cancelled partial file: \(error.localizedDescription)") }
+                }
+            }
+        }
+    }
+    func pauseUploadFile(_ transfer: UploadTransfer) {
+        pausedUploadIDs.insert(transfer.id); writeUploadControls()
+    }
+    func resumeUploadFile(_ transfer: UploadTransfer) {
+        pausedUploadIDs.remove(transfer.id); writeUploadControls()
+    }
+    func cancelUploadFile(_ transfer: UploadTransfer) {
+        cancelledUploadIDs.insert(transfer.id); pausedUploadIDs.remove(transfer.id); writeUploadControls()
+    }
+    func pausePendingDownload(_ item: PendingDownloadItem) {
+        pausedPendingDownloadIDs.insert(item.id)
+        if activeDownloadRequests.contains(where: { $0.pendingItems.contains(where: { $0.id == item.id }) }) {
+            pendingRootActions[liveDownloadRun ? "\(item.id.uuidString):\(item.remotePath)" : item.remotePath] = "pause"
+            for file in queuedDownloadTransfers + downloadingTransfers where liveDownloadRun ? downloadRequestIDsByFileID[file.id] == item.id : (file.remotePath == item.remotePath || file.remotePath?.hasPrefix(item.remotePath + "/") == true) {
+                pausedDownloadIDs.insert(file.id)
+            }
+            writeDownloadControls()
+        }
+    }
+    func resumePendingDownload(_ item: PendingDownloadItem) {
+        downloadsPaused = false
+        pausedPendingDownloadIDs.remove(item.id); pendingRootActions[liveDownloadRun ? "\(item.id.uuidString):\(item.remotePath)" : item.remotePath] = nil
+        for file in queuedDownloadTransfers + downloadingTransfers where liveDownloadRun ? downloadRequestIDsByFileID[file.id] == item.id : (file.remotePath == item.remotePath || file.remotePath?.hasPrefix(item.remotePath + "/") == true) {
+            pausedDownloadIDs.remove(file.id)
+        }
+        writeDownloadControls(); _ = startNextPendingDownloadIfNeeded()
+    }
+    private func cleanCancelledFolderPartials(_ trees: [URL], ignoringActiveWriters: Bool) {
+        guard !trees.isEmpty else { return }
+        let owner = transferOwnerKey, importedOwners = importedTransferOwnerKeys
+        Task { [weak self] in
+            do {
+                try await Task.detached(priority: .utility) {
+                    for tree in trees { try TransferPartialCleanup.removeOwned(in: tree, owner: owner, ignoringActiveWriters: ignoringActiveWriters, importedOwners: importedOwners) }
+                }.value
+            } catch { self?.setError("Could not remove a cancelled folder's partial download: \(error.localizedDescription)") }
+        }
+    }
+
+    func cancelPendingDownload(_ item: PendingDownloadItem) {
+        let trees = (activeDownloadRequests + pendingDownloadRequests).compactMap { $0.partialTreeURL(for: item.id) }
+        cleanCancelledFolderPartials(trees, ignoringActiveWriters: isDownloading)
+        rememberDownloadCancellation(controlID: "path:" + item.remotePath, remotePath: item.remotePath, destinationDirectory: item.destinationPath, requestID: item.id)
+        pausedPendingDownloadIDs.remove(item.id)
+        if activeDownloadRequests.contains(where: { $0.pendingItems.contains(where: { $0.id == item.id }) }) {
+            pendingRootActions[liveDownloadRun ? "\(item.id.uuidString):\(item.remotePath)" : item.remotePath] = "cancel"
+            for file in queuedDownloadTransfers + downloadingTransfers where liveDownloadRun ? downloadRequestIDsByFileID[file.id] == item.id : (file.remotePath == item.remotePath || file.remotePath?.hasPrefix(item.remotePath + "/") == true) {
+                cancelledDownloadIDs.insert(file.id); pausedDownloadIDs.remove(file.id)
+            }
+            writeDownloadControls()
+        } else {
+            let partial = pendingDownloadRequests.compactMap { $0.partialURL(for: item.id) }.first
+            let fileID = pendingDownloadRequests.compactMap { $0.fileID(for: item.id) }.first
+            removePendingDownloadItem(item.id)
+            if let partial, let fileID {
+                let owner = transferOwnerKey, importedOwners = importedTransferOwnerKeys
+                Task { [weak self] in
+                    do { try await Task.detached(priority: .utility) { try TransferPartialCleanup.remove(partial, owner: owner, fileID: fileID, importedOwners: importedOwners) }.value }
+                    catch { self?.setError("Could not remove the cancelled partial file: \(error.localizedDescription)") }
+                }
+            }
+        }
+    }
+
+    func stop() { stop(automatic: false) }
+    private func stop(automatic: Bool) {
+        automaticDownloadRetry?.cancel(); automaticDownloadRetry = nil
+        downloadsPaused = !automatic
+        _ = persistTransfersSynchronously()
         guard isDownloading, let downloadProcess, downloadProcess.isRunning else { return }
-        downloadRequestedStop = true
+        downloadRequestedStop = !automatic
         downloadRunState = .stopping
         setStatus("Stopping safely; partial files and waiting queue items will be kept…")
         downloadProcess.terminate()
     }
 
     func stopForWindowClose() {
-        fileSimilarity.close()
+        bookmarkNavigationTask?.cancel(); bookmarkNavigationTask = nil
+        pikpakManagement.clear()
+        folderThumbnails.cancel()
+        thumbnailPageReader?.cancel()
+        transferQuotaMonitor.clear()
+        automaticDownloadRetry?.cancel(); automaticUploadRetry?.cancel()
+        stopWatchingUploadDisk(); stopWatchingUploadRemount()
+        fileSimilarity.close(preservingScans:true)
         _ = cancelQuickLook()
         quickLookCopies.removeAll(); quickLookCopyOrder.removeAll()
         fileOpener.cancelAll()
         pendingSharedLinkLoads = []
+        cancelAutomaticSharedLinkRetry(resettingAttempts: true)
+        cancelAutomaticRecoveryTasks()
         sharedLinkRetryBatchIDs = []
         sharedLinkRetryProgress = nil
         #if FINDER_WORKSPACE_TESTS
@@ -8252,7 +10003,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func rememberBrowserPosition(beforeOpening item: BrowserItem) {
-        let visibleEntries = browserTreeEntries
+        let visibleEntries = displayedBrowserTreeEntries
         guard
             let location = browserStack.last,
             let index = visibleEntries.firstIndex(where: { $0.id == item.id })
@@ -8364,7 +10115,7 @@ final class DownloaderModel: ObservableObject {
         browserTreeLoadingFolderIDs = []
         applyBrowserSortToCachedItems()
 
-        let visibleEntries = browserTreeEntries
+        let visibleEntries = displayedBrowserTreeEntries
         let restoredIndex: Int?
         if let exactIndex = visibleEntries.firstIndex(where: {
             $0.item.id == snapshot.anchorItemID
@@ -8395,6 +10146,7 @@ final class DownloaderModel: ObservableObject {
         browserFolderSnapshots = browserFolderSnapshots.filter {
             activeLocationIDs.contains($0.key)
         }
+        resumeUnloadedBrowserFolders()
         if isBrowsingSharedLink {
             saveActiveBrowserWorkspace()
         }
@@ -8412,8 +10164,12 @@ final class DownloaderModel: ObservableObject {
             guard let location = stack.last else { return }
             browserStack = stack
             browserItems = finderFixtureFolders[location.id] ?? []
-            selectedBrowserItemID = nil
-            selectedBrowserItemIDs = []
+            if !preserveOutline {
+                resetBrowserTreeState()
+                selectedBrowserItemID = nil
+                selectedBrowserItemIDs = []
+            }
+            registerBrowserItems(browserItems, parentID: location.id, parentPath: location.path)
             setStatus("Offline folder refreshed — no network or cloud changes")
             return
         }
@@ -8429,7 +10185,7 @@ final class DownloaderModel: ObservableObject {
                 access: shareAccess,
                 parentId: location.id,
                 pageToken: append ? nextPageToken : nil,
-                limit: 200
+                limit: Self.browserPageSize
             )
             runEngine(
                 arguments: ["share-browse"],
@@ -8447,7 +10203,7 @@ final class DownloaderModel: ObservableObject {
         var arguments = [
             "browse",
             "--parent-id", location.id,
-            "--limit", "200",
+            "--limit", String(Self.browserPageSize),
         ]
         if append, let nextPageToken, !nextPageToken.isEmpty {
             arguments += ["--page-token", nextPageToken]
@@ -8469,6 +10225,10 @@ final class DownloaderModel: ObservableObject {
     /// Switching folder trees (navigation, link switch, sign-out) must not let
     /// an in-flight listing land in the workspace that replaced it.
     private func cancelBrowserTreeLoads() {
+        cancelOperationRetries(prefix: "tree:")
+        cancelOperationRetries(prefix: "foreground")
+        folderThumbnails.cancel()
+        thumbnailPageReader?.cancel()
         cancelBrowserFolderExpansion(announcesResult: false)
         let processes = browserTreeLoadProcesses
         browserTreeLoadProcesses = [:]
@@ -8488,6 +10248,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func cancelBrowserTreeLoad(_ folderID: String) {
+        cancelOperationRetries(prefix: "tree:\(folderID)")
         browserTreeLoadGenerations.removeValue(forKey: folderID)
         browserTreeLoadExpansionOwners.removeValue(forKey: folderID)
         if let process = browserTreeLoadProcesses.removeValue(forKey: folderID), process.isRunning {
@@ -8677,6 +10438,7 @@ final class DownloaderModel: ObservableObject {
             browserTreeLoadExpansionOwners.removeValue(forKey: folderID)
             browserTreeLoadErrors[folderID] = "This folder could not be opened."
             appendOutput("A folder helper could not start: \(error.localizedDescription)\n")
+            scheduleBrowserTreeRetry(folderID, append: append)
             return false
         }
     }
@@ -8740,8 +10502,59 @@ final class DownloaderModel: ObservableObject {
                 appendOutput(redactedEngineOutput(errorOutput))
             }
         }
+        if browserTreeLoadErrors[folderID] != nil { scheduleBrowserTreeRetry(folderID, append: append) }
+        else { cancelOperationRetries(prefix: "tree:\(folderID)") }
         resumeBrowserFolderExpansion(after: folderID)
         startNextPendingBrowserTreeLoadIfNeeded()
+        if browserFolderExpansion?.isWaiting(for: folderID) != true,
+           let folder = browserItem(withID: folderID) {
+            resumeUnloadedBrowserFolders(in: folder)
+        }
+    }
+
+    private func scheduleBrowserTreeRetry(_ folderID: String, append: Bool) {
+        let key = "tree:\(folderID)", context = fileOpenContext, link = activeSharedLinkID
+        guard !isClosingWindow, expandedBrowserFolderIDs.contains(folderID), operationRetryTasks[key] == nil else { return }
+        let attempt = operationRetryAttempts[key] ?? 0
+        operationRetryAttempts[key] = AutomaticRecovery.nextAttempt(attempt)
+        let delay = AutomaticRecovery.delay(attempt: attempt)
+        operationRetryTasks[key] = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return }
+            guard let self else { return }
+            self.operationRetryTasks[key] = nil
+            guard !Task.isCancelled, !self.isClosingWindow, self.fileOpenContext == context,
+                  self.activeSharedLinkID == link, self.expandedBrowserFolderIDs.contains(folderID),
+                  let item = self.browserItem(withID: folderID) else { return }
+            guard self.hasUsableSession else { self.scheduleBrowserTreeRetry(folderID, append: append); return }
+            self.browserTreeLoadErrors[folderID] = nil
+            if !self.requestBrowserTreeLoad(item, append: append) { self.scheduleBrowserTreeRetry(folderID, append: append) }
+        }
+    }
+
+    /// Expansion intent survives navigation and cancelled requests; a pending
+    /// process does not. Restore missing listings for visible open branches,
+    /// including descendants revealed by a later parent response. Cached empty
+    /// folders, collapsed branches and genuine failures need no automatic I/O.
+    private func resumeUnloadedBrowserFolders(in root: BrowserItem? = nil, retryStopped: Bool = false) {
+        guard hasActiveBrowserAccess, !isLoginPresented, !isClosingWindow else { return }
+        if let root, !browserTreeEntries.contains(where: { $0.id == root.id }) { return }
+        var folders = root.map { [$0] } ?? Array(browserItems.reversed())
+        var visited = Set<String>()
+        while let folder = folders.popLast() {
+            guard folder.isFolder, expandedBrowserFolderIDs.contains(folder.id), visited.insert(folder.id).inserted else { continue }
+            if let children = browserTreeChildren[folder.id] {
+                folders.append(contentsOf: children.reversed().filter(\.isFolder))
+                continue
+            }
+            guard browserTreeLoadErrors[folder.id] == nil
+                || (retryStopped && browserTreeLoadErrors[folder.id] == Self.browserFolderLoadStopped),
+                !isActivelyLoadingBrowserTreeFolder(folder.id),
+                !pendingBrowserTreeLoads.contains(where: { $0.item.id == folder.id }) else { continue }
+            let owner = browserFolderExpansion.flatMap { $0.isWaiting(for: folder.id) ? $0.id : nil }
+            if !requestBrowserTreeLoad(folder, append: false, expansionID: owner) {
+                browserTreeLoadErrors[folder.id] = browserTreeLoadErrors[folder.id] ?? "This folder could not be opened."
+            }
+        }
     }
 
 
@@ -8912,39 +10725,34 @@ final class DownloaderModel: ObservableObject {
     /// Sort sibling rows without flattening the outline. Folders remain above
     /// files in either direction, matching the app's Finder-style navigation;
     /// every expanded folder applies the same ordering to its own children.
+    /// Sort keys are computed once per item rather than in every comparison:
+    /// a kind title allocates several strings and a folder size is a cache
+    /// lookup, and a large folder makes hundreds of thousands of comparisons.
     private func sortedBrowserItems(_ items: [BrowserItem], in linkID: UUID? = nil) -> [BrowserItem] {
-        var modifiedDates: [String: Date] = [:]
-        if browserSortColumn == .modified {
-            modifiedDates.reserveCapacity(items.count)
-            for item in items {
-                if let date = Self.browserSortDate(from: item.modifiedTime) {
-                    modifiedDates[item.id] = date
-                }
-            }
+        let column = browserSortColumn
+        let keyed = items.map { item in
+            BrowserSortKey(
+                item: item,
+                date: column == .modified ? Self.browserSortDate(from: item.modifiedTime) : nil,
+                size: column != .size ? 0 : item.isFolder
+                    ? cachedFolderMeasurement(for: item.id, in: linkID)?.totalBytes ?? 0 : item.size,
+                kind: column == .kind ? item.kindDisplayTitle : ""
+            )
         }
 
-        return items.sorted { left, right in
+        return keyed.sorted { leftKey, rightKey in
+            let left = leftKey.item, right = rightKey.item
             if left.isFolder != right.isFolder {
                 return left.isFolder
             }
 
             // Unknown timestamps stay at the bottom in both directions rather
             // than jumping above real dates when descending is selected.
-            if browserSortColumn == .modified {
-                let leftHasDate = modifiedDates[left.id] != nil
-                let rightHasDate = modifiedDates[right.id] != nil
-                if leftHasDate != rightHasDate {
-                    return leftHasDate
-                }
+            if column == .modified, (leftKey.date != nil) != (rightKey.date != nil) {
+                return leftKey.date != nil
             }
 
-            let primaryOrder = compareBrowserItems(
-                left,
-                right,
-                by: browserSortColumn,
-                modifiedDates: modifiedDates,
-                linkID: linkID
-            )
+            let primaryOrder = compareBrowserItems(leftKey, rightKey, by: column)
             if primaryOrder != .orderedSame {
                 switch browserSortDirection {
                 case .ascending:
@@ -8959,35 +10767,32 @@ final class DownloaderModel: ObservableObject {
                 return nameOrder == .orderedAscending
             }
             return left.id < right.id
-        }
+        }.map(\.item)
+    }
+
+    private struct BrowserSortKey {
+        let item: BrowserItem
+        let date: Date?
+        let size: UInt64
+        let kind: String
     }
 
     private func compareBrowserItems(
-        _ left: BrowserItem,
-        _ right: BrowserItem,
-        by column: BrowserSortColumn,
-        modifiedDates: [String: Date],
-        linkID: UUID? = nil
+        _ left: BrowserSortKey,
+        _ right: BrowserSortKey,
+        by column: BrowserSortColumn
     ) -> ComparisonResult {
         switch column {
         case .name:
-            return left.name.localizedStandardCompare(right.name)
+            return left.item.name.localizedStandardCompare(right.item.name)
         case .size:
-            let leftSize = left.isFolder
-                ? cachedFolderMeasurement(for: left.id, in: linkID)?.totalBytes ?? 0
-                : left.size
-            let rightSize = right.isFolder
-                ? cachedFolderMeasurement(for: right.id, in: linkID)?.totalBytes ?? 0
-                : right.size
-            if leftSize < rightSize { return .orderedAscending }
-            if leftSize > rightSize { return .orderedDescending }
+            if left.size < right.size { return .orderedAscending }
+            if left.size > right.size { return .orderedDescending }
             return .orderedSame
         case .kind:
-            return left.kindDisplayTitle.localizedStandardCompare(right.kindDisplayTitle)
+            return left.kind.localizedStandardCompare(right.kind)
         case .modified:
-            let leftDate = modifiedDates[left.id]
-            let rightDate = modifiedDates[right.id]
-            switch (leftDate, rightDate) {
+            switch (left.date, right.date) {
             case let (.some(leftDate), .some(rightDate)):
                 return leftDate.compare(rightDate)
             case (.some, .none):
@@ -9053,10 +10858,78 @@ final class DownloaderModel: ObservableObject {
         browserItemIndex[itemID]
     }
 
+    /// Use the actual parent from the outline, which can be several levels
+    /// below the breadcrumb. File ids alone aren't unique across shared links.
+    private func prefetchFolderThumbnails(for item: BrowserItem) {
+        guard !item.isFolder, !isClosingWindow else {
+            folderThumbnails.cancel()
+            thumbnailPageReader?.cancel()
+            return
+        }
+        let parent = browserItemParentIDs[item.id] ?? item.parentId ?? browserStack.last?.id ?? ""
+        let isCurrentFolder = parent == browserStack.last?.id
+        let siblings = isCurrentFolder ? browserItems : (browserTreeChildren[parent] ?? [item])
+        let token = isCurrentFolder ? nextPageToken : browserTreeNextPageTokens[parent]
+        let source = isBrowsingSharedLink ? "share:\(activeSharedLinkID?.uuidString ?? "")"
+            : "account:\(activeAccountID?.uuidString ?? accountProfile?.sub ?? "")"
+        let context = FolderThumbnailPrefetcher.Context(source: source, folderID: parent,
+            proxyURL: PreviewTransport.effectiveProxyURL(proxyURL))
+        guard folderThumbnails.context != context else { return }
+        let urls = ([item] + siblings.filter { $0.id != item.id }).filter { !$0.isFolder }.compactMap(\.artworkURL)
+        thumbnailPageReader?.cancel()
+        // Snapshot this link's access; a page completion must never borrow a
+        // different link's passcode after the user changes workspace.
+        var access = isBrowsingSharedLink ? shareAccess : nil
+        folderThumbnails.start(context: context, urls: urls, nextPageToken: token) { [weak self] token in
+            guard let self else { throw CancellationError() }
+            try Task.checkCancellation()
+            #if FINDER_WORKSPACE_TESTS
+            if let fixture = self.thumbnailPageFixture { return try await fixture(context, token) }
+            if self.isFinderWorkspaceFixture { throw CancellationError() }
+            #endif
+            guard self.hasUsableSession, !self.isClosingWindow,
+                  let engine = Bundle.main.url(forResource: "pikpak", withExtension: nil) else {
+                throw CancellationError()
+            }
+            var environment = try self.engineEnvironment()
+            if context.proxyURL.isEmpty { environment.removeValue(forKey: "PIKPAK_PROXY") }
+            else { environment["PIKPAK_PROXY"] = context.proxyURL }
+            var requestURL: URL?
+            if let access {
+                requestURL = try self.writePrivateRequest(
+                    ShareBrowseInput(access: access, parentId: parent, pageToken: token, limit: 500),
+                    named: "thumbnail-page", in: self.makePrivateExchangeDirectory())
+            }
+            defer { if let requestURL { try? FileManager.default.removeItem(at: requestURL) } }
+            let reader = PikPakAccountVerifier()
+            self.thumbnailPageReader = reader
+            defer { if self.thumbnailPageReader === reader { self.thumbnailPageReader = nil } }
+            let data = try await reader.folderPage(engineURL: engine, environment: environment,
+                parentID: parent, pageToken: token, shareRequestURL: requestURL)
+            try Task.checkCancellation()
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            if let current = access {
+                let page = try decoder.decode(ShareBrowsePage.self, from: data)
+                access = ShareAccessInput(url: current.url, passCode: current.passCode, passCodeToken: page.passCodeToken)
+                return .init(urls: page.files.filter { !$0.isFolder }.compactMap(\.artworkURL), nextPageToken: page.nextPageToken)
+            }
+            let page = try decoder.decode(BrowserPage.self, from: data)
+            return .init(urls: page.files.filter { !$0.isFolder }.compactMap(\.artworkURL), nextPageToken: page.nextPageToken)
+        }
+    }
+
+    #if FINDER_WORKSPACE_TESTS
+    private var thumbnailPageFixture: ((FolderThumbnailPrefetcher.Context, String) async throws -> FolderThumbnailPrefetcher.Page)?
+    #endif
+
     private func updateBrowserSelection(
         to item: BrowserItem,
-        replacingSelection: Bool = true
+        replacingSelection: Bool = true,
+        requestsPreview: Bool = true
     ) {
+        collapsedBrowserFolderFocus = nil
+        prefetchFolderThumbnails(for: item)
         let keepsCurrentPreview = previewFileID == item.id
         if isBrowsingSharedLink {
             selectedSharedLinkRootID = nil
@@ -9079,7 +10952,7 @@ final class DownloaderModel: ObservableObject {
         } else if item.isFolder {
             cancelAutomaticPreviewNavigation()
             setStatus("Folder selected; use Right Arrow to expand or Return to open")
-        } else if !keepsCurrentPreview {
+        } else if !keepsCurrentPreview && requestsPreview {
             scheduleAutomaticPreview(for: item)
         }
     }
@@ -9088,7 +10961,7 @@ final class DownloaderModel: ObservableObject {
         to item: BrowserItem,
         visibleItems suppliedVisibleItems: [BrowserItem]? = nil
     ) {
-        let visibleItems = suppliedVisibleItems ?? browserTreeEntries.map(\.item)
+        let visibleItems = suppliedVisibleItems ?? browserFilterSelectionItems
         guard let targetIndex = visibleItems.firstIndex(where: { $0.id == item.id }) else {
             updateBrowserSelection(to: item)
             return
@@ -9158,7 +11031,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func selectFirstExplicitBrowserItem() {
-        let visibleItems = browserTreeEntries.map(\.item)
+        let visibleItems = browserFilterSelectionItems
         let replacement = visibleItems.first {
             selectedBrowserItemIDs.contains($0.id)
         } ?? selectedBrowserItems.first
@@ -9213,6 +11086,9 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func clearBrowserSelection() {
+        collapsedBrowserFolderFocus = nil
+        folderThumbnails.cancel()
+        thumbnailPageReader?.cancel()
         _ = cancelQuickLook()
         selectedBrowserItemID = nil
         selectedBrowserItemIDs = []
@@ -9228,6 +11104,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func resetBrowserTreeState() {
+        collapsedBrowserFolderFocus = nil
         cancelBrowserTreeLoads()
         expandedBrowserFolderIDs = []
         browserTreeChildren = [:]
@@ -9296,11 +11173,13 @@ final class DownloaderModel: ObservableObject {
     /// A background account-maintenance scan may finish while the user is in
     /// Links. Update the saved account workspace without touching the visible
     /// shared-link tree or its selection.
-    private func removeCachedAccountBrowserItems(withIDs itemIDs: Set<String>, invalidatingFolders: Set<String> = []) {
+    private func removeCachedAccountBrowserItems(withIDs itemIDs: Set<String>, invalidatingFolders: Set<String> = [],
+                                                preservingExpansion: Bool = false) {
         guard isBrowsingSharedLink else {
             removeCachedBrowserItems(withIDs: itemIDs)
             for id in invalidatingFolders {
-                expandedBrowserFolderIDs.remove(id)
+                cancelBrowserTreeLoad(id)
+                if !preservingExpansion { expandedBrowserFolderIDs.remove(id) }
                 browserTreeChildren.removeValue(forKey: id)
                 browserTreeNextPageTokens.removeValue(forKey: id)
                 browserTreeLoadErrors.removeValue(forKey: id)
@@ -9350,7 +11229,7 @@ final class DownloaderModel: ObservableObject {
             items: snapshot.items.filter { !removedIDs.contains($0.id) },
             stack: snapshot.stack,
             nextPageToken: snapshot.nextPageToken,
-            expandedFolderIDs: snapshot.expandedFolderIDs.subtracting(removedIDs.union(invalidatingFolders)),
+            expandedFolderIDs: snapshot.expandedFolderIDs.subtracting(removedIDs.union(preservingExpansion ? [] : invalidatingFolders)),
             childrenByFolderID: children,
             loadErrors: loadErrors,
             selectedItemID: snapshot.selectedItemID.flatMap {
@@ -9371,7 +11250,7 @@ final class DownloaderModel: ObservableObject {
 
     private func validateConfiguration() -> Bool {
         do {
-            refreshToken = try CredentialParser.refreshToken(from: refreshToken)
+            refreshToken = try (activeSavedAccount?.credentialKind ?? .desktopOAuth).parse(refreshToken)
         } catch {
             setError(error.localizedDescription)
             return false
@@ -9490,13 +11369,15 @@ final class DownloaderModel: ObservableObject {
             taskActivity.finish(.duplicates, state: .failed, message: message)
             setError(message)
             requireFreshAppLoginIfSessionTrustFailed(error)
+            scheduleOperationRetry(operation: .duplicates(scope: scope))
         }
     }
 
     /// Empty-folder and .DS_Store scans can take minutes on a large account.
     /// Keep them off the foreground engine slot so account folders, saved
     /// shared links, and media previews remain available throughout the scan.
-    private func runMaintenanceScan(arguments: [String], operation: Operation) {
+    private func runMaintenanceScan(arguments: [String], operation: Operation, retrying: Bool = false) {
+        if !retrying { cancelOperationRetries(prefix: "maintenance") }
         guard hasUsableSession else {
             presentLogin(reason: "Complete the desktop-session sign-in before scanning PikPak.")
             return
@@ -9637,6 +11518,7 @@ final class DownloaderModel: ObservableObject {
             taskActivity.finish(kind, state: .failed, message: message, diagnostic: diagnostic(for: error, source: "macOS process launcher"))
             setError(message, diagnostic: diagnostic(for: error, source: "macOS process launcher"))
             requireFreshAppLoginIfSessionTrustFailed(error)
+            scheduleOperationRetry(arguments: arguments, operation: operation)
         }
     }
 
@@ -9894,11 +11776,14 @@ final class DownloaderModel: ObservableObject {
         recordFolderSizeChange(in: changedFolders)
 
         if wasCancelled {
+            // Cancelling is the user's decision; nothing resumes on its own.
+            cancelAutomaticFolderMergeRetry(resettingAttempts: true)
             mergeStatus = "Merge cancelled safely. Moved items remain in the destination; nonempty sources were kept."
             if !isRunning {
                 setStatus(mergeStatus)
             }
         } else if exitCode == 0 {
+            cancelAutomaticFolderMergeRetry(resettingAttempts: true)
             finishMergeFolders(
                 output: structuredOutput,
                 requestedFolders: folders,
@@ -9917,6 +11802,7 @@ final class DownloaderModel: ObservableObject {
                 setError(failure.summary, diagnostic: failure.diagnostic)
             }
             handleWebLoginNeeded(for: errorOutput)
+            scheduleAutomaticFolderMergeRetry()
         }
 
         taskActivity.finish(.folderMerge,
@@ -10296,7 +12182,8 @@ final class DownloaderModel: ObservableObject {
         arguments: [String],
         operation: Operation,
         proxyOverride: String? = nil,
-        accountRequest: AccountDownloadInput? = nil
+        accountRequest: AccountDownloadInput? = nil,
+        liveQueue: Bool = false
     ) {
         guard hasUsableSession else {
             presentLogin(reason: "Complete the desktop-session sign-in before accessing PikPak.")
@@ -10310,6 +12197,12 @@ final class DownloaderModel: ObservableObject {
             assertionFailure("Unsupported background download operation")
             return
         }
+        #if FINDER_WORKSPACE_TESTS
+        if let downloadEngineFixture {
+            downloadEngineFixture(arguments, operation, accountRequest)
+            return
+        }
+        #endif
         guard let engineURL = Bundle.main.url(forResource: "pikpak", withExtension: nil) else {
             setError("The bundled download engine is missing. Rebuild the app.")
             return
@@ -10318,6 +12211,11 @@ final class DownloaderModel: ObservableObject {
         do {
             let exchangeDirectory = try makePrivateExchangeDirectory()
             var effectiveArguments = arguments
+            if liveQueue {
+                let requestURL = try writePrivateRequest(liveDownloadInbox, named: "download-queue", in: exchangeDirectory)
+                downloadInputURL = requestURL
+                effectiveArguments.append(contentsOf: ["--request-file", requestURL.path])
+            }
             if let accountRequest {
                 let requestURL = try writePrivateRequest(accountRequest, named: "account-download", in: exchangeDirectory)
                 downloadInputURL = requestURL
@@ -10348,6 +12246,24 @@ final class DownloaderModel: ObservableObject {
             process.qualityOfService = .utility
 
             var environment = try engineEnvironment()
+            downloadControlURL = exchangeDirectory.appendingPathComponent("download-control-\(UUID().uuidString).json")
+            if let controlURL = downloadControlURL {
+                var actions = restoredDownloadControls()
+                for id in pausedDownloadIDs where actions[id] != "cancel" { actions[id] = "pause" }
+                if liveDownloadRun { for id in pausedPendingDownloadIDs { actions["root:" + id.uuidString] = "pause" } }
+                try writeTransferControls(to: controlURL, actions: actions)
+                environment["MYCLOUDDRIVER_TRANSFER_CONTROL"] = controlURL.path
+                let locks = try LocalCredentialStore.applicationSupportDirectoryURL().appendingPathComponent("TransferLocks", isDirectory: true)
+                try FileManager.default.createDirectory(at: locks, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                environment["MYCLOUDDRIVER_TRANSFER_LOCKS"] = locks.path
+                environment["MYCLOUDDRIVER_TRANSFER_OWNER"] = transferOwnerKey
+                environment["MYCLOUDDRIVER_IMPORTED_TRANSFER_OWNERS"] = importedTransferOwnerKeys.sorted().joined(separator: ",")
+                if workspaceSessionID == "primary" { environment["MYCLOUDDRIVER_CLAIM_LEGACY_PARTS"] = "1" }
+            }
+            let restoredControls = restoredDownloadControls()
+            cancelledDownloadIDs = Set(restoredControls.keys.filter { !$0.hasPrefix("path:") })
+            pendingRootActions = Dictionary(restoredControls.filter { $0.key.hasPrefix("path:") }.map { (String($0.key.dropFirst(5)), $0.value) }, uniquingKeysWith: { first, _ in first })
+            cancelAllDownloadsRequested = false
             let proxy = (proxyOverride ?? proxyURL)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if proxy.isEmpty {
@@ -10364,7 +12280,8 @@ final class DownloaderModel: ObservableObject {
                 let lines = stdoutLineBuffer.append(data)
                 guard !lines.isEmpty else { return }
                 DispatchQueue.main.async {
-                    self?.enqueueDownloadOutputLines(lines)
+                    guard let self, self.downloadProcess === process else { return }
+                    self.enqueueDownloadOutputLines(lines)
                 }
             }
             stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -10373,7 +12290,8 @@ final class DownloaderModel: ObservableObject {
                 stderrBuffer.append(data)
                 if let text = String(data: data, encoding: .utf8) {
                     DispatchQueue.main.async {
-                        self?.appendOutput(self?.redactedEngineOutput(text) ?? text)
+                        guard let self, self.downloadProcess === process else { return }
+                        self.appendOutput(self.redactedEngineOutput(text))
                     }
                 }
             }
@@ -10391,7 +12309,7 @@ final class DownloaderModel: ObservableObject {
                 let completeOutput = stdoutBuffer.string()
                 let errorOutput = stderrBuffer.string()
                 DispatchQueue.main.async {
-                    guard let self else { return }
+                    guard let self, self.downloadProcess === finishedProcess else { return }
                     self.enqueueDownloadOutputLines(trailingLines)
                     self.flushAllDownloadOutputLines()
                     // Replaying the complete ordered transcript closes the
@@ -10439,6 +12357,7 @@ final class DownloaderModel: ObservableObject {
             if deferredLoginReason == nil {
                 _ = startNextPendingDownloadIfNeeded()
             }
+            scheduleAutomaticDownloadRetry()
         }
     }
 
@@ -10449,25 +12368,46 @@ final class DownloaderModel: ObservableObject {
     ) {
         guard !isClosingWindow else { cleanupDownloadInputFile(); return }
         let wasStopped = downloadRequestedStop
-        if wasStopped || exitCode != 0 {
+        let wasCancelled = cancelAllDownloadsRequested
+        let cancelTransfers = wasCancelled ? Array(activeDownloadTransfers.values) + Array(queuedDownloadTransfers) + failedDownloadTransfers : []
+        let cancelTrees = wasCancelled ? (activeDownloadRequests + interruptedDownloadRequests).flatMap { request in request.pendingItems.compactMap { request.partialTreeURL(for: $0.id) } } : []
+        if !wasCancelled && (wasStopped || exitCode != 0) {
             retainInterruptedDownload()
         } else {
-            activePersistentDownload = nil
+            if liveDownloadRun && !wasCancelled {
+                pendingDownloadRequests.insert(contentsOf: activeDownloadRequests, at: 0)
+            }
+            activeDownloadRequests = []
+            synchronizePendingDownloadQueue()
             _ = persistTransfersSynchronously()
         }
         synchronizeSharedSessionFromDisk()
         cleanupDownloadInputFile()
         downloadProcess = nil
+        if let url = downloadControlURL { try? FileManager.default.removeItem(at: url) }
+        downloadControlURL = nil
         downloadOperation = nil
         downloadRequestedStop = false
         activeDownloadRequestKey = nil
         downloadOutputFlushScheduled = false
         pendingDownloadOutputLines.removeAll(keepingCapacity: true)
         isDownloading = false
+        liveDownloadRun = false
+        submittedDownloadRequests = [:]
+        discoveringDownloadRequestIDs = []
+        activeDownloadSelectionKeys = []
+        cancelAllDownloadsRequested = false
+        if wasCancelled {
+            cleanCancelledFolderPartials(cancelTrees, ignoringActiveWriters: false)
+            for transfer in cancelTransfers { cancelDownloadFile(transfer) }
+            interruptedDownloadRequests = []; interruptedDownloadCount = 0
+            _ = persistTransfersSynchronously()
+        }
 
         if wasStopped {
             finishDownloadProgress(as: .stopped)
-            if !isRunning {
+            if wasCancelled { setStatus("Downloads cancelled. Incomplete local copies are removed; completed files are kept.") }
+            if !isRunning && !wasCancelled {
                 let message = {
                     if case .shareDownload = finishedOperation {
                         return "Stopped. Shared-file .part files were kept for resume."
@@ -10477,8 +12417,8 @@ final class DownloaderModel: ObservableObject {
                 setStatus(message)
             }
         } else if exitCode == 0 {
-            finishDownloadProgress(as: .completed)
-            if !isRunning {
+            finishDownloadProgress(as: interruptedDownloadRequests.isEmpty ? .completed : .failed)
+            if !isRunning && interruptedDownloadRequests.isEmpty {
                 setStatus(
                     {
                         if case .shareDownload = finishedOperation {
@@ -10505,10 +12445,51 @@ final class DownloaderModel: ObservableObject {
 
         stopTransferMetricsTaskIfIdle()
         presentDeferredLoginIfNeeded()
-        if !wasStopped, deferredLoginReason == nil {
-            _ = startNextPendingDownloadIfNeeded()
+        if !wasStopped {
+            if exitCode != 0 || !interruptedDownloadRequests.isEmpty {
+                scheduleAutomaticDownloadRetry()
+            } else {
+                downloadRetryAttempt = 0
+                _ = startNextPendingDownloadIfNeeded()
+            }
         }
         startPendingQuotaRefreshIfNeeded()
+    }
+
+    private func scheduleAutomaticDownloadRetry() {
+        guard !isClosingWindow, !downloadsPaused, !cancelAllDownloadsRequested,
+              !interruptedDownloadRequests.isEmpty || !pendingDownloadRequests.isEmpty else { return }
+        let account = transferAccountID
+        let delay = max(AutomaticRecovery.delay(attempt: downloadRetryAttempt), Double(downloadFailureRetryDelay) / 1_000)
+        if statusIsError { status += " Retrying automatically in \(Int(min(delay, 86_400)))s." }
+        downloadRetryAttempt = AutomaticRecovery.nextAttempt(downloadRetryAttempt)
+        automaticDownloadRetry?.cancel()
+        automaticDownloadRetry = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: UInt64(min(delay, 86_400) * 1_000_000_000)) } catch { return }
+            guard let self else { return }
+            self.automaticDownloadRetry = nil
+            guard !Task.isCancelled, !self.isClosingWindow, !self.downloadsPaused,
+                  self.transferAccountID == account else { return }
+            self.requeueInterruptedDownloads()
+            if !self.startNextPendingDownloadIfNeeded() { self.scheduleAutomaticDownloadRetry() }
+        }
+    }
+
+    private func scheduleAutomaticUploadRetry(_ id: UUID) {
+        guard !isClosingWindow, savedUploadBatches.contains(where: { $0.id == id && $0.automaticallyResume != false }) else { return }
+        let account = transferAccountID
+        let delay = AutomaticRecovery.delay(attempt: uploadRetryAttempt)
+        if statusIsError { status += " Retrying automatically in \(Int(delay))s." }
+        uploadRetryAttempt = AutomaticRecovery.nextAttempt(uploadRetryAttempt)
+        automaticUploadRetry?.cancel()
+        automaticUploadRetry = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return }
+            guard let self else { return }
+            self.automaticUploadRetry = nil
+            guard !Task.isCancelled, !self.isClosingWindow, self.transferAccountID == account,
+                  self.savedUploadBatches.contains(where: { $0.id == id && $0.automaticallyResume != false }) else { return }
+            self.resumeSavedUpload(id)
+        }
     }
 
     /// Folder-size recursion has its own read-only process. Results are merged
@@ -10565,7 +12546,7 @@ final class DownloaderModel: ObservableObject {
                 effectiveArguments.removeAll { $0 == "--use-size-cache" }
                 struct Seed: Encodable { let folders: [String: FolderMeasurement] }
                 let seedURL = try writePrivateRequest(
-                    Seed(folders: folderSizeIndex.usableMeasurements),
+                    Seed(folders: folderSizeIndex.seedMeasurements(under: folderID)),
                     named: "folder-size-seed", in: exchangeDirectory
                 )
                 folderMeasurementInputURL = seedURL
@@ -10626,17 +12607,21 @@ final class DownloaderModel: ObservableObject {
                 let trailingError = stderr.fileHandleForReading.readDataToEndOfFile()
                 stderrBuffer.append(trailingError)
                 let trailingErrorText = String(data: trailingError, encoding: .utf8) ?? ""
-                let structuredOutput = stdoutBuffer.string()
                 let errorOutput = stderrBuffer.string()
+                let exitCode = finishedProcess.terminationStatus
+                let report = exitCode == 0
+                    ? Result { try FolderMeasurementReport.decode(stdoutBuffer.string()) }
+                    : nil
                 DispatchQueue.main.async {
                     guard let self else { return }
                     if !trailingErrorText.isEmpty {
                         self.appendOutput(self.redactedEngineOutput(trailingErrorText))
                     }
                     self.finishFolderMeasurementProcess(
-                        exitCode: finishedProcess.terminationStatus,
-                        structuredOutput: structuredOutput,
+                        exitCode: exitCode,
+                        report: report,
                         errorOutput: errorOutput,
+                        arguments: arguments,
                         operation: operation,
                         folderID: folderID
                     )
@@ -10672,14 +12657,16 @@ final class DownloaderModel: ObservableObject {
             measuringFolderCacheKey = nil
             setError("Could not start folder-size calculation: \(error.localizedDescription)")
             requireFreshAppLoginIfSessionTrustFailed(error)
+            scheduleOperationRetry(arguments: arguments, operation: operation)
             startNextPendingFolderMeasurementIfNeeded()
         }
     }
 
     private func finishFolderMeasurementProcess(
         exitCode: Int32,
-        structuredOutput: String,
+        report: Result<FolderMeasurementReport, Error>?,
         errorOutput: String,
+        arguments: [String],
         operation finishedOperation: Operation,
         folderID: String
     ) {
@@ -10698,7 +12685,7 @@ final class DownloaderModel: ObservableObject {
             if !isRunning {
                 setStatus("Folder size calculation cancelled")
             }
-        } else if exitCode == 0 {
+        } else if exitCode == 0, let report {
             let linkID: UUID? = {
                 if case .shareMeasure(_, _, let linkID) = finishedOperation {
                     return linkID
@@ -10706,7 +12693,7 @@ final class DownloaderModel: ObservableObject {
                 return nil
             }()
             finishFolderMeasurement(
-                output: structuredOutput,
+                report: report,
                 folderID: folderID,
                 linkID: linkID,
                 scanRevision: folderMeasurementStartRevision,
@@ -10727,6 +12714,9 @@ final class DownloaderModel: ObservableObject {
             handleWebLoginNeeded(for: errorOutput)
         }
 
+        // Keep the original arguments so a failed seeded repair retries as a
+        // seeded repair rather than as a walk of the whole tree.
+        if !wasCancelled, exitCode != 0 { scheduleOperationRetry(arguments: arguments, operation: finishedOperation) }
         presentDeferredLoginIfNeeded()
         startPendingQuotaRefreshIfNeeded()
         startNextPendingFolderMeasurementIfNeeded()
@@ -10806,6 +12796,17 @@ final class DownloaderModel: ObservableObject {
             process.qualityOfService = .utility
 
             var environment = try engineEnvironment()
+            uploadControlURL = exchangeDirectory.appendingPathComponent("upload-control-\(UUID().uuidString).json")
+            let savedBatch = savedUploadBatches.first { $0.id == activeUploadBatchID }
+            pausedUploadIDs = savedBatch?.pausedFileIDs ?? []
+            cancelledUploadIDs = savedBatch?.cancelledFileIDs ?? []
+            if let controlURL = uploadControlURL {
+                var actions = Dictionary(uniqueKeysWithValues: pausedUploadIDs.map { ($0, "pause") })
+                for id in cancelledUploadIDs { actions[id] = "cancel" }
+                try writeTransferControls(to: controlURL, actions: actions)
+                environment["MYCLOUDDRIVER_TRANSFER_CONTROL"] = controlURL.path
+            }
+            cancelAllUploadsRequested = false
             let proxy = proxyURL.trimmingCharacters(in: .whitespacesAndNewlines)
             if proxy.isEmpty {
                 environment.removeValue(forKey: "PIKPAK_PROXY")
@@ -10820,7 +12821,8 @@ final class DownloaderModel: ObservableObject {
                 let lines = stdoutLineBuffer.append(data)
                 guard !lines.isEmpty else { return }
                 DispatchQueue.main.async {
-                    self?.enqueueUploadOutputLines(lines)
+                    guard let self, self.uploadProcess === process else { return }
+                    self.enqueueUploadOutputLines(lines)
                 }
             }
             stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -10845,7 +12847,7 @@ final class DownloaderModel: ObservableObject {
                 let trailingErrorText = String(data: trailingError, encoding: .utf8) ?? ""
                 let errorOutput = stderrBuffer.string()
                 DispatchQueue.main.async {
-                    guard let self else { return }
+                    guard let self, self.uploadProcess === finishedProcess else { return }
                     self.enqueueUploadOutputLines(trailingLines)
                     self.flushAllUploadOutputLines()
                     if !trailingErrorText.isEmpty {
@@ -10873,19 +12875,23 @@ final class DownloaderModel: ObservableObject {
                 status = "Preparing local files for upload…"
             }
             ensureTransferMetricsTask()
+            watchUploadDisk()
             try process.run()
         } catch {
+            stopWatchingUploadDisk()
             cleanupUploadInputFile()
             uploadProcess = nil
             uploadRequestedStop = false
             isUploadPaused = false
             isUploading = false
+            let interruptedBatch = activeUploadBatchID
             activeUploadBatchID = nil
             _ = persistTransfersSynchronously()
             finishUploadProgress(as: .failed)
             stopTransferMetricsTaskIfIdle()
             setError("Could not start uploader: \(error.localizedDescription)")
             requireFreshAppLoginIfSessionTrustFailed(error)
+            if let interruptedBatch { scheduleAutomaticUploadRetry(interruptedBatch) }
         }
     }
 
@@ -10895,16 +12901,22 @@ final class DownloaderModel: ObservableObject {
         destination: BrowserLocation
     ) {
         defer { _ = startNextPendingBrowserMoveIfNeeded() }
+        stopWatchingUploadDisk()
         guard !isClosingWindow else { cleanupUploadInputFile(); return }
-        let wasStopped = uploadRequestedStop
+        let wasCancelled = cancelAllUploadsRequested
+        let wasStopped = uploadRequestedStop || wasCancelled
+        let finishedBatchID = activeUploadBatchID
         if !uploadUndoMutations.isEmpty {
             fileUndoHistory.record(FinderUndoEntry(title: "Upload", mutations: uploadUndoMutations,
                                                   uploadBatchID: activeUploadBatchID))
             uploadUndoMutations.removeAll()
         }
         updateSavedUploadProgress()
-        let completedBatchID = !wasStopped && exitCode == 0 ? activeUploadBatchID : nil
-        if let completedBatchID { savedUploadBatches.removeAll { $0.id == completedBatchID } }
+        let completedBatchID = ((!wasStopped && exitCode == 0) || wasCancelled) ? activeUploadBatchID : nil
+        if let completedBatchID {
+            savedUploadBatches.removeAll { $0.id == completedBatchID }
+            uploadFileAccess.removeValue(forKey: completedBatchID)
+        }
         activeUploadBatchID = nil
         if persistTransfersSynchronously(), let completedBatchID {
             removeUploadCheckpoint(completedBatchID)
@@ -10912,14 +12924,21 @@ final class DownloaderModel: ObservableObject {
         synchronizeSharedSessionFromDisk()
         cleanupUploadInputFile()
         uploadProcess = nil
+        if let url = uploadControlURL { try? FileManager.default.removeItem(at: url) }
+        uploadControlURL = nil
         uploadRequestedStop = false
         isUploadPaused = false
         isUploading = false
+        cancelAllUploadsRequested = false
 
         if wasStopped {
             finishUploadProgress(as: .stopped)
             if !isRunning {
-                setStatus("Upload stopped. Use Resume in Saved Uploads to continue; completed cloud files were kept.")
+                if let uploadSourceError, !wasCancelled {
+                    setError("Upload paused. \(uploadSourceError) Reconnect the disk, then use Resume in saved uploads.")
+                } else {
+                    setStatus(wasCancelled ? "Upload cancelled. Local originals and completed cloud files were kept." : "Upload paused. Use Resume in saved uploads to continue.")
+                }
             }
         } else if exitCode == 0 {
             finishUploadProgress(as: .completed)
@@ -10948,6 +12967,14 @@ final class DownloaderModel: ObservableObject {
         }
 
         stopTransferMetricsTaskIfIdle()
+        if !wasStopped {
+            if exitCode != 0, let id = finishedBatchID {
+                scheduleAutomaticUploadRetry(id)
+            } else {
+                uploadRetryAttempt = 0
+                if let next = savedUploadBatches.first(where: { automaticUploadBatchIDs.contains($0.id) }) { resumeSavedUpload(next.id) }
+            }
+        }
         if deferredLoginReason != nil {
             presentDeferredLoginIfNeeded()
             return
@@ -11233,7 +13260,6 @@ final class DownloaderModel: ObservableObject {
                 entry.name = displayName
                 entry.state = .ready
             }
-            expandedSharedLinkIDs.insert(linkID)
 
             if isBrowsingSharedLink, activeSharedLinkID == linkID {
                 shareAccess = updatedAccess
@@ -11315,7 +13341,73 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
-    private func runEngine(arguments: [String], operation: Operation) {
+    private func cancelOperationRetries(prefix: String) {
+        for key in Array(operationRetryTasks.keys) where key.hasPrefix(prefix) {
+            operationRetryTasks.removeValue(forKey: key)?.cancel()
+        }
+        operationRetryAttempts = operationRetryAttempts.filter { !$0.key.hasPrefix(prefix) }
+    }
+
+    /// Only reads and scans with their own reconciliation enter this queue.
+    /// A failed create/move/delete reply must not blindly repeat a mutation.
+    private func operationRetryKey(_ operation: Operation) -> String? {
+        switch operation {
+        case .quota: return "quota"
+        case .browse, .shareBrowse, .browseTree, .shareBrowseTree: return "foreground"
+        case .preview, .sharePreview: return "preview"
+        case .measure(let id): return "measure:" + id
+        case .shareMeasure(_, let id, let link): return "measure:\(link):\(id)"
+        case .duplicates: return "duplicates"
+        case .emptyFolders, .dsStoreFiles: return "maintenance"
+        default: return nil
+        }
+    }
+
+    private func scheduleOperationRetry(arguments: [String] = [], operation: Operation) {
+        guard !isClosingWindow, !isChangingAccount, let key = operationRetryKey(operation),
+              operationRetryTasks[key] == nil else { return }
+        let context = fileOpenContext
+        let link = activeSharedLinkID, shared = isBrowsingSharedLink
+        let attempt = operationRetryAttempts[key] ?? 0
+        let delay = AutomaticRecovery.delay(attempt: attempt)
+        operationRetryAttempts[key] = AutomaticRecovery.nextAttempt(attempt)
+        operationRetryTasks[key] = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return }
+            guard let self else { return }
+            self.operationRetryTasks[key] = nil
+            guard !Task.isCancelled, !self.isClosingWindow, self.fileOpenContext == context else { return }
+            switch operation {
+            case .preview(let id), .sharePreview(_, let id):
+                guard self.selectedBrowserItemID == id, self.isBrowsingSharedLink == shared,
+                      !shared || self.activeSharedLinkID == link else { return }
+            case .browse, .shareBrowse, .browseTree, .shareBrowseTree:
+                guard self.isBrowsingSharedLink == shared, !shared || self.activeSharedLinkID == link else { return }
+            default: break
+            }
+            guard self.hasUsableSession, !self.isRunning, !self.hasExclusiveBackgroundTask else {
+                self.scheduleOperationRetry(arguments: arguments, operation: operation); return
+            }
+            switch operation {
+            case .measure(let id):
+                self.runFolderMeasurementEngine(
+                    arguments: arguments.isEmpty ? ["measure", "--id", id] : arguments, operation: operation
+                )
+            case .shareMeasure:
+                self.runFolderMeasurementEngine(arguments: ["share-measure"], operation: operation)
+            case .duplicates(let scope): self.runDuplicateScan(scope: scope)
+            case .emptyFolders(let scope):
+                self.runMaintenanceScan(arguments: ["empty-folders", "--parent-id", scope.id, "--root-path", scope.path,
+                    "--yes", "--progress-json"], operation: operation, retrying: true)
+            case .dsStoreFiles(let scope):
+                self.runMaintenanceScan(arguments: ["ds-store", "--parent-id", scope.id, "--root-path", scope.path,
+                    "--yes"], operation: operation, retrying: true)
+            default: self.runEngine(arguments: arguments, operation: operation, retrying: true)
+            }
+        }
+    }
+
+    private func runEngine(arguments: [String], operation: Operation, retrying: Bool = false) {
+        if !retrying, let key = operationRetryKey(operation) { cancelOperationRetries(prefix: key) }
         guard !isChangingAccount else { return }
         if case .archiveInspect(let request, let item) = operation {
             inspectArchive(item, password: request.password)
@@ -11326,6 +13418,7 @@ final class DownloaderModel: ObservableObject {
             return
         }
         guard !isRunning else { return }
+        operationArguments = arguments
         if hasExclusiveBackgroundTask {
             switch operation {
             case .quota, .browse, .browseTree, .preview,
@@ -11360,7 +13453,13 @@ final class DownloaderModel: ObservableObject {
             if let ids = batchItemIDs {
                 let idsURL = exchangeDirectory
                     .appendingPathComponent("\(batchFilenamePrefix)-\(UUID().uuidString).json")
-                try JSONEncoder().encode(ids).write(to: idsURL, options: .atomic)
+                let payload: Data
+                if case .trashBrowserItems = operation, let pending = pendingSimilarityTrash, !pending.keepers.isEmpty {
+                    payload = try JSONSerialization.data(withJSONObject: ["ids": ids, "keep": pending.keepers.map {
+                        ["id": $0.cloudId!, "size": $0.bytes] as [String: Any]
+                    }])
+                } else { payload = try JSONEncoder().encode(ids) }
+                try payload.write(to: idsURL, options: .atomic)
                 try FileManager.default.setAttributes(
                     [.posixPermissions: 0o600],
                     ofItemAtPath: idsURL.path
@@ -11805,6 +13904,7 @@ final class DownloaderModel: ObservableObject {
                 "Could not start downloader: \(error.localizedDescription)",
                 diagnostic: launchDiagnostic
             )
+            scheduleOperationRetry(arguments: arguments, operation: operation)
             if case .shareBrowse(_, _, _, let initial) = operation, initial {
                 isOpeningShareLink = false
                 markActiveSharedLinkFailed(error.localizedDescription)
@@ -11831,6 +13931,12 @@ final class DownloaderModel: ObservableObject {
             }
         }
         let completedOperation = operation
+        let completedArguments = operationArguments
+        defer {
+            if case .trashBrowserItems = completedOperation, pendingSimilarityTrash != nil {
+                completeSimilarityTrash(.failure(CloudDriveError.message(statusIsError ? status : "PikPak did not confirm this file was moved to Trash. Refresh its folder before retrying.")))
+            }
+        }
         let completedWasPreview: Bool
         switch completedOperation {
         case .preview, .sharePreview:
@@ -12095,6 +14201,13 @@ final class DownloaderModel: ObservableObject {
             handleWebLoginNeeded(for: errorOutput)
         }
         let operationWasStopped = requestedStop
+        if !operationWasStopped, let completedOperation {
+            if exitCode != 0 || statusIsError {
+                scheduleOperationRetry(arguments: completedArguments, operation: completedOperation)
+            } else if let key = operationRetryKey(completedOperation) {
+                cancelOperationRetries(prefix: key)
+            }
+        }
         if case .undoFiles = completedOperation {
             fileUndoHistory.cancelRequest()
             if !isBrowsingSharedLink { fileUndoRefreshFeedback = (status, statusIsError, statusErrorDiagnostic) }
@@ -12195,6 +14308,7 @@ final class DownloaderModel: ObservableObject {
             taskActivity.finish(.duplicates, state: .failed, message: failure.summary, diagnostic: failure.diagnostic)
             setError(failure.summary, diagnostic: failure.diagnostic)
             handleWebLoginNeeded(for: errorOutput)
+            scheduleOperationRetry(operation: .duplicates(scope: scope))
         }
         presentDeferredLoginIfNeeded()
         if !startNextPendingBrowserMoveIfNeeded() {
@@ -12210,6 +14324,7 @@ final class DownloaderModel: ObservableObject {
     ) {
         defer { _ = startNextPendingBrowserMoveIfNeeded() }
         let wasCancelled = maintenanceWasCancelled
+        if !wasCancelled, exitCode != 0 { scheduleOperationRetry(operation: finishedOperation) }
         synchronizeSharedSessionFromDisk()
         maintenanceProcess = nil
         maintenanceOperation = nil
@@ -12270,6 +14385,8 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func resetDownloadProgress() {
+        downloadFailureRetryable = false
+        downloadFailureRetryDelay = 0
         downloadOutputFlushScheduled = false
         pendingDownloadOutputLines.removeAll(keepingCapacity: true)
         downloadRunState = .scanning
@@ -12292,6 +14409,7 @@ final class DownloaderModel: ObservableObject {
         downloadNetworkBaselines = [:]
         downloadNetworkBytesByID = [:]
         downloadFileTotalsByID = [:]
+        downloadFileRates = [:]
         downloadNetworkTransferredBytes = 0
         lastDownloadSpeedSampleDate = Date()
         lastDownloadSpeedSampleBytes = 0
@@ -12917,6 +15035,9 @@ final class DownloaderModel: ObservableObject {
                 recordFolderSizeChange(in: [parent])
             }
             settleUploadTransfer(event, state: event.instant == true ? .instant : .completed)
+        case "file_cancelled":
+            if let id = event.uploadId { cancelledUploadIDs.insert(id); pausedUploadIDs.remove(id) }
+            settleUploadTransfer(event, state: .stopped)
         case "file_failed":
             settleUploadTransfer(event, state: .failed)
         default:
@@ -13118,6 +15239,11 @@ final class DownloaderModel: ObservableObject {
     private func sampleTransferRates() {
         let now = Date()
         sampleDownloadRate(at: now)
+        if sampleDownloadFileRates(at: now) {
+            downloadingTransfers = activeDownloadTransfers.values.sorted {
+                $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            }
+        }
 
         if isUploading, !isUploadPaused, uploadRunState == .uploading {
             let previousDate = lastUploadSpeedSampleDate ?? now
@@ -13172,6 +15298,26 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
+    @discardableResult
+    private func sampleDownloadFileRates(at now: Date) -> Bool {
+        var changed = false
+        for (id, transfer) in activeDownloadTransfers {
+            let baseline = downloadNetworkBaselines[id] ?? 0
+            let networkBytes = downloadNetworkBytesByID[id]
+                ?? (transfer.downloadedBytes >= baseline ? transfer.downloadedBytes - baseline : 0)
+            var rate = downloadFileRates[id] ?? DownloadFileRate()
+            let speed = rate.sample(networkBytes: networkBytes, at: now,
+                transferring: isDownloading && downloadRunState == .downloading && transfer.state == .downloading)
+            downloadFileRates[id] = rate
+            if transfer.bytesPerSecond != speed {
+                var updated = transfer; updated.bytesPerSecond = speed
+                activeDownloadTransfers[id] = updated
+                changed = true
+            }
+        }
+        return changed
+    }
+
     private func sampleDownloadRate(at now: Date) {
         guard isDownloading, downloadRunState == .downloading else {
             downloadBytesPerSecond = 0
@@ -13205,6 +15351,38 @@ final class DownloaderModel: ObservableObject {
 
     private func applyDownloadProgressEvent(_ event: DownloadProgressEvent) {
         switch event.event {
+        case "request_started":
+            if let id = event.requestId, submittedDownloadRequests[id] != nil {
+                discoveringDownloadRequestIDs.insert(id)
+                objectWillChange.send()
+            }
+        case "request_discovered":
+            if let id = event.requestId {
+                discoveringDownloadRequestIDs.remove(id)
+                objectWillChange.send()
+            }
+        case "request_retrying":
+            if let id = event.requestId, discoveringDownloadRequestIDs.contains(id) {
+                setStatus("Waiting for the network to continue finding download files…")
+            }
+        case "request_finished":
+            guard let id = event.requestId else { return }
+            discoveringDownloadRequestIDs.remove(id)
+            guard let index = activeDownloadRequests.firstIndex(where: { $0.pendingItems.contains(where: { $0.id == id }) }) else { return }
+            let request = activeDownloadRequests.remove(at: index)
+            activeDownloadSelectionKeys.remove(request.deduplicationKey)
+            if event.success != true {
+                if !interruptedDownloadRequests.contains(where: { $0.deduplicationKey == request.deduplicationKey }) {
+                    interruptedDownloadRequests.append(request)
+                    interruptedDownloadCount = interruptedDownloadRequests.reduce(0) { $0 + $1.itemCount }
+                }
+                if let error = event.error { setError("Some downloads need attention: \(FileSearchIndex.redacted(error))") }
+            }
+            _ = persistTransfersSynchronously()
+            objectWillChange.send()
+        case "batch_failed":
+            downloadFailureRetryable = event.retryable == true
+            downloadFailureRetryDelay = min(event.retryInMillis ?? 0, 86_400_000)
         case "plan":
             activeDownloadTransfers = [:]
             queuedDownloadIDs = []
@@ -13214,6 +15392,7 @@ final class DownloaderModel: ObservableObject {
             downloadNetworkBaselines = [:]
             downloadNetworkBytesByID = [:]
             downloadFileTotalsByID = [:]
+            downloadFileRates = [:]
             downloadNetworkTransferredBytes = 0
             downloadQueueTransfers = []
             downloadQueueOffset = 0
@@ -13236,15 +15415,27 @@ final class DownloaderModel: ObservableObject {
                 setStatus("Downloading \(downloadTotalFiles) file(s)…")
             }
 
-        case "queue_batch":
+        case "queue_batch", "queue_append":
             let additions = (event.files ?? []).compactMap { file -> DownloadTransfer? in
                 guard queuedDownloadIDs.insert(file.fileId).inserted else { return nil }
                 // The plan already includes this value in its aggregate. Keep
                 // the per-file component so an authoritative download URL can
                 // correct the aggregate later without double-counting it.
                 downloadFileTotalsByID[file.fileId] = file.totalBytes
-                if lastDownloadUsedSharedLink, let access = lastSharedDownloadAccess {
+                var shared = lastDownloadUsedSharedLink
+                if let id = file.requestId, let request = submittedDownloadRequests[id], let input = request.liveInputs.first {
+                    downloadRequestIDsByFileID[file.fileId] = id
+                    downloadSourceFileIDs[file.fileId] = file.sourceFileId ?? file.fileId
+                    downloadProxyByFileID[file.fileId] = input.proxyURL
+                    shared = input.access != nil
+                    downloadSharedAccessByFileID[file.fileId] = input.access
+                } else if lastDownloadUsedSharedLink, let access = lastSharedDownloadAccess {
                     downloadSharedAccessByFileID[file.fileId] = access
+                }
+                if event.event == "queue_append" {
+                    downloadTotalFiles += 1
+                    downloadTotalBytes = addingWithoutOverflow(downloadTotalBytes, file.totalBytes)
+                    if isDownloading { downloadRunState = .downloading }
                 }
                 return DownloadTransfer(
                     id: file.fileId,
@@ -13254,23 +15445,32 @@ final class DownloaderModel: ObservableObject {
                     state: .queued,
                     remotePath: file.remotePath,
                     outputDirectoryPath: file.outputDirectory,
-                    isShared: lastDownloadUsedSharedLink
+                    isShared: shared
                 )
             }
             if !additions.isEmpty {
                 downloadQueueTransfers.append(contentsOf: additions)
+                for file in additions {
+                    guard let path = file.remotePath else { continue }
+                    let scoped = downloadRequestIDsByFileID[file.id].map { "\($0.uuidString):\(path)" } ?? path
+                    var actions = pendingRootActions.filter { scoped == $0.key || scoped.hasPrefix($0.key + "/") }.map(\.value)
+                    if let requestID = downloadRequestIDsByFileID[file.id], pausedPendingDownloadIDs.contains(requestID) { actions.append("pause") }
+                    if actions.contains("cancel") { cancelledDownloadIDs.insert(file.id) }
+                    else if actions.contains("pause") { pausedDownloadIDs.insert(file.id) }
+                }
+                writeDownloadControls()
             }
 
         case "file_dequeued":
             guard let fileID = event.fileId, let name = event.name else { return }
             guard !settledDownloadIDs.contains(fileID) else { return }
-            let queued = dequeueTransfer(fileID: fileID)
+            let queued = activeDownloadTransfers[fileID] ?? dequeueTransfer(fileID: fileID)
             let reportedTotal = event.totalBytes ?? queued?.totalBytes ?? 0
             reconcileDownloadTotal(reportedTotal, for: fileID)
             activeDownloadTransfers[fileID] = DownloadTransfer(
                 id: fileID,
                 name: name,
-                downloadedBytes: 0,
+                downloadedBytes: queued?.downloadedBytes ?? 0,
                 totalBytes: reportedTotal,
                 state: .preparing,
                 remotePath: queued?.remotePath,
@@ -13349,6 +15549,9 @@ final class DownloaderModel: ObservableObject {
             settleDownloadTransfer(event, state: .completed)
         case "file_skipped":
             settleDownloadTransfer(event, state: .skipped)
+        case "file_cancelled":
+            if let id = event.fileId { cancelledDownloadIDs.insert(id); pausedDownloadIDs.remove(id) }
+            settleDownloadTransfer(event, state: .stopped)
         case "file_failed":
             settleDownloadTransfer(event, state: .failed)
         default:
@@ -13397,6 +15600,7 @@ final class DownloaderModel: ObservableObject {
         guard settledDownloadIDs.insert(fileID).inserted else { return }
 
         let previous = activeDownloadTransfers.removeValue(forKey: fileID)
+        downloadFileRates.removeValue(forKey: fileID)
         let networkBaseline = downloadNetworkBaselines.removeValue(forKey: fileID) ?? 0
         // A failure wrapper may only know the older browser-list size. Once a
         // started transfer supplied an authoritative total, preserve it.
@@ -13457,11 +15661,12 @@ final class DownloaderModel: ObservableObject {
             state: state,
             remotePath: previous?.remotePath,
             outputDirectoryPath: previous?.outputDirectoryPath,
-            isShared: previous?.isShared ?? lastDownloadUsedSharedLink
+            isShared: previous?.isShared ?? lastDownloadUsedSharedLink,
+            error: event.error.map { String(FileSearchIndex.redacted($0).prefix(500)) }
         )
         completedDownloadTransfers.append(settledTransfer)
         if state == .failed || state == .stopped {
-            appendFailedDownloadHistory(settledTransfer)
+            if !cancelledDownloadIDs.contains(settledTransfer.id) { appendFailedDownloadHistory(settledTransfer) }
         } else if state == .completed || state == .skipped {
             removeFailedDownloadFromHistory(settledTransfer)
         }
@@ -13483,8 +15688,9 @@ final class DownloaderModel: ObservableObject {
         _ left: DownloadTransfer,
         _ right: DownloadTransfer
     ) -> Bool {
-        left.id == right.id
+        (downloadSourceFileIDs[left.id] ?? left.id) == (downloadSourceFileIDs[right.id] ?? right.id)
             && left.isShared == right.isShared
+            && (!left.isShared || downloadSharedAccessByFileID[left.id]?.url == downloadSharedAccessByFileID[right.id]?.url)
             && left.remotePath == right.remotePath
             && left.outputDirectoryPath == right.outputDirectoryPath
     }
@@ -13508,6 +15714,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func publishDownloadProgress() {
+        sampleDownloadFileRates(at: Date())
         let active = activeDownloadTransfers.values.sorted {
             $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
@@ -13557,6 +15764,7 @@ final class DownloaderModel: ObservableObject {
             }
             for var transfer in unfinished where settledDownloadIDs.insert(transfer.id).inserted {
                 transfer.state = transferState
+                transfer.bytesPerSecond = 0
                 settledDownloadBytes = addingWithoutOverflow(
                     settledDownloadBytes,
                     transfer.downloadedBytes
@@ -13578,6 +15786,7 @@ final class DownloaderModel: ObservableObject {
             }
             activeDownloadTransfers = [:]
         }
+        downloadFileRates = [:]
         publishDownloadProgress()
         downloadBytesPerSecond = 0
     }
@@ -13722,6 +15931,7 @@ final class DownloaderModel: ObservableObject {
             }
             let suffix = page.nextPageToken == nil ? "" : " (more available)"
             setStatus("Loaded \(browserItems.count) item(s)\(suffix)")
+            if preservesOutline { resumeUnloadedBrowserFolders() }
         } catch {
             appendOutput("Could not decode folder data: \(error.localizedDescription)\n")
             setError("PikPak returned folder data this app could not read.")
@@ -13875,6 +16085,7 @@ final class DownloaderModel: ObservableObject {
                 registerBrowserItems(page.files, parentID: folderID, parentPath: folderPath)
             }
             browserTreeChildren[folderID] = sortedBrowserItems(displayedItems)
+            restoreCollapsedBrowserFolderFocus()
 
             if let token = page.nextPageToken, !token.isEmpty {
                 browserTreeNextPageTokens[folderID] = token
@@ -13926,6 +16137,32 @@ final class DownloaderModel: ObservableObject {
         if activeSharedLinkID == linkID {
             shareLinkIsOpen = false
         }
+        scheduleAutomaticSharedLinkRetry()
+    }
+
+    /// A link usually fails because the connection dropped, so it is retried on
+    /// its own on a widening schedule. The count resets whenever a retry opens
+    /// something. The delay stays capped during a prolonged outage.
+    private func scheduleAutomaticSharedLinkRetry() {
+        guard !isClosingWindow, !isChangingAccount, failedSharedLinkCount > 0,
+              sharedLinkRetryProgress == nil, automaticSharedLinkRetry == nil else { return }
+        let delay = AutomaticRecovery.delay(attempt: sharedLinkRetryAttempt)
+        sharedLinkRetryAttempt = AutomaticRecovery.nextAttempt(sharedLinkRetryAttempt)
+        automaticSharedLinkRetry = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            self.automaticSharedLinkRetry = nil
+            // An automatic attempt must never raise a sign-in prompt on its own.
+            guard self.hasUsableSession, self.canRetryFailedSharedLinks else {
+                self.scheduleAutomaticSharedLinkRetry(); return
+            }
+            self.retryAllFailedSharedLinks(automatic: true)
+        }
+    }
+
+    private func cancelAutomaticSharedLinkRetry(resettingAttempts: Bool) {
+        automaticSharedLinkRetry?.cancel(); automaticSharedLinkRetry = nil
+        if resettingAttempts { sharedLinkRetryAttempt = 0 }
     }
 
     private func finishBrowserTreeBrowse(
@@ -13977,6 +16214,7 @@ final class DownloaderModel: ObservableObject {
                 browserTreeNextPageTokens.removeValue(forKey: folderID)
             }
             browserTreeLoadErrors.removeValue(forKey: folderID)
+            restoreCollapsedBrowserFolderFocus()
 
             let moreSuffix = page.nextPageToken?.isEmpty == false ? " (more available)" : ""
             if displayedItems.isEmpty {
@@ -14051,6 +16289,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func finishPreview(output: String, fileID: String) {
+        guard previewRequestContentMode == finderSettings.contentMode else { return }
         do {
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -14156,6 +16395,13 @@ final class DownloaderModel: ObservableObject {
         previewErrorDiagnostic = detail
         isPreviewLoading = false
         setError(message, diagnostic: detail)
+    }
+
+    func reportVideoPreviewFailure(_ error: Error, fileID: String, player: AVPlayer) {
+        guard selectedBrowserItemID == fileID, previewFileID == fileID,
+              previewPlayer === player else { return }
+        tryNextPreviewSource(after: error, generation: previewLoadGeneration,
+            fileID: fileID, autoplay: mediaPlayback.wantsPlayback)
     }
 
     private func startTextPreviewDownload(
@@ -14409,21 +16655,81 @@ final class DownloaderModel: ObservableObject {
         return isPlaylist ? 5 : 4
     }
 
-    /// PikPak sometimes exposes only the original AVI rather than an H.264 or
-    /// HLS transcode. In that case AVPlayer cannot decode common legacy AVI
-    /// codecs such as FMP4/Xvid, so offer the already-installed compatibility
-    /// player immediately instead of waiting through repeated native failures.
+    /// Original AVI containers need a compatible copy even when PikPak omits
+    /// codec metadata. Prefer cloud transcodes when they are available.
     private func prepareCompatibilityPreviewIfNeeded() -> Bool {
         guard let item = selectedBrowserItem,
               item.normalizedFileExtension == "avi",
-              previewSources.allSatisfy(\.isOrigin),
-              previewSources.contains(where: { source in
-                  let codec = source.videoCodec?.uppercased() ?? ""
-                  return ["FMP4", "XVID", "DIVX", "DX50", "MP4V"].contains(codec)
-              }) else {
+              previewSources.allSatisfy(\.isOrigin) else {
             return false
         }
-        return activateCompatibilityPreview()
+        return startCompatibleVideoPreview(fileID: item.id, autoplay: false)
+    }
+
+    @discardableResult
+    private func startCompatibleVideoPreview(fileID: String, autoplay: Bool) -> Bool {
+        guard compatiblePreviewCopy == nil, compatiblePreviewTask == nil,
+              selectedBrowserItemID == fileID, previewFileID == fileID,
+              let source = preferredQuickLookSource(), let url = source.contentURL,
+              let index = previewSources.firstIndex(where: { $0.contentURL == url }) else { return false }
+        // A PikPak transcode is always MP4/HLS whatever the original was, so
+        // only an original's own extension selects the demuxer.
+        let format = (source.isOrigin
+            ? VideoPreviewPreparation.InputFormat(
+                fileExtension: selectedBrowserItem?.normalizedFileExtension ?? "")
+            : nil) ?? .mp4
+        // Keep the existing external-player fallback useful on Macs without
+        // FFmpeg; when neither is installed, preparation explains how to retry.
+        if VideoPreviewPreparation.ffmpegURL == nil, activateCompatibilityPreview() { return true }
+        removePreviewPlayerObservers()
+        previewPlayer?.pause(); previewPlayer = nil
+        // A failed parser must not reuse potentially incomplete cached bytes.
+        // Preparation downloads a fresh complete file through the same route.
+        clearPreviewResourceCaches()
+        let generation = UUID()
+        previewLoadGeneration = generation
+        previewPlaybackWasRequested = autoplay
+        previewPlaybackError = nil; previewErrorDiagnostic = nil
+        previewRequiresCompatibilityPlayer = false; previewCompatibilityPlayerName = nil
+        previewPreparationFraction = nil
+        previewSourceLabel = "Downloading \(format.displayName) for preview…"
+        isPreviewLoading = true
+        resetPreviewStreamingMetrics(state: .preparing)
+        let size = source.isOrigin ? (previewInfo?.size ?? 0) : 0
+        let proxy = proxyURL
+        #if FINDER_WORKSPACE_TESTS
+        let preparationURL = previewFixtureMediaURL ?? url
+        #else
+        let preparationURL = url
+        #endif
+        compatiblePreviewTask = Task { [weak self] in
+            do {
+                let copy = try await VideoPreviewPreparation.prepare(source: preparationURL, format: format, expectedSize: size, proxyURL: proxy) { [weak self] progress in
+                    Task { @MainActor in
+                        guard let self, self.previewLoadGeneration == generation, self.previewFileID == fileID else { return }
+                        self.previewSourceLabel = progress.message
+                        self.previewPreparationFraction = progress.fraction
+                    }
+                }
+                try Task.checkCancellation()
+                guard let self, self.previewLoadGeneration == generation, self.selectedBrowserItemID == fileID else { return }
+                self.compatiblePreviewTask = nil
+                self.compatiblePreviewCopy = copy
+                self.previewPreparationFraction = nil
+                self.loadPreviewSource(at: index, fileID: fileID, autoplay: autoplay, localURL: copy.url)
+            } catch {
+                guard let self, !Task.isCancelled, self.previewLoadGeneration == generation else { return }
+                self.compatiblePreviewTask = nil
+                // Invalidate any final queued progress callback.
+                self.previewLoadGeneration = UUID()
+                self.previewPreparationFraction = nil
+                self.isPreviewLoading = false
+                self.previewStreamingState = .failed
+                self.previewPlaybackError = error.localizedDescription
+                self.setError(error.localizedDescription)
+            }
+        }
+        return true
     }
 
     private func activateCompatibilityPreview() -> Bool {
@@ -14436,10 +16742,10 @@ final class DownloaderModel: ObservableObject {
         previewCompatibilityPlayerName = "IINA"
         previewPlaybackError = nil
         previewErrorDiagnostic = nil
-        previewSourceLabel = "Original AVI"
+        previewSourceLabel = "Original video"
         isPreviewLoading = false
         resetPreviewStreamingMetrics(state: .compatibility)
-        setStatus("AVI compatibility preview ready")
+        setStatus("Video compatibility preview ready")
         return true
     }
 
@@ -14575,10 +16881,16 @@ final class DownloaderModel: ObservableObject {
         return previewInfo?.mimeType?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func loadPreviewSource(at index: Int, fileID: String, autoplay: Bool) {
+    private func loadPreviewSource(at index: Int, fileID: String, autoplay: Bool, localURL: URL? = nil,
+                                  resumeAt: Double? = nil) {
+        #if FINDER_WORKSPACE_TESTS
+        let overrideURL = localURL ?? previewFixtureMediaURL
+        #else
+        let overrideURL = localURL
+        #endif
         guard selectedBrowserItemID == fileID,
               previewSources.indices.contains(index),
-              let contentURL = previewSources[index].contentURL else {
+              let contentURL = overrideURL ?? previewSources[index].contentURL else {
             isPreviewLoading = false
             return
         }
@@ -14589,6 +16901,7 @@ final class DownloaderModel: ObservableObject {
         let generation = UUID()
         previewLoadGeneration = generation
         previewPlaybackWasRequested = autoplay
+        previewResumeSeconds = resumeAt
         previewSourceIndex = index
         previewPlaybackError = nil
         previewErrorDiagnostic = nil
@@ -14599,15 +16912,15 @@ final class DownloaderModel: ObservableObject {
 
         let source = previewSources[index]
         let sourceName = previewSourceName(source)
-        let supportsRetainedTransport = contentURL.pathExtension.lowercased() != "m3u8"
+        let supportsRetainedTransport = !contentURL.isFileURL && contentURL.pathExtension.lowercased() != "m3u8"
         let resourceCache = supportsRetainedTransport
             ? previewResourceCache(for: source, index: index, fileID: fileID)
             : nil
         let usesManagedTransport = resourceCache != nil
         let proxyLabel = PreviewTransport.usesProxy(proxyURL) ? " • app proxy" : ""
         let transportLabel = usesManagedTransport ? " • retained cache\(proxyLabel)" : proxyLabel
-        previewSourceLabel =
-            "\(sourceName) • \(index + 1) of \(previewSources.count)\(transportLabel)"
+        previewSourceLabel = localURL != nil ? "Compatible preview • temporary copy"
+            : "\(sourceName) • \(index + 1) of \(previewSources.count)\(transportLabel)"
 
         // PikPak's signed links commonly use a generic `/download/` path and
         // may be served as application/octet-stream. Give AVFoundation the
@@ -14629,7 +16942,7 @@ final class DownloaderModel: ObservableObject {
             "Accept": "video/*, audio/*, */*;q=0.8",
         ]
         if #available(macOS 14.0, *),
-           let mimeType = previewMIMETypeOverride(for: source, contentURL: contentURL),
+           let mimeType = localURL != nil ? "video/mp4" : previewMIMETypeOverride(for: source, contentURL: contentURL),
            !mimeType.isEmpty {
             assetOptions[AVURLAssetOverrideMIMETypeKey] = mimeType
         }
@@ -14647,13 +16960,11 @@ final class DownloaderModel: ObservableObject {
                 proxyURL: proxyURL,
                 cache: resourceCache,
                 onCacheProgress: { [weak self] snapshot in
-                    Task { @MainActor [weak self] in
-                        self?.updatePreviewCacheMetrics(
-                            snapshot,
-                            generation: generation,
-                            fileID: fileID
-                        )
-                    }
+                    self?.updatePreviewCacheMetrics(
+                        snapshot,
+                        generation: generation,
+                        fileID: fileID
+                    )
                 }
             )
             previewResourceLoader = resourceLoader
@@ -14667,12 +16978,10 @@ final class DownloaderModel: ObservableObject {
             asset = AVURLAsset(url: contentURL, options: assetOptions)
         }
         let playerItem = AVPlayerItem(asset: asset)
-        // Keep network reads eligible while the user pauses playback and ask
-        // AVFoundation for a long forward buffer. AVFoundation can still cap
-        // this under system resource pressure, but it no longer receives the
-        // previous instruction to stop after only four seconds.
+        // Continue filling the disk cache while paused, but keep the player's
+        // in-memory lookahead independent of the full file duration.
         playerItem.canUseNetworkResourcesForLiveStreamingWhilePaused = true
-        playerItem.preferredForwardBufferDuration = Self.previewFallbackForwardBufferDuration
+        playerItem.preferredForwardBufferDuration = Self.previewForwardBufferDuration
         let player = AVPlayer(playerItem: playerItem)
         // Keep the requested playback rate across a temporary buffer shortage.
         // With this disabled AVPlayer converts an exhausted progressive stream
@@ -14772,8 +17081,15 @@ final class DownloaderModel: ObservableObject {
             queue: .main
         ) { [weak self] notification in
             let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+            let position = CMTimeGetSeconds(player.currentTime())
             DispatchQueue.main.async {
-                self?.tryNextPreviewSource(
+                guard let self else { return }
+                if self.resumePreviewAfterPlaybackFailure(
+                    at: position,
+                    generation: generation,
+                    fileID: fileID
+                ) { return }
+                self.tryNextPreviewSource(
                     after: error,
                     generation: generation,
                     fileID: fileID,
@@ -14917,9 +17233,9 @@ final class DownloaderModel: ObservableObject {
             if let playerItem = previewPlayer?.currentItem {
                 let duration = CMTimeGetSeconds(playerItem.duration)
                 if duration.isFinite, duration > 0 {
-                    // For finite video/audio, explicitly request buffering all
-                    // the way to the end even if playback is paused.
-                    playerItem.preferredForwardBufferDuration = duration
+                    playerItem.preferredForwardBufferDuration = min(
+                        duration, Self.previewForwardBufferDuration
+                    )
                 }
                 updatePreviewStreamingMetrics(
                     from: playerItem,
@@ -14930,6 +17246,16 @@ final class DownloaderModel: ObservableObject {
             }
             let mediaName = selectedBrowserItem?.mediaKind == .audio ? "Audio" : "Video"
             setStatus("\(mediaName) preview ready")
+            // Restore the viewer's place before resuming, so a reload after a
+            // mid-playback failure does not silently restart from the top.
+            if let resume = previewResumeSeconds, resume.isFinite, resume > 0 {
+                previewResumeSeconds = nil
+                previewPlayer?.seek(
+                    to: CMTime(seconds: resume, preferredTimescale: 600),
+                    toleranceBefore: .zero,
+                    toleranceAfter: .positiveInfinity
+                )
+            }
             if shouldStartPlayback {
                 previewPlayer?.play()
             }
@@ -15256,17 +17582,20 @@ final class DownloaderModel: ObservableObject {
               selectedBrowserItemID == fileID,
               previewFileID == fileID else { return }
 
+        guard resetsRateSample || snapshot != previewLastCacheSnapshot else { return }
         let cachedBytes = UInt64(max(snapshot.cachedBytes, 0))
         let totalBytes = UInt64(max(snapshot.contentLength ?? 0, 0))
-        previewUsesRetainedCache = true
-        previewRetainedBytes = cachedBytes
-        previewRetainedTotalBytes = totalBytes
-        previewStreamedBytes = cachedBytes
+        if !previewUsesRetainedCache { previewUsesRetainedCache = true }
+        if previewRetainedBytes != cachedBytes { previewRetainedBytes = cachedBytes }
+        if previewRetainedTotalBytes != totalBytes { previewRetainedTotalBytes = totalBytes }
+        if previewStreamedBytes != cachedBytes { previewStreamedBytes = cachedBytes }
         previewLastCacheSnapshot = snapshot
-        previewRetainedSegments = snapshot.normalizedRanges.enumerated().map { index, span in
+        let segments = snapshot.normalizedRanges.enumerated().map { index, span in
             PreviewBufferSegment(id: index, start: span.lowerBound, end: span.upperBound)
         }
-        previewBufferedSeconds = bufferedSecondsAhead(of: previewPlaybackSeconds, in: snapshot)
+        if previewRetainedSegments != segments { previewRetainedSegments = segments }
+        let buffered = bufferedSecondsAhead(of: previewPlaybackSeconds, in: snapshot)
+        if previewBufferedSeconds != buffered { previewBufferedSeconds = buffered }
 
         let now = Date()
         if resetsRateSample {
@@ -15293,6 +17622,36 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
+    /// A failure reported after the media has been playing is not a startup
+    /// failure: the source is known good up to that point, so discarding the
+    /// player would throw away both a working stream and the viewer's place in
+    /// it. Reload the same source once from there, and only fall through to the
+    /// remaining sources when that position fails again.
+    private func resumePreviewAfterPlaybackFailure(
+        at position: Double,
+        generation: UUID,
+        fileID: String
+    ) -> Bool {
+        guard generation == previewLoadGeneration,
+              selectedBrowserItemID == fileID,
+              previewFileID == fileID,
+              compatiblePreviewCopy == nil,
+              position.isFinite, position > 1,
+              previewSources.indices.contains(previewSourceIndex) else { return false }
+        let key = previewResourceCacheKey(for: previewSources[previewSourceIndex], index: previewSourceIndex)
+        guard previewResumeRetries.insert(key).inserted else { return false }
+        appendOutput(
+            "Playback stopped \(Int(position))s in; resuming the same source from there.\n"
+        )
+        loadPreviewSource(
+            at: previewSourceIndex,
+            fileID: fileID,
+            autoplay: true,
+            resumeAt: position
+        )
+        return true
+    }
+
     private func tryNextPreviewSource(
         after error: Error?,
         generation: UUID,
@@ -15314,7 +17673,7 @@ final class DownloaderModel: ObservableObject {
             || previewPlayer?.timeControlStatus == .playing
             || previewPlayer?.timeControlStatus == .waitingToPlayAtSpecifiedRate
 
-        let nextIndex = previewSourceIndex + 1
+        let nextIndex = compatiblePreviewCopy == nil ? previewSourceIndex + 1 : previewSources.count
         if previewSources.indices.contains(nextIndex) {
             appendOutput(
                 "Preview source \(failedSourceNumber) \(failure); trying the next secure source.\n"
@@ -15328,6 +17687,24 @@ final class DownloaderModel: ObservableObject {
         }
 
         let extensionName = selectedBrowserItem?.normalizedFileExtension ?? ""
+        let isConvertibleFormatFailure = VideoPreviewPreparation.InputFormat(fileExtension: extensionName) != nil
+            && VideoPreviewPreparation.isFormatFailure(error)
+        if isConvertibleFormatFailure, compatiblePreviewCopy == nil, previewUsesRetainedCache,
+           previewSources.indices.contains(previewSourceIndex) {
+            let key = previewResourceCacheKey(for: previewSources[previewSourceIndex], index: previewSourceIndex)
+            if previewFreshCacheRetries.insert(key).inserted {
+                appendOutput("\(extensionName.uppercased()) parsing failed; retrying with a fresh preview cache.\n")
+                removePreviewPlayerObservers()
+                previewResourceCaches.removeValue(forKey: key)?.removeFromDisk()
+                loadPreviewSource(at: previewSourceIndex, fileID: fileID, autoplay: shouldResumePlayback)
+                return
+            }
+        }
+        let canPrepareCompatibleCopy = extensionName == "avi"
+            || isConvertibleFormatFailure
+        if canPrepareCompatibleCopy, startCompatibleVideoPreview(fileID: fileID, autoplay: shouldResumePlayback) {
+            return
+        }
         if extensionName == "avi",
            activateCompatibilityPreview() {
             appendOutput(
@@ -15492,18 +17869,40 @@ final class DownloaderModel: ObservableObject {
         scanAccountID: String? = nil,
         usedCachedSubfolders: Bool = false
     ) {
+        finishFolderMeasurement(
+            report: Result { try FolderMeasurementReport.decode(output) },
+            folderID: folderID,
+            linkID: linkID,
+            scanRevision: scanRevision,
+            scanAccountID: scanAccountID,
+            usedCachedSubfolders: usedCachedSubfolders
+        )
+    }
+
+    private func finishFolderMeasurement(
+        report decodedReport: Result<FolderMeasurementReport, Error>,
+        folderID: String,
+        linkID: UUID? = nil,
+        scanRevision: UInt64? = nil,
+        scanAccountID: String? = nil,
+        usedCachedSubfolders: Bool = false
+    ) {
         do {
-            let decoder = JSONDecoder()
-            decoder.keyDecodingStrategy = .convertFromSnakeCase
-            let report = try decoder.decode(FolderMeasurementReport.self, from: Data(output.utf8))
+            let report = try decodedReport.get()
             if linkID == nil, let scanRevision {
                 guard scanAccountID == folderMeasurementAccountID,
                       !removedSizeFolderIDs.contains(folderID) else { return }
-                var topology = folderSizeIndex
-                topology.parents.merge(report.parents ?? [:]) { _, new in new }
-                let overlaps = folderSizeChanges.contains { id, revision in
-                    revision > scanRevision && topology.ancestors(of: id).contains(folderID)
-                } || sizeMutationOverlaps(folderID, topology: topology)
+                let laterChanges = folderSizeChanges.compactMap { $0.value > scanRevision ? $0.key : nil }
+                let scopes = activeSizeMutationScopes()
+                var overlaps = false
+                if !laterChanges.isEmpty || !scopes.isEmpty {
+                    // Merging the scanned topology copies the whole parent map;
+                    // only pay for it when something could overlap this scan.
+                    var topology = folderSizeIndex
+                    topology.parents.merge(report.parentIDs) { _, new in new }
+                    overlaps = laterChanges.contains { topology.ancestors(of: $0).contains(folderID) }
+                        || sizeMutationOverlaps(folderID, topology: topology, scopes: scopes)
+                }
                 if overlaps {
                     // Only an overlapping mutation invalidates the result. A
                     // manual full rescan remains full when retried, never seeded
@@ -15519,28 +17918,23 @@ final class DownloaderModel: ObservableObject {
 
             // Publish the complete cache in one assignment so a large folder
             // tree refreshes once instead of re-rendering for every descendant.
-            var updatedMeasurements = folderMeasurements
-            let contextualMeasurements = (report.folders ?? [:]).reduce(
-                into: [String: FolderMeasurement]()
-            ) { values, entry in
-                values[
-                    folderMeasurementCacheKey(for: entry.key, linkID: linkID)
-                ] = entry.value
-            }
-            updatedMeasurements.merge(contextualMeasurements) { _, newest in newest }
-            let rootCacheKey = folderMeasurementCacheKey(for: folderID, linkID: linkID)
-            updatedMeasurements[rootCacheKey] = rootMeasurement
+            let updatedMeasurements: [String: FolderMeasurement]
             if linkID == nil {
                 var sizes = report.folders ?? [:]
                 sizes[folderID] = rootMeasurement
                 folderSizeIndex.applyScan(
-                    rootID: folderID, folders: sizes,
-                    scannedListings: report.listings ?? [:], parentIDs: report.parents ?? [:]
+                    rootID: folderID, folders: sizes, scannedListings: report.listings ?? [:]
                 )
                 publishAccountFolderSizes()
                 updatedMeasurements = folderMeasurements
             } else {
-                folderMeasurements = updatedMeasurements
+                var measurements = folderMeasurements
+                for (id, measurement) in report.folders ?? [:] {
+                    measurements[folderMeasurementCacheKey(for: id, linkID: linkID)] = measurement
+                }
+                measurements[folderMeasurementCacheKey(for: folderID, linkID: linkID)] = rootMeasurement
+                folderMeasurements = measurements
+                updatedMeasurements = measurements
             }
             persistFolderMeasurements()
 
@@ -15605,7 +17999,16 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
-    private func sizeMutationOverlaps(_ folderID: String, topology: FolderSizeIndex) -> Bool {
+    private func sizeMutationOverlaps(
+        _ folderID: String, topology: FolderSizeIndex, scopes: Set<String>? = nil
+    ) -> Bool {
+        (scopes ?? activeSizeMutationScopes()).contains {
+            topology.ancestors(of: $0).contains(folderID)
+                || topology.ancestors(of: folderID).contains($0)
+        }
+    }
+
+    private func activeSizeMutationScopes() -> Set<String> {
         var scopes = isRunning ? sizeMutationScopes(for: operation) : []
         if isUploading, let destination = uploadDestination { scopes.insert(destination.id) }
         if isMergingFolders {
@@ -15621,10 +18024,7 @@ final class DownloaderModel: ObservableObject {
                 .filter { $0.isFolder && $0.name == "Pack From Shared" }.map(\.id)
             scopes.formUnion(parents.isEmpty ? [""] : parents)
         }
-        return scopes.contains {
-            topology.ancestors(of: $0).contains(folderID)
-                || topology.ancestors(of: folderID).contains($0)
-        }
+        return scopes
     }
 
     private func recordFolderSizeChange(in parentIDs: Set<String>) {
@@ -15642,10 +18042,14 @@ final class DownloaderModel: ObservableObject {
         finishFolderSizeMutation(affectedParents: parentIDs)
     }
 
-    private func finishFolderSizeMutation(affectedParents: Set<String>) {
-        folderSizeRevision &+= 1
+    /// `invalidatesInFlightScans` is false only when the index learned
+    /// something without a known change, so a running scan stays valid.
+    private func finishFolderSizeMutation(affectedParents: Set<String>, invalidatesInFlightScans: Bool = true) {
+        if invalidatesInFlightScans { folderSizeRevision &+= 1 }
         for id in affectedParents {
-            for ancestor in folderSizeIndex.ancestors(of: id) { folderSizeChanges[ancestor] = folderSizeRevision }
+            if invalidatesInFlightScans {
+                for ancestor in folderSizeIndex.ancestors(of: id) { folderSizeChanges[ancestor] = folderSizeRevision }
+            }
             if let root = folderSizeIndex.repairRoot(for: id), folderSizeIndex.dirty.contains(root) {
                 automaticSizeRepairIDs.insert(root)
             }
@@ -15721,8 +18125,12 @@ final class DownloaderModel: ObservableObject {
         // not reached the GUI yet. Do not reconcile that snapshot and then
         // apply the same confirmed deletion/move as a second delta.
         guard !sizeMutationOverlaps(folderID, topology: folderSizeIndex) else { return }
+        // Opening a folder for the first time records its contents but proves
+        // no change, so it must not discard a size scan of an ancestor that is
+        // still running. Only a listing that differs from a known one does.
+        let isFirstListing = folderSizeIndex.listings[folderID] == nil
         if folderSizeIndex.reconcile(folderID: folderID, entries: items.map(sizeEntry)) {
-            finishFolderSizeMutation(affectedParents: [folderID])
+            finishFolderSizeMutation(affectedParents: [folderID], invalidatesInFlightScans: !isFirstListing)
         }
     }
 
@@ -15795,7 +18203,9 @@ final class DownloaderModel: ObservableObject {
     private func persistFolderMeasurements() {
         folderSizePersistTask?.cancel()
         folderSizePersistTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 350_000_000)
+            // Each save encodes the whole index; browsing many folders should
+            // coalesce into one write. Closing a window still saves at once.
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
             guard !Task.isCancelled, let self else { return }
             self.persistFolderMeasurementsNow()
         }
@@ -15936,11 +18346,14 @@ final class DownloaderModel: ObservableObject {
             }
 
             recordTrashUndo(ids: [itemID])
-            removeCachedBrowserItems(withIDs: Set([itemID]))
-            if selectedBrowserItemID == itemID {
-                clearBrowserSelection()
-            } else {
-                selectedBrowserItemIDs.remove(itemID)
+            fileSimilarity.cloud.results.setCloudFilesTrashed([itemID], true)
+            removeCachedAccountBrowserItems(withIDs: Set([itemID]))
+            if !isBrowsingSharedLink {
+                if selectedBrowserItemID == itemID {
+                    clearBrowserSelection()
+                } else {
+                    selectedBrowserItemIDs.remove(itemID)
+                }
             }
             duplicateScan = nil
             selectedDuplicateFileIDs = []
@@ -15966,12 +18379,26 @@ final class DownloaderModel: ObservableObject {
             }
 
             recordTrashUndo(ids: requestedIDs.filter { trashed.contains($0) })
-            removeCachedBrowserItems(withIDs: trashed)
-            clearBrowserSelection()
+            if pendingSimilarityTrash == nil || pendingSimilarityTrash?.session == fileSimilarity.cloud.results.sessionToken {
+                fileSimilarity.cloud.results.setCloudFilesTrashed(trashed, true)
+            }
+            if pendingSimilarityTrash != nil {
+                removeCachedAccountBrowserItems(withIDs: trashed)
+                if !isBrowsingSharedLink {
+                    selectedBrowserItemIDs.subtract(trashed)
+                    if let selected = selectedBrowserItemID, trashed.contains(selected) { clearBrowserSelection() }
+                }
+            } else {
+                removeCachedBrowserItems(withIDs: trashed)
+                clearBrowserSelection()
+            }
             duplicateScan = nil
             selectedDuplicateFileIDs = []
             if requested.isSubset(of: trashed) { setStatus("Moved \(trashed.count.formatted()) selected item(s) to PikPak Trash") }
             else { setError("Moved \(trashed.count) of \(requested.count) item(s) to Trash. The confirmed items can be undone.") }
+            if let pending = pendingSimilarityTrash {
+                completeSimilarityTrash(.success(Set(pending.files.filter { $0.cloudId.map(trashed.contains) == true }.map(\.id))))
+            }
         } catch {
             appendOutput("Could not decode batch Trash response: \(error.localizedDescription)\n")
             setError("PikPak returned a Trash response this app could not read.")
@@ -16192,6 +18619,7 @@ final class DownloaderModel: ObservableObject {
                 ?? (fallbackParentPath.isEmpty ? "/" : fallbackParentPath)
             let renamedPath = joinedRemotePath(folder: parentPath, name: result.name)
             browserItemPaths[renamedItem.id] = renamedPath
+            FinderBookmarkStore.shared.rename(provider: "pikpak", scope: bookmarkScope, itemID: renamedItem.id, name: result.name)
             if renamedItem.isFolder {
                 updateKnownBrowserDescendantPaths(
                     folderID: renamedItem.id,
@@ -16545,7 +18973,7 @@ final class DownloaderModel: ObservableObject {
         if selection {
             let items = browserItemsSelectedForAction
             guard !items.isEmpty else {
-                throw NSError(domain: "FileSimilarity", code: 4, userInfo: [NSLocalizedDescriptionKey: "Select files or folders in Browser first, then choose Use Browser Selection."])
+                throw NSError(domain: "FileSimilarity", code: 4, userInfo: [NSLocalizedDescriptionKey: "Choose a PikPak folder to scan."])
             }
             return items.map { item in
                 let route = browserNavigationStack(opening: item)
@@ -16581,12 +19009,41 @@ final class DownloaderModel: ObservableObject {
     }
     #endif
 
+    private func chooseSimilarityCloudFolder() {
+        let coordinator = fileSimilarity
+        guard !coordinator.cloud.isRunning else { return }
+        do {
+            let configuration = try similarityConfiguration(.cloud), account = activeAccountID
+            let session = coordinator.cloud.sessionID
+            coordinator.scopePicker = SimilarityScopePicker(title: "Choose a PikPak Folder",
+                root: .init(id: "", title: "PikPak"), load: { [weak self] folder, token in
+                    guard let self, self.activeAccountID == account else { throw CancellationError() }
+                    var arguments = ["--parent-id", folder.id, "--limit", "500"]
+                    if let token { arguments += ["--page-token", token] }
+                    let data = try await SimilarityHelper.request(configuration: configuration, command: "browse", input: Data(), arguments: arguments)
+                    guard self.activeAccountID == account else { throw CancellationError() }
+                    let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+                    let page = try decoder.decode(BrowserPage.self, from: data)
+                    return .init(folders: page.files.filter { $0.isFolder && !$0.name.hasPrefix(".") }
+                        .map { .init(id: $0.id, title: $0.name) }, nextPage: page.nextPageToken)
+                }, accept: { [weak self] route in
+                    guard let self, self.activeAccountID == account, self.fileSimilarity.cloud.sessionID == session,
+                          !self.fileSimilarity.cloud.isRunning, let folder = route.last else { return }
+                    self.fileSimilarity.cloud.cloudRoots = [.init(id: folder.id, name: folder.title,
+                        path: route.count == 1 ? "/" : "/" + route.dropFirst().map(\.title).joined(separator: "/"),
+                        isFolder: true, size: 0, ancestors: route.dropFirst().dropLast().map { .init(id: $0.id, name: $0.title) })]
+                    self.fileSimilarity.cloud.error = nil
+                })
+        } catch { coordinator.cloud.error = error.localizedDescription }
+    }
+
     private func prepareSimilarityPreview(_ file: SimilarityFile, directory: URL) async throws -> URL {
         guard let fileID = file.cloudId, hasUsableSession, !isClosingWindow else { throw CloudDriveError.message("Sign in to this file's PikPak account to preview it.") }
         let account = activeAccountID, configuration = try similarityConfiguration(.cloud)
-        let data = try await SimilarityHelper.request(configuration: configuration, command: "preview", input: Data(), arguments: ["--id", fileID])
+        let data = try await SimilarityHelper.request(configuration: configuration, command: "preview", input: Data(), arguments: ["--id", fileID, "--parent-id", file.ancestors.last?.id ?? ""])
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         let info = try decoder.decode(PreviewInfo.self, from: data)
+        guard configuration.environment["PIKPAK_CONTENT_MODE"] == finderSettings.contentMode.rawValue else { throw CancellationError() }
         guard let source = FinderFileOpenStorage.originalURL(info) else { throw CloudDriveError.message("PikPak has not provided an original file to preview.") }
         let session = URLSession(configuration: PreviewTransport.configuration(proxyURL: proxyURL))
         defer { session.invalidateAndCancel() }
@@ -16607,7 +19064,7 @@ final class DownloaderModel: ObservableObject {
             // Results are account files even when the main window is in Links.
             let configuration = try similarityConfiguration(.cloud)
             let opening = FinderFileOpenConfiguration(executable: configuration.executable, environment: configuration.environment,
-                arguments: ["preview", "--id", fileID], exchangeDirectory: try makePrivateExchangeDirectory(),
+                arguments: ["preview", "--id", fileID, "--parent-id", file.ancestors.last?.id ?? ""], exchangeDirectory: try makePrivateExchangeDirectory(),
                 copiesDirectory: try LocalCredentialStore.applicationSupportDirectoryURL().appendingPathComponent("Opened Files", isDirectory: true),
                 proxyURL: proxyURL)
             fileOpener.open(identity: "similarity:\(activeAccountID?.uuidString ?? "desktop"):\(fileID):\(file.bytes)",
@@ -16618,11 +19075,13 @@ final class DownloaderModel: ObservableObject {
     private func engineEnvironment() throws -> [String: String] {
         guard !isChangingAccount else { throw PikPakAccountError.cancelled }
         if let accountStore {
-            guard let activeAccountID, activeSavedAccount?.needsSignIn == false else { throw LocalCredentialStoreError.untrustedSession }
+            guard let activeAccountID,
+                  try accountStore.load().accounts.first(where: { $0.id == activeAccountID })?.needsSignIn == false
+            else { throw LocalCredentialStoreError.untrustedSession }
             let files = accountStore.files(for: activeAccountID)
             let session = try files.load()
             guard session.deviceID == deviceID else { throw LocalCredentialStoreError.untrustedSession }
-            return desktopEngineEnvironment(tokenURL: files.tokenURL, lockURL: files.lockURL, deviceID: session.deviceID)
+            return desktopEngineEnvironment(tokenURL: files.tokenURL, lockURL: files.lockURL, deviceID: session.deviceID, credentialKind: session.credentialKind)
         }
         guard
             try LocalCredentialStore.hasDedicatedAppLoginProfile(),
@@ -16637,18 +19096,33 @@ final class DownloaderModel: ObservableObject {
             lockURL: try LocalCredentialStore.refreshLockFileURL(), deviceID: persistedDeviceID)
     }
 
-    private func desktopEngineEnvironment(tokenURL: URL, lockURL: URL, deviceID: String) -> [String: String] {
+    private func desktopEngineEnvironment(tokenURL: URL, lockURL: URL, deviceID: String, credentialKind: PikPakCredentialKind = .desktopOAuth) -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
         environment.removeValue(forKey: "PIKPAK_REFRESH_TOKEN")
         environment.removeValue(forKey: "PIKPAK_ROTATED_TOKEN_FILE")
-        environment["PIKPAK_REFRESH_TOKEN_FILE"] = tokenURL.path
-        environment["PIKPAK_REFRESH_TOKEN_LOCK_FILE"] = lockURL.path
+        environment.removeValue(forKey: "PIKPAK_TOKEN")
+        environment.removeValue(forKey: "PIKPAK_PERSONAL_ACCESS_TOKEN_FILE")
+        environment.removeValue(forKey: "PIKPAK_REFRESH_TOKEN_FILE")
+        environment.removeValue(forKey: "PIKPAK_REFRESH_TOKEN_LOCK_FILE")
+        if credentialKind == .personalAccessToken {
+            environment["PIKPAK_PERSONAL_ACCESS_TOKEN_FILE"] = tokenURL.path
+        } else {
+            environment["PIKPAK_REFRESH_TOKEN_FILE"] = tokenURL.path
+            environment["PIKPAK_REFRESH_TOKEN_LOCK_FILE"] = lockURL.path
+        }
         environment["PIKPAK_DEVICE_ID"] = deviceID
+        environment.removeValue(forKey: "PIKPAK_GUEST_MODE")
+        environment["PIKPAK_CONTENT_MODE"] = finderSettings.contentMode.rawValue
+        if let support = try? LocalCredentialStore.applicationSupportDirectoryURL() {
+            // Normal and similarity helpers share one socket allowance, across
+            // accounts and windows. The engine owns and releases advisory locks.
+            environment["MYCLOUDDRIVER_DOWNLOAD_CONNECTIONS"] = support.appendingPathComponent("Download Connections", isDirectory: true).path
+        }
         // The GUI session is deliberately issued to PikPak's desktop client.
         // Never let a shell-level Web-client override rejoin Safari's token
         // family when the bundled engine starts.
-        environment["PIKPAK_CLIENT_ID"] = PikPakDesktopOAuth.clientID
-        environment["PIKPAK_CLIENT_SECRET"] = PikPakDesktopOAuth.clientSecret
+        environment["PIKPAK_CLIENT_ID"] = credentialKind == .desktopOAuth ? PikPakDesktopOAuth.clientID : nil
+        environment["PIKPAK_CLIENT_SECRET"] = credentialKind == .desktopOAuth ? PikPakDesktopOAuth.clientSecret : nil
         return environment
     }
 
@@ -16681,6 +19155,7 @@ final class DownloaderModel: ObservableObject {
         storageQuotaError = nil
         isQuotaLoading = false
         quotaRefreshPending = false
+        transferQuotaMonitor.clear()
         presentLogin(
             reason: "The saved session is not an independent desktop session. Sign in here to keep MyCloudDriver separate from Safari."
         )
@@ -16744,6 +19219,12 @@ final class DownloaderModel: ObservableObject {
 
     private func clearPreview(preservingResourceCacheFor retainedFileID: String? = nil,
                               preservingQuickLook: Bool = false) {
+        cancelOperationRetries(prefix: "preview")
+        compatiblePreviewTask?.cancel(); compatiblePreviewTask = nil
+        previewFreshCacheRetries.removeAll()
+        previewResumeRetries.removeAll()
+        previewResumeSeconds = nil
+        previewPreparationFraction = nil
         imagePreview.reset(unlessFileID: retainedFileID)
         textPreviewLoader?.cancel()
         textPreviewLoader = nil
@@ -16754,6 +19235,7 @@ final class DownloaderModel: ObservableObject {
         removePreviewPlayerObservers()
         previewPlayer?.pause()
         previewPlayer = nil
+        compatiblePreviewCopy = nil
         previewInfo = nil
         previewFileID = nil
         previewSources = []
@@ -17057,7 +19539,8 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func lastDiagnosticLine(from raw: String, maximumLength: Int) -> String? {
-        let line = redactedEngineOutput(raw)
+        // Status notes arrive after the failure they would otherwise mask.
+        let line = FileSearchIndex.withoutStatusNotes(redactedEngineOutput(raw))
             .split(whereSeparator: \.isNewline)
             .map(String.init)
             .last { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -17119,15 +19602,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func isRejectedSessionError(_ lowered: String) -> Bool {
-        lowered.contains("invalid_grant")
-            || lowered.contains("error_code\":4126")
-            || lowered.contains("error_code: 4126")
-            || lowered.contains("status 400") && lowered.contains("authentication")
-            || lowered.contains("status 401") && lowered.contains("authentication")
-            || lowered.contains("refresh token")
-                && (lowered.contains("invalid")
-                    || lowered.contains("expired")
-                    || lowered.contains("rejected"))
+        PikPakSessionFailure.requiresSignIn(lowered)
     }
 
     private func handleWebLoginNeeded(for raw: String) {
@@ -17140,6 +19615,43 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func presentCleanLoginAfterRejectedSession(reason: String) {
+        guard !isClosingWindow, !isChangingAccount, !isLoginPresented, sessionRecoveryTask == nil else { return }
+        guard let store = accountStore, let id = activeAccountID else {
+            clearRejectedSessionAndPresentLogin(reason: reason)
+            return
+        }
+        // A helper may have failed with a stale token while another helper
+        // renewed it. Check the latest shared session before stopping work or
+        // deleting credentials. Temporary failures leave the session intact.
+        let expectedAccount = activeSavedAccount?.accountIdentifier
+        sessionRecoveryTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.sessionRecoveryTask = nil }
+            do {
+                let profile = try await self.verifyAccount(store.files(for: id), using: self.sessionRecoveryVerifier)
+                try Task.checkCancellation()
+                guard !self.isClosingWindow, !self.isChangingAccount, !self.isLoginPresented,
+                      self.activeAccountID == id,
+                      try store.load().accounts.first(where: { $0.id == id })?.needsSignIn == false else { return }
+                if let expectedAccount, profile.sub != expectedAccount { throw PikPakAccountError.accountMismatch }
+                self.rememberVerifiedAccount(profile)
+                self.synchronizeSharedSessionFromDisk()
+                self.setStatus("PikPak is still signed in. Retry the interrupted request.")
+            } catch {
+                guard !Task.isCancelled, !self.isClosingWindow, !self.isChangingAccount,
+                      !self.isLoginPresented, self.activeAccountID == id else { return }
+                if let error = error as? PikPakAccountError, error == .needsSignIn || error == .missingSession {
+                    self.clearRejectedSessionAndPresentLogin(reason: reason)
+                } else {
+                    self.accountSettingsError = error.localizedDescription
+                    self.accountLoginStatus = .unavailable
+                    self.setStatus("Could not verify the PikPak connection. Your saved session has been kept; retry shortly.")
+                }
+            }
+        }
+    }
+
+    private func clearRejectedSessionAndPresentLogin(reason: String) {
         clearPendingFolderMeasurements()
         if isRunning
             || sharedLinkLoadProcesses.values.contains(where: { $0.isRunning })
@@ -17163,10 +19675,12 @@ final class DownloaderModel: ObservableObject {
         accountLoginStatus = .needsSignIn
         accountLoginTargetID = activeAccountID
         attemptedInitialBrowse = false
+        loginCredentialKind = activeSavedAccount?.credentialKind ?? .desktopOAuth
         storageQuota = nil
         storageQuotaError = nil
         isQuotaLoading = false
         quotaRefreshPending = false
+        transferQuotaMonitor.clear()
         isLoginPresented = false
         deferredLoginRequiresCleanStart = false
         do {
@@ -17179,6 +19693,13 @@ final class DownloaderModel: ObservableObject {
             )
         }
         setStatus("Preparing a clean PikPak sign-in…")
+        #if FINDER_WORKSPACE_TESTS
+        if isFinderWorkspaceFixture {
+            loginReason = reason
+            isLoginPresented = true
+            return
+        }
+        #endif
         PikPakLoginDataStore.clearPikPakWebsiteData { [weak self] in
             guard let self else { return }
             self.loginReason = reason
@@ -17186,11 +19707,12 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
-    private func presentLogin(reason: String, fromSettings: Bool = false) {
+    private func presentLogin(reason: String, fromSettings: Bool = false, preserveConnectionChoice: Bool = false) {
         guard !isClosingWindow else { return }
         failPendingSharedLinkLoads(message: "Sign in, then retry this link.")
         loginFromSettings = fromSettings
-        if !loginFromSettings {
+        if !loginFromSettings && !preserveConnectionChoice {
+            loginCredentialKind = activeSavedAccount?.credentialKind ?? .desktopOAuth
             accountLoginTargetID = activeAccountID
             if accountLoginDeviceID == nil {
                 accountLoginDeviceID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
@@ -17364,6 +19886,38 @@ final class DownloaderModel: ObservableObject {
 
 #if FOLDER_EXPANSION_TESTS
 extension DownloaderModel {
+    /// Presents the production Browser with the interrupted 9/P/V shape. Its
+    /// only pending request is answered with generated metadata after launch.
+    static func folderRecoveryUIFixture() -> DownloaderModel {
+        func folder(_ id: String) -> BrowserItem {
+            BrowserItem(id: id, name: id, size: 0, kind: .folder, parentId: nil,
+                mimeType: nil, createdTime: nil, modifiedTime: nil, fileExtension: nil,
+                iconLink: nil, thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+        }
+        let model = DownloaderModel(folderExpansionFixture: true)
+        model.attemptedInitialBrowse = true
+        model.isUploading = true // Avoid unrelated folder-size persistence.
+        let root = folder("9"), parent = folder("P"), child = folder("V")
+        model.browserItems = [root]
+        model.browserTreeChildren = [root.id: [parent], parent.id: [child]]
+        model.registerBrowserItems([root], parentID: "", parentPath: "/")
+        model.registerBrowserItems([parent], parentID: root.id, parentPath: "/9")
+        model.registerBrowserItems([child], parentID: parent.id, parentPath: "/9/P")
+        model.expandedBrowserFolderIDs = [root.id, parent.id, child.id]
+        model.saveActiveBrowserWorkspace()
+        model.restoreBrowserWorkspace(model.accountBrowserWorkspace!)
+        Task { @MainActor [weak model] in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard let model, let request = model.recordedExpansionLoads.last(where: { $0.id == child.id }) else { return }
+            let output = #"{"files":[{"id":"recovered-leaf","name":"Recovered file.txt","size":42,"kind":"drive#file"}]}"#
+            model.finishBrowserTreeHelper(generation: request.generation, folderID: child.id, folderName: child.name,
+                folderPath: "/9/P/V", append: false, isShared: false, sizeRevision: model.folderSizeRevision,
+                exitCode: 0, structuredOutput: output, errorOutput: "")
+            model.isUploading = false
+        }
+        return model
+    }
+
     /// Synthetic listings and inert Process records exercise the real Browser
     /// scheduler. This fixture never reads credentials, persists link state,
     /// launches the engine, or touches the user's cloud data.
@@ -17418,6 +19972,118 @@ extension DownloaderModel {
             precondition(model.isDownloading && model.isUploading && !model.isRunning && model.canBrowse)
         }
         print("PASS model: cached 1/2-level expansion, stable selection/disclosures, concurrent upload/download availability")
+
+        // Expand All Levels over a multi-folder selection is one plan, and a
+        // folder selected next to its own ancestor is still opened once.
+        for roots in [[root, other], [root, root, other]] {
+            let selection = fixture()
+            selection.browserTreeChildren = [root.id: [a], a.id: [], other.id: []]
+            selection.expandBrowserSubfolders(roots, levels: nil)
+            await drain()
+            precondition(selection.expandedBrowserFolderIDs == [root.id, a.id, other.id],
+                         "every selected folder expands under one plan")
+            precondition(selection.recordedExpansionLoads.isEmpty && selection.browserFolderExpansionProgress == nil)
+        }
+        let nested = fixture()
+        nested.browserTreeChildren = [root.id: [a], a.id: [], other.id: []]
+        nested.expandBrowserSubfolders([root, a], levels: nil)
+        await drain()
+        precondition(nested.expandedBrowserFolderIDs == [root.id, a.id], "an ancestor and its child expand once, not twice")
+        let filesOnly = fixture()
+        filesOnly.expandBrowserSubfolders([item("plain.txt", folder: false)], levels: nil)
+        precondition(filesOnly.expandedBrowserFolderIDs.isEmpty && filesOnly.browserFolderExpansionProgress == nil,
+                     "a selection without folders starts nothing")
+        print("PASS model: Expand All Levels over a selection, deduplicated roots and nested roots")
+
+        // All Levels may be interrupted after publishing open disclosures but
+        // before the deepest listing arrives. Reopening the ancestor must
+        // restart that missing listing without toggling each child twice.
+        let interrupted = fixture(), leaf = item("leaf.txt", folder: false)
+        interrupted.browserTreeChildren = [root.id: [a], a.id: [b]]
+        interrupted.expandBrowserSubfolders(root, levels: nil)
+        await drain()
+        precondition(interrupted.isBrowserFolderExpanded(b.id) && interrupted.isBrowserFolderLoading(b.id))
+        let interruptedGeneration = interrupted.browserTreeLoadGenerations[b.id]!
+        interrupted.toggleBrowserFolderExpansion(root)
+        precondition(!interrupted.isBrowserFolderLoading(b.id))
+        interrupted.toggleBrowserFolderExpansion(root)
+        precondition(interrupted.isBrowserFolderLoading(b.id), "Reopening a parent must resume its open but unloaded descendant")
+        precondition(interrupted.browserTreeLoadGenerations[b.id] != interruptedGeneration)
+        try finish(interrupted, b.id, files: [item("stale.txt", folder: false)], staleGeneration: interruptedGeneration)
+        precondition(interrupted.browserTreeChildren[b.id] == nil)
+        try finish(interrupted, b.id, files: [leaf]); await drain()
+        precondition(interrupted.browserTreeEntries.map(\.id).contains(leaf.id))
+        print("PASS model: interrupted All Levels resumes unloaded nested folders on parent expansion; late cancelled replies are ignored")
+
+        let restored = fixture()
+        restored.browserTreeChildren = [root.id: [a], b.id: [leaf]]
+        restored.expandedBrowserFolderIDs = [root.id, a.id, b.id]
+        restored.saveActiveBrowserWorkspace()
+        let saved = restored.accountBrowserWorkspace!
+        restored.restoreBrowserWorkspace(saved)
+        precondition(restored.isBrowserFolderLoading(a.id), "Restoring open disclosures must restart missing child listings")
+        precondition(!restored.isBrowserFolderLoading(b.id), "Hidden descendants must wait for their parent")
+        try finish(restored, a.id, files: [b]); await drain()
+        precondition(restored.browserTreeEntries.map(\.id).contains(leaf.id))
+        precondition(restored.recordedExpansionLoads.map(\.id) == [a.id], "Already loaded descendants must not be refetched")
+        print("PASS model: restored workspaces resume visible missing listings and reveal cached descendants without refetching")
+
+        let cascade = fixture()
+        cascade.expandedBrowserFolderIDs = [root.id, a.id, b.id]
+        cascade.saveActiveBrowserWorkspace()
+        cascade.restoreBrowserWorkspace(cascade.accountBrowserWorkspace!)
+        try finish(cascade, root.id, files: [a]); await drain()
+        precondition(cascade.isBrowserFolderLoading(a.id))
+        try finish(cascade, a.id, files: [b]); await drain()
+        precondition(cascade.isBrowserFolderLoading(b.id))
+        try finish(cascade, b.id, files: [leaf]); await drain()
+        precondition(cascade.browserTreeEntries.map(\.id).contains(leaf.id))
+        print("PASS model: restored nested disclosures resume as each ancestor listing arrives")
+
+        let concurrent = fixture()
+        concurrent.browserTreeChildren = [root.id: [a]]
+        concurrent.expandedBrowserFolderIDs = [root.id, a.id, b.id]
+        precondition(concurrent.requestBrowserTreeLoad(a, append: false))
+        concurrent.expandBrowserSubfolders(other, levels: nil)
+        await drain()
+        precondition(concurrent.browserFolderExpansion != nil)
+        try finish(concurrent, a.id, files: [b])
+        precondition(concurrent.isBrowserFolderLoading(b.id),
+                     "An unrelated All Levels expansion must not block restored descendants")
+        try finish(concurrent, b.id, files: [leaf])
+        try finish(concurrent, other.id, files: [])
+        await drain()
+        precondition(concurrent.browserTreeEntries.map(\.id).contains(leaf.id))
+        precondition(concurrent.browserFolderExpansion == nil && concurrent.pendingBrowserTreeLoads.isEmpty)
+        precondition(concurrent.recordedExpansionLoads.count == 3)
+        print("PASS model: unrelated All Levels expansion does not block recovery of open descendants")
+
+        let back = fixture()
+        back.browserTreeChildren = [root.id: [a]]
+        back.expandedBrowserFolderIDs = [root.id, a.id]
+        back.rememberBrowserPosition(beforeOpening: a)
+        back.browserItems = []
+        precondition(back.restoreBrowserFolder(from: [.root]))
+        precondition(back.isBrowserFolderLoading(a.id), "Back navigation must reload an interrupted visible listing")
+        try finish(back, a.id, files: [leaf]); await drain()
+        precondition(back.browserTreeEntries.map(\.id).contains(leaf.id))
+
+        let bounded = fixture()
+        let waiting = (0..<9).map { item("Waiting \($0)") }
+        let empty = item("Empty"), failed = item("Failed"), hidden = item("Hidden")
+        bounded.browserTreeChildren = [root.id: waiting + [empty, failed, other], empty.id: [], other.id: [hidden]]
+        bounded.expandedBrowserFolderIDs = Set([root.id, empty.id, failed.id, hidden.id] + waiting.map(\.id))
+        bounded.browserTreeLoadErrors[failed.id] = "Offline listing failure"
+        bounded.saveActiveBrowserWorkspace()
+        bounded.restoreBrowserWorkspace(bounded.accountBrowserWorkspace!)
+        precondition(bounded.browserTreeLoadProcesses.count == 4 && bounded.pendingBrowserTreeLoads.count == 5)
+        precondition(!bounded.isBrowserFolderLoading(empty.id) && !bounded.isBrowserFolderLoading(failed.id) && !bounded.isBrowserFolderLoading(hidden.id))
+        while !bounded.browserTreeLoadGenerations.isEmpty {
+            precondition(bounded.browserTreeLoadProcesses.count <= 4)
+            for id in Array(bounded.browserTreeLoadGenerations.keys) { try finish(bounded, id, files: []) }
+        }
+        precondition(bounded.recordedExpansionLoads.count == waiting.count)
+        print("PASS model: Back navigation recovery, four-request limit, and no refetch of empty, failed or hidden branches")
 
         let deep = fixture()
         deep.browserTreeChildren = [root.id: [a], a.id: [b], b.id: [c], c.id: []]
@@ -17481,6 +20147,9 @@ extension DownloaderModel {
         cancelled.cancelBrowserFolderExpansion()
         precondition(cancelled.browserTreeLoadGenerations[other.id] != nil, "Cancel never cancels a manual browse")
         precondition(cancelled.browserTreeLoadGenerations[root.id] == nil && cancelled.expandedBrowserFolderIDs.contains(root.id))
+        precondition(cancelled.browserTreeLoadErrors[root.id] == Self.browserFolderLoadStopped)
+        try finish(cancelled, other.id)
+        precondition(cancelled.browserTreeLoadGenerations[root.id] == nil, "Completing an unrelated manual request must respect Cancel Expansion")
         cancelled.expandBrowserSubfolders(root)
         await drain()
         let newGeneration = cancelled.browserTreeLoadGenerations[root.id]!
@@ -17529,6 +20198,11 @@ extension DownloaderModel {
         try finish(links, root.id, files: [])
         await drain()
         precondition(links.browserFolderExpansion == nil && links.browserTreeChildren[root.id] == [])
+        links.activateSharedLink(firstID)
+        precondition(links.isBrowserFolderLoading(root.id), "Returning to the first link must resume its interrupted listing")
+        try finish(links, root.id, files: [leaf]); await drain()
+        precondition(links.sharedLinkTreeEntries(for: firstID).map(\.id).contains(leaf.id))
+        precondition(!links.sharedLinkTreeEntries(for: secondID).map(\.id).contains(leaf.id))
         print("PASS model: repeated-token termination, shared-link scope, preserved workspace, no cross-link results or persistence")
     }
 }
@@ -17536,6 +20210,57 @@ extension DownloaderModel {
 
 #if FINDER_WORKSPACE_TESTS
 extension DownloaderModel {
+    static func testVideoFrameRecovery(defaults: UserDefaults, unsupported: URL, supported: URL) async throws {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        defer { model.clearPreview(); model.clearPreviewResourceCaches() }
+        model.configureMediaPreviewFixture(videoURL: unsupported)
+        let item = model.selectedBrowserItem!
+        let first = PreviewSource(url: "https://fixture.invalid/first.mp4", label: "First", isOrigin: false,
+            videoCodec: nil, audioCodec: "aac")
+        let second = PreviewSource(url: "https://fixture.invalid/original.mp4", label: "Original", isOrigin: true,
+            videoCodec: nil, audioCodec: "aac")
+        let failure = NSError(domain: AVFoundationErrorDomain, code: AVError.Code.decodeFailed.rawValue)
+        model.previewSources = [first, second]; model.previewFixtureMediaURL = unsupported
+        model.loadPreviewSource(at: 0, fileID: item.id, autoplay: false)
+        for _ in 0..<200 {
+            if model.mediaPlayback.canSeek { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        precondition(model.mediaPlayback.canSeek, "The unusable video still opens successfully")
+        let old = model.previewPlayer!
+        model.previewFixtureMediaURL = supported
+        model.reportVideoPreviewFailure(failure, fileID: item.id, player: old)
+        precondition(model.previewSourceIndex == 1 && model.previewPlayer !== old)
+        let next = model.previewPlayer!
+        model.reportVideoPreviewFailure(failure, fileID: item.id, player: old)
+        precondition(model.previewPlayer === next, "A discarded view cannot fail the replacement player")
+        for _ in 0..<200 {
+            if model.mediaPlayback.canSeek { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        precondition(next.rate == 0 && model.previewPlaybackError == nil)
+
+        model.clearPreview(); model.previewFileID = item.id
+        model.previewSources = [second]; model.previewFixtureMediaURL = unsupported
+        model.loadPreviewSource(at: 0, fileID: item.id, autoplay: false)
+        let unrenderable = model.previewPlayer!
+        model.reportVideoPreviewFailure(failure, fileID: item.id, player: unrenderable)
+        for _ in 0..<600 {
+            if model.compatiblePreviewCopy != nil && model.mediaPlayback.canSeek || model.previewPlaybackError != nil { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        precondition(model.previewPlaybackError == nil && model.compatiblePreviewCopy != nil)
+        let player = model.previewPlayer!, output = model.compatiblePreviewCopy!.url
+        let frame = try await AVAssetImageGenerator(asset: player.currentItem!.asset).image(at: CMTime(seconds: 1, preferredTimescale: 600))
+        precondition(frame.image.width == 160 && player.rate == 0)
+        model.reportVideoPreviewFailure(failure, fileID: item.id, player: player)
+        precondition(model.previewPlaybackError != nil && model.compatiblePreviewTask == nil,
+            "A generated copy must not cause a conversion loop")
+        model.clearPreview()
+        precondition(!FileManager.default.fileExists(atPath: output.path))
+        print("PASS video frame recovery: next cloud source, stale-view rejection, compatible copy, paused intent, bounded failure and cleanup")
+    }
+
     static func workspaceSwitchFixture(count: Int = 50_000) -> DownloaderModel {
         let model = finderWorkspaceFixture()
         model.populateScrollingFixture(count: count)
@@ -17548,6 +20273,223 @@ extension DownloaderModel {
         return model
     }
 
+    static func testAVIPreviewRouting(defaults: UserDefaults, original: URL) async throws {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        let item = BrowserItem(id: "avi-fixture", name: "Legacy.AVI", size: 1_024, kind: .file,
+            parentId: "", mimeType: "video/x-msvideo", createdTime: nil, modifiedTime: nil, fileExtension: "AVI",
+            iconLink: nil, thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+        model.browserItems = [item]; model.selectedBrowserItemID = item.id; model.selectedBrowserItemIDs = [item.id]
+        model.previewRequestContentMode = model.finderSettings.contentMode
+        let source = PreviewSource(url: "https://fixture.invalid/original.avi", label: "Original", isOrigin: true, videoCodec: nil, audioCodec: nil)
+        let preview = PreviewInfo(name: item.name, size: item.size, mimeType: item.mimeType,
+            thumbnailLink: nil, iconLink: nil, contentLink: source.url, sources: [source])
+        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+        model.finishPreview(output: String(decoding: try encoder.encode(preview), as: UTF8.self), fileID: item.id)
+        precondition(model.compatiblePreviewTask != nil && model.isPreviewLoading && model.previewPlayer == nil)
+        precondition(!model.previewRequiresCompatibilityPlayer, "AVI without codec metadata prepares inside the app")
+        model.clearPreview()
+        precondition(model.compatiblePreviewTask == nil && model.previewPreparationFraction == nil)
+        await Task.yield()
+        precondition(model.previewPlayer == nil && model.previewPlaybackError == nil, "Cancelled preparation cannot repopulate the selection")
+
+        let optimized = PreviewSource(url: "https://fixture.invalid/optimized.mp4", label: "Optimized", isOrigin: false, videoCodec: "h264", audioCodec: "aac")
+        model.previewFileID = item.id
+        model.previewSources = [optimized, source]
+        precondition(!model.prepareCompatibilityPreviewIfNeeded(), "A cloud transcode should keep streaming normally")
+        // Simulate exhaustion of a failed cloud transcode and the original.
+        model.previewSourceIndex = 1
+        model.tryNextPreviewSource(after: nil, generation: model.previewLoadGeneration, fileID: item.id, autoplay: false)
+        precondition(model.compatiblePreviewTask != nil && model.isPreviewLoading)
+        model.clearPreview()
+
+        model.previewFileID = item.id; model.previewSources = [source]
+        model.previewInfo = preview
+        var copy: VideoPreviewCopy? = try await VideoPreviewPreparation.prepare(source: original) { _ in }
+        let url = copy!.url
+        model.compatiblePreviewCopy = copy; copy = nil
+        model.loadPreviewSource(at: 0, fileID: item.id, autoplay: false, localURL: url)
+        for _ in 0..<200 {
+            if model.mediaPlayback.canSeek { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        precondition(model.mediaPlayback.canSeek && !model.isPreviewLoading && model.previewPlaybackError == nil)
+        precondition((model.previewPlayer?.currentItem?.asset as? AVURLAsset)?.url == url)
+        precondition(model.previewSourceLabel == "Compatible preview • temporary copy" && !model.previewUsesRetainedCache)
+        model.clearPreview()
+        precondition(!FileManager.default.fileExists(atPath: url.path))
+        print("PASS cloud AVI routing, cloud-transcode preference/fallback, cancellation and playable MP4 handoff")
+    }
+
+    static func testPreviewBufferLimit(defaults: UserDefaults, mediaURL: URL) async throws {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        defer { model.clearPreview(); model.clearPreviewResourceCaches() }
+        let item = BrowserItem(id: "buffer-fixture", name: "Generated.mp4", size: 0, kind: .file,
+            parentId: "", mimeType: "video/mp4", createdTime: nil, modifiedTime: nil, fileExtension: "mp4",
+            iconLink: nil, thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+        model.browserItems = [item]; model.selectedBrowserItemID = item.id
+        model.previewFileID = item.id
+        model.previewSources = [PreviewSource(url: "https://fixture.invalid/generated.mp4", label: "Original",
+            isOrigin: true, videoCodec: "h264", audioCodec: nil)]
+        model.loadPreviewSource(at: 0, fileID: item.id, autoplay: false, localURL: mediaURL)
+        let playerItem = model.previewPlayer!.currentItem!
+        precondition(playerItem.preferredForwardBufferDuration == 30,
+                     "Loading must not request hours of in-memory buffering")
+        for _ in 0..<200 {
+            if model.mediaPlayback.canSeek { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        precondition(model.mediaPlayback.canSeek && model.previewDurationSeconds > 60)
+        precondition(playerItem.preferredForwardBufferDuration == 30,
+                     "Discovering the duration must not expand the buffer to the entire file")
+        let generation = model.previewLoadGeneration
+        let snapshot = PreviewResourceCacheSnapshot(cachedBytes: 100, contentLength: 200, ranges: [0..<100])
+        model.updatePreviewCacheMetrics(snapshot, generation: generation, fileID: item.id)
+        var publications = 0
+        let observation = model.objectWillChange.sink { publications += 1 }
+        for _ in 0..<10_000 {
+            model.updatePreviewCacheMetrics(snapshot, generation: generation, fileID: item.id)
+        }
+        precondition(publications == 0, "Identical cache metrics must not invalidate the whole browser")
+        model.updatePreviewCacheMetrics(.init(cachedBytes: 200, contentLength: 200, ranges: [0..<200]),
+                                        generation: UUID(), fileID: item.id)
+        precondition(publications == 0 && model.previewRetainedBytes == 100,
+                     "Old previews must not update the current file")
+        observation.cancel()
+        print("PASS real preview: bounded buffer before/after duration, duplicate metrics and stale generation")
+    }
+
+    static func testMP4PreviewRecovery(defaults: UserDefaults, remote: URL, bytes: Data) async throws {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        defer { model.clearPreview(); model.clearPreviewResourceCaches() }
+        let item = BrowserItem(id: "mp4-fixture", name: "Generated.MP4", size: UInt64(bytes.count), kind: .file,
+            parentId: "", mimeType: "video/mp4", createdTime: nil, modifiedTime: nil, fileExtension: "MP4",
+            iconLink: nil, thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+        model.browserItems = [item]; model.selectedBrowserItemID = item.id; model.selectedBrowserItemIDs = [item.id]
+        let source = PreviewSource(url: "https://fixture.invalid/download/generated", label: "Original · Guest",
+            isOrigin: true, videoCodec: nil, audioCodec: nil)
+        let parseError = NSError(domain: AVFoundationErrorDomain, code: -11829,
+            userInfo: [NSUnderlyingErrorKey: NSError(domain: NSOSStatusErrorDomain, code: -12848)])
+        for repairRanges in [false, true] {
+            model.clearPreview(); model.clearPreviewResourceCaches()
+            model.previewFixtureMediaURL = repairRanges ? remote.appendingPathExtension("repair") : remote
+            model.previewFileID = item.id; model.previewSources = [source]
+            model.previewInfo = PreviewInfo(name: item.name, size: item.size, mimeType: item.mimeType,
+                thumbnailLink: nil, iconLink: nil, contentLink: source.url, sources: [source])
+            precondition(!model.prepareCompatibilityPreviewIfNeeded(), "A normal MP4 must keep streaming")
+            let cache = model.previewResourceCache(for: source, index: 0, fileID: item.id)!
+            cache.updateMetadata(typeIdentifier: "public.mpeg-4", contentLength: Int64(bytes.count), supportsByteRanges: true)
+            cache.store(Data(repeating: 0, count: bytes.count), at: 0)
+            model.loadPreviewSource(at: 0, fileID: item.id, autoplay: repairRanges)
+            for _ in 0..<600 {
+                if model.mediaPlayback.canSeek || model.previewPlaybackError != nil { break }
+                try await Task.sleep(nanoseconds: 25_000_000)
+            }
+            precondition(model.previewPlaybackError == nil, model.previewPlaybackError ?? "")
+            precondition(model.mediaPlayback.canSeek && !model.isPreviewLoading)
+            precondition(cache.read(at: 0, maximumLength: 8) == nil, "The damaged cache must be discarded")
+            precondition(model.previewFreshCacheRetries.count == 1, "Cache retry must be bounded")
+            precondition((model.compatiblePreviewCopy != nil) == repairRanges)
+            precondition(model.previewUsesRetainedCache != repairRanges)
+            let player = model.previewPlayer!
+            if repairRanges {
+                for _ in 0..<120 {
+                    if player.currentTime().seconds > 0.1 { break }
+                    try await Task.sleep(nanoseconds: 25_000_000)
+                }
+                precondition(player.currentTime().seconds > 0.1, "Recovery must preserve requested playback")
+                player.pause()
+            } else { precondition(player.rate == 0, "Cache repair must not start paused playback") }
+            let generator = AVAssetImageGenerator(asset: player.currentItem!.asset)
+            let frame = try await generator.image(at: CMTime(seconds: 1, preferredTimescale: 600))
+            precondition(frame.image.width == 160 && frame.image.height == 120)
+            let finished = await player.seek(to: CMTime(seconds: 1.2, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+            precondition(finished && abs(player.currentTime().seconds - 1.2) < 0.1)
+            let output = model.compatiblePreviewCopy?.url
+            if repairRanges {
+                // A failed generated copy must report failure rather than loop.
+                model.tryNextPreviewSource(after: parseError, generation: model.previewLoadGeneration, fileID: item.id, autoplay: false)
+                precondition(model.compatiblePreviewTask == nil && model.previewPlaybackError != nil)
+            }
+            model.clearPreview(); model.clearPreviewResourceCaches()
+            if let output { precondition(!FileManager.default.fileExists(atPath: output.path)) }
+            print(repairRanges
+                ? "PASS MP4: real parser failure, one cache retry, full download/conversion, decoded frame, autoplay/seek, bounded fallback and cleanup"
+                : "PASS MP4: real parser failure repairs a damaged retained cache without conversion or unwanted autoplay")
+        }
+        model.previewFileID = item.id; model.previewSources = [source]; model.previewUsesRetainedCache = true
+        model.tryNextPreviewSource(after: URLError(.notConnectedToInternet), generation: model.previewLoadGeneration,
+                                  fileID: item.id, autoplay: false)
+        precondition(model.compatiblePreviewTask == nil && model.previewFreshCacheRetries.isEmpty)
+        precondition(model.previewPlaybackError != nil, "Network failures must not download/convert again")
+        print("PASS MP4: network errors keep their diagnostic without cache or conversion retries")
+    }
+
+    static func testMergeFolderSelection(defaults: UserDefaults) throws {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        model.selectedBrowserItemIDs = ["Projects"]
+        precondition(!model.canMergeSelectedFolders)
+        model.selectedBrowserItemIDs = ["Projects", "Notes"]
+        precondition(model.canMergeSelectedFolders && model.selectedFoldersForMerge.count == 2)
+        model.selectedBrowserItemIDs = ["Projects", "Readme.txt"]
+        precondition(!model.canMergeSelectedFolders)
+        model.selectedBrowserItemIDs = ["Drafts", "Notes"]
+        precondition(!model.canMergeSelectedFolders, "Folders from different parents cannot be merged")
+        model.selectedBrowserItemIDs = ["Projects", "Drafts"]
+        precondition(!model.canMergeSelectedFolders, "A parent cannot merge into its descendant")
+        print("PASS merge selection: sibling folders only; single, mixed and ancestor selections stay disabled")
+    }
+
+    static func testPreviewResponseURLs(defaults: UserDefaults) throws {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        let item = BrowserItem(id: "preview-url-fixture", name: "Sample.png", size: 1_024, kind: .file,
+            parentId: "", mimeType: "image/png", createdTime: nil, modifiedTime: nil, fileExtension: "png",
+            iconLink: nil, thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+        model.browserItems = [item]
+        model.selectedBrowserItemID = item.id
+        model.selectedBrowserItemIDs = [item.id]
+        let insecure = "http://dl-a10b-0001.mypikpak.com/object%2Foriginal.png?token=a%2Bb%2Fc%3D&empty="
+        let secure = "https" + insecure.dropFirst(4)
+        func output(_ link: String, sources: [String]?) throws -> String {
+            var response: [String: Any] = ["name": item.name, "size": item.size,
+                "mime_type": "image/png", "content_link": link]
+            if let sources {
+                response["sources"] = sources.map { ["url": $0, "label": "Original", "is_origin": true] as [String: Any] }
+            }
+            return String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
+        }
+
+        for mode in PikPakContentMode.allCases {
+            model.finderSettings.contentMode = mode
+            model.previewRequestContentMode = mode
+            for sources: [String]? in [[insecure], [insecure, secure], nil] {
+                model.clearPreview()
+                model.isPreviewLoading = true
+                model.finishPreview(output: try output(insecure, sources: sources), fileID: item.id)
+                precondition(model.previewErrorDiagnostic == nil && model.previewPlaybackError == nil,
+                             "A working PikPak CDN URL must not become MISSING_PREVIEW_URL")
+                precondition(!model.isPreviewLoading && !model.statusIsError)
+                precondition(model.previewInfo?.contentURL?.absoluteString == secure,
+                             "Images must receive the secure original URL")
+                precondition(model.previewSources.count == 1 && model.previewSources[0].contentURL?.absoluteString == secure,
+                             "Playback must deduplicate HTTP and HTTPS forms of the same source")
+                precondition(model.preferredQuickLookSource()?.contentURL?.absoluteString == secure,
+                             "Quick Look must use the same secure original")
+                precondition(FinderFileOpenStorage.originalURL(model.previewInfo!)?.absoluteString == secure,
+                             "Open/Open With must use the same secure original")
+            }
+        }
+        print("PASS: real preview JSON in User/Guest/Dynamic modes, source deduplication, legacy content-only replies, image/Quick Look/Open URLs")
+
+        for invalid in ["", "http://example.invalid/original.png", "https:///missing-host"] {
+            model.clearPreview()
+            model.finishPreview(output: try output(invalid, sources: [invalid]), fileID: item.id)
+            precondition(model.previewErrorDiagnostic?.code == "MISSING_PREVIEW_URL" && model.previewSources.isEmpty,
+                         "Responses without a usable secure URL must still fail")
+        }
+        model.clearPreview()
+        print("PASS: missing and unusable preview links remain errors")
+    }
+
     static func testWorkspacePresentation() throws {
         let model = workspaceSwitchFixture(count: 5_000)
         let original = model.browserTreeEntries.map(\.id)
@@ -17556,10 +20498,7 @@ extension DownloaderModel {
         precondition(model.activateSharedLinkBrowser())
         let first = model.sharedLinks[0].id
         let firstEntries = model.sharedLinkTreeEntries(for: first).map(\.id)
-        model.setSharedLinkExpanded(first, expanded: false)
-        precondition(!model.isSharedLinkExpanded(first))
-        model.setSharedLinkExpanded(first, expanded: true)
-        precondition(model.isSharedLinkExpanded(first) && model.sharedLinkTreeEntries(for: first).map(\.id) == firstEntries)
+        precondition(model.sharedLinkHasContents(first) && model.sharedLinkTreeEntries(for: first).map(\.id) == firstEntries)
         model.browserSortDirection = .descending
         model.applyBrowserSortToCachedItems()
         for link in model.sharedLinks.prefix(3) {
@@ -17585,7 +20524,6 @@ extension DownloaderModel {
         precondition(model.browserTreeEntries.count == original.count - 1)
         let small = finderWorkspaceFixture()
         precondition(!small.workspaceSwitchNeedsLoading(to: 0) && !small.workspaceSwitchNeedsLoading(to: 3))
-        small.expandedSharedLinkIDs = Set(small.sharedLinks.map(\.id))
         let scoped = small.sharedLinks.flatMap { link in
             small.sharedLinkTreeEntries(for: link.id).map { "\(link.id.uuidString)|\($0.id)" }
         }
@@ -17623,6 +20561,98 @@ extension DownloaderModel {
         }
     }
 
+    static func testWorkspaceAccountIsolation() async throws {
+        let primary = try finderAccountsFixture()
+        let store = primary.accountStore!
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let accountA = primary.activeSavedAccount!
+        let accountB = primary.savedAccounts.first { $0.id != accountA.id }!
+        let secondary = finderWorkspaceFixture()
+        secondary.workspaceSessionID = "secondary"
+        secondary.finderSettings = primary.finderSettings
+        secondary.accountStore = try PikPakAccountStore(directory: store.directory)
+        secondary.accountFixtureTransferDirectory = primary.accountFixtureTransferDirectory
+        secondary.accountProfileLoader = primary.accountProfileLoader
+        secondary.applyAccounts(try secondary.accountStore!.registerWorkspace("secondary"))
+        let session = try store.files(for: accountA.id).load()
+        secondary.refreshToken = session.token; secondary.deviceID = session.deviceID
+        secondary.requiresDedicatedSignIn = false; secondary.accountProfile = accountA.profile
+        secondary.adoptTransferAccount(accountA.profile!.sub)
+        precondition(primary.finderSettings === secondary.finderSettings)
+        let primaryEnvironment = try primary.engineEnvironment()
+        let secondaryEnvironment = try secondary.engineEnvironment()
+        precondition(primaryEnvironment["PIKPAK_REFRESH_TOKEN_FILE"] == secondaryEnvironment["PIKPAK_REFRESH_TOKEN_FILE"])
+        precondition(primaryEnvironment["PIKPAK_REFRESH_TOKEN_LOCK_FILE"] == secondaryEnvironment["PIKPAK_REFRESH_TOKEN_LOCK_FILE"])
+        let primaryStore = try primary.transferStore(), secondaryStore = try secondary.transferStore()
+        precondition(primaryStore.directory != secondaryStore.directory)
+        let primaryDirectory = try primaryStore.accountDirectory(accountA.profile!.sub)
+        let secondaryDirectory = try secondaryStore.accountDirectory(accountA.profile!.sub)
+        precondition(primaryDirectory != secondaryDirectory)
+        let primaryQueueID = UUID(), secondaryQueueID = UUID()
+        for (model, id, name) in [(primary, primaryQueueID, "First.txt"), (secondary, secondaryQueueID, "Second.txt")] {
+            model.queueDownload(.account(roots: [.init(queueID: id, path: "/\(name)", name: name, kind: .file, file: nil, relativeParent: [])],
+                destination: store.directory.appendingPathComponent("Downloads"), jobs: 1, proxyURL: ""))
+            precondition(model.persistTransfersSynchronously())
+        }
+        let savedPrimary = try primaryStore.load(SavedTransfers.self, accountID: accountA.profile!.sub)!
+        let savedSecondary = try secondaryStore.load(SavedTransfers.self, accountID: accountA.profile!.sub)!
+        precondition(savedPrimary.downloads.flatMap(\.pendingItems).map(\.id) == [primaryQueueID])
+        precondition(savedSecondary.downloads.flatMap(\.pendingItems).map(\.id) == [secondaryQueueID])
+        secondary.switchAccount(to: accountB.id)
+        await secondary.accountCheckTask?.value
+        precondition(primary.activeAccountID == accountA.id && secondary.activeAccountID == accountB.id)
+        primary.rememberVerifiedAccount(accountA.profile!)
+        precondition(primary.activeAccountID == accountA.id, "A status refresh must not adopt another window's account")
+        let changedEnvironment = try secondary.engineEnvironment()
+        precondition(primaryEnvironment["PIKPAK_REFRESH_TOKEN_FILE"] != changedEnvironment["PIKPAK_REFRESH_TOKEN_FILE"])
+        precondition(primaryEnvironment["PIKPAK_REFRESH_TOKEN_LOCK_FILE"] != changedEnvironment["PIKPAK_REFRESH_TOKEN_LOCK_FILE"])
+        // Explicit selections start on their own, and a restored queue resumes
+        // with its account, so this engine-less fixture retains both as
+        // interrupted work. Return it to the queue before comparing: what this
+        // test pins down is which account's item each window owns, not which
+        // bucket the item is resting in.
+        primary.requeueInterruptedDownloads()
+        precondition(primary.pendingDownloadItems.map(\.id) == [primaryQueueID])
+        secondary.switchAccount(to: accountA.id)
+        await secondary.accountCheckTask?.value
+        secondary.requeueInterruptedDownloads()
+        precondition(secondary.pendingDownloadItems.map(\.id) == [secondaryQueueID])
+        // Additional windows must never fall back to the primary storage path.
+        var extraModels: [DownloaderModel] = []
+        var directories = Set([primaryDirectory, secondaryDirectory])
+        for slot in 3...6 {
+            let id = PikPakWorkspaceStorage.sessionID(for: slot)
+            let extra = finderWorkspaceFixture(workspaceSessionID: id, settings: primary.finderSettings)
+            extra.accountStore = try PikPakAccountStore(directory: store.directory)
+            extra.accountFixtureTransferDirectory = primary.accountFixtureTransferDirectory
+            extra.accountProfileLoader = primary.accountProfileLoader
+            extra.applyAccounts(try extra.accountStore!.registerWorkspace(id))
+            extra.refreshToken = session.token; extra.deviceID = session.deviceID
+            extra.requiresDedicatedSignIn = false; extra.accountProfile = accountA.profile
+            extra.adoptTransferAccount(accountA.profile!.sub)
+            let extraStore = try extra.transferStore()
+            let extraDirectory = try extraStore.accountDirectory(accountA.profile!.sub)
+            precondition(directories.insert(extraDirectory).inserted)
+            let queueID = UUID()
+            extra.queueDownload(.account(roots: [.init(queueID: queueID, path: "/Window-\(slot).txt", name: "Window-\(slot).txt",
+                kind: .file, file: nil, relativeParent: [])], destination: store.directory.appendingPathComponent("Downloads"), jobs: 1, proxyURL: ""))
+            precondition(extra.persistTransfersSynchronously())
+            let saved = try extraStore.load(SavedTransfers.self, accountID: accountA.profile!.sub)!
+            precondition(saved.downloads.flatMap(\.pendingItems).map(\.id) == [queueID])
+            extraModels.append(extra)
+        }
+        extraModels[0].switchAccount(to: accountB.id)
+        await extraModels[0].accountCheckTask?.value
+        primary.rememberVerifiedAccount(accountA.profile!)
+        precondition(primary.activeAccountID == accountA.id && secondary.activeAccountID == accountA.id)
+        precondition(extraModels[0].activeAccountID == accountB.id)
+        for extra in extraModels.dropFirst() { precondition(extra.activeAccountID == accountA.id) }
+        let unchanged = try primaryStore.load(SavedTransfers.self, accountID: accountA.profile!.sub)!
+        precondition(unchanged.downloads.flatMap(\.pendingItems).map(\.id) == [primaryQueueID])
+        for model in [primary, secondary] + extraModels { model.stopForWindowClose() }
+        print("PASS six workspaces: shared settings, account-specific helper credentials, independent account changes and persisted transfer queues")
+    }
+
     static func finderAccountsFixture() throws -> DownloaderModel {
         let model = finderWorkspaceFixture()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("pikpak-accounts-fixture-\(UUID().uuidString)")
@@ -17648,6 +20678,58 @@ extension DownloaderModel {
             return .init(sub: "offline-account-c", name: "Alex Morgan")
         }
         return model
+    }
+
+    static func testSessionRecovery() async throws {
+        func require(_ condition: Bool) { precondition(condition) }
+        let model = try finderAccountsFixture()
+        let store = model.accountStore!
+        defer { model.stopForWindowClose(); try? FileManager.default.removeItem(at: store.directory) }
+        let id = model.activeAccountID!
+        let other = model.savedAccounts.first { $0.id != id }!
+        for message in [
+            #"error: authentication failed: status 400: {"error":"invalid_client"}"#,
+            "HTTP request failed: HTTP status 401 Unauthorized",
+            "connection timed out at request 4126",
+            "Could not open fixture-invalid_grant.txt",
+        ] {
+            model.handleWebLoginNeeded(for: message)
+            require(model.sessionRecoveryTask == nil && !model.isLoginPresented && model.hasAccountSession)
+        }
+        let rejection = "error: PikPak session rejected: fixture credential rejected"
+        let profile = model.accountProfile!
+        var checks = 0
+        model.accountProfileLoader = { _ in
+            checks += 1
+            try await Task.sleep(nanoseconds: 20_000_000)
+            return profile
+        }
+        for _ in 0..<3 { model.handleWebLoginNeeded(for: rejection) }
+        await model.sessionRecoveryTask?.value
+        require(checks == 1 && !model.isLoginPresented && model.accountLoginStatus == .signedIn)
+        require(try store.files(for: id).load().token == "fixture-account-a")
+        model.accountProfileLoader = { _ in throw PikPakAccountError.unavailable }
+        model.handleWebLoginNeeded(for: rejection)
+        await model.sessionRecoveryTask?.value
+        require(model.hasAccountSession && !model.isLoginPresented && model.accountLoginStatus == .unavailable)
+        require(try store.files(for: id).load().token == "fixture-account-a")
+        model.accountProfileLoader = { _ in
+            try await Task.sleep(nanoseconds: 20_000_000)
+            throw PikPakAccountError.needsSignIn
+        }
+        model.handleWebLoginNeeded(for: rejection)
+        model.applyAccounts(try store.activate(other.id))
+        await model.sessionRecoveryTask?.value
+        require(!model.isLoginPresented && !model.requiresDedicatedSignIn)
+        require(try store.files(for: id).load().token == "fixture-account-a")
+        require(try store.files(for: other.id).load().token == "fixture-account-b")
+        model.applyAccounts(try store.activate(id))
+        model.handleWebLoginNeeded(for: rejection)
+        await model.sessionRecoveryTask?.value
+        require(model.isLoginPresented && model.requiresDedicatedSignIn && !model.hasAccountSession)
+        require(!FileManager.default.fileExists(atPath: store.files(for: id).tokenURL.path))
+        require(try store.files(for: other.id).load().token == "fixture-account-b")
+        print("PASS session recovery: temporary failures preserve credentials, stale errors recheck once, late replies respect account switches, confirmed rejection requires sign-in")
     }
 
     static func testAccountManagement() async throws {
@@ -17733,6 +20815,121 @@ extension DownloaderModel {
         print("PASS accounts: status check, busy-task guards, session/worker isolation, workspace clearing, failed/cancelled/mismatched/expired switches, add account and logout")
     }
 
+    static func finderConnectionsFixture() throws -> DownloaderModel {
+        let model = try finderAccountsFixture()
+        let store = model.accountStore!
+        let profile = model.accountProfile!
+        let token = "eyJmaXh0dXJlIjoxfQ.eyJzdWIiOiJmaXh0dXJlIn0.fixture-signature"
+        let files = try store.stage(token: token, deviceID: String(repeating: "p", count: 32), credentialKind: .personalAccessToken)
+        let document = try store.commit(files, profile: profile)
+        model.applyAccounts(document)
+        model.refreshToken = token
+        model.deviceID = try files.load().deviceID
+        model.accountProfileLoader = { files in
+            try await Task.sleep(nanoseconds: 30_000_000)
+            if try files.load().token == "fixture-account-b" { return .init(sub: "offline-account-b", name: "Jordan Lee") }
+            return profile
+        }
+        return model
+    }
+
+    static func testPersonalAccessTokenConnection() async throws {
+        func require(_ condition: Bool, _ message: String = "PAT invariant failed", line: UInt = #line) {
+            precondition(condition, "\(message) at test line \(line)")
+        }
+        let model = try finderAccountsFixture()
+        let store = model.accountStore!
+        defer { model.stopForWindowClose(); try? FileManager.default.removeItem(at: store.directory) }
+        let previousID = model.activeAccountID!
+        let oldFiles = store.files(for: previousID)
+        let profile = model.accountProfile!
+        let newToken = "eyJmaXh0dXJlIjoxfQ.eyJzdWIiOiJmaXh0dXJlIn0.fixture-signature"
+        model.selectPikPakConnection(.personalAccessToken)
+        require(model.isLoginPresented && !model.loginFromSettings && model.loginCredentialKind == .personalAccessToken,
+                "Sidebar connects the requested method in the main-window sheet")
+        require(model.accountLoginTargetID == previousID)
+        model.cancelLogin()
+        model.accountLoginTargetID = previousID
+        model.accountProfileLoader = { _ in throw PikPakAccountError.needsSignIn }
+        model.completeWebLogin(with: .init(refreshToken: newToken, deviceID: String(repeating: "p", count: 32), credentialKind: .personalAccessToken))
+        await model.accountCheckTask?.value
+        require(try model.activeAccountID == previousID && oldFiles.load().token == "fixture-account-a")
+        model.accountLoginTargetID = previousID
+        model.accountProfileLoader = { _ in .init(sub: "other-account", name: "Other") }
+        model.completeWebLogin(with: .init(refreshToken: newToken, deviceID: String(repeating: "p", count: 32), credentialKind: .personalAccessToken))
+        await model.accountCheckTask?.value
+        require(try model.activeAccountID == previousID && oldFiles.load().token == "fixture-account-a")
+        model.accountLoginTargetID = previousID
+        model.accountProfileLoader = { _ in try await Task.sleep(nanoseconds: 5_000_000_000); return profile }
+        model.completeWebLogin(with: .init(refreshToken: newToken, deviceID: String(repeating: "p", count: 32), credentialKind: .personalAccessToken))
+        model.cancelAccountCheck()
+        await model.accountCheckTask?.value
+        require(try model.activeAccountID == previousID && oldFiles.load().token == "fixture-account-a")
+        print("PASS token replacement: expired token, wrong account and cancellation preserve the working connection")
+
+        model.accountLoginTargetID = previousID
+        model.accountProfileLoader = { files in
+            require(try files.load().credentialKind == .personalAccessToken)
+            return profile
+        }
+        model.completeWebLogin(with: .init(refreshToken: newToken, deviceID: String(repeating: "p", count: 32), credentialKind: .personalAccessToken))
+        await model.accountCheckTask?.value
+        require(model.accountProfile == profile && model.activeSavedAccount?.credentialKind == .personalAccessToken)
+        require(model.validateConfiguration(), "PAT JWTs must not go through the refresh-token parser")
+        let newID = model.activeAccountID!
+        require(newID != previousID && model.savedAccounts.count == 3 && model.savedAccountGroups.count == 2)
+        require(try oldFiles.load().token == "fixture-account-a", "Connecting a token must preserve normal login")
+        let session = try store.files(for: newID).load()
+        require(session.token == newToken && session.credentialKind == .personalAccessToken)
+        let index = try String(contentsOf: store.directory.appendingPathComponent("accounts.json"), encoding: .utf8)
+        require(!index.contains(newToken))
+        for mode in PikPakContentMode.allCases {
+            model.finderSettings.contentMode = mode
+            let environment = try model.engineEnvironment()
+            require(environment["PIKPAK_PERSONAL_ACCESS_TOKEN_FILE"] == store.files(for: newID).tokenURL.path)
+            require(environment["PIKPAK_REFRESH_TOKEN_FILE"] == nil && environment["PIKPAK_REFRESH_TOKEN_LOCK_FILE"] == nil)
+            require(environment["PIKPAK_CLIENT_SECRET"] == nil && environment["PIKPAK_CLIENT_ID"] == nil)
+            require(environment["PIKPAK_TOKEN"] == nil && environment["PIKPAK_REFRESH_TOKEN"] == nil)
+            require(!environment.values.contains(newToken) && environment["PIKPAK_CONTENT_MODE"] == mode.rawValue)
+        }
+        let reopened = try PikPakAccountStore(directory: store.directory)
+        require(try reopened.files(for: newID).load().credentialKind == .personalAccessToken)
+        model.accountProfileLoader = { _ in profile }
+        let quota = PikPakQuotaSnapshot(accountId: profile.sub, total: 1000, used: 100,
+            transfer: .init(cloudDownload: nil, downstream: .init(total: 4000, used: 4040), upload: nil,
+                            connectedApps: .init(cloudDownload: nil, downstream: .init(total: 1000, used: 0), upload: nil)))
+        await model.transferQuotaMonitor.refresh(accountID: profile.sub, connectionID: newID) { quota }
+        model.selectPikPakConnection(.desktopOAuth)
+        await model.accountCheckTask?.value
+        require(model.activeAccountID == previousID && model.activeCredentialKind == .desktopOAuth)
+        require(model.transferQuotaMonitor.snapshot == nil, "Switching methods clears the previous connection's quotas")
+        require(!model.isLoginPresented && model.accountProfile == profile)
+        for mode in PikPakContentMode.allCases {
+            model.finderSettings.contentMode = mode
+            let environment = try model.engineEnvironment()
+            require(environment["PIKPAK_REFRESH_TOKEN_FILE"] == oldFiles.tokenURL.path)
+            require(environment["PIKPAK_PERSONAL_ACCESS_TOKEN_FILE"] == nil)
+            require(environment["PIKPAK_CONTENT_MODE"] == mode.rawValue)
+        }
+        model.selectPikPakConnection(.personalAccessToken)
+        await model.accountCheckTask?.value
+        require(model.activeAccountID == newID && !model.isLoginPresented)
+        require(model.activeAccountGroup?.connections.count == 2)
+        model.beginAccountLogin(credentialKind: .personalAccessToken, fromSettings: false)
+        require(model.isLoginPresented && model.accountLoginTargetID == nil && !model.loginFromSettings,
+                "Add Account in sidebar must allow a different user")
+        model.cancelLogin()
+        model.beginAccountLogin(accountID: newID, credentialKind: .desktopOAuth, fromSettings: false)
+        require(model.loginCredentialKind == .desktopOAuth)
+        model.cancelLogin()
+        model.logOutAccount()
+        require(try oldFiles.load().token == "fixture-account-a", "Disconnecting a token keeps normal login")
+        model.selectPikPakConnection(.desktopOAuth, accountID: previousID)
+        await model.accountCheckTask?.value
+        require(model.activeAccountID == previousID)
+        print("PASS dual login: separate saved credentials, main-window connection flow, identity verification, switching both ways, quota reset, all download modes and independent logout")
+    }
+
     func populateScrollingFixture(count: Int, links: Bool = false) {
         precondition(isFinderWorkspaceFixture)
         finderSettings.showsPreviewPane = false
@@ -17759,7 +20956,6 @@ extension DownloaderModel {
             let allItems = browserItems
             sharedLinks = []
             sharedLinkSessions = [:]
-            expandedSharedLinkIDs = []
             let perLink = max(1, (count + 101) / 102)
             for index in 0..<102 {
                 let id = UUID()
@@ -17774,7 +20970,6 @@ extension DownloaderModel {
                         selectedItemIDs: [], selectionAnchorID: nil, folderSnapshots: [:], childPageTokens: [:],
                         itemPaths: Dictionary(items.map { ($0.id, "/\($0.name)") }, uniquingKeysWith: { _, new in new }),
                         parentIDs: Dictionary(items.map { ($0.id, "") }, uniquingKeysWith: { _, new in new })), savedItemIDs: [])
-                expandedSharedLinkIDs.insert(id)
             }
             browserSource = .sharedLink
             activeSharedLinkID = sharedLinks.first?.id
@@ -18066,8 +21261,12 @@ extension DownloaderModel {
         print("PASS Links download compatibility: multiple shared selections enter the queue with separate authorization")
     }
 
-    static func finderWorkspaceFixture(defaults: UserDefaults = .standard) -> DownloaderModel {
+    static func finderWorkspaceFixture(defaults: UserDefaults = .standard, workspaceSessionID: String = "primary",
+                                       settings: FinderSettings? = nil) -> DownloaderModel {
+        precondition(PikPakWorkspaceStorage.isValidSessionID(workspaceSessionID))
         let model = DownloaderModel(finderFixture: true, defaults: defaults)
+        model.workspaceSessionID = workspaceSessionID
+        if let settings { model.finderSettings = settings }
         model.accountProfile = PikPakAccountProfile(sub: "offline-account", name: "Taylor Chen")
         let content = Data("My PikPak Open test. This is a synthetic local document.\n".utf8)
         model.fileOpener.resolve = { _ in
@@ -18116,10 +21315,28 @@ extension DownloaderModel {
                     folderSnapshots: [:], childPageTokens: [:], itemPaths: model.browserItemPaths,
                     parentIDs: model.browserItemParentIDs),
                 savedItemIDs: number == 1 ? [projects.id] : [])
-            model.expandedSharedLinkIDs.insert(id)
             if model.activeSharedLinkID == nil { model.activeSharedLinkID = id }
         }
         return model
+    }
+
+    func configureMediaPreviewFixture(videoURL: URL) {
+        clearPreview()
+        browserSource = .account; browserStack = [.root]
+        browserTreeChildren = [:]; expandedBrowserFolderIDs = []
+        let item = BrowserItem(id: "fixture-" + videoURL.lastPathComponent, name: videoURL.lastPathComponent, size: 245_760, kind: .file,
+            parentId: "", mimeType: "video/mp4", createdTime: nil, modifiedTime: nil, fileExtension: "mp4",
+            iconLink: nil, thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+        browserItems = [item]; finderFixtureFolders = ["": browserItems]
+        registerBrowserItems(browserItems, parentID: "", parentPath: "/")
+        selectedBrowserItemID = item.id; selectedBrowserItemIDs = [item.id]
+        previewFileID = item.id
+        previewInfo = .init(name: item.name, size: item.size, mimeType: item.mimeType,
+            thumbnailLink: nil, iconLink: nil, contentLink: videoURL.absoluteString, sources: nil)
+        previewPlayer = AVPlayer(url: videoURL)
+        previewStreamingState = .paused; previewDurationSeconds = 120
+        previewSourceLabel = "Synthetic local video"; isPreviewLoading = false
+        finderSettings.showsPreviewPane = true
     }
 
     func configureFileInteractionFixture(directory: URL, metadataLoading: Bool = false) throws {
@@ -18188,6 +21405,10 @@ extension DownloaderModel {
         browserItems = [folder, file]; registerBrowserItems(browserItems, parentID: "", parentPath: "/")
         fileUndoFixtureItems = [file.id: file, folder.id: folder]; fileUndoFixtureTrashed = []
         switch scenario {
+        case "trash-folder", "trash-batch":
+            let ids = scenario == "trash-folder" ? [folder.id] : [folder.id, file.id]
+            let reply = String(decoding: try! JSONEncoder().encode(["trashed_ids": ids]), as: UTF8.self)
+            finishTrashBrowserItems(output: reply, requestedIDs: ids)
         case "move":
             finishMoveBrowserItems(output: "{\"moved_ids\":[\"Report.txt\"],\"parent_id\":\"Projects\"}",
                 requestedItems: [file], destination: BrowserLocation(id: folder.id, name: folder.name, path: "/Projects"))
@@ -18234,6 +21455,7 @@ extension DownloaderModel {
     private func finishFileUndoFixture(request: FinderUndoRequest, title: String) {
         let applied = fileUndoHistory.finish(completed: request.changes.map(\.id))
         applyFileUndoFixtureChanges(applied)
+        synchronizeSimilarityTrash(applied)
         setStatus("\(title) completed · \(applied.count) item(s) · synthetic files only")
     }
 
@@ -18250,10 +21472,13 @@ extension DownloaderModel {
             precondition(model.fileUndoHistory.undoEntries.last!.mutations == changes)
         }
         model.isUploading = true
-        precondition(!model.canUndoFileAction, "a live upload must settle before cloud undo")
+        precondition(model.canUndoFileAction, "Background uploads must not block unrelated file Undo")
         model.isUploading = false; model.isRunning = true
         precondition(!model.canUndoFileAction, "one mutation at a time")
         model.isRunning = false
+        model.isManagingCloudItems = true
+        precondition(!model.canUndoFileAction, "A management mutation must finish before file Undo")
+        model.isManagingCloudItems = false
         model.configureFileUndoFixture("upload")
         let batch = model.fileUndoHistory.undoEntries.last!.uploadBatchID!
         model.savedUploadBatches = [SavedUploadBatch(id: batch, sources: ["/offline/Report.txt"], destination: .root,
@@ -18541,12 +21766,10 @@ extension DownloaderModel {
 
     static func testFinderWorkspace(defaults: UserDefaults) throws {
         let model = finderWorkspaceFixture(defaults: defaults)
-        model.finderSettings.setTransferWorkers(48)
-        precondition(model.effectiveDownloadConcurrentJobs == 48 && model.effectiveUploadConcurrentJobs == 48)
-        model.uploadConcurrentJobs = 24
-        precondition(model.concurrentJobs == 24 && model.effectiveDownloadConcurrentJobs == 24)
-        model.concurrentJobs = 32
-        precondition(model.uploadConcurrentJobs == 32)
+        defaults.set(1, forKey: "finderTransferWorkers")
+        precondition(model.effectiveDownloadConcurrentJobs == TransferConcurrency.automaticLimit
+                     && model.effectiveUploadConcurrentJobs == TransferConcurrency.automaticLimit,
+                     "Legacy worker preferences must not constrain automatic transfers")
 
         model.selectedBrowserItemID = "Design.txt"
         model.selectedBrowserItemIDs = ["Design.txt"]
@@ -18560,9 +21783,9 @@ extension DownloaderModel {
         let root = AccountDownloadRoot(queueID: UUID(), path: "/Readme.txt", name: "Readme.txt", kind: .file,
                                       file: nil, relativeParent: [])
         let original = PendingDownloadRequest.account(roots: [root], destination: model.outputURL, jobs: 2, proxyURL: "")
-        let updated = original.withWorkerLimit(48)
+        let updated = original.withWorkerLimit(model.effectiveDownloadConcurrentJobs)
         precondition(updated.pendingItems == original.pendingItems)
-        if case .account(_, _, let jobs, _) = updated { precondition(jobs == 48) }
+        if case .account(_, _, let jobs, _) = updated { precondition(jobs == TransferConcurrency.automaticLimit) }
         else { preconditionFailure("account queue source changed") }
 
         let first = model.sharedLinks[0].id, second = model.sharedLinks[1].id
@@ -18570,16 +21793,35 @@ extension DownloaderModel {
         precondition(!model.canSaveSharedItem(item, in: first))
         precondition(model.canSaveSharedItem(item, in: second), "same ID on another link must stay saveable")
         model.activateSharedLink(first)
-        precondition(model.isBrowsingSharedLink && model.isSharedLinkExpanded(first) && model.isSharedLinkExpanded(second))
+        precondition(model.isBrowsingSharedLink && model.sharedLinkHasContents(first) && model.sharedLinkHasContents(second))
         precondition(model.activateAccountBrowser())
         precondition(model.browserStack.last?.id == "Projects", "sidebar switching preserves navigation")
-        print("PASS Finder model: unified limits, queued limit changes preserve files, selected path ancestry, remembered navigation, link-scoped save state")
+        print("PASS Finder model: automatic concurrency ignores legacy settings, queued upgrades preserve files, selected path ancestry, remembered navigation, link-scoped save state")
     }
 }
 #endif
 
 #if BROWSER_DROP_TESTS
 extension DownloaderModel {
+    static func testExternalDiskUploadSources(_ files: [URL], available: Bool, saved: SavedUploadBatch? = nil) throws -> SavedUploadBatch {
+        let model = DownloaderModel(browserDropFixture: true)
+        var batch = saved ?? SavedUploadBatch(id: UUID(), sources: files.map(\.path), destination: .root,
+            workers: 4, createdAt: Date(), totalFiles: 3, completedFiles: 1, totalBytes: 90, completedBytes: 30)
+        if saved == nil { batch.sourceVolumes = try LocalFileAccess.validateUploadSources(files) }
+        let accepted = model.startUpload(files: files, destination: batch.destination, resumingBatch: batch)
+        precondition(accepted == available && model.recordedDropUploads.count == (available ? 1 : 0),
+                     "Resume must validate disk availability before starting an upload")
+        precondition(batch.completedFiles == 1 && batch.completedBytes == 30, "Preflight must retain progress")
+        if available {
+            var wrongDisk = batch
+            wrongDisk.sourceVolumes = Dictionary(uniqueKeysWithValues: files.map { ($0.path, "another-disk") })
+            precondition(!model.startUpload(files: files, destination: .root, resumingBatch: wrongDisk),
+                         "A replacement disk must not resume an upload from the same pathname")
+            precondition(model.recordedDropUploads.count == 1)
+        }
+        return batch
+    }
+
     static func browserDropUIFixture() -> DownloaderModel {
         let model = DownloaderModel(browserDropFixture: true)
         func item(_ id: String, folder: Bool, parent: String = "") -> BrowserItem {
@@ -18691,11 +21933,9 @@ extension DownloaderModel {
         queued.isUploading = true
         let queuedToken = queued.beginBrowserDrag(first)!
         precondition(queued.performBrowserDrop(token: queuedToken, on: dest))
-        precondition(queued.recordedDropMoves.isEmpty && queued.pendingBrowserMoves.count == 1)
-        queued.browserStack = [.root, queued.browserLocation(for: a)]
-        queued.isUploading = false
-        precondition(queued.startNextPendingBrowserMoveIfNeeded())
-        precondition(queued.recordedDropMoves[0].1 == dest, "navigation cannot retarget a queued drop")
+        precondition(queued.recordedDropMoves.count == 1 && queued.pendingBrowserMoves.isEmpty,
+                     "uploads must not hold an unrelated file move behind a batch")
+        precondition(queued.recordedDropMoves[0].1 == dest, "a running upload cannot retarget a drop")
 
         let stale = fixture()
         let staleToken = stale.beginBrowserDrag(first)!
@@ -18718,7 +21958,7 @@ extension DownloaderModel {
         precondition(!upload.uploadDroppedLocalItems(localFiles + [URL(fileURLWithPath: "/nonexistent-drop-fixture")], to: dest))
         precondition(upload.recordedDropUploads.count == 1, "a failed drop must never start a partial upload")
         upload.isUploading = true
-        precondition(upload.browserDropRejection(on: dest, payload: .upload) != nil)
+        precondition(upload.browserDropRejection(on: dest, payload: .upload) == nil, "an active upload may accept another queued batch")
         print("PASS model: multi-selection, recursive roots, no-op/self/descendant rejection, one-use/account-bound tokens, exact destination, background work, queued moves, outline preservation, atomic uploads")
     }
 }
@@ -18834,21 +22074,412 @@ extension DownloaderModel {
                     folderSnapshots: [:], childPageTokens: [:], itemPaths: [:], parentIDs: ["A": "", "B": "A", "Deep.txt": "B"]),
                 savedItemIDs: [])
         }
-        links.expandedSharedLinkIDs = [firstLink, secondLink]
         let linkVisible = links.currentExpandedSearchItems()
-        precondition(linkVisible.count == 6 && Set(linkVisible.map(\.id)).count == 6)
-        precondition(!linkVisible.contains { $0.linkID == collapsedLink })
+        precondition(linkVisible.count == 9 && Set(linkVisible.map(\.id)).count == 9)
+        precondition(linkVisible.contains { $0.linkID == collapsedLink }, "ready links always show their contents")
         let linkIndex = FileSearchIndex()
         linkIndex.replaceExpandedItems(linkVisible)
         let secondResult = linkIndex.search("Deep.txt", limit: 100).matches.first { $0.linkID == secondLink }!
         links.revealFileSearchResult(linkIndex.navigation(for: secondResult, scope: .expanded))
         precondition(links.activeSharedLinkID == secondLink && links.selectedSharedLinkRootID == nil)
-        precondition(links.selectedBrowserItemID == "Deep.txt" && links.expandedSharedLinkIDs == [firstLink, secondLink])
+        precondition(links.selectedBrowserItemID == "Deep.txt" && links.sharedLinks.allSatisfy { links.sharedLinkHasContents($0.id) })
         precondition(links.sharedLinkSessions[firstLink]?.workspace?.expandedFolderIDs == ["A", "B"])
         links.revealFileSearchResult(navigation)
         precondition(!links.isBrowsingSharedLink && links.selectedBrowserItemID == "Deep.txt")
         precondition(links.browserTreeEntries.contains { $0.id == "Deep.txt" && $0.depth == 2 })
         print("PASS browser reveal: expanded-only scope, full ancestry, parent expansion, selection/focus, pagination, thumbnails, existing branches, transfer independence, multiple links")
+    }
+}
+#endif
+
+
+#if FINDER_WORKSPACE_TESTS
+extension DownloaderModel {
+    /// Synthetic Browser/Links folders for thumbnail integration and UI tests.
+    static func folderThumbnailFixture(defaults: UserDefaults, load: @escaping ThumbnailCache.Loader) -> DownloaderModel {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        model.thumbnailCache = ThumbnailCache(load: load)
+        model.clearBrowserSelection()
+        func item(_ id: String, namespace: String, folder: Bool = false, thumbnail: Bool = true) -> BrowserItem {
+            BrowserItem(id: id, name: folder ? "Nested Folder" : "\(id).jpg", size: folder ? 0 : 3_000_000,
+                kind: folder ? .folder : .file, parentId: nil, mimeType: folder ? nil : "image/jpeg",
+                createdTime: nil, modifiedTime: nil, fileExtension: folder ? nil : "jpg", iconLink: nil,
+                thumbnailLink: thumbnail ? "https://thumbnail.invalid/\(namespace)/\(id)" : nil,
+                fileCategory: nil, hash: nil, md5Checksum: nil)
+        }
+        func workspace(_ namespace: String) -> BrowserWorkspaceSnapshot {
+            let folder = item("nested", namespace: namespace, folder: true)
+            let roots = [folder] + (1...12).map { item(String(format: "Photo %02d", $0), namespace: namespace) }
+                + [item("No thumbnail", namespace: namespace, thumbnail: false)]
+            let child = item("Nested photo", namespace: namespace)
+            let items = roots + [child]
+            return BrowserWorkspaceSnapshot(items: roots, stack: [.root], nextPageToken: "remaining",
+                expandedFolderIDs: [folder.id], childrenByFolderID: [folder.id: [child]], loadErrors: [:],
+                selectedItemID: nil, selectedItemIDs: [], selectionAnchorID: nil, folderSnapshots: [:],
+                childPageTokens: [:], itemPaths: Dictionary(uniqueKeysWithValues: items.map { ($0.id, "/" + $0.name) }),
+                parentIDs: Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0.id == child.id ? folder.id : "") }))
+        }
+        model.restoreBrowserWorkspace(workspace("account"))
+        model.finderFixtureFolders = ["": model.browserItems, "nested": model.browserTreeChildren["nested"]!]
+        for (index, entry) in model.sharedLinks.enumerated() {
+            model.sharedLinkSessions[entry.id]?.workspace = workspace("link-\(index)")
+        }
+        model.thumbnailPageFixture = { context, token in
+            precondition(token == "remaining")
+            return .init(urls: (13...24).map { URL(string: "https://thumbnail.invalid/pages/\(context.source)/\($0)")! }, nextPageToken: nil)
+        }
+        model.status = "Thumbnail prefetch test · generated pictures and simulated transfers"
+        return model
+    }
+
+    static func testFolderThumbnailSelection(defaults: UserDefaults) async throws {
+        var requested: [URL] = []
+        let image = NSImage(size: NSSize(width: 32, height: 32))
+        let model = folderThumbnailFixture(defaults: defaults, load: { url, _ in requested.append(url); return image })
+        defer { model.stopForWindowClose() }
+        func finish() async throws {
+            for _ in 0..<200 {
+                if !model.folderThumbnails.isRunning { return }
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            preconditionFailure("Folder integration timed out")
+        }
+        // Selecting a file without artwork still prefetches its siblings.
+        model.selectBrowserItem(model.browserItems.first { $0.id == "No thumbnail" }!)
+        try await finish()
+        precondition(requested.count == 24 && !requested.contains { $0.path.contains("Nested") || $0.path.contains("nested") })
+        precondition(model.browserItems.count == 14 && model.nextPageToken == "remaining",
+                     "prefetch must not mutate visible pagination, selection or the outline")
+        precondition(model.selectedBrowserItemID == "No thumbnail")
+        let firstImage = model.browserItems.first { $0.id == "Photo 01" }!
+        model.selectBrowserItem(firstImage)
+        try await finish()
+        precondition(requested.count == 24)
+        model.imagePreview.update(.init(fileID: firstImage.id, thumbnailURL: firstImage.artworkURL,
+            contentURL: nil, generation: UUID(), proxyURL: ""))
+        for _ in 0..<100 {
+            if model.imagePreview.frame != nil { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        precondition(model.imagePreview.frame?.quality == .thumbnail && requested.count == 24,
+                     "the inspector must reuse the prefetched image")
+        let nested = model.browserTreeChildren["nested"]!.first!
+        model.selectBrowserItem(nested)
+        try await finish()
+        precondition(requested.count == 25 && model.folderThumbnails.context?.folderID == "nested",
+                     "inline children must use their real parent, not the breadcrumb")
+        for entry in model.sharedLinks {
+            model.activateSharedLink(entry.id)
+            model.selectBrowserItem(model.browserItems.first { $0.id == "Photo 01" }!)
+            try await finish()
+            precondition(model.folderThumbnails.context?.source == "share:" + entry.id.uuidString)
+        }
+        precondition(requested.count == 73 && Set(requested).count == 73,
+                     "the same file ids in separate links must prefetch each link's own thumbnails")
+        model.toggleBrowserCheckbox(model.browserItems.first { $0.id == "Photo 02" }!)
+        try await finish()
+        precondition(requested.count == 73)
+        model.clearBrowserSelectionFromCanvas()
+        precondition(model.folderThumbnails.context == nil)
+        print("PASS Browser/Links: row and checkbox selection, nested parent, all pages, missing artwork, preview cache reuse, link isolation, cancellation")
+    }
+}
+#endif
+
+
+#if FINDER_WORKSPACE_TESTS
+extension DownloaderModel {
+    static func browserFileFilterFixture(defaults: UserDefaults) -> DownloaderModel {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        func file(_ name: String, parent: String = "") -> BrowserItem {
+            BrowserItem(id: name, name: name, size: 1024, kind: .file, parentId: parent,
+                mimeType: nil, createdTime: nil, modifiedTime: nil, fileExtension: nil,
+                iconLink: nil, thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+        }
+        let folder = model.browserItems.first { $0.id == "Projects" }!
+        model.browserItems = [folder, file("Beach.JPG"), file("Clip.MP4"), file("Readme.txt"), file("Report.pdf"), file("Backup.zip")]
+        model.browserTreeChildren = [folder.id: [file("Nested.mp4", parent: folder.id), file("Notes.txt", parent: folder.id)]]
+        model.expandedBrowserFolderIDs = [folder.id]
+        model.finderFixtureFolders = model.browserTreeChildren.merging(["": model.browserItems]) { _, new in new }
+        for (parent, children) in model.finderFixtureFolders {
+            model.registerBrowserItems(children, parentID: parent, parentPath: parent.isEmpty ? "/" : "/\(parent)")
+        }
+        model.clearBrowserSelection()
+        return model
+    }
+
+    static func testBrowserFileFiltering(defaults: UserDefaults) {
+        let model = browserFileFilterFixture(defaults: defaults)
+        defer { model.stopForWindowClose() }
+        let raw = model.browserTreeEntries
+        let folder = model.browserItems.first { $0.isFolder }!
+        model.selectBrowserItem(folder)
+        model.browserFileFilter = .category(.videos)
+        precondition(model.selectedBrowserItemIDs.isEmpty && model.selectedBrowserItem == nil)
+        precondition(model.displayedBrowserTreeEntries.map(\.id) == ["Projects", "Nested.mp4", "Clip.MP4"],
+                     "folders stay visible and keep their expanded matches")
+        precondition(model.displayedBrowserItems.map(\.id) == ["Projects", "Clip.MP4"])
+        precondition(model.browserTreeEntries == raw && model.expandedBrowserFolderIDs == [folder.id])
+        precondition(Set(model.availableBrowserFileExtensions(includingExpanded: true)) == ["jpg", "mp4", "txt", "pdf", "zip"])
+        _ = model.selectAdjacentBrowserItem(by: 1)
+        _ = model.selectAdjacentBrowserItem(by: 1, extendingSelection: true)
+        precondition(model.selectedBrowserItems.map(\.id) == ["Projects"],
+                     "a range over a visible folder and its match keeps the folder as the one root")
+        model.setBrowserFilterViewMode(includingExpanded: false)
+        precondition(model.selectedBrowserItems.isEmpty, "switching to thumbnails clears expanded selections")
+        precondition(model.selectAdjacentBrowserItem(by: 1) == "Projects")
+        precondition(model.selectAdjacentBrowserItem(by: 1) == "Clip.MP4")
+        precondition(model.selectAdjacentBrowserItem(by: 1) == nil, "Quick Look and keyboard movement stay within filtered thumbnails")
+        model.setBrowserFilterViewMode(includingExpanded: true)
+        model.browserFileFilter = .fileExtension("pdf")
+        precondition(model.displayedBrowserTreeEntries.map(\.id) == ["Projects", "Report.pdf"])
+        model.browserFileFilter = .category(.audio)
+        model.nextPageToken = "next-page"
+        precondition(model.displayedBrowserItems.map(\.id) == ["Projects"] && model.hasMoreBrowserItems,
+                     "a type with no matches still leaves folders to open")
+        let audio = BrowserItem(id: "song", name: "Song.MP3", size: 42, kind: .file, parentId: "",
+            mimeType: "audio/mpeg", createdTime: nil, modifiedTime: nil, fileExtension: nil,
+            iconLink: nil, thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+        model.browserItems.append(audio)
+        model.registerBrowserItems([audio], parentID: "", parentPath: "/")
+        precondition(model.displayedBrowserItems.map(\.id) == ["Projects", "song"], "new pages invalidate the filtered cache")
+        model.browserFileFilter = .all
+        precondition(model.displayedBrowserTreeEntries.count == raw.count + 1)
+        precondition(model.displayedBrowserItems.contains(folder))
+        model.browserFileFilter = .category(.videos)
+        model.saveActiveBrowserWorkspace()
+        _ = model.activateSharedLinkBrowser()
+        precondition(model.activeBrowserFileFilter == .all && model.displayedBrowserTreeEntries == model.browserTreeEntries,
+                     "Browser filter does not hide another workspace's Links")
+        _ = model.activateAccountBrowser()
+        precondition(model.browserFileFilter == .category(.videos))
+        precondition(Set(model.displayedBrowserTreeEntries.map(\.id)) == ["Projects", "Clip.MP4", "Nested.mp4"])
+        print("PASS PikPak filter: visible folders, expanded rows, thumbnails, selection, pagination, cache invalidation, reset and workspace isolation")
+    }
+
+    /// Command-A over the folder on screen, and the refresh that used to
+    /// collapse every folder the user had opened.
+    static func testBrowserFolderSelection(defaults: UserDefaults) {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        defer { model.stopForWindowClose() }
+        precondition(model.expandedBrowserFolderIDs == ["Projects", "Drafts"])
+
+        precondition(model.selectAllBrowserFolders() == 2)
+        precondition(model.selectedBrowserItemIDs == ["Projects", "Notes"], "Command-A takes the folders and leaves the files")
+        precondition(model.selectedBrowserItemID == "Projects" && model.browserSelectionAnchorID == "Projects")
+        precondition(Set(model.selectedBrowserItems.map(\.id)) == ["Projects", "Notes"])
+
+        // An upload, an Undo or a background file change all refresh the folder
+        // on screen. None of them is a move, so the outline stays as it is.
+        model.refreshBrowser()
+        precondition(model.expandedBrowserFolderIDs == ["Projects", "Drafts"], "a refresh keeps the open outline")
+        precondition(model.browserTreeChildren["Projects"]?.map(\.id) == ["Drafts"], "and keeps the branches it already read")
+        precondition(model.selectedBrowserItemIDs == ["Projects", "Notes"], "and keeps the selection")
+
+        // Moving to another folder still starts from a closed outline.
+        let projects = model.browserItems.first { $0.id == "Projects" }!
+        model.openFolder(projects)
+        precondition(model.browserStack.last?.id == "Projects" && model.browserItems.map(\.id) == ["Drafts"])
+        precondition(model.expandedBrowserFolderIDs.isEmpty && model.selectedBrowserItemIDs.isEmpty)
+        precondition(model.selectAllBrowserFolders() == 1 && model.selectedBrowserItemIDs == ["Drafts"])
+        precondition(model.selectAllBrowserFolders() == 1, "repeating Command-A is stable")
+        model.browserItems = model.browserItems.filter { !$0.isFolder }
+        precondition(model.selectAllBrowserFolders() == 0, "a folder without subfolders selects nothing")
+        print("PASS browser folders: Command-A selects folders only, refresh keeps the open outline, navigation resets it")
+    }
+
+    /// Up and Down while the preview pane holds focus walk the same rows the
+    /// file list walks.
+    static func testPreviewKeyboardNavigation(defaults: UserDefaults) {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        defer { model.stopForWindowClose() }
+        let readme = model.browserItems.first { $0.id == "Readme.txt" }!
+        model.selectBrowserItem(readme)
+        model.previewFileID = readme.id
+
+        // The rows are Projects, its open Drafts, that folder's Design.txt,
+        // then Notes and Readme.txt: the arrows walk the outline, not just the
+        // top level, and keep walking after selecting a file clears the old
+        // preview or after passing a folder that has none.
+        precondition(model.movePreviewSelection(by: -1) == "Notes" && model.selectedBrowserItemID == "Notes")
+        precondition(model.previewFileID == nil, "selecting the next file clears the preview it replaces")
+        precondition(model.movePreviewSelection(by: -1) == "Design.txt", "expanded rows are files too")
+        precondition(model.movePreviewSelection(by: -1) == "Drafts")
+        precondition(model.movePreviewSelection(by: -1) == "Projects", "a folder in the way does not stop the arrows")
+        precondition(model.movePreviewSelection(by: -1) == nil, "the first row is the top")
+        precondition(model.selectedBrowserItemID == "Projects", "a blocked step keeps the current file")
+        precondition(model.movePreviewSelection(by: 1) == "Drafts" && model.selectedBrowserItemIDs == ["Drafts"])
+        print("PASS preview keyboard: Up/Down step one file through the outline, past folders and cleared previews")
+    }
+
+    static func testBrowserFolderToggle(defaults: UserDefaults) {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        defer { model.stopForWindowClose() }
+        let design = model.browserItem(withID: "Design.txt")!, projects = model.browserItem(withID: "Projects")!
+        let drafts = model.browserItem(withID: "Drafts")!, readme = model.browserItem(withID: "Readme.txt")!
+        model.selectBrowserItem(design)
+        for _ in 0..<3 {
+            model.toggleFocusedBrowserFolder()
+            precondition(model.selectedBrowserItemID == drafts.id && model.selectedBrowserItemIDs == [drafts.id])
+            precondition(!model.isBrowserFolderExpanded(drafts.id) && model.isBrowserFolderExpanded(projects.id))
+            precondition(!model.displayedBrowserTreeEntries.contains { $0.id == design.id })
+            model.toggleFocusedBrowserFolder()
+            precondition(model.selectedBrowserItemID == design.id && model.selectedBrowserItemIDs == [design.id])
+            precondition(model.browserScrollRestoreRequest?.itemID == design.id)
+        }
+        model.toggleBrowserFolderExpansion(projects)
+        precondition(model.selectedBrowserItemID == projects.id, "A disclosure also promotes a hidden descendant to its folder")
+        model.toggleFocusedBrowserFolder()
+        precondition(model.selectedBrowserItemID == design.id, "Reopening an ancestor restores the exact nested file")
+        model.toggleFocusedBrowserFolder()
+        model.selectBrowserItem(readme)
+        precondition(!model.canToggleFocusedBrowserFolder, "A file at the listing root has no outline folder to collapse")
+        model.selectBrowserItem(drafts)
+        model.toggleFocusedBrowserFolder()
+        precondition(model.selectedBrowserItemID == drafts.id, "An unrelated selection cancels the remembered child")
+        model.selectBrowserItem(design); model.toggleFocusedBrowserFolder()
+        model.removeCachedBrowserItems(withIDs: [design.id]); model.toggleFocusedBrowserFolder()
+        precondition(model.selectedBrowserItemID == drafts.id, "A removed file must not regain focus")
+
+        let links = sharedSelectionFixture(defaults: defaults)
+        defer { links.stopForWindowClose() }
+        let first = links.sharedLinks[0].id, second = links.sharedLinks[1].id
+        links.activateSharedLink(first)
+        links.selectBrowserItem(links.browserItem(withID: "Design.txt")!)
+        links.toggleFocusedBrowserFolder(); links.toggleFocusedBrowserFolder()
+        precondition(links.selectedBrowserItemID == "Design.txt")
+        links.toggleFocusedBrowserFolder(); links.activateSharedLink(second)
+        links.selectBrowserItem(links.browserItem(withID: "Drafts")!)
+        if links.isBrowserFolderExpanded("Drafts") { links.toggleFocusedBrowserFolder() }
+        links.toggleFocusedBrowserFolder()
+        precondition(links.selectedBrowserItemID == "Drafts", "Identical IDs in a different link cannot restore the previous link's file")
+        print("PASS folder toggle: nearest folder, remembered nested file, disclosure focus, repeated toggles, missing files and link isolation")
+    }
+
+    static func testTrashUndoOutline(defaults: UserDefaults) throws {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        defer { model.stopForWindowClose() }
+        #if FOLDER_EXPANSION_TESTS
+        model.isFolderExpansionFixture = true
+        #endif
+        let roots = model.browserItems, file = model.browserItem(withID: "Design.txt")!
+        let drafts = model.browserItem(withID: "Drafts")!
+        func listing(_ items: [BrowserItem]) throws -> String {
+            let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+            return String(decoding: try encoder.encode(["files": items]), as: UTF8.self)
+        }
+        func applyUndo(redo: Bool) throws {
+            let title = redo ? model.fileUndoHistory.redoTitle : model.fileUndoHistory.undoTitle
+            let request = model.fileUndoHistory.begin(redo: redo)!
+            let reply = FinderUndoResult(completed: request.changes.map(\.id), error: nil)
+            model.finishFileUndo(output: String(decoding: try JSONEncoder().encode(reply), as: UTF8.self), request: request, title: title)
+            model.finishBrowse(output: try listing(roots), stack: [.root], append: false, includesQuota: false, preservesOutline: true)
+        }
+        model.selectBrowserItem(file)
+        model.finishTrashBrowserItems(output: #"{"trashed_ids":["Design.txt"]}"#, requestedIDs: [file.id])
+        precondition(model.canUndoFileAction && !model.browserTreeEntries.contains { $0.id == file.id })
+        try applyUndo(redo: false)
+        precondition(model.expandedBrowserFolderIDs == ["Projects", "Drafts"], "Undo must keep the containing outline expanded")
+        #if FOLDER_EXPANSION_TESTS
+        precondition(model.recordedExpansionLoads.last?.id == "Drafts", "Undo refresh must reload the restored file's parent")
+        #endif
+        model.finishBrowserTreeBrowse(output: try listing([file]), folderID: drafts.id, folderName: drafts.name,
+            folderPath: "/Projects/Drafts", append: false)
+        precondition(model.browserTreeEntries.contains { $0.id == file.id && $0.depth == 2 }, "The restored file reappears in place")
+        try applyUndo(redo: true)
+        precondition(!model.browserTreeEntries.contains { $0.id == file.id })
+        precondition(model.expandedBrowserFolderIDs == ["Projects", "Drafts"])
+        model.finishBrowserTreeBrowse(output: try listing([]), folderID: drafts.id, folderName: drafts.name,
+            folderPath: "/Projects/Drafts", append: false)
+        model.finishTrashBrowserItems(output: #"{"trashed_ids":["Drafts"]}"#, requestedIDs: [drafts.id])
+        try applyUndo(redo: false)
+        precondition(model.isBrowserFolderExpanded("Projects"))
+        model.finishBrowserTreeBrowse(output: try listing([drafts]), folderID: "Projects", folderName: "Projects",
+            folderPath: "/Projects", append: false)
+        precondition(model.browserTreeEntries.contains { $0.id == drafts.id && $0.depth == 1 }, "A deleted folder also returns under its expanded parent")
+
+        let links = sharedSelectionFixture(defaults: defaults)
+        defer { links.stopForWindowClose() }
+        links.accountBrowserWorkspace = BrowserWorkspaceSnapshot(items: roots, stack: [.root], nextPageToken: nil,
+            expandedFolderIDs: ["Projects", "Drafts"], childrenByFolderID: ["Projects": [drafts], "Drafts": []],
+            loadErrors: [:], selectedItemID: nil, selectedItemIDs: [], selectionAnchorID: nil,
+            folderSnapshots: [:], childPageTokens: [:], itemPaths: [:], parentIDs: [:])
+        let visibleLinks = links.browserTreeEntries
+        links.removeCachedAccountBrowserItems(withIDs: [], invalidatingFolders: ["Drafts"], preservingExpansion: true)
+        precondition(links.accountBrowserWorkspace?.expandedFolderIDs == ["Projects", "Drafts"])
+        precondition(links.accountBrowserWorkspace?.childrenByFolderID["Drafts"] == nil)
+        precondition(links.browserTreeEntries == visibleLinks, "Background account Undo leaves the visible Links tree alone")
+        print("PASS Trash Undo: restored files/folders reappear under expanded parents, Redo, fresh branch loads and Links isolation")
+    }
+
+    static func testSharedFolderNavigation(defaults: UserDefaults) throws {
+        let model = sharedSelectionFixture(defaults: defaults)
+        defer { model.stopForWindowClose() }
+        let first = model.sharedLinks[0].id, second = model.sharedLinks[1].id
+        let initialIdentity = model.browserPresentationIdentity
+        precondition(model.showsSharedLinkOverview && initialIdentity == "shared-links")
+        precondition(model.sharedLinks.allSatisfy { model.sharedLinkHasContents($0.id) })
+        let projects = model.browserItems.first { $0.id == "Projects" }!
+        let originalItems = model.browserItems
+        model.toggleBrowserFolderExpansion(projects)
+        precondition(!model.isBrowserFolderExpanded(projects.id) && model.sharedLinkHasContents(first))
+        precondition(model.sharedLinkTreeEntries(for: second).contains { $0.id == "Drafts" },
+                     "collapsing a real folder cannot collapse another link or its folders")
+        model.toggleBrowserFolderExpansion(projects)
+        model.selectSharedLinkRoot(first)
+        precondition(model.sharedLinkHasContents(first) && model.browserPresentationIdentity == initialIdentity)
+        model.selectBrowserItem(projects)
+        precondition(model.showsSharedLinkOverview && !model.canGoBack,
+                     "a single click selects; opening uses the same separate action as Browser")
+        model.nextPageToken = "root-page-two"
+        model.openFolder(projects)
+        precondition(!model.showsSharedLinkOverview && model.canGoBack)
+        precondition(model.browserStack.map(\.id) == ["", "Projects"])
+        precondition(model.browserItems.map(\.id) == ["Drafts"])
+        precondition(model.browserPresentationIdentity == "share:\(first.uuidString)|/Projects")
+        let focusedSearch = model.currentExpandedSearchItems()
+        precondition(focusedSearch.allSatisfy { $0.linkID == first })
+        precondition(model.currentExpandedSearchItems(includesExpandedChildren: false).map(\.item.id) == ["Drafts"])
+        precondition(model.canSaveSharedItem(model.browserItems[0], in: first), "focused folder retains its share actions")
+        let drafts = model.browserItems[0]
+        model.openFolder(drafts)
+        precondition(model.browserStack.map(\.id) == ["", "Projects", "Drafts"])
+        model.goBack()
+        precondition(model.browserStack.last?.id == "Projects" && model.selectedBrowserItemID == "Drafts")
+        precondition(model.browserScrollRestoreRequest?.itemID == "Drafts")
+        model.selectBreadcrumb(model.browserStack[0])
+        precondition(model.showsSharedLinkOverview && model.browserPresentationIdentity == initialIdentity)
+        precondition(model.browserItems == originalItems && model.nextPageToken == "root-page-two")
+        precondition(model.selectedBrowserItemID == "Projects" && model.isBrowserFolderExpanded("Projects"))
+        precondition(model.sharedLinks.allSatisfy { model.sharedLinkHasContents($0.id) })
+        print("PASS Links folder navigation: select/open parity, nested paths, Back, breadcrumbs, scroll anchor, folder disclosures, scoped actions/search and root pagination")
+
+        model.activateSharedLink(second)
+        let secondProjects = model.browserItems.first { $0.id == "Projects" }!
+        model.openFolder(secondProjects)
+        precondition(model.browserPresentationIdentity == "share:\(second.uuidString)|/Projects")
+        let secondAccess = model.shareAccess
+        precondition(model.activateAccountBrowser())
+        precondition(!model.isBrowsingSharedLink && model.browserStack == [.root])
+        precondition(model.activateSharedLinkBrowser())
+        precondition(!model.showsSharedLinkOverview && model.activeSharedLinkID == second && model.shareAccess == secondAccess)
+        precondition(model.browserStack.last?.id == "Projects")
+
+        func reply(_ items: [BrowserItem], token: String? = nil) throws -> String {
+            let page = ShareBrowsePage(files: items, nextPageToken: token, shareId: "fixture",
+                passCodeToken: "fixture-token", parentId: "Projects", folderName: "Projects")
+            let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+            return String(decoding: try encoder.encode(page), as: UTF8.self)
+        }
+        let stack = model.browserStack
+        model.finishShareBrowse(output: try reply([], token: "next"), stack: stack, append: false, initial: false)
+        precondition(!model.showsSharedLinkOverview && model.browserItems.isEmpty && model.hasMoreBrowserItems)
+        model.finishShareBrowse(output: try reply([drafts]), stack: stack, append: true, initial: false)
+        precondition(model.browserItems == [drafts] && !model.hasMoreBrowserItems)
+        model.goBack()
+        precondition(model.showsSharedLinkOverview && model.activeSharedLinkID == second)
+        precondition(model.sharedLinks.allSatisfy { model.sharedLinkHasContents($0.id) })
+        print("PASS Links state: link/account isolation, restored folder navigation, real page decoding, empty folders and pagination")
     }
 }
 #endif

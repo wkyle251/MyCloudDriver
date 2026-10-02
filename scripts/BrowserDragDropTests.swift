@@ -204,7 +204,7 @@ struct BrowserDragDropTests {
                 "an empty release reports why nothing started")
         _ = receiver.proposal(at: point, payload: .upload)
         dropCoordinator.setGeometry(zones: destinationZones, bounds: bounds)
-        dropModel.isUploading = true
+        dropModel.isRunning = true
         require(receiver.proposal(at: point, payload: .upload).operation == .cancel, "known rejected targets stay rejected")
         require(!receiver.receive(at: point, payload: .upload) { _ in
             preconditionFailure("an unavailable upload must not consume providers")

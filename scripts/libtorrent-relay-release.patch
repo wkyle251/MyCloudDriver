@@ -1,0 +1,171 @@
+--- a/include/libtorrent/torrent_handle.hpp
++++ b/include/libtorrent/torrent_handle.hpp
+@@ -673,6 +673,10 @@
+ 		// ``torrent_handle::flush_cache()`` has been written to disk.
+ 		void flush_cache() const;
+ 
++		// MyCloudDriver: withdraw verified pieces before a fenced file release.
++		// The caller must flush_cache() and await cache_flushed_alert before unlinking.
++		bool forget_verified_pieces(std::vector<piece_index_t> const& pieces) const;
++
+ 		// ``force_recheck`` puts the torrent back in a state where it assumes to
+ 		// have no resume data. All peers will be disconnected and the torrent
+ 		// will stop announcing to the tracker. The torrent will be added to the
+--- a/include/libtorrent/torrent.hpp
++++ b/include/libtorrent/torrent.hpp
+@@ -596,6 +596,7 @@
+ 		error_code error() const { return m_error; }
+ 
+ 		void flush_cache();
++		bool forget_verified_pieces(std::vector<piece_index_t> const& pieces);
+ 		void pause(pause_flags_t flags = {});
+ 		void resume();
+ 
+@@ -1109,7 +1110,7 @@
+ 			TORRENT_ASSERT(m_picker.get());
+ 			return *m_picker;
+ 		}
+-		void need_picker();
++		void need_picker(bool restore_all = false);
+ 		bool has_picker() const
+ 		{
+ 			return m_picker.get() != nullptr;
+--- a/include/libtorrent/mmap_storage.hpp
++++ b/include/libtorrent/mmap_storage.hpp
+@@ -139,6 +139,9 @@
+ 			tick();
+ 		}
+ 
++		// Called only from a fenced disk job after a piece is withdrawn.
++		void clear_piece(piece_index_t piece);
++
+ 		void set_owner(std::shared_ptr<void> const& tor) { m_torrent = tor; }
+ 
+ 		storage_index_t storage_index() const { return m_storage_index; }
+--- a/src/torrent_handle.cpp
++++ b/src/torrent_handle.cpp
+@@ -358,6 +358,11 @@
+ 	{ async_call(&torrent::set_sequential_download, sd); }
+ #endif
+ 
++	bool torrent_handle::forget_verified_pieces(std::vector<piece_index_t> const& pieces) const
++	{
++		return sync_call_ret<bool>(false, &torrent::forget_verified_pieces, pieces);
++	}
++
+ 	void torrent_handle::flush_cache() const
+ 	{
+ 		async_call(&torrent::flush_cache);
+--- a/src/torrent.cpp
++++ b/src/torrent.cpp
+@@ -1290,7 +1290,7 @@
+ 		if (m_peer_list) m_peer_list->clear();
+ 	}
+ 
+-	void torrent::need_picker()
++	void torrent::need_picker(bool const restore_all)
+ 	{
+ 		if (m_picker) return;
+ 
+@@ -1301,7 +1301,7 @@
+ 
+ 		// if we have all pieces we should not have a picker
+ 		// unless we're in suggest mode
+-		TORRENT_ASSERT(!m_have_all
++		TORRENT_ASSERT(restore_all || !m_have_all
+ 			|| settings().get_int(settings_pack::suggest_mode)
+ 			== settings_pack::suggest_read_cache);
+ 
+@@ -9697,6 +9697,48 @@
+ 			&& !m_session_paused;
+ 	}
+ 
++	bool torrent::forget_verified_pieces(std::vector<piece_index_t> const& pieces)
++	{
++		TORRENT_ASSERT(is_single_thread());
++		if (!valid_metadata() || !m_storage || m_seed_mode || m_abort
++			|| !is_downloading_state(m_state)) return false;
++		// Validate the whole batch before changing either the picker or peers.
++		std::set<piece_index_t> unique(pieces.begin(), pieces.end());
++		for (auto const p : unique)
++			if (p < piece_index_t(0) || p >= torrent_file().end_piece()
++				|| !have_piece(p)) return false;
++		if (unique.empty()) return true;
++		bool const was_finished = is_finished();
++		need_picker(true);
++		set_have_all(false);
++		for (auto const index : unique)
++		{
++			m_picker->set_piece_priority(index, dont_download);
++			m_picker->we_dont_have(index);
++			// Retire any unselected boundary slot behind the same disk fence.
++			m_ses.disk_thread().async_clear_piece(m_storage, index, [](piece_index_t) {});
++			inc_stats_counter(counters::num_have_pieces, -1);
++			for (auto* p : m_connections)
++			{
++				TORRENT_INCREMENT(m_iterating_connections);
++				p->reject_piece(index);
++				p->write_dont_have(index);
++			}
++		}
++		// Rebuild verified file accounting after withdrawing the shared pieces.
++		// The caller retains separate receipts for files verified before release.
++		m_file_progress.clear();
++		m_file_progress.init(*m_picker, torrent_file().files());
++		if (m_state == torrent_status::seeding) set_state(torrent_status::finished);
++		update_gauge();
++		update_peer_interest(was_finished);
++		update_want_peers();
++		update_state_timers();
++		set_need_save_resume(torrent_handle::if_download_progress);
++		state_updated();
++		return true;
++	}
++
+ 	void torrent::flush_cache()
+ 	{
+ 		TORRENT_ASSERT(is_single_thread());
+--- a/src/peer_connection.cpp
++++ b/src/peer_connection.cpp
+@@ -2087,7 +2087,8 @@
+ 			if (t && t->has_picker())
+ 				t->picker().check_peer_invariant(m_have_piece, peer_info_struct());
+ #endif
+-			if (disconnect_if_redundant()) return;
++			// Interest in this newly announced piece is updated below before
++			// deciding whether a peer that just became a seed is redundant.
+ 		}
+ 
+ 		// it's important to update whether we're interested in this peer before
+--- a/src/mmap_storage.cpp
++++ b/src/mmap_storage.cpp
+@@ -495,6 +495,11 @@
+ 		m_stat_cache.clear();
+ 	}
+ 
++	void mmap_storage::clear_piece(piece_index_t const piece)
++	{
++		if (m_part_file) m_part_file->free_piece(piece);
++	}
++
+ 	void mmap_storage::delete_files(remove_flags_t const options, storage_error& ec)
+ 	{
+ 		// make sure we don't have the files open
+--- a/src/mmap_disk_io.cpp
++++ b/src/mmap_disk_io.cpp
+@@ -1314,10 +1314,11 @@
+ 	// this job won't return until all outstanding jobs on this
+ 	// piece are completed or cancelled and the buffers for it
+ 	// have been evicted
+-	status_t mmap_disk_io::do_clear_piece(aux::mmap_disk_job*)
+-	{
+-		// there's nothing to do here, by the time this is called the jobs for
+-		// this storage has been completed since this is a fence job
++	status_t mmap_disk_io::do_clear_piece(aux::mmap_disk_job* j)
++	{
++		// The fence guarantees no reader/writer can still use this partfile
++		// slot. Reuse it for later windows instead of growing the partfile.
++		j->storage->clear_piece(j->piece);
+ 		return status_t::no_error;
+ 	}
+ 

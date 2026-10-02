@@ -16,7 +16,7 @@ struct FolderSizeCacheTests {
             "root": [folder("a"), folder("b"), folder("empty")],
             "a": [file("one", 25), folder("nested")],
             "nested": [file("two", 20), file("three", 30)], "b": [file("four", 100)], "empty": []
-        ], parentIDs: [:])
+        ])
         return index
     }
     static func check(_ condition: @autoclosure () -> Bool, _ text: String) {
@@ -74,10 +74,23 @@ struct FolderSizeCacheTests {
         cache.applyScan(rootID: "root", folders: [
             "root": size(182, 5, 4), "a": size(82, 4, 1), "nested": size(57, 3, 0),
             "b": size(100, 1, 0), "empty": .zero
-        ], scannedListings: ["nested": [file("two", 20), file("three", 30), file("added", 7)]], parentIDs: [:])
+        ], scannedListings: ["nested": [file("two", 20), file("three", 30), file("added", 7)]])
         check(cache.dirty.isEmpty && cache.entry("added") == file("added", 7), "incremental scan reconciles changed branch")
         check(cache.entry("four") == file("four", 100), "reused subtree keeps its original direct index")
         print("PASS: dirty-branch repair and clean-subtree reuse")
+
+        cache = fixture()
+        cache.markChanged("nested")
+        cache.measurements["outside"] = size(9, 1, 0)
+        cache.parents["outside"] = "elsewhere"
+        cache.measurements["cycle-a"] = size(1, 1, 0)
+        cache.parents["cycle-a"] = "cycle-b"
+        cache.parents["cycle-b"] = "cycle-a"
+        check(Set(cache.seedMeasurements(under: "root").keys) == ["b", "empty"],
+              "seed holds only clean descendants, never the root, other branches or cycles")
+        check(cache.seedMeasurements(under: "a").isEmpty, "a dirty descendant is never reused")
+        check(cache.seedMeasurements(under: "unknown").isEmpty, "an unindexed folder has nothing to reuse")
+        print("PASS: size seeds are limited to clean descendants")
 
         cache = fixture()
         cache.reconcile(folderID: "nested", entries: [file("two", 27)])

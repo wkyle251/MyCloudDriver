@@ -24,9 +24,14 @@ base64 = "0.22"
 bytes = "1"
 futures-util = "0.3"
 ring = "0.17"
-filetwin-core = { path = "vendor/FileTwin/crates/filetwin-core", features = ["bundled-sqlite"] }
+filetwin-core = { path = "vendor/FileTwin/crates/filetwin-core" }
+rusqlite = { version = "0.40", features = ["bundled"] }
+rustix = { version = "1.1", features = ["fs", "process", "event"] }
+httpdate = "1"
 signal-hook = "0.3"
 tempfile = "3"
+zstd = "0.13"
+memmap2 = "0.9"
 
 [profile.release]
 lto = "thin"

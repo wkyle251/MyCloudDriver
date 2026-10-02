@@ -8,5 +8,5 @@ archive_object="${test_binary}.archive.o"
 xcrun clang -target arm64-apple-macos13.0 -O2 -Wall -Wextra -c macos/DriveArchive.c -o "${archive_object}"
 swiftc -D FINDER_WORKSPACE_TESTS -swift-version 5 -target arm64-apple-macos13.0 \
     -parse-as-library "${test_sources[@]}" "${test_entry}" "${archive_object}" \
-    -larchive.2 -o "${test_binary}"
+    -framework AVKit -larchive.2 -o "${test_binary}"
 rm -- "${archive_object}"

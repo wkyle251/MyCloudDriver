@@ -6,12 +6,21 @@ use pdfium_render::prelude::*;
 use quick_xml::{NsReader, events::Event, name::ResolveResult};
 use serde_json::json;
 use std::{
-    fs::File,
     io::{Read, Seek, SeekFrom},
 };
 
 fn decode_error(e: impl std::fmt::Display) -> Error {
     Error::new(ErrorCode::DecodeFailed, "document", e.to_string())
+}
+fn password_error() -> Error {
+    Error::new(ErrorCode::UnsupportedFormat, "password", "Password-protected file skipped; a password is required to analyse its contents")
+}
+fn zip_error(error: zip::result::ZipError) -> Error {
+    match error {
+        zip::result::ZipError::UnsupportedArchive(zip::result::ZipError::PASSWORD_REQUIRED)
+            | zip::result::ZipError::InvalidPassword => password_error(),
+        other => decode_error(other),
+    }
 }
 fn limit() -> Error {
     Error::new(
@@ -66,8 +75,11 @@ fn pdf(request: &Request) -> Result<(String, serde_json::Value)> {
     crate::verify_runtime(path, "pdfium")?;
     let pdfium = Pdfium::new(Pdfium::bind_to_library(path).map_err(decode_error)?);
     let document = pdfium
-        .load_pdf_from_file(&request.path, None)
-        .map_err(decode_error)?;
+        .load_pdf_from_reader(request.open_input()?, None)
+        .map_err(|error| match error {
+            PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError) => password_error(),
+            other => decode_error(other),
+        })?;
     let pages = document.pages().len();
     if pages > 10000 {
         return Err(limit());
@@ -107,15 +119,15 @@ fn pdf(request: &Request) -> Result<(String, serde_json::Value)> {
 }
 
 fn docx(request: &Request) -> Result<(String, serde_json::Value)> {
-    let mut file = File::open(&request.path)?;
+    let mut file = request.open_input()?;
     zip_preflight(&mut file)?;
-    let mut archive = zip::ZipArchive::new(file).map_err(decode_error)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(zip_error)?;
     if archive.len() > 4096 {
         return Err(limit());
     }
     let mut names = std::collections::BTreeSet::new();
     for i in 0..archive.len() {
-        let entry = archive.by_index(i).map_err(decode_error)?;
+        let entry = archive.by_index(i).map_err(zip_error)?;
         if !names.insert(entry.name().to_owned()) {
             return Err(decode_error("Duplicate DOCX ZIP member"));
         }
@@ -128,7 +140,7 @@ fn docx(request: &Request) -> Result<(String, serde_json::Value)> {
         ));
     }
     let mut xml = String::new();
-    let entry = archive.by_name("word/document.xml").map_err(decode_error)?;
+    let entry = archive.by_name("word/document.xml").map_err(zip_error)?;
     if entry.size() > MAX_TEXT_BYTES {
         return Err(limit());
     }
@@ -255,8 +267,8 @@ fn docx_xml(xml: &str) -> Result<String> {
     Ok(result)
 }
 
-fn zip_preflight(file: &mut File) -> Result<()> {
-    let size = file.metadata()?.len();
+fn zip_preflight(file: &mut (impl Read + Seek)) -> Result<()> {
+    let size = file.seek(SeekFrom::End(0))?;
     let tail_size = size.min(65557);
     file.seek(SeekFrom::Start(size - tail_size))?;
     let mut tail = Vec::new();
@@ -290,6 +302,15 @@ fn zip_preflight(file: &mut File) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_password_errors_become_password_exclusions() {
+        let protected = zip_error(zip::result::ZipError::UnsupportedArchive(zip::result::ZipError::PASSWORD_REQUIRED));
+        assert_eq!(protected.code, ErrorCode::UnsupportedFormat);
+        assert_eq!(protected.stage, "password");
+        let broken = zip_error(zip::result::ZipError::InvalidArchive("damaged directory".into()));
+        assert_eq!(broken.code, ErrorCode::DecodeFailed);
+        assert_eq!(broken.stage, "document");
+    }
     #[test]
     fn docx_namespaces_entities_structure_and_exclusions() {
         let xml = r#"<d:document xmlns:d="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><d:body><d:p><d:r><d:t>A &amp; B&#33;</d:t><d:tab/><d:t>next</d:t></d:r><d:del><d:r><d:t>deleted</d:t></d:r></d:del></d:p></d:body></d:document>"#;

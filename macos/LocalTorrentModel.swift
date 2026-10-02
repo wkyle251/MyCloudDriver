@@ -47,6 +47,9 @@ struct LocalTorrentFile: Codable, Identifiable, Equatable {
     let index: Int
     let path: String
     let length: UInt64
+    /// Optional for queues written before native padding flags were exposed.
+    var padding: Bool? = nil
+    var isPadding: Bool { padding == true }
     var id: Int { index }
 }
 
@@ -60,6 +63,11 @@ struct LocalTorrentJob: Codable, Identifiable {
     var name: String
     var magnet: String?
     var phase: LocalTorrentPhase
+    /// Optional for older queues. A user pause/stop is durable; an unexpected
+    /// interruption remains eligible to resume, including after app restart.
+    var automaticallyResume: Bool? = nil
+    var retryAttempt: Int? = nil
+    var retryAt: Date? = nil
     var files: [LocalTorrentFile] = []
     var selected: [Int] = []
     var relay: TorrentRelayState?
@@ -71,7 +79,13 @@ struct LocalTorrentJob: Codable, Identifiable {
     var completed: UInt64 = 0
     var total: UInt64 = 0
     var downloadSpeed: UInt64 = 0
+    /// Upload to BitTorrent peers. A relay job seeds while it fills RAM, so
+    /// this is reported separately from the PikPak rate below.
     var uploadSpeed: UInt64 = 0
+    /// Upload from RAM to PikPak on a relay job, which runs alongside the
+    /// torrent rather than taking turns with it. Optional so queues saved by
+    /// earlier builds, which have no such key, still decode.
+    var relayUploadSpeed: UInt64?
     /// Peers past the BitTorrent handshake, not sockets aria2 has opened.
     var peers = 0
     var seeders = 0
@@ -80,6 +94,22 @@ struct LocalTorrentJob: Codable, Identifiable {
     var attempted: Int?
     /// When the download last went quiet. Cleared by any byte of progress.
     var stalledSince: Date?
+    /// Optional for saved queues from builds without verification telemetry.
+    var checkingPieces: Bool?
+    /// How far the running hash check has read. Nil while it waits for a slot,
+    /// so a queued check still reads as plain progressless wording.
+    var checkingFraction: Double?
+    /// "Checking downloaded pieces", with the figure once there is one.
+    var checkingPiecesLabel: String { "Checking downloaded pieces" + checkingPercentSuffix }
+    /// The same, worded for the card message underneath.
+    var checkingPiecesMessage: String {
+        checkingFraction == nil ? "Checking downloaded pieces before continuing…"
+                                : "Checking downloaded pieces before continuing" + checkingPercentSuffix
+    }
+    private var checkingPercentSuffix: String {
+        guard let checkingFraction else { return "" }
+        return " — \(Int((checkingFraction * 100).rounded()))%"
+    }
     var message = ""
     var createdAt = Date()
     var status: String {
@@ -87,20 +117,77 @@ struct LocalTorrentJob: Codable, Identifiable {
         case .metadata: return "Loading file list"
         case .choosing: return "Choose files"
         case .downloading:
+            if checkingPieces == true { return checkingPiecesLabel }
+            if relay != nil, total > 0, downloadedBytes >= total { return "Download complete — waiting for PikPak" }
+            if relay?.waitingForUploadSpace == true { return "Waiting for buffer space" }
             if downloadSpeed > 0 { return "Downloading" }
             return peers > 0 ? "Connected — waiting for pieces" : "Looking for peers"
         case .uploading: return relay?.stage == "hashing" ? "Preparing upload" : "Uploading to PikPak"
-        case .paused: return "Paused"
+        case .paused: return retryAt == nil ? "Paused" : "Waiting to retry"
         case .completed: return "Completed"
         case .failed: return "Failed"
         case .stopped: return "Stopped"
         }
     }
     var progress: Double { total == 0 ? (phase == .completed ? 1 : 0) : min(1, Double(completed) / Double(total)) }
+    var downloadedBytes: UInt64 { min(total, max(completed, relay?.downloadedBytes ?? completed)) }
+    /// Logical download bytes and cloud receipts count each selected byte once.
+    /// Allocated disk space also includes uploaded copies retained for peers.
+    var downloadedAwaitingPikPakBytes: UInt64 {
+        guard relay != nil else { return 0 }
+        return downloadedBytes - min(downloadedBytes, completed)
+    }
+    var downloadProgress: Double { total == 0 ? (phase == .completed ? 1 : 0) : Double(downloadedBytes) / Double(total) }
+    var downloadETA: TimeInterval? {
+        guard phase.active, total > downloadedBytes, downloadSpeed > 0 else { return nil }
+        return Double(total - downloadedBytes) / Double(downloadSpeed)
+    }
+    var downloadEstimate: String {
+        if total > 0, downloadedBytes >= total { return "Download complete" }
+        if phase == .paused { return "Paused" }
+        guard let downloadETA else { return "Download ETA —" }
+        return "Download ETA about " + LocalTorrentFormat.duration(downloadETA)
+    }
     var canChoose: Bool { !files.isEmpty && destination == nil && relay == nil && !phase.active }
+    var payloadFiles: [LocalTorrentFile] { files.filter { !$0.isPadding } }
+    var savedFileCount: Int { relay?.uploaded.intersection(selected).count ?? 0 }
+
+    /// Keep padding in the byte layout, but never select or upload it. Old
+    /// cloud receipts remain intact so cleanup can identify previous padding uploads.
+    mutating func excludePaddingFiles(_ indexes: Set<Int>) -> Bool {
+        guard !indexes.isEmpty,
+              files.contains(where: { indexes.contains($0.index) && !$0.isPadding }) || !indexes.isDisjoint(with: selected) else { return false }
+        for position in files.indices where indexes.contains(files[position].index) { files[position].padding = true }
+        selected.removeAll { indexes.contains($0) }
+        let wanted = Set(selected)
+        total = files.filter { wanted.contains($0.index) }.reduce(0) { $0 + $1.length }
+        if let state = relay {
+            completed = files.filter { wanted.contains($0.index) && state.uploaded.contains($0.index) }.reduce(0) { $0 + $1.length }
+            relay?.selection?.removeAll { indexes.contains($0) }
+            relay?.downloadedBytes = completed
+        }
+        return true
+    }
+    var canSwitchRelayToStorage: Bool { relay != nil && relay?.storage == nil && phase != .completed }
+    var localFolder: String? { relay?.storage?.path ?? destination }
+
+    /// Carry the hash check's flag and its figure together.
+    ///
+    /// Storage jobs arrive here through `updateTransferStats`; relay jobs refresh
+    /// on their own path and set these fields directly. Both go through this, so
+    /// a card cannot end up knowing a check is running but not how far along.
+    mutating func applyCheckingState(_ status: LocalTorrentStatus) {
+        checkingPieces = status.checkingPieces
+        checkingFraction = status.checkingFraction
+    }
 
     mutating func updateTransferStats(_ status: LocalTorrentStatus) {
+        if status.checkingPieces {
+            clearTransferStats(); applyCheckingState(status)
+            return
+        }
         guard status.state == "active" else { clearTransferStats(); return }
+        checkingPieces = false
         downloadSpeed = status.downloadSpeed; uploadSpeed = status.uploadSpeed
         attempted = status.connections
         seeders = status.seeders
@@ -116,24 +203,37 @@ struct LocalTorrentJob: Codable, Identifiable {
         peers = census.connected; attempted = census.attempted
     }
     mutating func clearTransferStats() {
-        downloadSpeed = 0; uploadSpeed = 0; peers = 0; seeders = 0
-        attempted = nil; stalledSince = nil
+        downloadSpeed = 0; uploadSpeed = 0; relayUploadSpeed = nil; peers = 0; seeders = 0
+        attempted = nil; stalledSince = nil; checkingPieces = nil; checkingFraction = nil
     }
 
     /// Why nothing is arriving, once it has been quiet long enough to matter.
     /// Without this the card reads "connecting" forever and a swarm this Mac
     /// cannot reach looks the same as one that is merely slow.
-    func stallNote(portMapping: TorrentPortMapState) -> String? {
-        guard phase == .downloading, downloadSpeed == 0, let since = stalledSince else { return nil }
+    func stallNote(portMapping: TorrentPortMapState, dns: TorrentDNSState) -> String? {
+        guard phase == .downloading, checkingPieces != true, downloadSpeed == 0, let since = stalledSince else { return nil }
         let quiet = Date().timeIntervalSince(since)
         guard quiet >= 90 else { return nil }
         let waited = LocalTorrentFormat.duration(quiet)
         if peers > 0 { return "Connected to \(peers) \(peers == 1 ? "peer" : "peers") for \(waited), but none has sent a piece yet." }
         var note = "No peer has completed a connection in \(waited)."
-        if let attempted, attempted > 0 { note += " \(attempted) \(attempted == 1 ? "attempt is" : "attempts are") in flight; peers behind NAT cannot answer." }
+        if let attempted, attempted > 0 { note += " \(attempted) \(attempted == 1 ? "attempt is" : "attempts are") in flight." }
+        // A tunnel may route these virtual addresses successfully for TCP and
+        // UDP. DNS interception is evidence of a proxy, not a failed connection.
+        if case .placeholder(let address) = dns {
+            return note + " A proxy is returning virtual DNS addresses (\(address)). Check whether it supports BitTorrent and UDP; these addresses alone do not show that traffic is blocked."
+        }
         switch portMapping {
-        case .mapped: note += " This Mac is reachable for incoming peers."
-        case .unsupported: note += " The router did not offer automatic port mapping, so peers cannot connect in — forward the torrent port to speed this up."
+        case .mapped(let port, let address):
+            // A mapping onto a private or carrier-NAT address is a door onto a
+            // network that is itself behind another door. Saying "reachable"
+            // there sends the reader hunting for a fault that is not theirs.
+            if let address, !TorrentIPv4.isRoutable(address) {
+                note += " Your router mapped port \(port), but its own address (\(address)) is behind another network. Incoming peer reachability is unconfirmed."
+            } else {
+                note += " An incoming port mapping on port \(port) is active; external reachability has not been verified."
+            }
+        case .unsupported: note += " Automatic incoming port mapping was not confirmed. Some peers may be unreachable through this router or VPN."
         case .failed(let reason): note += " " + reason
         case .idle: break
         }
@@ -179,7 +279,10 @@ struct LocalTorrentStore {
         guard saved.version == 1, Set(saved.jobs.map(\.id)).count == saved.jobs.count else { throw CocoaError(.fileReadCorruptFile) }
         return saved.jobs.map { value in
             var job = value
-            if job.phase.active { job.phase = .paused; job.message = "Resume to continue from saved progress." }
+            if job.phase.active {
+                if job.automaticallyResume == nil { job.automaticallyResume = true }
+                job.phase = .paused; job.message = "Continuing from saved progress…"
+            }
             job.clearTransferStats()
             return job
         }
@@ -201,10 +304,20 @@ struct LocalTorrentStore {
     @Published var error: String?
     /// Whether incoming peers can reach this Mac. Explains a stalled swarm.
     @Published private(set) var portMapping: TorrentPortMapState = .idle
+    @Published private(set) var dnsState: TorrentDNSState = .unknown
+    /// When the resolver was last questioned. Its answer only changes when a
+    /// proxy is switched on or off, and `getaddrinfo` blocks, so this is rare.
+    private var dnsProbedAt: Date?
+    /// The handshaked peers behind each running torrent's two summary rates.
+    /// Outside `LocalTorrentJob`: live details never enter the saved queue.
+    /// The engine separately caches validated public peer endpoints briefly.
+    @Published private(set) var peerDetails: [UUID: [LocalTorrentPeer]] = [:]
+    @Published private(set) var networkDetails: [UUID: LocalTorrentNetworkDiagnostics] = [:]
     /// Connected-peer counts come from `aria2.getPeers`, whose reply carries a
     /// piece bitfield per peer, so it is polled far less often than status.
     private var censusAt: [UUID: Date] = [:]
-    var censusInterval: TimeInterval = 5
+    private var networkCensusAt: [UUID: Date] = [:]
+    var censusInterval: TimeInterval = 30
     private(set) var storageAvailable = true
     let store: LocalTorrentStore
     let engine: LocalTorrentDriving
@@ -214,8 +327,14 @@ struct LocalTorrentStore {
     var pendingStops = Set<UUID>()
     var polling: Task<Void, Never>?
     var closed = false
+    /// Only launch-restored work is eligible. Pausing again in this session
+    /// cancels its pending automatic start; Stop is never auto-resumed.
+    var restoredResumeIDs = Set<UUID>()
+    var relayStorageLimitChanged = Set<UUID>()
     var metadataRetryAt: [UUID: Date] = [:]
     static let metadataRetryDelay: TimeInterval = 15
+    var recoveryDelays = AutomaticRecovery.delays
+    private var saveRetryTask: Task<Void, Never>?
 
     var ram: TorrentRAMDriving
     var relayUploaderFactory: () -> TorrentRelayUploading = { TorrentRelayUpload() }
@@ -223,8 +342,13 @@ struct LocalTorrentStore {
     var relayFilesChanged: (() -> Void)?
     var relayTasks: [UUID: Task<Void, Never>] = [:]
     var relayUploaders: [UUID: TorrentRelayUploading] = [:]
+    var paddingCleanupTasks: [UUID: Task<Void, Never>] = [:]
+    var paddingCleanupUploaders: [UUID: TorrentRelayUploading] = [:]
+    var paddingCleanupUploaderFactory: () -> TorrentRelayUploading = { TorrentRelayUpload() }
     var relayGenerations: [UUID: UUID] = [:]
     var relayLastProgress: [UUID: (Date, UInt64)] = [:]
+    var relayUploadFailures: [UUID: Int] = [:]
+    var relayUploadRetryDelay: TimeInterval = 30
     /// Completed files waiting for their uploader spawn, and when the oldest of
     /// them started waiting. Uploading one file per spawn wastes a process and
     /// a folder lookup; waiting for the whole batch defeats the purpose.
@@ -232,9 +356,14 @@ struct LocalTorrentStore {
     var relayQueuedSince: [UUID: Date] = [:]
     /// Per-file status is far heavier than the plain poll — a `files:true` reply
     /// for 14,623 files is megabytes — so it runs on the census cadence while
-    /// speeds and peers keep refreshing every second.
+    /// speeds and peer counts keep refreshing every ten seconds.
     var relayFileCensusAt: [UUID: Date] = [:]
-    var relayFileCensusInterval: TimeInterval = 5
+    var relayFileCensusInterval: TimeInterval = 30
+    /// Consecutive status replies lost per job. One dropped reply from the
+    /// local engine is not a failed transfer: it used to stop a RAM relay
+    /// outright, and to blank a local download's swarm and rates.
+    var statusFailures: [UUID: Int] = [:]
+    var statusRetries = 5
     /// How long a completed file waits for company before it is uploaded alone.
     var relayFlushWait: TimeInterval = TorrentRelayDrain.flushWait
 
@@ -242,15 +371,52 @@ struct LocalTorrentStore {
         let root = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("MyCloudDriver/LocalTorrents", isDirectory: true)
         store = .init(directory: root)
         self.ram = ram ?? TorrentRAMDisk()
-        self.engine = engine ?? Aria2TorrentEngine(directory: root.appendingPathComponent("Engine", isDirectory: true))
-        do { jobs = try store.load() }
+        self.engine = engine ?? LibtorrentEngine(directory: root.appendingPathComponent("Engine", isDirectory: true))
+        do {
+            jobs = try store.load()
+            restoredResumeIDs = Set(jobs.filter {
+                $0.phase == .paused && $0.automaticallyResume == true &&
+                ($0.destination != nil || $0.relay != nil || $0.files.isEmpty)
+            }.map(\.id))
+        }
         catch { storageAvailable = false; self.error = "Saved local torrents could not be read. Their files have been kept. \(error.localizedDescription)" }
     }
 
     func job(_ id: UUID) -> LocalTorrentJob? { jobs.first { $0.id == id } }
     func edit(_ id: UUID, _ body: (inout LocalTorrentJob) -> Void) { if let index = jobs.firstIndex(where: { $0.id == id }) { body(&jobs[index]) } }
     func save() throws { guard storageAvailable else { throw LocalTorrentError.message("Saved torrent state is unavailable.") }; try store.save(jobs) }
-    func saveOrReport() { do { try save() } catch { self.error = "Could not save torrent progress: \(error.localizedDescription)" } }
+    func saveOrReport() {
+        do { try save(); saveRetryTask?.cancel(); saveRetryTask = nil }
+        catch {
+            self.error = "Could not save torrent progress. Retrying automatically: \(error.localizedDescription)"
+            guard !closed, storageAvailable, saveRetryTask == nil else { return }
+            saveRetryTask = Task { [weak self] in
+                do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
+                guard let self, !self.closed else { return }
+                self.saveRetryTask = nil; self.saveOrReport()
+            }
+        }
+    }
+
+    func queueRecovery(_ id: UUID, message: String) {
+        guard !closed, let value = job(id), value.automaticallyResume != false,
+              value.phase != .stopped, value.phase != .completed else { return }
+        let attempt = value.retryAttempt ?? 0
+        let delay = AutomaticRecovery.delay(attempt: attempt, schedule: recoveryDelays)
+        edit(id) {
+            $0.automaticallyResume = true
+            $0.retryAttempt = AutomaticRecovery.nextAttempt(attempt)
+            $0.retryAt = Date().addingTimeInterval(delay)
+            $0.message = "Retrying automatically in \(Int(delay))s. \(message)"
+        }
+        saveOrReport(); startPolling()
+    }
+
+    func holdRecovery(_ id: UUID) {
+        restoredResumeIDs.remove(id); metadataRetryAt[id] = nil
+        edit(id) { $0.automaticallyResume = false; $0.retryAt = nil; $0.retryAttempt = nil }
+        saveOrReport()
+    }
     func finishOperation(_ id: UUID) {
         busy.remove(id)
         if pendingStops.remove(id) != nil, !closed { Task { await stop(id) } }
@@ -288,7 +454,14 @@ struct LocalTorrentStore {
         guard !gids.isEmpty else { return }
         for id in gids.keys where job(id)?.phase.active == true {
             if job(id)?.phase == .metadata, job(id)?.magnet != nil { scheduleMetadataRetry(id) }
-            else { edit(id) { $0.phase = .paused; $0.clearTransferStats(); $0.message = "Torrent engine stopped. Resume to continue." } }
+            else {
+                // Fence off the old uploader before a fresh run reconciles its
+                // receipts. Keep the payload and RAM volume for that run.
+                relayGenerations[id] = nil
+                relayUploaders[id]?.stop(); relayTasks[id]?.cancel()
+                edit(id) { $0.phase = .paused; $0.clearTransferStats() }
+                queueRecovery(id, message: "Torrent engine stopped.")
+            }
         }
         gids.removeAll(); leases.removeAll(); saveOrReport()
     }
@@ -299,7 +472,7 @@ struct LocalTorrentStore {
     }
     private func prepare(_ id: UUID, retrying: Bool = false) async {
         guard let job = job(id), !busy.contains(id), !closed else { return }
-        busy.insert(id); edit(id) { $0.phase = .metadata; $0.clearTransferStats(); $0.message = "Finding peers for the file list…" }; error = nil
+        busy.insert(id); edit(id) { $0.phase = .metadata; $0.automaticallyResume = true; $0.clearTransferStats(); $0.message = "Finding peers for the file list…" }; error = nil
         defer { finishOperation(id); preparations[id] = nil }
         do {
             let folder = try store.jobDirectory(id)
@@ -320,8 +493,11 @@ struct LocalTorrentStore {
             try save(); startPolling()
         } catch {
             if !closed {
-                if retrying { scheduleMetadataRetry(id) }
-                else { edit(id) { $0.phase = .failed; $0.message = error.localizedDescription }; saveOrReport() }
+                if retrying && job.magnet != nil { scheduleMetadataRetry(id); startPolling() }
+                else {
+                    edit(id) { $0.phase = .paused }
+                    queueRecovery(id, message: error.localizedDescription)
+                }
             }
         }
     }
@@ -336,10 +512,17 @@ struct LocalTorrentStore {
         let files = try status.files.map { file -> LocalTorrentFile in
             let path = URL(fileURLWithPath: file.path).standardizedFileURL.path
             guard path.hasPrefix(root), path.count > root.count else { throw LocalTorrentError.message("The torrent contains a path outside its download folder.") }
-            return .init(index: file.index, path: String(path.dropFirst(root.count)), length: file.length)
+            return .init(index: file.index, path: String(path.dropFirst(root.count)), length: file.length, padding: file.padding ? true : nil)
         }
         guard Set(files.map(\.index)).count == files.count else { throw LocalTorrentError.message("The torrent contains duplicate file indexes.") }
-        edit(id) { $0.name = status.name; $0.pieceLength = status.pieceLength; $0.files = files; $0.selected = files.map(\.index); $0.phase = .choosing; $0.clearTransferStats(); $0.message = "Choose files and a destination to start."; $0.total = status.total }
+        // aria2 does not relocate a BitTorrent DownloadContext when `dir` is
+        // changed later. Retire the metadata-only handle; the selected payload
+        // must be added afresh in the chosen local folder or RAM volume.
+        try await engine.remove(gid)
+        gids[id] = nil
+        let payload = files.filter { !$0.isPadding }
+        let total = try selectedTotal(payload)
+        edit(id) { $0.name = status.name; $0.pieceLength = status.pieceLength; $0.files = files; $0.selected = payload.map(\.index); $0.phase = .choosing; $0.clearTransferStats(); $0.message = "Choose files and a destination to start."; $0.total = total }
         metadataRetryAt[id] = nil
     }
 
@@ -348,7 +531,7 @@ struct LocalTorrentStore {
         busy.insert(id); error = nil
         defer { finishOperation(id) }
         do {
-            guard !selected.isEmpty, selected.isSubset(of: Set(job.files.map(\.index))) else { throw LocalTorrentError.message("Select at least one file from this torrent.") }
+            guard !selected.isEmpty, selected.isSubset(of: Set(job.payloadFiles.map(\.index))) else { throw LocalTorrentError.message("Select at least one file from this torrent.") }
             let lease = LocalFileAccessLease([parent]); leases[id] = lease
             try LocalFileAccess.validate(parent, directory: true, writing: true)
             let destination = parent.appendingPathComponent(LocalTorrentSource.folderName(job.name, id: id), isDirectory: true)
@@ -358,20 +541,28 @@ struct LocalTorrentStore {
             if let available, total > UInt64(max(0, available)) { throw LocalTorrentError.message("The selected files need more space than this disk has available. Choose fewer files or another disk.") }
             try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
             let bookmark = try? parent.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: [.volumeUUIDStringKey], relativeTo: nil)
-            edit(id) { $0.destination = destination.path; $0.parentDirectory = parent.path; $0.volumeID = LocalFileAccess.volumeID(parent); $0.bookmark = bookmark; $0.selected = selected.sorted(); $0.total = total; $0.message = "" }
+            edit(id) { $0.destination = destination.path; $0.parentDirectory = parent.path; $0.volumeID = LocalFileAccess.volumeID(parent); $0.bookmark = bookmark; $0.selected = selected.sorted(); $0.total = total; $0.automaticallyResume = true; $0.message = "" }
             try save()
             try await begin(id)
-        } catch { self.error = error.localizedDescription; if self.job(id)?.phase != .downloading { edit(id) { $0.message = error.localizedDescription } }; saveOrReport() }
+        } catch {
+            self.error = error.localizedDescription
+            if self.job(id)?.destination != nil {
+                if self.job(id)?.phase != .downloading { edit(id) { $0.phase = .paused } }
+                queueRecovery(id, message: error.localizedDescription)
+            } else { edit(id) { $0.message = error.localizedDescription }; saveOrReport() }
+        }
     }
 
-    func resume(_ id: UUID) async {
+    func resume(_ id: UUID, automatic: Bool = false) async {
         guard let value = job(id), !busy.contains(id), !value.phase.active, !closed else { return }
+        restoredResumeIDs.remove(id)
+        edit(id) { $0.automaticallyResume = true; $0.retryAt = nil; if !automatic { $0.retryAttempt = nil } }
         if value.relay != nil { await resumeRelay(id); return }
         if value.files.isEmpty { launchPreparation(id); return }
         guard value.destination != nil else { return }
         busy.insert(id); error = nil; defer { finishOperation(id) }
         do { try await begin(id) }
-        catch { self.error = error.localizedDescription; edit(id) { $0.message = error.localizedDescription }; saveOrReport() }
+        catch { self.error = error.localizedDescription; queueRecovery(id, message: error.localizedDescription) }
     }
     private func begin(_ id: UUID) async throws {
         guard let value = job(id), let path = value.destination, let parentPath = value.parentDirectory else { return }
@@ -390,7 +581,7 @@ struct LocalTorrentStore {
             gids[id] = try await engine.addTorrent(data, directory: destination, selection: value.selected)
         }
         guard let gid = gids[id], !closed else { return }
-        edit(id) { $0.phase = .downloading; $0.message = "" }
+        edit(id) { $0.phase = .downloading; $0.automaticallyResume = true; $0.message = "" }
         try save(); startPolling()
         // Mark the job as monitored before unpausing: an ambiguous RPC result
         // must not leave an actual download running outside the progress list.
@@ -398,12 +589,14 @@ struct LocalTorrentStore {
     }
 
     func pause(_ id: UUID) async {
+        let waitingForMetadata = metadataRetryAt[id] != nil
+        holdRecovery(id)
         if job(id)?.relay != nil { await pauseRelay(id); return }
         guard !busy.contains(id), job(id)?.phase.active == true else { return }
         busy.insert(id); defer { finishOperation(id) }
         do {
             if let gid = gids[id], engine.running {
-                if metadataRetryAt[id] != nil { try await engine.remove(gid); gids[id] = nil }
+                if waitingForMetadata { try await engine.remove(gid); gids[id] = nil }
                 else { try await engine.pause(gid) }
             }
             metadataRetryAt[id] = nil
@@ -412,6 +605,7 @@ struct LocalTorrentStore {
         catch { self.error = error.localizedDescription }
     }
     func stop(_ id: UUID) async {
+        holdRecovery(id)
         if job(id)?.relay != nil { await stopRelay(id); return }
         if busy.contains(id) { pendingStops.insert(id); return }
         busy.insert(id); defer { busy.remove(id) }
@@ -436,7 +630,7 @@ struct LocalTorrentStore {
         } catch { jobs = previous; self.error = "Could not remove the saved torrent: \(error.localizedDescription)" }
     }
     func reveal(_ id: UUID) {
-        guard let path = job(id)?.destination, FileManager.default.fileExists(atPath: path) else { return }
+        guard let path = job(id)?.localFolder, FileManager.default.fileExists(atPath: path) else { return }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 
@@ -446,24 +640,110 @@ struct LocalTorrentStore {
             while !Task.isCancelled {
                 guard let self, !self.closed else { return }
                 await self.refresh()
-                do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
+                do { try await Task.sleep(nanoseconds: 10_000_000_000) } catch { return }
             }
         }
     }
+    /// Missing status replies never pause an otherwise running engine. The
+    /// normal poll cadence retries transport failures for as long as needed;
+    /// the failure budget only expires stale telemetry. Repeated engine
+    /// errors and an exited process still follow the ordinary error path.
+    func pollStatus(_ id: UUID, gid: String, files: Bool) async throws -> LocalTorrentStatus? {
+        do {
+            let status = try await engine.status(gid, files: files)
+            statusFailures[id] = nil
+            return status
+        } catch {
+            guard engine.running else { throw error }
+            let failures = min(statusRetries, (statusFailures[id] ?? 0) + 1)
+            statusFailures[id] = failures
+            if failures >= statusRetries {
+                guard LocalTorrentError.isConnectionInterruption(error) else { throw error }
+                edit(id) {
+                    $0.peers = 0; $0.seeders = 0; $0.attempted = nil
+                    $0.checkingPieces = nil; $0.stalledSince = nil
+                }
+                peerDetails[id] = nil; censusAt[id] = nil
+            }
+            return nil
+        }
+    }
+
     /// Updates the connected-peer count on its own slower cadence.
+    ///
+    /// One state escapes that cadence: no peers beside open sockets. Between
+    /// censuses the count can only ratchet down, so a single poll that saw no
+    /// sockets — a dropped status reply, the gap at a batch boundary, a swarm
+    /// blinking out — pins the card at "0 peers" for the rest of the window
+    /// while aria2 has already reconnected. Re-censusing then costs one
+    /// loopback call at the poll cadence, and only while the count reads zero.
     func refreshCensus(_ id: UUID, gid: String, attempted: Int) async {
         // Only an active download has peers; anything else just cleared its stats.
         let now = Date()
-        if let last = censusAt[id], now.timeIntervalSince(last) < censusInterval { return }
+        let blankWithSockets = attempted > 0 && job(id)?.peers == 0
+        if let last = censusAt[id], now.timeIntervalSince(last) < censusInterval, !blankWithSockets { return }
         censusAt[id] = now
         guard let census = try? await engine.peerCensus(gid, attempted: attempted) else { return }
         guard !closed, gids[id] == gid, job(id)?.phase.active == true else { return }
         edit(id) { $0.updatePeerCensus(census) }
+        peerDetails[id] = census.peers
+        if let last = networkCensusAt[id], now.timeIntervalSince(last) < 30 { return }
+        networkCensusAt[id] = now
+        let network = try? await engine.networkDiagnostics(gid)
+        guard !closed, gids[id] == gid, job(id)?.phase.active == true else { return }
+        networkDetails[id] = network
+    }
+
+    /// Peers to show for a job. A census is only taken while the torrent is
+    /// running, so any other phase would be showing the ghost of the last one.
+    func connectedPeers(_ id: UUID) -> [LocalTorrentPeer] {
+        guard let value = job(id), value.checkingPieces != true else { return [] }
+        let phase = value.phase
+        // `.uploading` beside a live torrent is a drain: finished files are on
+        // their way to PikPak while the rest of the batch still downloads.
+        guard phase == .downloading || phase == .metadata || (phase == .uploading && torrentIsLive(id)) else { return [] }
+        return peerDetails[id] ?? []
+    }
+
+    /// Whether the engine still holds a torrent for this job. True throughout a
+    /// drain; false once a finished batch has been handed to the uploader.
+    func torrentIsLive(_ id: UUID) -> Bool { gids[id] != nil }
+
+    /// Ask the resolver whether a proxy is answering for the trackers, off the
+    /// main actor and no more than once a minute.
+    private func refreshDNSState() {
+        if let dnsProbedAt, Date().timeIntervalSince(dnsProbedAt) < 60 { return }
+        dnsProbedAt = Date()
+        let hosts = Aria2TorrentEngine.fallbackTrackers.compactMap { URL(string: $0)?.host }
+        guard !hosts.isEmpty else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            let state = TorrentFakeIP.probe(hosts)
+            await MainActor.run { self?.dnsState = state }
+        }
     }
 
     func refresh() async {
+        for value in jobs where value.phase.active || value.phase == .completed {
+            launchPaddingCleanup(value.id)
+        }
         if !engine.running { engineDidStop() }
+        for value in jobs where value.automaticallyResume == true &&
+            (value.phase == .paused || value.phase == .failed) &&
+            value.retryAt.map({ $0 <= Date() }) == true && !busy.contains(value.id) {
+            if let task = relayTasks[value.id], relayGenerations[value.id] == nil {
+                await task.value
+                relayTasks[value.id] = nil; relayUploaders[value.id] = nil
+            }
+            guard !closed, job(value.id)?.automaticallyResume == true else { continue }
+            await resume(value.id, automatic: true)
+        }
         portMapping = engine.portMapping
+        refreshDNSState()
+        if !peerDetails.isEmpty || !networkDetails.isEmpty {
+            let running = Set(jobs.filter { $0.phase.active }.map(\.id))
+            peerDetails = peerDetails.filter { running.contains($0.key) }
+            networkDetails = networkDetails.filter { running.contains($0.key) }
+        }
         for value in jobs where value.phase.active && !busy.contains(value.id) {
             if value.phase == .metadata, let retryAt = metadataRetryAt[value.id] {
                 if Date() >= retryAt { await prepare(value.id, retrying: true) }
@@ -474,10 +754,15 @@ struct LocalTorrentStore {
             let id = value.id
             var retryMetadataOnError = value.phase == .metadata && value.magnet != nil
             do {
-                let status = try await engine.status(gid, files: false)
+                guard let status = try await pollStatus(id, gid: gid, files: false) else {
+                    // The swarm and seed counts stand: nothing said they changed.
+                    edit(id) { $0.downloadSpeed = 0; $0.uploadSpeed = 0
+                               if $0.phase != .metadata { $0.message = "Reconnecting to download status…" } }
+                    continue
+                }
                 guard !closed, gids[id] == gid, job(id)?.phase.active == true, !busy.contains(id) else { continue }
                 edit(id) { $0.updateTransferStats(status) }
-                if status.state == "active" { await refreshCensus(id, gid: gid, attempted: status.connections) }
+                if status.state == "active", !status.checkingPieces { await refreshCensus(id, gid: gid, attempted: status.connections) }
                 guard !closed, gids[id] == gid, job(id)?.phase.active == true, !busy.contains(id) else { continue }
                 if value.phase == .metadata {
                     if status.state == "complete" {
@@ -492,7 +777,7 @@ struct LocalTorrentStore {
                         let next = try await engine.addTorrent(data, directory: directory, selection: nil)
                         gids[id] = next
                         do { try await acceptManifest(id, gid: next); try save() }
-                        catch { edit(id) { $0.phase = .failed; $0.message = error.localizedDescription }; saveOrReport() }
+                        catch { edit(id) { $0.phase = .paused }; queueRecovery(id, message: error.localizedDescription) }
                     } else if ["error", "removed", "paused"].contains(status.state) { scheduleMetadataRetry(id) }
                     else if status.state == "waiting" {
                         edit(id) { $0.message = "Queued for a free torrent slot…" }
@@ -500,12 +785,17 @@ struct LocalTorrentStore {
                 } else {
                     let mapping = portMapping
                     edit(id) {
+                        if status.completed > $0.completed { $0.retryAttempt = nil; $0.retryAt = nil }
                         $0.completed = status.completed; $0.total = status.total
-                        $0.message = status.state == "waiting" ? "Queued — up to three torrents run at once." : ($0.stallNote(portMapping: mapping) ?? "")
+                        $0.message = status.checkingPieces ? $0.checkingPiecesMessage :
+                            status.state == "waiting" ? "Queued — up to three torrents run at once." : ($0.stallNote(portMapping: mapping, dns: dnsState) ?? "")
                         if status.state == "complete" { $0.phase = .completed; $0.completed = $0.total; $0.message = "Saved to this Mac. Seeding has stopped." }
                         else if status.state == "paused" { $0.phase = .paused }
                         else if status.state == "error" { $0.phase = .failed; $0.message = status.error }
-                        else if status.state == "removed" { $0.phase = .stopped }
+                        else if status.state == "removed" { $0.phase = .paused }
+                    }
+                    if ["paused", "error", "removed"].contains(status.state) {
+                        queueRecovery(id, message: status.error.isEmpty ? "Torrent transfer was interrupted." : status.error)
                     }
                     if job(id)?.phase.active == false { leases[id] = nil; saveOrReport() }
                 }
@@ -513,8 +803,8 @@ struct LocalTorrentStore {
                 if !closed, gids[id] == gid, job(id)?.phase.active == true {
                     edit(id) { $0.clearTransferStats() }
                     if retryMetadataOnError { scheduleMetadataRetry(id) }
-                    else if !engine.running { edit(id) { $0.phase = .paused; $0.message = "Torrent engine stopped. Resume to continue." }; gids[id] = nil; saveOrReport() }
-                    else if value.phase == .metadata { edit(id) { $0.phase = .failed; $0.message = error.localizedDescription }; saveOrReport() }
+                    else if !engine.running { engineDidStop() }
+                    else if value.phase == .metadata { edit(id) { $0.phase = .paused }; queueRecovery(id, message: error.localizedDescription) }
                     else { edit(id) { $0.message = "Reconnecting to download status…" } }
                 }
             }
@@ -524,13 +814,20 @@ struct LocalTorrentStore {
     func shutdown() {
         guard !closed else { return }
         closed = true; polling?.cancel(); polling = nil
+        saveRetryTask?.cancel(); saveRetryTask = nil
+        restoredResumeIDs.removeAll()
         metadataRetryAt.removeAll()
         preparations.values.forEach { $0.cancel() }; preparations.removeAll()
         relayGenerations.removeAll()
         relayUploaders.values.forEach { $0.stop() }
         relayTasks.values.forEach { $0.cancel() }; relayTasks.removeAll()
-        for index in jobs.indices where jobs[index].phase.active { jobs[index].phase = .paused; jobs[index].clearTransferStats() }
-        saveOrReport(); engine.stop(); gids.removeAll(); leases.removeAll()
+        paddingCleanupUploaders.values.forEach { $0.stop() }
+        paddingCleanupTasks.values.forEach { $0.cancel() }; paddingCleanupTasks.removeAll()
+        for index in jobs.indices where jobs[index].phase.active {
+            if jobs[index].automaticallyResume == nil { jobs[index].automaticallyResume = true }
+            jobs[index].phase = .paused; jobs[index].clearTransferStats()
+        }
+        saveOrReport(); engine.stop(); gids.removeAll(); leases.removeAll(); peerDetails.removeAll()
     }
     func selectedTotal(_ files: [LocalTorrentFile]) throws -> UInt64 {
         try files.reduce(0) { total, file in

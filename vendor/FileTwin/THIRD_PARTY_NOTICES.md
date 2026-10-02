@@ -1,5 +1,10 @@
 # Native encoding components
 
+FileTwin's original code is licensed under the
+[PolyForm Noncommercial License 1.0.0](LICENSE). Third-party dependencies, model
+weights, native runtimes and external test fixtures retain their own licenses.
+FileTwin's license does not relicense those components or replace their notices.
+
 FileTwin's developer setup downloads artifacts only when explicitly requested.
 Keep these notices and the downloaded artifact licenses when distributing a
 native bundle. Rust dependency licenses are recorded by each dependency crate.
@@ -12,6 +17,9 @@ native bundle. Rust dependency licenses are recorded by each dependency crate.
   different model. No calibration claims are inherited from SSCD's benchmarks.
 - ONNX Runtime 1.28.2: [Microsoft's release](https://github.com/microsoft/onnxruntime/releases/tag/v1.28.2),
   MIT license and upstream third-party notices, preserved by setup-native.py.
+  This includes the optional Linux x86-64 CUDA execution-provider libraries.
+  The separately installed NVIDIA driver, CUDA runtime and cuDNN retain their
+  respective NVIDIA licenses; the setup script does not redistribute them.
 - PDFium Chromium 8044: [binary publisher](https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium%2F8044),
   BSD-style PDFium license and bundled third-party licenses, preserved by setup.
 - FFmpeg: separately installed executable, [license/build information](https://ffmpeg.org/legal.html).

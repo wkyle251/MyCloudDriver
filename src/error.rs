@@ -5,6 +5,12 @@ use thiserror::Error;
 /// All errors that can be returned by a [`crate::Client`] operation.
 #[derive(Error, Debug)]
 pub enum Error {
+    /// Guest access never falls back to the account's download allowance.
+    #[error("Guest Mode: {0}")]
+    Guest(&'static str),
+    /// Preserve the provider's cooldown when an outer operation retries.
+    #[error("API error {status}: the provider requested a retry after {delay:?}")]
+    RetryAfter { status: u16, delay: std::time::Duration },
     /// Underlying HTTP transport failure (DNS, TLS, socket, etc.).
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
@@ -21,6 +27,11 @@ pub enum Error {
     /// Authentication or token refresh failed.
     #[error("authentication failed: {0}")]
     Auth(String),
+
+    /// A credential was explicitly revoked/rejected, distinct from an
+    /// expired access token, service outage, or OAuth client configuration.
+    #[error("PikPak session rejected: {0}")]
+    SessionRejected(&'static str),
 
     /// Response body did not match the expected JSON shape.
     #[error("failed to parse response: {0}")]

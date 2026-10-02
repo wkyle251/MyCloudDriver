@@ -43,7 +43,10 @@ struct WorkspaceSwitchingTests {
         navigation.select(2, needsLoading: false) { preconditionFailure("removed Tasks destination") }
         navigation.showImmediately(2)
         precondition(navigation.section == 1, "removed Tasks cannot be presented")
-        precondition(FinderWorkspaceSection.allCases.map(\.title) == ["Browser", "Transfers", "Links"])
+        precondition(FinderWorkspaceSection.standard.map(\.title) == ["Browser", "Bookmarks", "Transfers", "Links"])
+        precondition(!FinderWorkspaceSection.bookmarks.isPikPakManagement && FinderWorkspaceSection.cloudDownloads.isPikPakManagement)
+        navigation.showImmediately(FinderWorkspaceSection.bookmarks.rawValue)
+        precondition(navigation.section == 7, "Bookmarks is a valid destination while removed Tasks remains invalid")
         precondition(FinderWorkspaceSection.links.shortcut == 3)
         print("PASS tab loading: immediate small switches, early feedback, latest-click wins, cancelled/blocked switches, stale completion and closing")
         try DownloaderModel.testWorkspacePresentation()

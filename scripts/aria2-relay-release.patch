@@ -1,0 +1,805 @@
+--- a/src/BtBitfieldMessage.cc
++++ b/src/BtBitfieldMessage.cc
+@@ -100,6 +100,9 @@
+   bittorrent::createPeerMessageString(msg.data(), msgLength,
+                                       1 + bitfield_.size(), ID);
+   std::copy(std::begin(bitfield_), std::end(bitfield_), std::begin(msg) + 5);
++  if (getPieceStorage()) {
++    getPieceStorage()->maskUnavailablePieces(msg.data() + 5, bitfield_.size());
++  }
+   return msg;
+ }
+ 
+--- a/src/BtHaveAllMessage.cc
++++ b/src/BtHaveAllMessage.cc
+@@ -33,6 +33,7 @@
+  */
+ /* copyright --> */
+ #include "BtHaveAllMessage.h"
++#include "bittorrent_helper.h"
+ #include "DlAbortEx.h"
+ #include "Peer.h"
+ #include "fmt.h"
+@@ -49,6 +50,21 @@
+ BtHaveAllMessage::create(const unsigned char* data, size_t dataLength)
+ {
+   return ZeroBtMessage::create<BtHaveAllMessage>(data, dataLength);
++}
++
++std::vector<unsigned char> BtHaveAllMessage::createMessage()
++{
++  auto* ps = getPieceStorage();
++  if (ps && ps->hasReleasedFiles()) {
++    // HAVE_ALL may have been queued before a release. Send a masked bitfield.
++    const auto length = ps->getBitfieldLength();
++    std::vector<unsigned char> msg(5 + length);
++    bittorrent::createPeerMessageString(msg.data(), msg.size(), 1 + length, 5);
++    std::copy(ps->getBitfield(), ps->getBitfield() + length, msg.begin() + 5);
++    ps->maskUnavailablePieces(msg.data() + 5, length);
++    return msg;
++  }
++  return ZeroBtMessage::createMessage();
+ }
+ 
+ void BtHaveAllMessage::doReceivedAction()
+--- a/src/BtHaveAllMessage.h
++++ b/src/BtHaveAllMessage.h
+@@ -51,6 +51,7 @@
+                                                   size_t dataLength);
+ 
+   virtual void doReceivedAction() CXX11_OVERRIDE;
++  virtual std::vector<unsigned char> createMessage() CXX11_OVERRIDE;
+ };
+ 
+ } // namespace aria2
+--- a/src/BtHaveMessage.cc
++++ b/src/BtHaveMessage.cc
+@@ -50,6 +50,15 @@
+   return IndexBtMessage::create<BtHaveMessage>(data, dataLength);
+ }
+ 
++std::vector<unsigned char> BtHaveMessage::createMessage()
++{
++  if (getPieceStorage() && getPieceStorage()->hasReleasedFiles() &&
++      !getPieceStorage()->hasReadablePiece(getIndex())) {
++    return std::vector<unsigned char>(4, 0); // Replace a stale HAVE with keepalive.
++  }
++  return IndexBtMessage::createMessage();
++}
++
+ void BtHaveMessage::doReceivedAction()
+ {
+   if (isMetadataGetMode()) {
+--- a/src/BtHaveMessage.h
++++ b/src/BtHaveMessage.h
+@@ -51,6 +51,7 @@
+                                                size_t dataLength);
+ 
+   virtual void doReceivedAction() CXX11_OVERRIDE;
++  virtual std::vector<unsigned char> createMessage() CXX11_OVERRIDE;
+ };
+ 
+ } // namespace aria2
+--- a/src/BtPieceMessage.cc
++++ b/src/BtPieceMessage.cc
+@@ -203,6 +203,15 @@
+   if (isInvalidate()) {
+     return;
+   }
++  // Recheck queued requests: the relay may have released this piece since
++  // the request arrived. Never reopen missing data or abort the peer socket.
++  if (!getPieceStorage()->hasReadablePiece(index_)) {
++    if (getPeer()->isFastExtensionEnabled()) {
++      getBtMessageDispatcher()->addMessageToQueue(
++          getBtMessageFactory()->createRejectMessage(index_, begin_, blockLength_));
++    }
++    return;
++  }
+   A2_LOG_INFO(fmt(MSG_SEND_PEER_MESSAGE, getCuid(),
+                   getPeer()->getIPAddress().c_str(), getPeer()->getPort(),
+                   toString().c_str()));
+--- a/src/BtRequestMessage.cc
++++ b/src/BtRequestMessage.cc
+@@ -62,7 +62,7 @@
+   if (isMetadataGetMode()) {
+     return;
+   }
+-  if (getPieceStorage()->hasPiece(getIndex()) &&
++  if (getPieceStorage()->hasReadablePiece(getIndex()) &&
+       (!getPeer()->amChoking() ||
+        getPeer()->isInAmAllowedIndexSet(getIndex()))) {
+     getBtMessageDispatcher()->addMessageToQueue(
+--- a/src/DefaultPieceStorage.cc
++++ b/src/DefaultPieceStorage.cc
+@@ -538,6 +538,28 @@
+   return bitfieldMan_->isBitSet(index);
+ }
+ 
++bool DefaultPieceStorage::hasReadablePiece(size_t index)
++{
++  return hasPiece(index) && (!diskAdaptor_ || diskAdaptor_->canReadRange(
++      static_cast<int64_t>(index) * downloadContext_->getPieceLength(), getPieceLength(index)));
++}
++
++bool DefaultPieceStorage::hasReleasedFiles() const
++{
++  return diskAdaptor_ && diskAdaptor_->hasReleasedFiles();
++}
++
++void DefaultPieceStorage::maskUnavailablePieces(unsigned char* bits, size_t length)
++{
++  if (!hasReleasedFiles()) { return; }
++  const auto count = std::min(length * 8, downloadContext_->getNumPieces());
++  for (size_t index = 0; index < count; ++index) {
++    if ((bits[index / 8] & (0x80 >> (index % 8))) && !hasReadablePiece(index)) {
++      bits[index / 8] &= ~(0x80 >> (index % 8));
++    }
++  }
++}
++
+ bool DefaultPieceStorage::isPieceUsed(size_t index)
+ {
+   return bitfieldMan_->isUseBitSet(index);
+--- a/src/DefaultPieceStorage.h
++++ b/src/DefaultPieceStorage.h
+@@ -189,6 +189,9 @@
+                            cuid_t cuid) CXX11_OVERRIDE;
+ 
+   virtual bool hasPiece(size_t index) CXX11_OVERRIDE;
++  virtual bool hasReadablePiece(size_t index) CXX11_OVERRIDE;
++  virtual bool hasReleasedFiles() const CXX11_OVERRIDE;
++  virtual void maskUnavailablePieces(unsigned char* bits, size_t length) CXX11_OVERRIDE;
+ 
+   virtual bool isPieceUsed(size_t index) CXX11_OVERRIDE;
+ 
+--- a/src/DiskAdaptor.h
++++ b/src/DiskAdaptor.h
+@@ -68,6 +68,12 @@
+   virtual void openExistingFile() = 0;
+ 
+   virtual void initAndOpenFile() = 0;
++
++  // A relay may release verified, cloud-committed files in the event loop.
++  // Logical completion stays intact; released bytes must never be seeded.
++  virtual bool hasReleasedFiles() const { return false; }
++  virtual bool canReadRange(int64_t offset, size_t length) const { return true; }
++  virtual bool releaseFile(size_t index, const std::string& root) { return false; }
+ 
+   virtual bool fileExists() = 0;
+ 
+--- a/src/MultiDiskAdaptor.cc
++++ b/src/MultiDiskAdaptor.cc
+@@ -37,6 +37,9 @@
+ #include <cassert>
+ #include <algorithm>
+ #include <map>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ 
+ #include "DefaultDiskWriter.h"
+ #include "message.h"
+@@ -130,6 +133,7 @@
+ 
+ void MultiDiskAdaptor::resetDiskWriterEntries()
+ {
++  releasedFiles_ = false;
+   assert(openedDiskWriterEntries_.empty());
+   diskWriterEntries_.clear();
+   if (getFileEntries().empty()) {
+@@ -213,6 +217,7 @@
+ void MultiDiskAdaptor::openIfNot(DiskWriterEntry* entry,
+                                  void (DiskWriterEntry::*open)())
+ {
++  if (entry->isReleased()) { return; }
+   if (!entry->isOpen()) {
+     // A2_LOG_NOTICE(fmt("DiskWriterEntry: Cache MISS. offset=%s",
+     //        util::itos(entry->getFileEntry()->getOffset()).c_str()));
+@@ -334,6 +339,65 @@
+ }
+ } // namespace
+ 
++bool MultiDiskAdaptor::canReadRange(int64_t offset, size_t length) const
++{
++  if (!releasedFiles_ || length == 0) { return true; }
++  auto first = findFirstDiskWriterEntry(diskWriterEntries_, offset);
++  const auto end = offset + length;
++  for (auto i = first; i != diskWriterEntries_.end(); ++i) {
++    const auto& file = (*i)->getFileEntry();
++    if (file->getOffset() >= end) { break; }
++    if ((*i)->isReleased() && file->getLength() > 0) { return false; }
++  }
++  return true;
++}
++
++bool MultiDiskAdaptor::releaseFile(size_t index, const std::string& root)
++{
++  if (index >= diskWriterEntries_.size() || root.empty() || root[0] != '/') {
++    return false;
++  }
++  auto* entry = diskWriterEntries_[index].get();
++  if (entry->isReleased()) { return true; } // Idempotent after a lost RPC reply.
++  auto prefix = root.back() == '/' ? root : root + '/';
++  const auto& path = entry->getFilePath();
++  if (path.compare(0, prefix.size(), prefix) != 0) { return false; }
++  auto relative = path.substr(prefix.size());
++  // Anchor unlinkat to the owned directory; never follow a payload symlink.
++  auto parent = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
++  if (parent < 0) { return false; }
++  size_t from = 0;
++  std::string leaf;
++  while (true) {
++    const auto slash = relative.find('/', from);
++    leaf = relative.substr(from, slash == std::string::npos ? slash : slash - from);
++    if (leaf.empty() || leaf == "." || leaf == "..") { ::close(parent); return false; }
++    if (slash == std::string::npos) { break; }
++    auto next = ::openat(parent, leaf.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
++    ::close(parent);
++    if (next < 0) { return false; }
++    parent = next;
++    from = slash + 1;
++  }
++  struct stat st;
++  if (::fstatat(parent, leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode)) {
++    ::close(parent); return false;
++  }
++  // Close just this file, including mmap, so unlink actually returns its blocks.
++  auto opened = std::find(openedDiskWriterEntries_.begin(), openedDiskWriterEntries_.end(), entry);
++  if (opened != openedDiskWriterEntries_.end()) {
++    entry->closeFile();
++    openedDiskWriterEntries_.erase(opened);
++    if (getOpenedFileCounter()) { getOpenedFileCounter()->reduceNumOfOpenedFile(1); }
++  }
++  const auto removed = ::unlinkat(parent, leaf.c_str(), 0) == 0;
++  ::close(parent);
++  if (!removed) { return false; }
++  entry->setReleased();
++  releasedFiles_ = true;
++  return true;
++}
++
+ void MultiDiskAdaptor::writeData(const unsigned char* data, size_t len,
+                                  int64_t offset)
+ {
+@@ -342,13 +406,16 @@
+   int64_t fileOffset = offset - (*first)->getFileEntry()->getOffset();
+   for (auto i = first, eoi = diskWriterEntries_.cend(); i != eoi; ++i) {
+     ssize_t writeLength = calculateLength((*i).get(), fileOffset, rem);
+-    openIfNot((*i).get(), &DiskWriterEntry::openFile);
+-    if (!(*i)->isOpen()) {
+-      throwOnDiskWriterNotOpened((*i).get(), offset + (len - rem));
+-    }
+-
+-    (*i)->getDiskWriter()->writeData(data + (len - rem), writeLength,
+-                                     fileOffset);
++    // A late duplicate must not recreate a released file. Preserve any
++    // neighbouring bytes in the same write (e.g. a boundary piece).
++    if (!(*i)->isReleased()) {
++      openIfNot((*i).get(), &DiskWriterEntry::openFile);
++      if (!(*i)->isOpen()) {
++        throwOnDiskWriterNotOpened((*i).get(), offset + (len - rem));
++      }
++      (*i)->getDiskWriter()->writeData(data + (len - rem), writeLength,
++                                       fileOffset);
++    }
+     rem -= writeLength;
+     fileOffset = 0;
+     if (rem == 0) {
+--- a/src/MultiDiskAdaptor.h
++++ b/src/MultiDiskAdaptor.h
+@@ -48,6 +48,7 @@
+   std::shared_ptr<FileEntry> fileEntry_;
+   std::unique_ptr<DiskWriter> diskWriter_;
+   bool open_;
++  bool released_ = false;
+   bool needsFileAllocation_;
+   bool needsDiskWriter_;
+ 
+@@ -65,6 +66,8 @@
+   void closeFile();
+ 
+   bool isOpen() const { return open_; }
++  bool isReleased() const { return released_; }
++  void setReleased() { released_ = true; }
+ 
+   bool fileExists();
+ 
+@@ -102,6 +105,7 @@
+   std::vector<DiskWriterEntry*> openedDiskWriterEntries_;
+ 
+   bool readOnly_;
++  bool releasedFiles_ = false;
+ 
+   void resetDiskWriterEntries();
+ 
+@@ -123,6 +127,9 @@
+   virtual void openExistingFile() CXX11_OVERRIDE;
+ 
+   virtual void closeFile() CXX11_OVERRIDE;
++  virtual bool hasReleasedFiles() const CXX11_OVERRIDE { return releasedFiles_; }
++  virtual bool canReadRange(int64_t offset, size_t length) const CXX11_OVERRIDE;
++  virtual bool releaseFile(size_t index, const std::string& root) CXX11_OVERRIDE;
+ 
+   virtual void writeData(const unsigned char* data, size_t len,
+                          int64_t offset) CXX11_OVERRIDE;
+--- a/src/PieceStorage.h
++++ b/src/PieceStorage.h
+@@ -172,6 +172,9 @@
+    * Otherwise returns false.
+    */
+   virtual bool hasPiece(size_t index) = 0;
++  virtual bool hasReadablePiece(size_t index) { return hasPiece(index); }
++  virtual bool hasReleasedFiles() const { return false; }
++  virtual void maskUnavailablePieces(unsigned char* bits, size_t length) {}
+ 
+   virtual bool isPieceUsed(size_t index) = 0;
+ 
+--- a/src/RpcMethodFactory.cc
++++ b/src/RpcMethodFactory.cc
+@@ -78,6 +78,7 @@
+     "aria2.getOption",
+     "aria2.changeUri",
+     "aria2.changeOption",
++    "aria2.releaseFiles",
+     "aria2.getGlobalOption",
+     "aria2.changeGlobalOption",
+     "aria2.purgeDownloadResult",
+@@ -207,6 +208,10 @@
+     return make_unique<ChangeUriRpcMethod>();
+   }
+ 
++  if (methodName == ReleaseFilesRpcMethod::getMethodName()) {
++    return make_unique<ReleaseFilesRpcMethod>();
++  }
++
+   if (methodName == ChangeOptionRpcMethod::getMethodName()) {
+     return make_unique<ChangeOptionRpcMethod>();
+   }
+--- a/src/RpcMethodImpl.cc
++++ b/src/RpcMethodImpl.cc
+@@ -1106,6 +1106,72 @@
+   return createOKResponse();
+ }
+ 
++std::unique_ptr<ValueBase> ReleaseFilesRpcMethod::process(const RpcRequest& req,
++                                                         DownloadEngine* e)
++{
++  const auto gid = str2Gid(checkRequiredParam<String>(req, 0));
++  const auto indexes = checkRequiredParam<List>(req, 1);
++  const auto root = checkRequiredParam<String>(req, 2)->s();
++  auto released = List::g();
++  auto group = e->getRequestGroupMan()->findGroup(gid);
++  if (!group || indexes->size() > 128) { throw DL_ABORT_EX("Invalid relay release request"); }
++  const auto& dctx = group->getDownloadContext();
++  const auto& ps = group->getPieceStorage();
++  if (!dctx->hasAttribute(CTX_ATTR_BT) || !ps || !ps->getDiskAdaptor() ||
++      group->getOption()->get(PREF_DIR) != root ||
++      group->getOption()->get(PREF_BT_METADATA_ONLY) == A2_V_TRUE) {
++    throw DL_ABORT_EX("Relay release requires the active torrent's payload directory");
++  }
++  if (group->getState() != RequestGroup::STATE_ACTIVE || group->isHaltRequested() ||
++      group->isPauseRequested()) { return std::move(released); }
++  auto checking = [&group](const CheckIntegrityEntry& ent) {
++    return ent.getRequestGroup() == group.get();
++  };
++  if (e->getCheckIntegrityMan() && (e->getCheckIntegrityMan()->isPicked(checking) ||
++                                   e->getCheckIntegrityMan()->isQueued(checking))) {
++    return std::move(released);
++  }
++  const auto& files = dctx->getFileEntries();
++  std::vector<size_t> requested;
++  for (const auto& value : *indexes) {
++    const auto index = downcast<Integer>(value);
++    if (!index || index->i() < 1 || static_cast<uint64_t>(index->i()) > files.size()) {
++      throw DL_ABORT_EX("Invalid relay file index");
++    }
++    requested.push_back(index->i() - 1);
++  }
++  BitfieldMan bf(dctx->getPieceLength(), dctx->getTotalLength());
++  bf.setBitfield(ps->getBitfield(), ps->getBitfieldLength());
++  const int64_t piece = dctx->getPieceLength();
++  for (auto index : requested) {
++    const auto& file = files[index];
++    auto complete = [&bf](const std::shared_ptr<FileEntry>& f) {
++      return bf.getOffsetCompletedLength(f->getOffset(), f->getLength()) == f->getLength();
++    };
++    // An unselected cloud-committed file may be only a boundary stub after
++    // restart. Its requested neighbours below still protect every live write.
++    if (file->isRequested() && !complete(file)) { continue; }
++    bool safe = true;
++    if (file->getLength() > 0) {
++      const auto first = file->getOffset() / piece * piece;
++      const auto last = (file->getOffset() + file->getLength() - 1) / piece * piece + piece;
++      auto neighbor = std::lower_bound(files.begin(), files.end(), first,
++          [](const std::shared_ptr<FileEntry>& f, int64_t offset) {
++            return f->getOffset() + f->getLength() <= offset;
++          });
++      for (; neighbor != files.end() && (*neighbor)->getOffset() < last; ++neighbor) {
++        if ((*neighbor)->isRequested() && !complete(*neighbor)) { safe = false; break; }
++      }
++    }
++    // A completed bit is set only after its verified write cache is flushed.
++    // Keep logical completion and selection: no pause, recheck or peer reset.
++    if (safe && ps->getDiskAdaptor()->releaseFile(index, root)) {
++      released->append(Integer::g(index + 1));
++    }
++  }
++  return std::move(released);
++}
++
+ std::unique_ptr<ValueBase> ChangeOptionRpcMethod::process(const RpcRequest& req,
+                                                           DownloadEngine* e)
+ {
+--- a/src/RpcMethodImpl.h
++++ b/src/RpcMethodImpl.h
+@@ -408,6 +408,14 @@
+   static const char* getMethodName() { return "aria2.tellStopped"; }
+ };
+ 
++class ReleaseFilesRpcMethod : public RpcMethod {
++protected:
++  virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
++                                            DownloadEngine* e) CXX11_OVERRIDE;
++public:
++  static const char* getMethodName() { return "aria2.releaseFiles"; }
++};
++
+ class ChangeOptionRpcMethod : public RpcMethod {
+ protected:
+   virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
+--- a/src/DefaultBtProgressInfoFile.cc
++++ b/src/DefaultBtProgressInfoFile.cc
+@@ -37,8 +37,13 @@
+ #include <cstring>
+ #include <cstdio>
+ #include <array>
++#include <algorithm>
++#include <cerrno>
++#include <sys/stat.h>
+ 
+ #include "PieceStorage.h"
++#include "FileEntry.h"
++#include "MessageDigest.h"
+ #include "Piece.h"
+ #include "BitfieldMan.h"
+ #include "Option.h"
+@@ -164,8 +169,12 @@
+   uint32_t bitfieldLengthNL = htonl(pieceStorage_->getBitfieldLength());
+   WRITE_CHECK(fp, &bitfieldLengthNL, sizeof(bitfieldLengthNL));
+   // bitfield
+-  WRITE_CHECK(fp, pieceStorage_->getBitfield(),
+-              pieceStorage_->getBitfieldLength());
++  // Released relay files remain logically complete during this session, but
++  // their bytes must never be trusted after reopening the disk adaptor.
++  std::vector<unsigned char> readable(pieceStorage_->getBitfield(),
++      pieceStorage_->getBitfield() + pieceStorage_->getBitfieldLength());
++  pieceStorage_->maskUnavailablePieces(readable.data(), readable.size());
++  WRITE_CHECK(fp, readable.data(), readable.size());
+   // the number of in-flight piece: 32 bits
+   // TODO implement this
+   uint32_t numInFlightPieceNL = htonl(pieceStorage_->countInFlightPiece());
+@@ -185,6 +194,12 @@
+     WRITE_CHECK(fp, &bitfieldLengthNL, sizeof(bitfieldLengthNL));
+     WRITE_CHECK(fp, (*itr)->getBitfield(), (*itr)->getBitfieldLength());
+   }
++  // Optional trailer: stock aria2 can still read the normal control data.
++  // Missing/old/truncated trailers simply require the ordinary hash check.
++  if (!resumeDigest_.empty()) {
++    WRITE_CHECK(fp, "MCVR0001", 8);
++    WRITE_CHECK(fp, resumeDigest_.data(), resumeDigest_.size());
++  }
+   if (fp.close() == EOF) {
+     throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_WRITE, filename_.c_str()));
+   }
+@@ -192,6 +207,17 @@
+ 
+ void DefaultBtProgressInfoFile::save()
+ {
++  resumeDigest_.clear();
++#ifdef ENABLE_BITTORRENT
++  // RequestGroup disables control saves throughout integrity checking. Only
++  // cache a session that actually reached verified peer transfer, never one
++  // started with seed-unverified or unchecked legacy progress.
++  if (isTorrentDownload() && btRuntime_->ready() &&
++      option_->getAsBool(PREF_CHECK_INTEGRITY) &&
++      !option_->getAsBool(PREF_BT_SEED_UNVERIFIED)) {
++    resumeDigest_ = verifiedStateDigest();
++  }
++#endif
+   SHA1IOFile sha1io;
+ 
+   save(sha1io);
+@@ -201,8 +227,6 @@
+     // We don't write control file if the content is not changed.
+     return;
+   }
+-
+-  lastDigest_ = std::move(digest);
+ 
+   A2_LOG_INFO(fmt(MSG_SAVING_SEGMENT_FILE, filename_.c_str()));
+   std::string filenameTemp = filename_;
+@@ -221,6 +245,62 @@
+   if (!File(filenameTemp).renameTo(filename_)) {
+     throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_WRITE, filename_.c_str()));
+   }
++  lastDigest_ = std::move(digest);
++}
++
++std::string DefaultBtProgressInfoFile::verifiedStateDigest()
++{
++#ifdef ENABLE_BITTORRENT
++  if (!isTorrentDownload()) { return {}; }
++  auto digest = MessageDigest::create("sha-256");
++  auto number = [&digest](uint64_t value) {
++    auto encoded = hton64(value);
++    digest->update(&encoded, sizeof(encoded));
++  };
++  digest->update(bittorrent::getInfoHash(dctx_), INFO_HASH_LENGTH);
++  number(dctx_->getPieceLength());
++  number(dctx_->getTotalLength());
++  std::vector<unsigned char> readable(pieceStorage_->getBitfield(),
++      pieceStorage_->getBitfield() + pieceStorage_->getBitfieldLength());
++  pieceStorage_->maskUnavailablePieces(readable.data(), readable.size());
++  number(readable.size());
++  digest->update(readable.data(), readable.size());
++  std::vector<std::shared_ptr<Piece>> partial;
++  pieceStorage_->getInFlightPieces(partial);
++  std::sort(partial.begin(), partial.end(), [](const std::shared_ptr<Piece>& a,
++                                             const std::shared_ptr<Piece>& b) {
++    return a->getIndex() < b->getIndex();
++  });
++  number(partial.size());
++  for (const auto& piece : partial) {
++    number(piece->getIndex()); number(piece->getLength());
++    number(piece->getBitfieldLength());
++    digest->update(piece->getBitfield(), piece->getBitfieldLength());
++  }
++  number(dctx_->getFileEntries().size());
++  for (const auto& file : dctx_->getFileEntries()) {
++    const auto& path = file->getPath();
++    number(path.size()); digest->update(path.data(), path.size());
++    struct stat info;
++    if (::lstat(path.c_str(), &info) != 0) {
++      if (errno != ENOENT) { return {}; }
++      number(0); // Absent files have no verified bytes to preserve.
++      continue;
++    }
++    if (!S_ISREG(info.st_mode)) { return {}; }
++    number(1); number(info.st_dev); number(info.st_ino); number(info.st_size);
++#ifdef __APPLE__
++    number(info.st_mtimespec.tv_sec); number(info.st_mtimespec.tv_nsec);
++    number(info.st_ctimespec.tv_sec); number(info.st_ctimespec.tv_nsec);
++#else
++    number(info.st_mtim.tv_sec); number(info.st_mtim.tv_nsec);
++    number(info.st_ctim.tv_sec); number(info.st_ctim.tv_nsec);
++#endif
++  }
++  return digest->digest();
++#else
++  return {};
++#endif
+ }
+ 
+ #define READ_CHECK(fp, ptr, count)                                             \
+@@ -233,6 +313,7 @@
+ // 2) network byte order if version == 0001
+ void DefaultBtProgressInfoFile::load()
+ {
++  verifiedResume_ = false;
+   A2_LOG_INFO(fmt(MSG_LOADING_SEGMENT_FILE, filename_.c_str()));
+   BufferedFile fp(filename_.c_str(), BufferedFile::READ);
+   if (!fp) {
+@@ -399,6 +480,17 @@
+     util::convertBitfield(&dest, &src);
+     pieceStorage_->setBitfield(dest.getBitfield(), dest.getBitfieldLength());
+   }
++  if (isTorrentDownload() && pieceLength == static_cast<uint32_t>(dctx_->getPieceLength())) {
++    char magic[8];
++    std::array<char, 32> saved;
++    if (fp.read(magic, sizeof(magic)) == sizeof(magic) &&
++        memcmp(magic, "MCVR0001", sizeof(magic)) == 0 &&
++        fp.read(saved.data(), saved.size()) == saved.size()) {
++      auto current = verifiedStateDigest();
++      verifiedResume_ = current.size() == saved.size() &&
++                        memcmp(current.data(), saved.data(), saved.size()) == 0;
++    }
++  }
+   A2_LOG_INFO(MSG_LOADED_SEGMENT_FILE);
+ }
+ 
+--- a/src/DefaultBtProgressInfoFile.h
++++ b/src/DefaultBtProgressInfoFile.h
+@@ -62,9 +62,12 @@
+   // is empty string.  This is used to avoid to write same content
+   // repeatedly, which could wake up disk that may be sleeping.
+   std::string lastDigest_;
++  std::string resumeDigest_;
++  bool verifiedResume_ = false;
+ 
+   bool isTorrentDownload();
+   void save(IOFile& fp);
++  std::string verifiedStateDigest();
+ 
+ public:
+   DefaultBtProgressInfoFile(const std::shared_ptr<DownloadContext>& btContext,
+@@ -80,6 +83,7 @@
+   virtual void save() CXX11_OVERRIDE;
+ 
+   virtual void load() CXX11_OVERRIDE;
++  bool hasVerifiedResume() const { return verifiedResume_; }
+ 
+   virtual void removeFile() CXX11_OVERRIDE;
+ 
+--- a/src/RequestGroup.cc
++++ b/src/RequestGroup.cc
+@@ -449,6 +449,19 @@
+     progressInfoFile_ = progressInfoFile;
+ 
+     auto entry = make_unique<BtCheckIntegrityEntry>(this);
++    // Keep check-integrity enabled as the fallback. An explicit hash-only
++    // request always reads the payload, even if its metadata is unchanged.
++    if (progressInfoFile->hasVerifiedResume() &&
++        !option_->getAsBool(PREF_HASH_CHECK_ONLY)) {
++      A2_LOG_INFO("Reusing verified torrent resume data (unchanged files).");
++      if (pieceStorage_->downloadFinished()) {
++        entry->onDownloadFinished(commands, e);
++      }
++      else {
++        entry->onDownloadIncomplete(commands, e);
++      }
++      return;
++    }
+     // --bt-seed-unverified=true is given and download has completed, skip
+     // validation for piece hashes.
+     if (option_->getAsBool(PREF_BT_SEED_UNVERIFIED) &&
+--- a/src/Peer.h
++++ b/src/Peer.h
+@@ -74,6 +74,9 @@
+ 
+   bool seeder_;
+ 
++  // Per-connection state; a remembered peer ID can outlive a connection.
++  bool handshakeCompleted_;
++
+   std::unique_ptr<PeerSessionResource> res_;
+ 
+   // If true, port is assumed not to be a listening port.
+@@ -115,6 +118,8 @@
+   void setPeerId(const unsigned char* peerId);
+ 
+   const unsigned char* getPeerId() const { return peerId_; }
++
++  bool isHandshakeCompleted() const { return handshakeCompleted_; }
+ 
+   bool isSeeder() const { return seeder_; }
+ 
+--- a/src/Peer.cc
++++ b/src/Peer.cc
+@@ -53,6 +53,7 @@
+       firstContactTime_(global::wallclock()),
+       dropStartTime_(Timer::zero()),
+       seeder_(false),
++      handshakeCompleted_(false),
+       incoming_(incoming),
+       localPeer_(false),
+       disconnectedGracefully_(false)
+@@ -66,6 +67,7 @@
+ 
+ void Peer::allocateSessionResource(int32_t pieceLength, int64_t totalLength)
+ {
++  handshakeCompleted_ = false;
+   res_ = make_unique<PeerSessionResource>(pieceLength, totalLength);
+   res_->getNetStat().downloadStart();
+   updateSeeder();
+@@ -77,11 +79,16 @@
+   res_->reconfigure(pieceLength, totalLength);
+ }
+ 
+-void Peer::releaseSessionResource() { res_.reset(); }
++void Peer::releaseSessionResource()
++{
++  handshakeCompleted_ = false;
++  res_.reset();
++}
+ 
+ void Peer::setPeerId(const unsigned char* peerId)
+ {
+   memcpy(peerId_, peerId, PEER_ID_LENGTH);
++  handshakeCompleted_ = true;
+ }
+ 
+ bool Peer::amChoking() const
+--- a/src/RpcMethodImpl.cc
++++ b/src/RpcMethodImpl.cc
+@@ -762,6 +762,8 @@
+     auto peerEntry = Dict::g();
+     peerEntry->put(KEY_PEER_ID, util::torrentPercentEncode(peer->getPeerId(),
+                                                            PEER_ID_LENGTH));
++    peerEntry->put("handshakeCompleted",
++                   peer->isHandshakeCompleted() ? VLB_TRUE : VLB_FALSE);
+     peerEntry->put(KEY_IP, peer->getIPAddress());
+     if (peer->isIncomingPeer()) {
+       peerEntry->put(KEY_PORT, VLB_ZERO);
+--- a/src/RpcMethodFactory.cc
++++ b/src/RpcMethodFactory.cc
+@@ -55,6 +55,7 @@
+ #ifdef ENABLE_BITTORRENT
+     "aria2.addTorrent",
+     "aria2.getPeers",
++    "aria2.addPeers",
+ #endif // ENABLE_BITTORRENT
+ #ifdef ENABLE_METALINK
+     "aria2.addMetalink",
+@@ -127,6 +128,10 @@
+   if (methodName == GetPeersRpcMethod::getMethodName()) {
+     return make_unique<GetPeersRpcMethod>();
+   }
++
++  if (methodName == AddPeersRpcMethod::getMethodName()) {
++    return make_unique<AddPeersRpcMethod>();
++  }
+ #endif // ENABLE_BITTORRENT
+ 
+ #ifdef ENABLE_METALINK
+--- a/src/RpcMethodImpl.h
++++ b/src/RpcMethodImpl.h
+@@ -267,6 +267,14 @@
+ };
+ 
+ #ifdef ENABLE_BITTORRENT
++class AddPeersRpcMethod : public RpcMethod {
++protected:
++  virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
++                                            DownloadEngine* e) CXX11_OVERRIDE;
++public:
++  static const char* getMethodName() { return "aria2.addPeers"; }
++};
++
+ class GetPeersRpcMethod : public RpcMethod {
+ protected:
+   virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
+--- a/src/RpcMethodImpl.cc
++++ b/src/RpcMethodImpl.cc
+@@ -974,6 +974,42 @@
+ }
+ 
+ #ifdef ENABLE_BITTORRENT
++std::unique_ptr<ValueBase> AddPeersRpcMethod::process(const RpcRequest& req,
++                                                    DownloadEngine* e)
++{
++  const auto gid = str2Gid(checkRequiredParam<String>(req, 0));
++  const auto entries = checkRequiredParam<List>(req, 1);
++  auto group = e->getRequestGroupMan()->findGroup(gid);
++  if (!group || entries->size() > 64 ||
++      group->getState() != RequestGroup::STATE_ACTIVE ||
++      group->isPauseRequested() || group->isHaltRequested()) {
++    throw DL_ABORT_EX("Peer hints require an active torrent and at most 64 peers");
++  }
++  auto btObject = e->getBtRegistry()->get(gid);
++  if (!btObject || !btObject->peerStorage) {
++    throw DL_ABORT_EX("The torrent is not ready for peer hints");
++  }
++  // Validate the complete request before adding anything. Numeric endpoints
++  // only: this authenticated method must not resolve names from a stale cache.
++  std::vector<std::shared_ptr<Peer>> peers;
++  for (const auto& value : *entries) {
++    const auto entry = downcast<Dict>(value);
++    const auto host = entry ? downcast<String>(entry->get("ip")) : nullptr;
++    const auto port = entry ? downcast<Integer>(entry->get("port")) : nullptr;
++    if (!host || host->s().size() > 45 || !util::isNumericHost(host->s()) ||
++        !port || port->i() < 1 || port->i() > 65535) {
++      throw DL_ABORT_EX("Invalid cached peer endpoint");
++    }
++    peers.push_back(std::make_shared<Peer>(host->s(), static_cast<uint16_t>(port->i())));
++  }
++  int64_t added = 0;
++  for (const auto& peer : peers) {
++    if (btObject->peerStorage->addPeer(peer)) { ++added; }
++  }
++  e->setRefreshInterval(std::chrono::milliseconds(0));
++  return Integer::g(added);
++}
++
+ std::unique_ptr<ValueBase> GetPeersRpcMethod::process(const RpcRequest& req,
+                                                       DownloadEngine* e)
+ {

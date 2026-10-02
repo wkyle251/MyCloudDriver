@@ -8,15 +8,16 @@ struct CloudDriveActivityRecord: Identifiable {
     let title: String
     var progress: CloudDriveProgress
     var state = "Running"
-    var active: Bool { state == "Running" || state == "Stopping" }
+    var transferDirection: Int? = nil
+    var active: Bool { state == "Running" || state == "Stopping" || state == "Paused" || state == "Retrying" || state == "Queued" }
 }
 
 @MainActor final class CloudDriveActivityStore: ObservableObject {
     @Published var records: [CloudDriveActivityRecord] = []
     var active: [CloudDriveActivityRecord] { records.filter(\.active) }
     var latest: CloudDriveActivityRecord? { active.last ?? records.last }
-    func begin(_ title: String) -> UUID {
-        let id = UUID(); records.append(.init(id: id, title: title, progress: .init(message: title)))
+    func begin(_ title: String, transferDirection: Int? = nil) -> UUID {
+        let id = UUID(); records.append(.init(id: id, title: title, progress: .init(message: title), transferDirection: transferDirection))
         if records.count > 200 { records.removeAll { !$0.active && $0.id != id } }
         return id
     }
@@ -31,68 +32,202 @@ struct CloudDriveActivityRecord: Identifiable {
     }
 }
 
+@MainActor private final class NativeExportCheckpoint { var ids = Set<String>() }
+
 @MainActor final class NativeDriveModel: ObservableObject {
     let kind: CloudDriveKind
     let activity = CloudDriveActivityStore()
+    let tree = NativeDriveTree()
+    let mediaPreview: NativeMediaPreviewModel
     let similarity = FileSimilarityCoordinator(activity: FinderTaskActivityStore())
     @Published private(set) var provider: (any NativeCloudDrive)?
     @Published private(set) var history: [CloudDriveLocation] = []
     @Published private(set) var items: [CloudDriveItem] = []
-    @Published var selection: Set<String> = []
+    @Published var selection: Set<String> = [] {
+        didSet {
+            selectedItemsCache = nil
+            if let remembered = collapsedFolderFocus, selection != [remembered.folderID.itemID] {
+                collapsedFolderFocus = nil
+            }
+        }
+    }
     @Published var query = ""
     @Published var section = 0
-    @Published var viewMode = 0
+    @Published var viewMode = 0 { didSet { if oldValue != viewMode { collapsedFolderFocus = nil; invalidateRowCaches(); reconcileSelection() } } }
+    @Published var fileTypeFilter: BrowserFileFilter = .all {
+        didSet {
+            guard oldValue != fileTypeFilter else { return }
+            collapsedFolderFocus = nil
+            invalidateRowCaches()
+            let previousSelection = selection
+            reconcileSelection()
+            if previousSelection != selection { closePreview(); mediaPreview.clear() }
+        }
+    }
     @Published var zoom = 1.0
     @Published private(set) var isLoading = false
     @Published private(set) var isMutating = false
     @Published private(set) var total = 0
     @Published private(set) var nextOffset: Int?
+    @Published private(set) var lastExportDestination: URL?
     @Published var error: String?
+    @Published private(set) var bookmarkRevealedItemID: String?
     @Published private(set) var undoStack: [CloudDriveUndo] = []
     @Published private(set) var redoStack: [CloudDriveUndo] = []
     var location: CloudDriveLocation { history.last ?? .init(id: "", title: kind.title) }
-    var selectedItems: [CloudDriveItem] { items.filter { selection.contains($0.id) } }
-    var isConnected: Bool { provider != nil }
+    /// The toolbar, menus, inspector and window actions each ask on every
+    /// render; derive it once per change of rows or selection.
+    var selectedItems: [CloudDriveItem] {
+        if let selectedItemsCache { return selectedItemsCache }
+        let items = contextSelection(selection)
+        selectedItemsCache = items
+        return items
+    }
+    private var filteredRowsCache: [NativeDriveRow]?
+    private var selectedItemsCache: [CloudDriveItem]?
+    private var fileExtensionsCache: [String]?
+    private func invalidateRowCaches() {
+        filteredRowsCache = nil; selectedItemsCache = nil; fileExtensionsCache = nil
+    }
+    /// Same answer as `visibleRows.contains { $0.id == id }` without scanning.
+    private func isVisibleRow(_ id: NativeDriveRowID) -> Bool {
+        guard let row = tree.rowByID[id], viewMode == 0 || id.path.count == 1 else { return false }
+        return !fileTypeFilter.isActive || fileTypeFilter.matches(row.item)
+    }
+    var visibleRows: [NativeDriveRow] {
+        let rows = viewMode == 0 ? tree.rows : tree.rootRows
+        guard fileTypeFilter.isActive else { return rows }
+        if let filteredRowsCache { return filteredRowsCache }
+        let filtered = rows.filter { fileTypeFilter.matches($0.item) }
+        filteredRowsCache = filtered
+        return filtered
+    }
+    var visibleFileCount: Int { visibleRows.lazy.filter { !$0.item.isFolder }.count }
+    var availableFileExtensions: [String] {
+        if let fileExtensionsCache { return fileExtensionsCache }
+        let rows = viewMode == 0 ? tree.rows : tree.rootRows
+        let extensions = Array(Set(rows.filter { !$0.item.isFolder }.map { BrowserFileFilter.extensionOf($0.item.name) })).sorted()
+        fileExtensionsCache = extensions
+        return extensions
+    }
+    @Published private(set) var availabilityMessage: String?
+    var isConnected: Bool { provider != nil && availabilityMessage == nil }
+    private var volumeObservers: [NSObjectProtocol] = []
     var isBusy: Bool { isMutating || !jobs.isEmpty || similarity.local.isRunning }
     var scanConfiguration: (() throws -> SimilarityConfiguration)?
     var onSendToPikPak: (([URL]) -> Void)?
     private var loadTask: Task<Void, Never>?
     private var loadID = UUID()
     private var jobs: [UUID: Task<Void, Never>] = [:]
+    private var transferControls: [UUID: NativeTransferControl] = [:]
+    private enum TransferPhase { case waiting, running, retrying }
+    private var transferPhases: [UUID: TransferPhase] = [:]
+    private var transferPermits: [UUID: UUID] = [:]
+    private var transferPermitReleases: [UUID: Task<Void, Never>] = [:]
+    private var transferResumeTasks: [UUID: Task<Void, Never>] = [:]
+    private var transferResumeGenerations: [UUID: UUID] = [:]
+    private let transferAdmission: NativeTransferAdmission
     private let quickLook = QuickLookPreviewCoordinator()
     private var previewTask: Task<Void, Never>?
     private var previewID = UUID()
     private var scanItemsByPath: [String: CloudDriveItem] = [:]
     private var scanItemsByID: [String: CloudDriveItem] = [:]
+    private var similarityProvider: (any NativeCloudDrive)?
+    private var similarityScopeProvider: (any NativeCloudDrive)?
     private var preparationIssues: [SimilarityIssue] = []
     private var scanDirectory: URL?
+    private var pendingSimilarityRevealID: String?
     private var previewCache: [String: URL] = [:]
     private var previewOrder: [String] = []
     private var openCache: [String: URL] = [:]
     private var sortMode = 0
-    private var selectionAnchor: String?
+    private var sortRequest = UUID()
+    @Published private(set) var browserSortColumn: BrowserSortColumn = .name
+    @Published private(set) var browserSortDirection: BrowserSortDirection = .ascending
+    private var selectionAnchor: NativeDriveRowID?
+    @Published private var selectionCursor: NativeDriveRowID?
+    private var collapsedFolderFocus: (folderID: NativeDriveRowID, itemID: NativeDriveRowID, reopening: Bool)?
+    var gridColumnCount = 1
+    var focusedRowID: NativeDriveRowID? {
+        if let selectionCursor, selection.contains(selectionCursor.itemID),
+           isVisibleRow(selectionCursor) { return selectionCursor }
+        return visibleRows.first { selection.contains($0.item.id) }?.id
+    }
+    var focusedItemID: String? { focusedRowID?.itemID }
+    var focusedItem: CloudDriveItem? { focusedRowID.flatMap { tree.rowByID[$0]?.item } }
     private let temporaryRoot: URL
 
-    init(kind: CloudDriveKind, temporaryRoot: URL? = nil) {
+    init(kind: CloudDriveKind, temporaryRoot: URL? = nil, playbackSettings: MediaPlaybackSettings? = nil,
+         transferAdmission: NativeTransferAdmission = .shared) {
         self.kind = kind
+        self.transferAdmission = transferAdmission
+        mediaPreview = NativeMediaPreviewModel(settings: playbackSettings ?? MediaPlaybackSettings())
         self.temporaryRoot = temporaryRoot ?? FileManager.default.temporaryDirectory
             .appendingPathComponent("MyCloudDriver-\(kind.rawValue)-\(UUID().uuidString)", isDirectory: true)
+        tree.onChange = { [weak self] in
+            self?.invalidateRowCaches()
+            self?.objectWillChange.send(); self?.reconcileSelection()
+            self?.restoreCollapsedFolderFocus()
+        }
         similarity.externalTitle = kind.title; similarity.externalSymbol = kind.symbol
         similarity.source = .local; similarity.local.externalTitle = kind.title
+        if kind == .local {
+            similarity.chooseFolderScope = { [weak self] in self?.chooseSimilarityFolder() }
+        } else {
+            similarity.scopePickerButtonTitle = kind == .photos ? "Choose Album or Library…" : "Choose Folder…"
+            similarity.chooseFolderScope = { [weak self] in self?.chooseSimilarityDriveFolder() }
+        }
         similarity.local.onRunningChanged = { [weak self] in self?.objectWillChange.send() }
+        similarity.local.onSessionReset = { [weak self] in
+            guard let self else { return }
+            self.scanItemsByPath = [:]; self.scanItemsByID = [:]; self.preparationIssues = []
+            self.similarityProvider = nil
+            self.similarityScopeProvider = nil
+            if let directory = self.scanDirectory { try? FileManager.default.removeItem(at: directory) }
+            self.scanDirectory = nil
+        }
         similarity.configuration = { [weak self] _ in
             guard let self, let configuration = self.scanConfiguration else { throw CocoaError(.fileNoSuchFile) }
             return try configuration()
         }
+        similarity.restoreNativeScope = { [weak self] scope in
+            guard let self, scope.drive == self.kind else { throw CloudDriveError.message("Open the original drive to resume this scan.") }
+            let restored: any NativeCloudDrive
+            if self.kind == .local, let url=scope.providerRoot.url {
+                var stale=false
+                let restoredURL=scope.bookmark.flatMap { try? URL(resolvingBookmarkData:$0,options:.withSecurityScope,relativeTo:nil,bookmarkDataIsStale:&stale) } ?? url
+                restored=ICloudDriveProvider(rootURL:restoredURL,kind:.local)
+            } else {
+                guard let provider=self.provider, provider.kind == scope.drive else { throw CloudDriveError.message("Connect this drive, then resume the saved scan.") }
+                restored=provider
+            }
+            self.configureSimilarity(scope.selection,provider:restored,location:scope.location,exactOnly:false,presentWindow:false,photosUsePreviews:scope.photosUsePreviews ?? false)
+        }
         similarity.openExternalFile = { [weak self] file in
-            guard let self, let item = self.scanItemsByID[file.id] else { return }
-            self.open(item)
+            guard let self else { return }
+            self.open(self.similarityItem(file), using: self.similarityProvider)
+        }
+        similarity.moveToTrash = { [weak self] file in
+            guard let self else { throw CancellationError() }
+            try await self.trashSimilarityFile(file)
+        }
+        similarity.keepSmallest = { [weak self] plan in
+            guard let self else { throw CancellationError() }
+            return try await self.keepSmallestSimilarityFiles(plan)
         }
         similarity.preparePreview = { [weak self] file, directory in
-            guard let self, let provider = self.provider, let item = self.scanItemsByID[file.id] else {
+            guard let self, let provider = self.similarityProvider ?? self.provider else {
                 throw CloudDriveError.message("This item is no longer available in the connected drive.")
             }
-            return try await provider.materialize(item, directory: directory, progress: { _ in })
+            return try await provider.materialize(self.similarityItem(file), directory: directory, progress: { _ in })
+        }
+        if kind != .photos {
+            let center = NSWorkspace.shared.notificationCenter
+            for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification, NSWorkspace.didRenameVolumeNotification] {
+                volumeObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    Task { @MainActor in self?.refreshAvailability() }
+                })
+            }
         }
         quickLook.onClose = { [weak self] in self?.closePreview() }
         quickLook.onMove = { [weak self] offset in self?.movePreview(offset) }
@@ -100,103 +235,456 @@ struct CloudDriveActivityRecord: Identifiable {
     }
     func connect(_ provider: any NativeCloudDrive) {
         guard !isBusy else { error = "Finish or cancel this drive’s active work before reconnecting."; return }
-        closePreview(); self.provider = provider; history = [provider.root]; query = ""; undoStack = []; redoStack = []
+        similarity.local.detachPausedForRecovery()
+        closePreview(); mediaPreview.clear(); self.provider = provider; history = [provider.root]; query = ""; undoStack = []; redoStack = []
+        fileTypeFilter = .all
         items = []; selection = []; total = 0; nextOffset = nil
-        similarity.local.clearAccount(); similarity.local.localURLs = []; similarity.local.externalScopeNames = []
+        tree.reset(provider: provider); selectionAnchor = nil; selectionCursor = nil
         scanItemsByPath = [:]; scanItemsByID = [:]
-        reload()
+        refreshAvailability(reloadWhenAvailable: false)
+        if isConnected { reload() }
     }
+
+    func refreshAvailability(reloadWhenAvailable: Bool = true) {
+        guard let disk = provider as? ICloudDriveProvider else { availabilityMessage = nil; return }
+        let previous = availabilityMessage
+        do { try disk.validateAccess(); availabilityMessage = nil }
+        catch { availabilityMessage = error.localizedDescription }
+        if availabilityMessage != nil {
+            loadTask?.cancel(); loadTask = nil; loadID = UUID(); isLoading = false
+            closePreview(); mediaPreview.clear(); items = []; selection = []; total = 0; nextOffset = nil
+            tree.reset(provider: provider); selectionAnchor = nil; selectionCursor = nil
+        } else if previous != nil && reloadWhenAvailable { reload() }
+    }
+
+    func sendToPikPak(_ items: [CloudDriveItem]) {
+        guard kind == .local, let disk = provider as? ICloudDriveProvider, let onSendToPikPak else { return }
+        do { onSendToPikPak(try disk.uploadSources(operationItems(items))) }
+        catch { self.error = error.localizedDescription; refreshAvailability() }
+    }
+
+    private func similarityItem(_ file: SimilarityFile) -> CloudDriveItem {
+        if let item = scanItemsByID[file.id] { return item }
+        let path = file.localPath ?? (file.path.hasPrefix("/") ? file.path : nil)
+        return CloudDriveItem(id:file.id,name:file.name,isFolder:false,bytes:file.bytes,
+            url:kind == .photos ? nil : path.map { URL(fileURLWithPath:$0) },
+            mediaType:file.family,canRename:kind != .photos)
+    }
+
     func disconnect() {
         guard !isBusy else { error = "Finish or cancel this drive’s active work before disconnecting."; return }
-        loadTask?.cancel(); closePreview(); provider = nil; history = []; items = []; selection = []
+        similarity.local.detachPausedForRecovery()
+        loadTask?.cancel(); loadTask = nil; loadID = UUID(); isLoading = false
+        closePreview(); mediaPreview.clear(); availabilityMessage = nil; provider = nil; history = []; items = []; selection = []; query = ""
+        tree.reset(provider: nil)
+        selectionAnchor = nil; selectionCursor = nil; error = nil
         total = 0; nextOffset = nil; undoStack = []; redoStack = []
-        similarity.local.clearAccount(); similarity.local.localURLs = []; similarity.local.externalScopeNames = []
         scanItemsByPath = [:]; scanItemsByID = [:]
     }
     func reload(append: Bool = false) {
-        guard let provider else { return }
+        refreshAvailability(reloadWhenAvailable: false)
+        guard isConnected, let provider else { return }
         loadTask?.cancel(); let id = UUID(); loadID = id
         let location = location, query = query, offset = append ? nextOffset ?? 0 : 0
+        if tree.search != query { items = []; tree.reset(provider: provider, search: query) }
         isLoading = true; error = nil
         loadTask = Task { [weak self] in
             do {
                 if !query.isEmpty { try await Task.sleep(nanoseconds: 180_000_000) }
-                let page = try await provider.list(location, offset: offset, search: query)
+                let page = try await AutomaticRecovery.read(onRetry: { [weak self] failure, delay in
+                    guard self?.loadID == id else { return }
+                    self?.error = "Retrying in \(Int(delay))s. \(failure.localizedDescription)"
+                }) { try await provider.list(location, offset: offset, search: query) }
                 try Task.checkCancellation()
                 guard let self, self.loadID == id else { return }
-                if append {
-                    let existing = Set(self.items.map(\.id)); self.items.append(contentsOf: page.items.filter { !existing.contains($0.id) })
-                } else { self.items = page.items }
-                if self.sortMode != 0 { self.sort(by: self.sortMode) }
-                self.selection.formIntersection(Set(self.items.map(\.id)))
-                self.total = page.total; self.nextOffset = page.nextOffset; self.isLoading = false
+                var seen = Set<String>()
+                let merged = ((append ? self.items : []) + page.items).filter { seen.insert($0.id).inserted }
+                while true {
+                    let mode = self.sortMode, direction = self.browserSortDirection
+                    let sorted = await Task.detached(priority: .userInitiated) { NativeDriveTree.sorted(merged, by: mode, direction: direction) }.value
+                    try Task.checkCancellation()
+                    guard self.loadID == id else { return }
+                    if mode != self.sortMode || direction != self.browserSortDirection { continue }
+                    self.sortRequest = UUID(); self.items = sorted
+                    self.tree.replaceRoots(sorted, refreshChildren: !append)
+                    break
+                }
+                self.total = page.total; self.nextOffset = page.nextOffset; self.isLoading = false; self.error = nil
+                if let target = self.pendingSimilarityRevealID {
+                    if let row = self.visibleRows.first(where: { $0.item.id == target }) {
+                        self.pendingSimilarityRevealID = nil
+                        self.select(row, extending: false, toggling: false, requestsPreview: self.bookmarkRevealedItemID != target)
+                    } else if page.nextOffset != nil { self.reload(append: true) }
+                    else { self.pendingSimilarityRevealID = nil; self.error = "This file is no longer in its original folder." }
+                }
             } catch {
                 guard let self, self.loadID == id, !Task.isCancelled else { return }
                 self.error = error.localizedDescription; self.isLoading = false
             }
         }
     }
-    func enter(_ item: CloudDriveItem) {
+    func enter(_ item: CloudDriveItem, rowID: NativeDriveRowID? = nil) {
         guard item.isFolder else { open(item); return }
-        closePreview(); history.append(item.location); selection = []; query = ""; items = []; reload()
+        let rowID = rowID ?? visibleRows.first(where: { $0.item.id == item.id })?.id
+        if let rowID {
+            // Opening an indented folder keeps its ancestors in the breadcrumb.
+            for count in 1..<rowID.path.count {
+                if let ancestor = tree.rowByID[.init(path: Array(rowID.path.prefix(count)))] {
+                    history.append(ancestor.item.location)
+                }
+            }
+        }
+        history.append(item.location); resetLocation()
     }
-    func back() { guard history.count > 1 else { return }; closePreview(); history.removeLast(); query = ""; items = []; selection = []; reload() }
-    func root() { guard let root = provider?.root else { return }; history = [root]; query = ""; items = []; selection = []; reload() }
-    func contextSelection(_ ids: Set<String>) -> [CloudDriveItem] { items.filter { ids.contains($0.id) } }
+    func back() { guard history.count > 1 else { return }; history.removeLast(); resetLocation() }
+    func navigate(to location: CloudDriveLocation) {
+        guard let index = history.firstIndex(of: location) else { return }
+        history = Array(history.prefix(index + 1)); resetLocation()
+    }
+    func root() { guard let root = provider?.root else { return }; history = [root]; resetLocation() }
+
+    @discardableResult
+    func openBookmark(_ bookmark: FinderBookmark, store requestedStore: FinderBookmarkStore? = nil) -> Bool {
+        guard let provider, isConnected, !isMutating, bookmark.provider == kind.rawValue,
+              bookmark.scope == bookmarkScope else { return false }
+        let store = requestedStore ?? .shared
+        do {
+            var targetID = bookmark.itemID
+            if kind == .local || kind == .icloud {
+                var stale = false
+                let resolved = bookmark.fileBookmark.flatMap {
+                    try? URL(resolvingBookmarkData: $0, options: [.withoutUI, .withoutMounting], bookmarkDataIsStale: &stale)
+                } ?? bookmark.url
+                guard let resolved, let root = provider.root.url else { throw CloudDriveError.message("This bookmark has no folder location.") }
+                let url = resolved.standardizedFileURL.resolvingSymlinksInPath()
+                let prefix = root.path == "/" ? "/" : root.path + "/"
+                guard url == root || url.path.hasPrefix(prefix) else { throw CloudDriveError.message("This bookmarked item has moved outside the connected folder. Connect its new folder to open it.") }
+                var isDirectory = ObjCBool(false)
+                guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue == bookmark.isFolder else {
+                    throw CloudDriveError.message("This bookmarked item is no longer available. Reconnect its disk or remove it from Bookmarks.")
+                }
+                let folder = bookmark.isFolder ? url : url.deletingLastPathComponent()
+                let suffix = folder == root ? "" : String(folder.path.dropFirst(prefix.count))
+                var route = [provider.root], cursor = root
+                for component in suffix.split(separator: "/") {
+                    cursor.appendPathComponent(String(component), isDirectory: true)
+                    route.append(.init(id: cursor.absoluteString, title: String(component), url: cursor))
+                }
+                history = route
+                targetID = url.absoluteString
+                if url != bookmark.url || stale {
+                    let updated = FinderBookmark(provider: bookmark.provider, scope: bookmark.scope, itemID: targetID,
+                        name: url.lastPathComponent, isFolder: bookmark.isFolder,
+                        parents: (bookmark.isFolder ? Array(route.dropLast()) : route).map { .init(id: $0.id, name: $0.title, path: $0.url?.path ?? $0.title, url: $0.url) },
+                        url: url, fileBookmark: try? url.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil), addedAt: bookmark.addedAt)
+                    store.remove(bookmark); store.add(updated)
+                }
+            } else {
+                history = [provider.root] + bookmark.parents.filter { $0.id != provider.root.id }.map {
+                    .init(id: $0.id, title: $0.name, url: $0.url)
+                }
+                if bookmark.isFolder { history.append(.init(id: bookmark.itemID, title: bookmark.name)) }
+            }
+            fileTypeFilter = .all
+            resetLocation()
+            mediaPreview.clear()
+            if !bookmark.isFolder { pendingSimilarityRevealID = targetID; bookmarkRevealedItemID = targetID }
+            return true
+        } catch { self.error = error.localizedDescription; return false }
+    }
+    private func resetLocation() {
+        bookmarkRevealedItemID = nil
+        collapsedFolderFocus = nil
+        pendingSimilarityRevealID = nil
+        closePreview(); query = ""; items = []; selection = []; selectionAnchor = nil; selectionCursor = nil
+        tree.reset(provider: provider); reload()
+    }
+    func contextSelection(_ ids: Set<String>) -> [CloudDriveItem] {
+        guard !ids.isEmpty else { return [] }
+        var seen = Set<String>()
+        return visibleRows.compactMap { ids.contains($0.item.id) && seen.insert($0.item.id).inserted ? $0.item : nil }
+    }
+
+    private func reconcileSelection() {
+        selection.formIntersection(Set(visibleRows.map { $0.item.id }))
+        if let cursor = selectionCursor, !isVisibleRow(cursor) {
+            var parent = cursor.parent
+            while let candidate = parent {
+                if isVisibleRow(candidate), let row = tree.rowByID[candidate] {
+                    selection.insert(row.item.id); selectionCursor = row.id; selectionAnchor = row.id
+                    return
+                }
+                parent = candidate.parent
+            }
+            selectionCursor = nil; selectionAnchor = nil
+        }
+    }
+
+    private var focusedToggleFolder: NativeDriveRow? {
+        guard isConnected, viewMode == 0, let focusedRowID, let row = tree.rowByID[focusedRowID] else { return nil }
+        if row.item.isFolder { return row }
+        guard let parentID = focusedRowID.parent, tree.expanded.contains(parentID), isVisibleRow(parentID) else { return nil }
+        return tree.rowByID[parentID]
+    }
+    var canToggleFocusedFolder: Bool { focusedToggleFolder != nil }
+    var focusedFolderToggleTitle: String {
+        guard let folder = focusedToggleFolder else { return "Expand or Collapse Folder" }
+        let container = kind == .photos ? "Album" : "Folder"
+        return (tree.expanded.contains(folder.id) ? "Collapse " : "Expand ") + container
+    }
+    func toggleFocusedFolder() {
+        guard let folder = focusedToggleFolder else { return }
+        toggleExpansion(folder)
+    }
+    private func restoreCollapsedFolderFocus() {
+        guard let remembered = collapsedFolderFocus, remembered.reopening else { return }
+        guard focusedRowID == remembered.folderID, tree.expanded.contains(remembered.folderID) else {
+            collapsedFolderFocus = nil
+            return
+        }
+        if let row = visibleRows.first(where: { $0.id == remembered.itemID }) {
+            // A refresh retains old rows while it reloads expanded branches.
+            // Wait for the file's full path to be confirmed before selecting it.
+            for count in remembered.folderID.path.count..<remembered.itemID.path.count {
+                let parentID = NativeDriveRowID(path: Array(remembered.itemID.path.prefix(count)))
+                guard let parent = tree.rowByID[parentID], tree.branch(for: parent.item).loaded else { return }
+            }
+            select(row, extending: false, toggling: false)
+        } else if let folder = tree.rowByID[remembered.folderID], tree.branch(for: folder.item).loaded,
+                  tree.rowByID[remembered.itemID] == nil, !tree.isLoading {
+            collapsedFolderFocus = nil
+        }
+    }
+    func toggleExpansion(_ row: NativeDriveRow) {
+        guard row.item.isFolder, tree.rowByID[row.id] != nil else { return }
+        if tree.expanded.contains(row.id) {
+            let child = focusedRowID.flatMap { id in
+                id.path.count > row.id.path.count && id.path.starts(with: row.id.path) ? id : nil
+            }
+            collapsedFolderFocus = nil
+            tree.toggle(row)
+            if let child {
+                select(row, extending: false, toggling: false)
+                collapsedFolderFocus = (row.id, child, false)
+            }
+        } else {
+            if collapsedFolderFocus?.folderID == row.id { collapsedFolderFocus?.reopening = true }
+            else { collapsedFolderFocus = nil }
+            tree.toggle(row)
+            restoreCollapsedFolderFocus()
+        }
+    }
+    func toggleExpansion(_ item: CloudDriveItem) {
+        if let row = visibleRows.first(where: { $0.item.id == item.id }) { toggleExpansion(row) }
+    }
+    func isExpanded(_ item: CloudDriveItem) -> Bool {
+        // Every folder row's menu asks; few folders are expanded, so check
+        // those before scanning the rows.
+        guard tree.expanded.contains(where: { $0.itemID == item.id }) else { return false }
+        return visibleRows.first(where: { $0.item.id == item.id }).map { tree.expanded.contains($0.id) } ?? false
+    }
+    func expandSelection() {
+        guard let id = focusedRowID, let row = tree.rowByID[id], row.item.isFolder else { return }
+        if !tree.expanded.contains(id) { tree.toggle(row) }
+        else if let child = tree.rows.first(where: { $0.id.parent == id }) { select(child, extending: false, toggling: false) }
+    }
+    func collapseSelection() {
+        guard let id = focusedRowID, let row = tree.rowByID[id] else { return }
+        if row.item.isFolder && tree.expanded.contains(id) { tree.toggle(row) }
+        else if let parent = id.parent.flatMap({ tree.rowByID[$0] }) { select(parent, extending: false, toggling: false) }
+    }
 
     func sort(by mode: Int) {
         sortMode = mode
-        let current = items, generation = loadID
-        Task {
-            let sorted = await Task.detached(priority: .userInitiated) { Self.sorted(current, by: mode) }.value
-            guard loadID == generation, sortMode == mode else { return }; items = sorted
-        }
+        browserSortColumn = mode == 1 ? .modified : mode == 2 ? .size : mode == 3 ? .kind : .name
+        browserSortDirection = mode == 1 || mode == 2 ? .descending : .ascending
+        applySort()
     }
-    private nonisolated static func sorted(_ items: [CloudDriveItem], by mode: Int) -> [CloudDriveItem] {
-        items.sorted {
-            if $0.isFolder != $1.isFolder { return $0.isFolder }
-            if mode == 1, $0.modified != $1.modified { return ($0.modified ?? .distantPast) > ($1.modified ?? .distantPast) }
-            if mode == 2, $0.bytes != $1.bytes { return ($0.bytes ?? 0) > ($1.bytes ?? 0) }
-            return $0.name == $1.name ? $0.id < $1.id : $0.name.localizedStandardCompare($1.name) == .orderedAscending
+    func toggleSort(_ column: BrowserSortColumn) {
+        browserSortDirection = browserSortColumn == column && browserSortDirection == .ascending ? .descending : .ascending
+        browserSortColumn = column
+        sortMode = column == .modified ? 1 : column == .size ? 2 : column == .kind ? 3 : 0
+        applySort()
+    }
+    private func applySort() {
+        let current = items, generation = loadID, mode = sortMode, direction = browserSortDirection, request = UUID()
+        sortRequest = request
+        tree.setSort(mode: mode, direction: direction)
+        Task {
+            let sorted = await Task.detached(priority: .userInitiated) { NativeDriveTree.sorted(current, by: mode, direction: direction) }.value
+            guard provider != nil, loadID == generation, sortRequest == request else { return }
+            items = sorted; tree.replaceRoots(sorted)
         }
     }
     func select(_ item: CloudDriveItem, extending: Bool, toggling: Bool) {
-        if extending, let anchor = selectionAnchor, let a = items.firstIndex(where: { $0.id == anchor }), let b = items.firstIndex(where: { $0.id == item.id }) {
-            selection = Set(items[min(a, b)...max(a, b)].map(\.id))
-        } else if toggling {
-            if selection.contains(item.id) { selection.remove(item.id) } else { selection.insert(item.id) }; selectionAnchor = item.id
-        } else { selection = [item.id]; selectionAnchor = item.id }
+        if let row = visibleRows.first(where: { $0.item.id == item.id }) { select(row, extending: extending, toggling: toggling) }
     }
-    func moveSelection(_ offset: Int) {
-        guard !items.isEmpty else { return }
-        let current = selectedItems.first.flatMap { selected in items.firstIndex(where: { $0.id == selected.id }) } ?? -1
-        selection = [items[min(items.count - 1, max(0, current + offset))].id]
+    func select(_ row: NativeDriveRow, extending: Bool, toggling: Bool, requestsPreview: Bool = true) {
+        let rows = visibleRows, item = row.item
+        guard rows.contains(where: { $0.id == row.id }) else { return }
+        if requestsPreview { bookmarkRevealedItemID = nil }
+        collapsedFolderFocus = nil
+        if extending, let anchor = selectionAnchor, let a = rows.firstIndex(where: { $0.id == anchor }), let b = rows.firstIndex(where: { $0.id == row.id }) {
+            selection = Set(rows[min(a, b)...max(a, b)].map { $0.item.id })
+        } else if toggling {
+            if selection.contains(item.id) { selection.remove(item.id) } else { selection.insert(item.id) }; selectionAnchor = row.id
+        } else { selection = [item.id]; selectionAnchor = row.id }
+        selectionCursor = row.id
+    }
+    func showBookmarkPreview() { bookmarkRevealedItemID = nil }
+    func moveSelection(_ offset: Int, extending: Bool = false) {
+        let rows = visibleRows
+        guard !rows.isEmpty else { return }
+        let currentID = focusedRowID
+        let current = currentID.flatMap { id in rows.firstIndex(where: { $0.id == id }) } ?? -1
+        let target = rows[min(rows.count - 1, max(0, current + offset))]
+        if extending, selectionAnchor == nil || !selection.contains(selectionAnchor!.itemID) {
+            selectionAnchor = currentID ?? target.id
+        }
+        select(target, extending: extending, toggling: false)
     }
 
     @discardableResult
-    func run(_ title: String, mutating: Bool = false, _ operation: @escaping (any NativeCloudDrive, @escaping CloudDriveProgressHandler) async throws -> CloudDriveUndo?) -> UUID? {
-        guard let provider else { return nil }
-        guard !mutating || !isMutating else { error = "Wait for the current file change to finish."; return nil }
-        let id = activity.begin(title)
+    func run(_ title: String, mutating: Bool = false, transferDirection: Int? = nil,
+             using alternateProvider: (any NativeCloudDrive)? = nil,
+             completion: ((Result<Void, Error>) -> Void)? = nil,
+             _ operation: @escaping (any NativeCloudDrive, @escaping CloudDriveProgressHandler) async throws -> CloudDriveUndo?) -> UUID? {
+        guard let provider = alternateProvider ?? provider else {
+            completion?(.failure(CloudDriveError.message("Reconnect this drive before changing files."))); return nil
+        }
+        let locksBrowser = mutating && transferDirection == nil
+        guard !locksBrowser || !isMutating else {
+            error = "Wait for the current file change to finish."
+            completion?(.failure(CloudDriveError.message(error!))); return nil
+        }
+        let id = activity.begin(title, transferDirection: transferDirection)
+        let control = transferDirection == nil ? nil : NativeTransferControl()
+        transferControls[id] = control
+        if control != nil, let index = activity.records.firstIndex(where: { $0.id == id }) { activity.records[index].state = "Queued" }
         objectWillChange.send()
-        if mutating { isMutating = true }
+        if locksBrowser { isMutating = true }
         let handler: CloudDriveProgressHandler = { [weak activity] value in Task { @MainActor in activity?.update(id, value) } }
         jobs[id] = Task { [weak self] in
-            guard let self else { return }
-            defer { self.objectWillChange.send(); self.jobs[id] = nil; if mutating { self.isMutating = false; self.reload() } }
-            do {
-                let undo = try await operation(provider, handler)
-                if let undo { self.undoStack.append(undo); self.redoStack = [] }
-                self.activity.finish(id)
-            } catch {
-                self.activity.finish(id, error: error)
-                if !(error is CancellationError) { self.error = error.localizedDescription }
+            guard let self else { completion?(.failure(CancellationError())); return }
+            defer {
+                self.transferResumeTasks[id]?.cancel(); self.transferResumeTasks[id] = nil
+                self.transferResumeGenerations[id] = nil; self.transferPhases[id] = nil
+                self.releaseTransferPermit(id)
+                self.transferPermitReleases[id] = nil
+                self.objectWillChange.send(); self.jobs[id] = nil; self.transferControls[id] = nil
+                if locksBrowser { self.isMutating = false }
+                if mutating { self.reload() }
+            }
+            var attempt = 0
+            while true {
+                do {
+                    if let control {
+                        self.transferPhases[id] = .waiting
+                        try await self.acquireTransferPermit(id, control: control)
+                        self.transferPhases[id] = .running
+                        if let index = self.activity.records.firstIndex(where: { $0.id == id }) { self.activity.records[index].state = "Running" }
+                    }
+                    let undo = try await NativeTransferControl.$current.withValue(control) { try await operation(provider, handler) }
+                    if let undo { self.undoStack.append(undo); self.redoStack = [] }
+                    self.activity.finish(id); completion?(.success(())); break
+                } catch {
+                    if Task.isCancelled || control?.isCancelled == true || (control == nil && error is CancellationError) {
+                        self.activity.finish(id, error: CancellationError()); completion?(.failure(CancellationError())); break
+                    }
+                    guard let control, TransferFailure.isRetryable(error) else {
+                        self.activity.finish(id, error: error)
+                        if completion == nil { self.error = error.localizedDescription }
+                        completion?(.failure(error)); break
+                    }
+                    self.transferPhases[id] = .retrying
+                    self.transferResumeTasks[id]?.cancel(); self.transferResumeTasks[id] = nil
+                    self.transferResumeGenerations[id] = nil
+                    self.releaseTransferPermit(id)
+                    attempt = min(attempt + 1, 7)
+                    let delay = min(60, 1 << (attempt - 1))
+                    if let index = self.activity.records.firstIndex(where: { $0.id == id }) {
+                        if self.activity.records[index].state != "Paused" { self.activity.records[index].state = "Retrying" }
+                        self.activity.records[index].progress.message = "Retrying in \(delay)s · \(error.localizedDescription)"
+                    }
+                    do { try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000); try await control.wait() }
+                    catch { self.activity.finish(id, error: CancellationError()); completion?(.failure(CancellationError())); break }
+                }
             }
         }
         return id
     }
+    func pauseTransfer(_ id: UUID) {
+        guard let control = transferControls[id] else { return }
+        control.pause()
+        transferResumeTasks[id]?.cancel(); transferResumeTasks[id] = nil
+        transferResumeGenerations[id] = nil
+        releaseTransferPermit(id)
+        if let index = activity.records.firstIndex(where: { $0.id == id && $0.active }) { activity.records[index].state = "Paused" }
+    }
+    func resumeTransfer(_ id: UUID) {
+        guard let control = transferControls[id] else { return }
+        guard transferPhases[id] == .running else {
+            // Queued and backoff jobs acquire normally at their next attempt.
+            control.resume()
+            if let index = activity.records.firstIndex(where: { $0.id == id && $0.active }) {
+                activity.records[index].state = transferPhases[id] == .retrying ? "Retrying" : "Queued"
+            }
+            return
+        }
+        guard transferPermits[id] == nil, transferResumeTasks[id] == nil else { return }
+        let generation = UUID(); transferResumeGenerations[id] = generation
+        if let index = activity.records.firstIndex(where: { $0.id == id && $0.active }) { activity.records[index].state = "Queued" }
+        transferResumeTasks[id] = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.transferResumeGenerations[id] == generation {
+                    self.transferResumeTasks[id] = nil; self.transferResumeGenerations[id] = nil
+                }
+            }
+            await self.transferPermitReleases[id]?.value
+            do {
+                let permit = try await self.transferAdmission.acquire(control: control, ignoringPause: true)
+                guard !Task.isCancelled, self.jobs[id] != nil, self.transferPhases[id] == .running,
+                      self.transferResumeGenerations[id] == generation, self.transferPermits[id] == nil else {
+                    await self.transferAdmission.release(permit); return
+                }
+                self.transferPermits[id] = permit
+                control.resume()
+                if let index = self.activity.records.firstIndex(where: { $0.id == id && $0.active }) { self.activity.records[index].state = "Running" }
+            } catch { /* A newer pause/cancel or completed job owns the visible state. */ }
+        }
+    }
+
+    private func acquireTransferPermit(_ id: UUID, control: NativeTransferControl) async throws {
+        while true {
+            try await control.wait()
+            await transferPermitReleases[id]?.value
+            let permit = try await transferAdmission.acquire(control: control)
+            // Pause can arrive while the actor hands a permit back to AppKit.
+            if control.isPaused || Task.isCancelled {
+                await transferAdmission.release(permit)
+                try Task.checkCancellation()
+                continue
+            }
+            transferPermits[id] = permit
+            return
+        }
+    }
+
+    private func releaseTransferPermit(_ id: UUID) {
+        guard let permit = transferPermits.removeValue(forKey: id) else { return }
+        let priorRelease = transferPermitReleases[id]
+        let admission = transferAdmission
+        transferPermitReleases[id] = Task {
+            await priorRelease?.value
+            await admission.release(permit)
+        }
+    }
     func cancel(_ id: UUID) {
         if let index = activity.records.firstIndex(where: { $0.id == id && $0.active }) { activity.records[index].state = "Stopping" }
+        transferControls[id]?.cancel()
+        transferResumeTasks[id]?.cancel(); transferResumeTasks[id] = nil
+        transferResumeGenerations[id] = nil
         jobs[id]?.cancel()
     }
     func undo(redo: Bool = false) {
@@ -217,25 +705,110 @@ struct CloudDriveActivityRecord: Identifiable {
         run("New \(kind.containerName)", mutating: true) { provider, _ in try await provider.createContainer(name, in: location) }
     }
     func rename(_ item: CloudDriveItem, name: String) { run("Rename", mutating: true) { provider, _ in try await provider.rename(item, to: name) } }
+    /// Selecting an expanded folder and its children must perform a recursive
+    /// iCloud operation once, not move/delete/export the same file twice.
+    func operationItems(_ items: [CloudDriveItem]) -> [CloudDriveItem] {
+        var seen = Set<String>()
+        let unique = items.filter { seen.insert($0.id).inserted }
+        guard kind != .photos else { return unique }
+        let folders = Set(unique.filter(\.isFolder).compactMap { $0.url?.standardizedFileURL.path })
+        return unique.filter { item in
+            guard var parent = item.url?.standardizedFileURL.deletingLastPathComponent() else { return true }
+            while parent.path != "/" {
+                if folders.contains(parent.path) { return false }
+                parent.deleteLastPathComponent()
+            }
+            return true
+        }
+    }
     func delete(_ items: [CloudDriveItem]) {
+        let items = operationItems(items)
         closePreview(); run(kind == .photos ? "Delete from Photos" : "Move to Trash", mutating: true) { provider, progress in try await provider.delete(items, progress: progress) }
     }
+    func trashSimilarityFile(_ file: SimilarityFile) async throws {
+        guard similarity.local.results.index?.byID[file.id] != nil else {
+            throw CloudDriveError.message("This result no longer belongs to the current scan. Scan the folder again.")
+        }
+        // Use the provider captured by the scan. A later folder choice, browser
+        // navigation or another window must not change the deletion target.
+        guard let provider = similarityProvider ?? provider else {
+            throw CloudDriveError.message("Reconnect \(kind.title) before moving this file to Trash.")
+        }
+        let item: CloudDriveItem
+        if let scanned = scanItemsByID[file.id] { item = scanned }
+        else if kind != .photos, let path = file.localPath { item = try ICloudDriveProvider.item(URL(fileURLWithPath: path)) }
+        else { throw CloudDriveError.message("This file is no longer available in the scan’s drive.") }
+        guard !item.isFolder, item.canDelete else { throw CloudDriveError.message("This file cannot be moved to Trash.") }
+        let results = similarity.local.results, session = results.sessionToken
+        closePreview(); similarity.preview.close()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            run(kind == .photos ? "Move to Recently Deleted" : "Move to Trash", mutating: true, using: provider,
+                completion: { continuation.resume(with: $0) }) { provider, progress in
+                let undo = try await provider.delete([item], progress: progress)
+                return undo.map { Self.similarityUndo($0, fileIDs: [file.id], results: results, session: session, restoring: true) }
+            }
+        }
+    }
+    func keepSmallestSimilarityFiles(_ plan: SimilarityKeepSmallestPlan) async throws -> Set<String> {
+        let results = similarity.local.results
+        try results.validateKeepSmallest(plan)
+        guard let provider = similarityProvider ?? provider else {
+            throw CloudDriveError.message("Reconnect the scan’s drive before changing files.")
+        }
+        func item(_ file: SimilarityFile) throws -> CloudDriveItem {
+            if let scanned = scanItemsByID[file.id] { return scanned }
+            if kind != .photos, let path = file.localPath { return try ICloudDriveProvider.item(URL(fileURLWithPath: path)) }
+            throw CloudDriveError.message("A file is no longer available in the scan’s drive. No files were moved to Trash.")
+        }
+        let keepers = try plan.keepers.map(item), removals = try plan.removals.map(item)
+        guard removals.allSatisfy({ !$0.isFolder && $0.canDelete }),
+              Set(keepers.map(\.id)).isDisjoint(with: Set(removals.map(\.id))) else {
+            throw CloudDriveError.message("These files cannot be safely moved to Trash. Review the group and try again.")
+        }
+        closePreview(); similarity.preview.close()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            run("Keep Smallest", mutating: true, using: provider, completion: { continuation.resume(with: $0) }) { provider, progress in
+                let fresh = try await provider.refreshedItems(keepers)
+                guard fresh.count == keepers.count, zip(fresh, keepers).allSatisfy({ $0.id == $1.id && !$0.isFolder }),
+                      zip(fresh, plan.keepers).allSatisfy({ $0.bytes == nil || $0.bytes == $1.bytes }) else {
+                    throw CloudDriveError.message("A file to keep is missing or has changed size. No files were moved to Trash. Scan this group again.")
+                }
+                try await MainActor.run { try results.validateKeepSmallest(plan) }
+                try Task.checkCancellation()
+                let undo = try await provider.delete(removals, progress: progress)
+                return undo.map { Self.similarityUndo($0, fileIDs: plan.removalIDs, results: results, session: plan.session, restoring: true) }
+            }
+        }
+        return plan.removalIDs
+    }
+    private static func similarityUndo(_ undo: CloudDriveUndo, fileIDs: Set<String>, results: SimilarityResultsModel,
+                                       session: UUID, restoring: Bool) -> CloudDriveUndo {
+        .init(title: undo.title) {
+            let reverse = try await undo.apply()
+            return await MainActor.run {
+                if results.sessionToken == session { results.setTrashedIDs(fileIDs, !restoring) }
+                return Self.similarityUndo(reverse, fileIDs: fileIDs, results: results, session: session, restoring: !restoring)
+            }
+        }
+    }
     func relocate(_ items: [CloudDriveItem], from source: CloudDriveLocation? = nil, to destination: CloudDriveLocation, copy: Bool) {
-        let source = source ?? location
+        let source = source ?? location, items = operationItems(items)
         run(copy ? "Copy" : "Move", mutating: true) { provider, progress in try await provider.relocate(items, from: source, to: destination, copy: copy, progress: progress) }
     }
     func importFiles(_ urls: [URL], into destination: CloudDriveLocation? = nil) {
-        guard provider != nil, !isMutating else { error = "Wait for the current file change to finish."; return }
+        guard provider != nil else { return }
         let location = destination ?? location
-        let scoped = urls.filter { $0.startAccessingSecurityScopedResource() }
-        run("Import files", mutating: true) { provider, progress in
-            defer { scoped.forEach { $0.stopAccessingSecurityScopedResource() } }
-            return try await provider.importFiles(urls, into: location, progress: progress)
+        for url in urls {
+            run("Import \(url.lastPathComponent)", mutating: true, transferDirection: 1) { provider, progress in
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                return try await provider.importFiles([url], into: location, progress: progress)
+            }
         }
     }
     func chooseImport() {
         let destination = location, rootID = provider?.root.id
-        let panel = NSOpenPanel(); panel.title = kind == .photos ? "Import into Apple Photos" : "Import into iCloud Drive"
+        let panel = NSOpenPanel(); panel.title = "Import into \(kind.title)"
         panel.canChooseFiles = true; panel.canChooseDirectories = true; panel.allowsMultipleSelection = true
         panel.begin { [weak self] response in
             if response == .OK { Task { @MainActor in
@@ -245,24 +818,42 @@ struct CloudDriveActivityRecord: Identifiable {
         }
     }
     func export(_ items: [CloudDriveItem], to destination: URL) {
+        let items = operationItems(items)
+        guard provider != nil, !items.isEmpty else { return }
+        let access = LocalFileAccessLease([destination])
+        do {
+            if let disk = provider as? ICloudDriveProvider { try disk.validateAccess() }
+            try LocalFileAccess.validate(destination, directory: true, writing: true)
+        } catch { self.error = error.localizedDescription; refreshAvailability(); return }
+        lastExportDestination = destination
+        let volumeID = LocalFileAccess.volumeID(destination)
+        for item in items { exportOne(item, to: destination, access: access, volumeID: volumeID) }
+    }
+    private func exportOne(_ item: CloudDriveItem, to destination: URL, access: LocalFileAccessLease, volumeID: String?) {
+        let items = [item]
         let location = location, temp = temporaryRoot.appendingPathComponent("Exports/\(UUID().uuidString)")
-        run("Export files") { provider, progress in
-            let scoped = destination.startAccessingSecurityScopedResource(); defer { if scoped { destination.stopAccessingSecurityScopedResource() }; try? FileManager.default.removeItem(at: temp) }
-            if provider.kind == .icloud {
+        let completed = NativeExportCheckpoint()
+        run("Export \(item.name)", transferDirection: 0) { provider, progress in
+            defer { withExtendedLifetime(access) {}; try? FileManager.default.removeItem(at: temp) }
+            try LocalFileAccess.validate(destination, volumeID: volumeID, directory: true, writing: true)
+            if provider.kind != .photos {
                 for (index, item) in items.enumerated() {
-                    guard let url = item.url else { continue }
-                    try await CloudDriveFiles.detached { try ICloudDriveProvider.copy(url, to: destination.appendingPathComponent(item.name), progress: progress) }
+                    let url = try await provider.materialize(item, directory: temp, progress: progress)
+                    try await CloudDriveFiles.detached { try ICloudDriveProvider.copy(url, to: destination.appendingPathComponent(item.name), progress: progress, destinationVolumeID: volumeID) }
                     progress(.init(message: "Exporting files", completed: index + 1, total: items.count))
                 }
             } else {
                 let files = try await provider.scanItems(items, location: location, progress: progress)
                 for (index, file) in files.enumerated() {
+                    if completed.ids.contains(file.id) { continue }
+                    try await NativeTransferControl.current?.wait()
                     try Task.checkCancellation()
                     let url = try await provider.materialize(file, directory: temp, progress: progress)
                     try await CloudDriveFiles.detached {
                         let target = CloudDriveFiles.availableName(file.name, in: destination)
-                        try ICloudDriveProvider.copy(url, to: target, progress: progress)
+                        try ICloudDriveProvider.copy(url, to: target, progress: progress, destinationVolumeID: volumeID)
                     }
+                    completed.ids.insert(file.id)
                     try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
                     progress(.init(message: "Exporting originals", completed: index + 1, total: files.count))
                 }
@@ -275,12 +866,12 @@ struct CloudDriveActivityRecord: Identifiable {
         panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.canCreateDirectories = true
         panel.begin { [weak self] response in if response == .OK, let url = panel.url { Task { @MainActor in self?.export(items, to: url) } } }
     }
-    func open(_ item: CloudDriveItem, application: URL? = nil) {
+    func open(_ item: CloudDriveItem, application: URL? = nil, using alternateProvider: (any NativeCloudDrive)? = nil) {
         if item.isFolder { enter(item); return }
         // Copies handed to another app survive exit, like the PikPak Open flow.
         let directory = ((try? LocalCredentialStore.applicationSupportDirectoryURL()) ?? temporaryRoot)
             .appendingPathComponent("OpenFiles/\(kind.rawValue)")
-        run("Open \(item.name)") { [weak self] provider, progress in
+        run("Open \(item.name)", using: alternateProvider) { [weak self] provider, progress in
             let url: URL
             if let cached = self?.openCache[item.id], FileManager.default.fileExists(atPath: cached.path) { url = cached }
             else {
@@ -296,9 +887,12 @@ struct CloudDriveActivityRecord: Identifiable {
         if quickLook.isVisible { closePreview() }
         else { quickLook.prepare(in: window); previewSelection() }
     }
-    func selectionChanged() { if quickLook.isActive { previewSelection() } }
+    func selectionChanged() {
+        if mediaPreview.itemID != selectedItems.first?.id { mediaPreview.clear() }
+        if quickLook.isActive { previewSelection() }
+    }
     private func previewSelection() {
-        guard let item = selectedItems.first, let provider else { closePreview(); return }
+        guard let item = focusedItem, let provider else { closePreview(); return }
         previewTask?.cancel(); let generation = UUID(); previewID = generation
         if item.isFolder { quickLook.showFolder(fileID: item.id, name: item.name); return }
         if let cached = previewCache[item.id], FileManager.default.fileExists(atPath: cached.path) {
@@ -308,7 +902,10 @@ struct CloudDriveActivityRecord: Identifiable {
         let folder = temporaryRoot.appendingPathComponent("QuickLook")
         previewTask = Task { [weak self] in
             do {
-                let url = try await provider.materialize(item, directory: folder, progress: { _ in })
+                let url = try await AutomaticRecovery.read(onRetry: { [weak self] failure, delay in
+                    guard self?.previewID == generation else { return }
+                    self?.quickLook.showFailure("Retrying in \(Int(delay))s. \(failure.localizedDescription)")
+                }) { try await provider.materialize(item, directory: folder, progress: { _ in }) }
                 guard let self, self.previewID == generation, !Task.isCancelled else {
                     if provider.kind == .photos { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
                     return
@@ -328,9 +925,7 @@ struct CloudDriveActivityRecord: Identifiable {
         }
     }
     private func movePreview(_ offset: Int) {
-        guard let id = selectedItems.first?.id, let index = items.firstIndex(where: { $0.id == id }) else { return }
-        let next = min(max(index + offset, 0), items.count - 1)
-        selection = [items[next].id]; previewSelection()
+        moveSelection(offset); previewSelection()
     }
     func closePreview() {
         previewID = UUID(); previewTask?.cancel(); previewTask = nil; quickLook.dismiss()
@@ -340,22 +935,213 @@ struct CloudDriveActivityRecord: Identifiable {
         }
     }
 
+    /// Navigate to the file’s original container, then select it after all
+    /// needed pages arrive. Photos uses the complete library collection.
+    func revealSimilarityFile(_ file: SimilarityFile) {
+        guard var provider = provider ?? (kind == .local ? similarityProvider : nil) else {
+            error = "Reconnect \(kind.title) to browse this file."; return
+        }
+        fileTypeFilter = .all
+        do {
+            let item: CloudDriveItem
+            if let known = scanItemsByID[file.id] { item = known }
+            else if kind != .photos, let path = file.localPath {
+                item = try ICloudDriveProvider.item(URL(fileURLWithPath: path))
+            } else { throw CloudDriveError.message("This file is no longer available in this scan’s drive.") }
+            if kind == .photos {
+                history = [provider.root, .init(id: "photos:all", title: "All Photos & Videos")]
+            } else {
+                // The folder picker can scan another disk without reconnecting
+                // Browser. Only navigate there when a result is explicitly revealed.
+                if kind == .local, scanItemsByID[file.id] != nil,
+                   let scanProvider = similarityProvider, let folder = item.url?.deletingLastPathComponent(),
+                   let scanRoot = scanProvider.root.url,
+                   folder == scanRoot || folder.path.hasPrefix(scanRoot.path == "/" ? "/" : scanRoot.path + "/") {
+                    let isWithinBrowser = provider.root.url.map {
+                        folder == $0 || folder.path.hasPrefix($0.path == "/" ? "/" : $0.path + "/")
+                    } ?? false
+                    if self.provider == nil || !isWithinBrowser {
+                        provider = scanProvider; self.provider = scanProvider
+                    }
+                }
+                guard let folder = item.url?.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath(),
+                      let root = provider.root.url else { throw CloudDriveError.message("This file has no containing folder.") }
+                let prefix = root.path == "/" ? "/" : root.path + "/"
+                guard folder == root || folder.path.hasPrefix(prefix) else {
+                    throw CloudDriveError.message("This file is outside the selected folder. Choose its disk or parent folder first.")
+                }
+                var locations = [provider.root], cursor = root
+                let suffix = folder == root ? "" : String(folder.path.dropFirst(prefix.count))
+                for component in suffix.split(separator: "/") {
+                    cursor.appendPathComponent(String(component), isDirectory: true)
+                    locations.append(.init(id: cursor.absoluteString, title: String(component), url: cursor))
+                }
+                history = locations
+            }
+            section = 0; resetLocation(); pendingSimilarityRevealID = item.id
+        } catch { self.error = error.localizedDescription }
+    }
+
     func findSimilar(_ selected: [CloudDriveItem]? = nil, exactOnly: Bool = false, presentWindow: Bool = true) {
         guard let provider else { return }
+        configureSimilarity(selected ?? selectedItems, provider: provider, location: location,
+                            exactOnly: exactOnly, presentWindow: presentWindow)
+    }
+
+    private func chooseSimilarityDriveFolder() {
+        guard !similarity.local.isRunning else { return }
+        guard let provider else { similarity.local.error = "Connect \(kind.title) in Settings → Drives to choose a scan location."; return }
+        let session = similarity.local.sessionID
+        similarity.scopePicker = SimilarityScopePicker(title: kind == .photos ? "Choose an Album or Library" : "Choose an iCloud Folder",
+            prompt: kind == .photos ? "Use Location" : "Use Folder", root: provider.root,
+            load: { folder, token in
+                if provider.kind == .photos && folder.id != provider.root.id { return .init(folders: []) }
+                let page = try await provider.list(folder, offset: token.flatMap(Int.init) ?? 0, search: "")
+                return .init(folders: page.items.filter { $0.isFolder && !$0.name.hasPrefix(".") }.map(\.location),
+                             nextPage: page.nextOffset.map(String.init))
+            }, accept: { [weak self] route in
+                guard let self, self.similarity.local.sessionID == session, let folder = route.last else { return }
+                self.configureSimilarity([], provider: provider, location: folder, exactOnly: self.similarity.duplicatesOnly, presentWindow: false)
+                self.similarity.local.error = nil
+            })
+    }
+
+    private func chooseSimilarityFolder() {
+        guard kind == .local, !similarity.local.isRunning else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose a Folder to Scan"; panel.prompt = "Use Folder"
+        panel.message = "Compare files in this folder and its subfolders. Your Browser location stays the same."
+        panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
+        panel.directoryURL = similarityScopeProvider?.root.url ?? location.url
+        let sessionID = similarity.local.sessionID
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in
+                guard let self, self.similarity.local.sessionID == sessionID else { return }
+                self.useSimilarityFolder(url)
+            }
+        }
+        if let window = NSApp.keyWindow {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            panel.begin(completionHandler: completion)
+        }
+    }
+
+    /// Apply only an accepted picker choice. A nil/cancelled choice is a no-op.
+    func useSimilarityFolder(_ url: URL?) {
+        guard kind == .local, !similarity.local.isRunning, let url else { return }
+        do {
+            guard url.isFileURL else { throw CloudDriveError.message("Choose a folder on this Mac or an external disk.") }
+            let scanProvider = ICloudDriveProvider(rootURL: url, kind: .local)
+            guard try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
+                throw CloudDriveError.message("Choose a folder to scan.")
+            }
+            configureSimilarity([], provider: scanProvider, location: scanProvider.root,
+                                exactOnly: similarity.duplicatesOnly, presentWindow: false)
+            similarity.local.error = nil
+        } catch { similarity.local.error = error.localizedDescription }
+    }
+
+    private func configureSimilarity(_ selected: [CloudDriveItem], provider: any NativeCloudDrive,
+                                     location: CloudDriveLocation, exactOnly: Bool, presentWindow: Bool, photosUsePreviews: Bool = true) {
         guard !similarity.local.isRunning else { if presentWindow { similarity.present(source: .local) }; return }
-        let selected = selected ?? selectedItems, location = location
-        similarity.local.externalScopeNames = selected.isEmpty ? [location.title] : selected.map(\.name)
+        similarityScopeProvider = provider
+        similarity.local.nativeScope = SimilarityNativeScope(drive:provider.kind,providerRoot:provider.root,
+            location:location,selection:selected,bookmark:provider.root.url.flatMap { try? $0.bookmarkData(options:.withSecurityScope,includingResourceValuesForKeys:nil,relativeTo:nil) })
+        similarity.local.externalScopeNames = selected.isEmpty ? [location.url?.path ?? location.title]
+            : selected.map { $0.url?.path ?? $0.name }
         similarity.local.exactDuplicates = true
-        similarity.local.includeHidden = false
         similarity.duplicatesOnly = exactOnly
         similarity.local.externalDuplicatesOnly = exactOnly
+        similarity.local.configurePhotosPreviews(supported: provider.supportsSimilarityPreviews && SimilarityScanModel.visualSimilarityAvailable, enabled: photosUsePreviews)
+        similarity.local.exactDuplicates = !similarity.local.usesPhotosPreviews
+        similarity.local.inventoryExternalSources = nil
+        similarity.local.streamExternalSources = nil
+        similarity.local.resolveExternalSource = nil
+        similarity.local.resolveExternalMemorySource = nil
+        if !exactOnly {
+            similarity.local.prepareExternalScope = nil
+            similarity.local.streamExternalSources = { [weak self] emit in
+                guard let self else { throw CancellationError() }
+                self.similarityProvider = provider
+                self.preparationIssues = []
+                var lastProgress = Date(), seen = Set<String>()
+                for try await item in provider.scanItemStream(selected, location: location, progress: { _ in }) {
+                    try Task.checkCancellation()
+                    guard !item.name.hasPrefix("."), seen.insert(item.id).inserted else { continue }
+                    self.scanItemsByID[item.id] = item
+                    if let url = item.url { self.scanItemsByPath[url.standardizedFileURL.path] = item }
+                    try await emit(.init(id: item.id, name: item.name,
+                        path: item.url?.path ?? "\(provider.kind.title)/\(location.title)/\(item.name)",
+                        size: item.bytes ?? 0, localPath: provider.kind == .photos ? nil : item.url?.path,
+                        revision:item.modified.map { String($0.timeIntervalSince1970) },
+                        contentKind:self.similarity.local.usesPhotosPreviews ? PhotosSimilarityPreview.contentKind : nil))
+                    if seen.count == 1 || Date().timeIntervalSince(lastProgress) > 0.25 {
+                        self.similarity.local.recordDiscovery(found: seen.count)
+                        lastProgress = Date()
+                    }
+                }
+                self.scanItemsByID = self.scanItemsByID.filter { seen.contains($0.key) }
+                self.scanItemsByPath = self.scanItemsByPath.filter { seen.contains($0.value.id) }
+                self.similarity.local.recordDiscovery(found: seen.count, complete: true)
+            }
+            similarity.local.inventoryExternalSources = { [weak self] in
+                guard let self else { throw CancellationError() }
+                self.similarityProvider = provider
+                self.scanItemsByPath = [:]; self.scanItemsByID = [:]; self.preparationIssues = []
+                let handler: CloudDriveProgressHandler = { [weak self] value in
+                    Task { @MainActor in self?.similarity.local.externalProgress(value) }
+                }
+                let items = try await provider.scanItems(selected, location: location, progress: handler)
+                    .filter { !$0.name.hasPrefix(".") }
+                try Task.checkCancellation()
+                var sources: [SimilarityExternalSource] = []
+                for item in items where self.scanItemsByID[item.id] == nil {
+                    self.scanItemsByID[item.id] = item
+                    if let url = item.url { self.scanItemsByPath[url.standardizedFileURL.path] = item }
+                    sources.append(.init(id: item.id, name: item.name,
+                        path: item.url?.path ?? "\(provider.kind.title)/\(location.title)/\(item.name)",
+                        size: item.bytes ?? 0, localPath: provider.kind == .photos ? nil : item.url?.path,
+                        revision:item.modified.map { String($0.timeIntervalSince1970) },
+                        contentKind:self.similarity.local.usesPhotosPreviews ? PhotosSimilarityPreview.contentKind : nil))
+                }
+                return sources
+            }
+            // The captured scan mode chooses the Photos representation. All
+            // Photos content uses the RAM pipe and retains its original asset ID.
+            similarity.local.resolveExternalMemorySource = { [weak self] id, pipe, capacity, progress in
+                guard let self, let item = self.scanItemsByID[id] else { throw CancellationError() }
+                if self.similarity.local.usesPhotosPreviews {
+                    let bytes = try await provider.previewForSimilarity(item, progress: progress)
+                    guard bytes.count <= PhotosSimilarityPreview.maximumBytes else { throw CocoaError(.fileReadTooLarge) }
+                    guard UInt64(bytes.count) <= capacity else { throw PhotosMemoryCapacityExceeded(requiredBytes: UInt64(bytes.count)) }
+                    try await CloudDriveFiles.detached {
+                        let handle = try SimilarityMemoryPipe.open(pipe)
+                        defer { try? handle.close() }
+                        try SimilarityMemoryPipe.write(bytes, to: handle)
+                    }
+                    return pipe
+                }
+                return try await provider.streamForSimilarity(item, pipe: pipe, capacity: capacity, progress: progress)
+            }
+            similarity.local.resolveExternalSource = { [weak self] id, directory, progress in
+                guard let self, let item = self.scanItemsByID[id] else { throw CancellationError() }
+                try Task.checkCancellation()
+                return try await provider.materialize(item, directory: directory, progress: progress)
+            }
+        } else {
         similarity.local.prepareExternalScope = { [weak self] in
             guard let self else { throw CancellationError() }
+            self.similarityProvider = provider
             let directory = self.temporaryRoot.appendingPathComponent("Scan/\(UUID().uuidString)")
             try CloudDriveFiles.privateDirectory(directory); self.scanDirectory = directory
             self.scanItemsByPath = [:]; self.scanItemsByID = [:]; self.preparationIssues = []
             let handler: CloudDriveProgressHandler = { [weak self] value in Task { @MainActor in self?.similarity.local.externalProgress(value) } }
+            // Filter original names before Photos exports/renames an asset or
+            // iCloud downloads its contents for analysis.
             let items = try await provider.scanItems(selected, location: location, progress: handler)
+                .filter { !$0.name.hasPrefix(".") }
             for (index, item) in items.enumerated() {
                 try Task.checkCancellation()
                 let total = items.count
@@ -378,19 +1164,23 @@ struct CloudDriveActivityRecord: Identifiable {
             }
             // Scan a directory root for Photos, even for very large albums.
             if provider.kind == .photos {
-                guard !self.scanItemsByID.isEmpty else { throw CloudDriveError.message("No originals could be prepared. \(self.preparationIssues.first?.reason ?? "Choose a different scope.")") }
+                guard items.isEmpty || !self.scanItemsByID.isEmpty else { throw CloudDriveError.message("No originals could be prepared. \(self.preparationIssues.first?.reason ?? "Choose a different scope.")") }
                 return [directory]
             }
             return selected.isEmpty ? [location.url].compactMap { $0 } : selected.compactMap(\.url)
         }
+        }
         similarity.local.transformExternalReport = { [weak self] report in
             guard let self else { return report }
-            let itemsByPath = self.scanItemsByPath, kind = self.kind
+            for file in report.files ?? [] where self.scanItemsByID[file.id] == nil {
+                self.scanItemsByID[file.id] = self.similarityItem(file)
+            }
+            let itemsByPath = self.scanItemsByPath, itemsByID = self.scanItemsByID, kind = self.kind
             func mapped(_ file: SimilarityFile) -> SimilarityFile {
                 let path = URL(fileURLWithPath: file.localPath ?? file.path).standardizedFileURL.path
-                guard let item = itemsByPath[path] else { return file }
+                guard let item = itemsByID[file.id] ?? itemsByPath[path] else { return file }
                 return SimilarityFile(id: item.id, name: item.name, path: item.url?.path ?? "\(kind.title)/\(location.title)/\(item.name)", bytes: file.bytes,
-                    family: file.family, localPath: kind == .icloud ? item.url?.path : nil, cloudId: nil, ancestors: [],
+                    family: file.family, localPath: kind != .photos ? item.url?.path : nil, cloudId: nil, ancestors: [],
                     engineIndex: file.engineIndex, engineId: file.scoreID, state: file.state)
             }
             let groups = report.groups.filter { !exactOnly || $0.isExact }.map { group in
@@ -401,13 +1191,23 @@ struct CloudDriveActivityRecord: Identifiable {
                 let path = URL(fileURLWithPath: issue.path).standardizedFileURL.resolvingSymlinksInPath().path
                 return SimilarityIssue(path: self.scanItemsByPath[path]?.name ?? (self.kind == .photos ? "Photos asset" : issue.path), reason: issue.reason)
             }
-            return SimilarityReport(source: report.source, scope: self.similarity.local.externalScopeNames, status: self.preparationIssues.isEmpty ? report.status : "partial",
-                threshold: report.threshold, scannedFiles: report.scannedFiles, analysedFiles: report.analysedFiles,
+            var summary = report.issueSummary
+            if summary != nil {
+                for issue in self.preparationIssues {
+                    if let index = summary!.firstIndex(where: { $0.category == "failed" && $0.reason == issue.reason }) {
+                        let previous = summary![index]
+                        summary![index] = SimilarityIssueSummary(category: "failed", reason: previous.reason, count: previous.count + 1)
+                    } else { summary!.append(SimilarityIssueSummary(category: "failed", reason: issue.reason, count: 1)) }
+                }
+            }
+            return SimilarityReport(source: report.source, scope: self.similarity.local.externalScopeNames, status: self.preparationIssues.isEmpty || report.status == "cancelled" ? report.status : "partial",
+                threshold: report.threshold, scannedFiles: max(report.scannedFiles, self.similarity.local.progress.foundFiles), analysedFiles: report.analysedFiles,
                 skippedFiles: report.skippedFiles + UInt64(self.preparationIssues.count), downloadedBytes: report.downloadedBytes,
                 totalGroups: report.totalGroups, groups: groups,
                 issues: Array(issues.prefix(500)), truncated: report.truncated || issues.count > 500,
                 coverage: (self.preparationIssues.isEmpty ? "" : "Some originals could not be prepared. ") + report.coverage, elapsedSeconds: report.elapsedSeconds,
-                files: report.files?.map(mapped), runId: report.runId, resultRevision: report.resultRevision, scoresRetained: report.scoresRetained)
+                files: report.files?.map(mapped), runId: report.runId, resultRevision: report.resultRevision, scoresRetained: report.scoresRetained,
+                unsupportedFiles: report.unsupportedFiles, failedFiles: report.failedFiles.map { $0 + UInt64(self.preparationIssues.count) }, issueSummary: summary)
         }
         similarity.local.cleanupExternalScope = { [weak self] in
             if let directory = self?.scanDirectory { try? FileManager.default.removeItem(at: directory); self?.scanDirectory = nil }
@@ -415,32 +1215,31 @@ struct CloudDriveActivityRecord: Identifiable {
         if presentWindow { similarity.present(source: .local) }
     }
     func measure(_ items: [CloudDriveItem]) {
-        let location = location, directory = temporaryRoot.appendingPathComponent("Measure/\(UUID().uuidString)")
+        let items = operationItems(items), location = location, directory = temporaryRoot.appendingPathComponent("Measure/\(UUID().uuidString)")
         run("Recalculate size") { [weak self] provider, progress in
             defer { try? FileManager.default.removeItem(at: directory) }
-            let files = try await provider.scanItems(items, location: location, progress: progress)
-            var size: UInt64 = 0
-            for (index, file) in files.enumerated() {
-                try Task.checkCancellation()
-                if let bytes = file.bytes { size += bytes }
-                else {
-                    let url = try await provider.materialize(file, directory: directory, progress: progress)
-                    size += UInt64(max(0, try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0))
-                    if provider.kind == .photos { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
-                }
-                progress(.init(message: "Calculating original size", completed: index + 1, total: files.count))
+            // The provider walks and sums off the main actor; only the total returns here.
+            let total = try await provider.measureFiles(items, location: location, directory: directory, progress: progress)
+            if items.count == 1, let self {
+                if let index = self.items.firstIndex(where: { $0.id == items[0].id }) { self.items[index].bytes = total.bytes }
+                self.tree.updateSize(total.bytes, for: items[0].id); self.tree.replaceRoots(self.items)
             }
-            if items.count == 1, let index = self?.items.firstIndex(where: { $0.id == items[0].id }) { self?.items[index].bytes = size }
-            progress(.init(message: "\(files.count.formatted()) files · \(SimilarityScanProgress.bytes(size))", completed: files.count, total: files.count))
+            progress(.init(message: "\(total.files.formatted()) files · \(SimilarityScanProgress.bytes(total.bytes))",
+                           completed: total.files, total: total.files))
             return nil
         }
     }
     var resourceActivities: [Int32: TaskResourceActivity] {
         guard let pid = similarity.local.processIdentifier else { return [:] }
-        return [pid: .init(name: "Finding similar files · \(kind.title)", detail: similarity.local.message + "\n" + similarity.local.detail, symbol: "doc.text.magnifyingglass")]
+        return [pid: .init(name: "Finding similar files · \(kind.title)", detail: similarity.local.message + "\n" + similarity.local.detail,
+            symbol: "doc.text.magnifyingglass", processing: similarity.local.resourceProcessing)]
     }
     func close() {
-        loadTask?.cancel(); jobs.values.forEach { $0.cancel() }; closePreview(); similarity.close()
+        for observer in volumeObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        volumeObservers = []
+        loadTask?.cancel(); loadID = UUID(); tree.reset(provider: nil)
+        transferControls.values.forEach { $0.cancel() }
+        jobs.values.forEach { $0.cancel() }; closePreview(); mediaPreview.clear(); similarity.close(preservingScans:true)
         // Operations remove their staging area after cancellation. Do not remove
         // a directory underneath a writer that has not stopped yet.
     }

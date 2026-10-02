@@ -71,5 +71,96 @@ struct PikPakAccountStoreTests {
             removedUntrustedCredential: true, requiresDedicatedSignIn: true))
         require(empty.accounts.isEmpty && empty.activeID == nil)
         print("PASS storage validation: symlinks and untrusted legacy sessions rejected without changing other files")
+        try workspaceIsolation(at: root.appendingPathComponent("workspaces"))
+        try loginMethods(at: root.appendingPathComponent("login-methods"))
+    }
+
+    static func loginMethods(at root: URL) throws {
+        let store = try PikPakAccountStore(directory: root)
+        let profile = PikPakAccountProfile(sub: "same-user", name: "Both methods")
+        let device = String(repeating: "a", count: 32)
+        let oauth = try store.stage(token: "normal-login", deviceID: device)
+        _ = try store.commit(oauth, profile: profile)
+        _ = try store.registerWorkspace("secondary")
+        let token = "eyJmaXh0dXJlIjoxfQ.eyJzdWIiOiJmaXh0dXJlIn0.fixture-signature"
+        let pat = try store.stage(token: token, deviceID: device, credentialKind: .personalAccessToken)
+        var document = try store.commit(pat, profile: profile, workspaceSessionID: "secondary")
+        require(document.accounts.count == 2 && document.activeID == oauth.id && document.activeID(for: "secondary") == pat.id)
+        require(try oauth.load().token == "normal-login")
+        require(PikPakAccountGroup.grouped(document.accounts).count == 1)
+        let pat2 = try store.stage(token: token, deviceID: device, credentialKind: .personalAccessToken)
+        document = try store.commit(pat2, profile: profile, workspaceSessionID: "secondary")
+        require(document.accounts.count == 2 && document.activeID == oauth.id && document.activeID(for: "secondary") == pat2.id)
+        require(!FileManager.default.fileExists(atPath: pat.directory.path))
+        let oauth2 = try store.stage(token: "renewed-normal", deviceID: device)
+        document = try store.commit(oauth2, profile: profile)
+        require(document.accounts.count == 2 && document.activeID == oauth2.id && document.activeID(for: "secondary") == pat2.id)
+        let reopened = try PikPakAccountStore(directory: root)
+        require(try reopened.files(for: pat2.id).load().token == token)
+        _ = try reopened.logOut(pat2.id)
+        require(try reopened.files(for: oauth2.id).load().token == "renewed-normal")
+        require(try reopened.load().activeID == oauth2.id && reopened.load().activeID(for: "secondary") == nil)
+        print("PASS login methods: grouped user, separate saved methods, renewal follows only the same method, independent workspace selection and logout")
+    }
+
+    static func workspaceIsolation(at root: URL) throws {
+        let primary = try PikPakAccountStore(directory: root)
+        let a = try primary.stage(token: "workspace-token-a", deviceID: String(repeating: "a", count: 32))
+        let profileA = PikPakAccountProfile(sub: "workspace-a", name: "Account A")
+        _ = try primary.commit(a, profile: profileA)
+        let b = try primary.stage(token: "workspace-token-b", deviceID: String(repeating: "b", count: 32))
+        let profileB = PikPakAccountProfile(sub: "workspace-b", name: "Account B")
+        _ = try primary.commit(b, profile: profileB)
+        _ = try primary.activate(a.id)
+        let pending = try primary.stage(token: "pending-login", deviceID: String(repeating: "c", count: 32))
+        let secondary = try PikPakAccountStore(directory: root)
+        require(try pending.load().token == "pending-login")
+        _ = try secondary.registerWorkspace("secondary")
+        _ = try secondary.activate(b.id, workspaceSessionID: "secondary")
+        var snapshot = try primary.updateProfile(profileA, for: a.id)
+        require(snapshot.activeID == a.id && snapshot.activeID(for: "secondary") == b.id)
+        _ = try primary.activate(b.id)
+        _ = try primary.activate(a.id)
+        snapshot = try secondary.updateProfile(profileB, for: b.id)
+        require(snapshot.activeID == a.id && snapshot.activeID(for: "secondary") == b.id)
+        let reopened = try PikPakAccountStore(directory: root)
+        require(try reopened.load().activeID(for: "secondary") == b.id)
+        require(primary.files(for: a.id).tokenURL == secondary.files(for: a.id).tokenURL)
+        require(primary.files(for: a.id).lockURL == secondary.files(for: a.id).lockURL)
+        require(primary.files(for: a.id).tokenURL != secondary.files(for: b.id).tokenURL)
+        require(primary.files(for: a.id).lockURL != secondary.files(for: b.id).lockURL)
+        _ = try secondary.logOut(b.id)
+        snapshot = try primary.load()
+        require(snapshot.activeID == a.id && snapshot.activeID(for: "secondary") == nil)
+        require(try primary.files(for: a.id).load().token == "workspace-token-a")
+        let c = try secondary.stage(token: "workspace-token-c", deviceID: String(repeating: "d", count: 32))
+        _ = try secondary.commit(c, profile: .init(sub: "workspace-c", name: "Account C"), workspaceSessionID: "secondary")
+        snapshot = try primary.load()
+        require(snapshot.activeID == a.id && snapshot.activeID(for: "secondary") == c.id)
+        try primary.discard(pending)
+        let base = root.appendingPathComponent("Transfers")
+        require(PikPakWorkspaceStorage.directory(base, workspaceSessionID: "primary") == base)
+        require(PikPakWorkspaceStorage.directory(base, workspaceSessionID: "secondary") == base.appendingPathComponent("Sessions/secondary", isDirectory: true))
+        var paths: Set<URL> = [base, PikPakWorkspaceStorage.directory(base, workspaceSessionID: "secondary")]
+        for slot in 3...128 {
+            let id = PikPakWorkspaceStorage.sessionID(for: slot)
+            require(PikPakWorkspaceStorage.isValidSessionID(id))
+            require(paths.insert(PikPakWorkspaceStorage.directory(base, workspaceSessionID: id)).inserted)
+        }
+        for invalid in ["", "../primary", "workspace-../../", "workspace-2", "workspace-03", "workspace-+3", "workspace--3", "workspace-3/extra"] {
+            require(!PikPakWorkspaceStorage.isValidSessionID(invalid))
+        }
+        for slot in 3...12 {
+            let id = PikPakWorkspaceStorage.sessionID(for: slot)
+            let windowStore = try PikPakAccountStore(directory: root)
+            _ = try windowStore.registerWorkspace(id)
+            _ = try windowStore.activate(slot.isMultiple(of: 2) ? a.id : c.id, workspaceSessionID: id)
+        }
+        snapshot = try primary.load()
+        require(snapshot.activeID == a.id && snapshot.activeID(for: "secondary") == c.id)
+        for slot in 3...12 {
+            require(snapshot.activeID(for: PikPakWorkspaceStorage.sessionID(for: slot)) == (slot.isMultiple(of: 2) ? a.id : c.id))
+        }
+        print("PASS workspace isolation: 12 persisted account selections, 128 unique queue paths, legacy path compatibility, safe identifiers, shared account locks and staging preserved")
     }
 }

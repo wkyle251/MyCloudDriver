@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(MyCloudTorrent LANGUAGES CXX OBJCXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_OBJCXX_STANDARD 17)
+find_package(LibtorrentRasterbar 2.0 CONFIG REQUIRED)
+add_executable(mycloud-torrent main.mm)
+target_compile_options(mycloud-torrent PRIVATE -fobjc-arc -Wall -Wextra)
+target_link_libraries(mycloud-torrent PRIVATE LibtorrentRasterbar::torrent-rasterbar
+    "-framework Foundation" "-framework Security")
+install(TARGETS mycloud-torrent RUNTIME DESTINATION bin)

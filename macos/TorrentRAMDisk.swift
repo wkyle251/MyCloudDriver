@@ -15,22 +15,29 @@ struct TorrentRAMVolume: Codable, Equatable {
 @MainActor protocol TorrentRAMDriving {
     func acquire(id: UUID, bytes: UInt64, directory: URL) async throws -> TorrentRAMVolume
     func validate(_ volume: TorrentRAMVolume) async throws
+    func availableBytes(_ volume: TorrentRAMVolume) throws -> UInt64
+    /// Empty the volume without detaching it, at a window boundary.
+    ///
+    /// This used to detach and reattach instead, on the understanding that a
+    /// `ram://` image never hands blocks back until it is detached. Measured
+    /// on macOS 26.5 that does not hold: deleting a file returns its memory,
+    /// and the freed blocks are reusable — a 512 MB volume took 800 MB of
+    /// writes across a delete with memory returning to its pre-write level.
+    /// Where an older system does hold the high-water mark, the volume simply
+    /// stays at the budget the user chose, which is what a full window reaches
+    /// anyway. Keeping it attached costs neither, and saves a reformat and a
+    /// torn-down swarm at every boundary.
     func clear(_ volume: TorrentRAMVolume) async throws
     func release(_ volume: TorrentRAMVolume) async throws
-    func recycle(_ volume: TorrentRAMVolume, id: UUID, bytes: UInt64, directory: URL) async throws -> TorrentRAMVolume
 }
 
 extension TorrentRAMDriving {
-    /// Detach and reattach, rather than emptying in place.
-    ///
-    /// A `ram://` image allocates lazily but never hands blocks back: deleting
-    /// files inside it returns only the page-cache copy, while the backing
-    /// store stays at the high-water mark of bytes ever resident until the
-    /// image is detached. Emptying a 43 GB window in place therefore leaves
-    /// 43 GB of this Mac's memory claimed for every window that follows.
-    func recycle(_ volume: TorrentRAMVolume, id: UUID, bytes: UInt64, directory: URL) async throws -> TorrentRAMVolume {
-        try await release(volume)
-        return try await acquire(id: id, bytes: bytes, directory: directory)
+    func availableBytes(_ volume: TorrentRAMVolume) throws -> UInt64 {
+        let values = try volume.root.resourceValues(forKeys: [.volumeAvailableCapacityKey])
+        guard let available = values.volumeAvailableCapacity, available >= 0 else {
+            throw LocalTorrentError.message("Could not measure free space in the RAM buffer. Resume to try again.")
+        }
+        return min(volume.bytes, UInt64(available))
     }
 }
 
@@ -110,8 +117,9 @@ extension TorrentRAMDriving {
             try LocalTorrentStore.write(Data(id.uuidString.utf8), to: mount.appendingPathComponent(".mycloud-owner"))
             try LocalTorrentStore.write(Data(), to: mount.appendingPathComponent(".metadata_never_index"))
             try LocalTorrentStore.write(JSONEncoder().encode(volume), to: record)
-            try await validate(volume)
+            try await validateMount(volume)
             try LocalTorrentStore.protect(volume.payload)
+            try await validate(volume)
             return volume
         } catch {
             // We still own this fresh attachment; it has never been released or
@@ -121,6 +129,13 @@ extension TorrentRAMDriving {
         }
     }
     func validate(_ volume: TorrentRAMVolume) async throws {
+        try await validateMount(volume)
+        let payload = try volume.payload.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .volumeUUIDStringKey])
+        guard payload.isDirectory == true, payload.isSymbolicLink != true, payload.volumeUUIDString == volume.uuid else {
+            throw LocalTorrentError.message("The download folder is no longer inside the RAM buffer. It was not used.")
+        }
+    }
+    private func validateMount(_ volume: TorrentRAMVolume) async throws {
         guard try await imageExists(volume) else { throw LocalTorrentError.message("The RAM buffer was lost. Restart Download to fetch unfinished files again.") }
         let info = try await Self.plist("/usr/sbin/diskutil", ["info", "-plist", volume.mount])
         guard info["VolumeUUID"] as? String == volume.uuid, info["DeviceNode"] as? String == volume.volumeDevice,
@@ -136,7 +151,9 @@ extension TorrentRAMDriving {
     }
     func release(_ volume: TorrentRAMVolume) async throws {
         if try await !imageExists(volume) { return } // RAM was lost after a Mac restart.
-        try await validate(volume)
+        // Detaching an owned volume is safe even if its payload directory was
+        // damaged. Stop/Restart must still be able to release that memory.
+        try await validateMount(volume)
         _ = try await Self.command("/usr/bin/hdiutil", ["detach", volume.device])
     }
 }

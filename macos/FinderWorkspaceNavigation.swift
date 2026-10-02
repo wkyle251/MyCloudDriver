@@ -3,15 +3,26 @@ import SwiftUI
 /// Keep the Links identity stable for cached workspace state. The removed
 /// Tasks section (2) is never a valid navigation destination.
 enum FinderWorkspaceSection: Int, CaseIterable, Identifiable {
-    case browser = 0, transfers = 1, links = 3
+    case browser = 0, bookmarks = 7, transfers = 1, links = 3
+    case cloudDownloads = 4, shares = 5, trash = 6
+    static let standard: [Self] = [.browser, .bookmarks, .transfers, .links]
+    var isPikPakManagement: Bool { (4...6).contains(rawValue) }
     var id: Int { rawValue }
     var title: String {
-        switch self { case .browser: return "Browser"; case .transfers: return "Transfers"; case .links: return "Links" }
+        switch self {
+        case .browser: return "Browser"; case .transfers: return "Transfers"; case .links: return "Links"
+        case .cloudDownloads: return "Cloud Downloads"; case .shares: return "My Shares"; case .trash: return "Trash"
+        case .bookmarks: return "Bookmarks"
+        }
     }
     var symbol: String {
-        switch self { case .browser: return "cloud"; case .transfers: return "arrow.up.arrow.down"; case .links: return "link" }
+        switch self {
+        case .browser: return "cloud"; case .transfers: return "arrow.up.arrow.down"; case .links: return "link"
+        case .cloudDownloads: return "icloud.and.arrow.down"; case .shares: return "person.2.badge.key"; case .trash: return "trash"
+        case .bookmarks: return "bookmark"
+        }
     }
-    var shortcut: Int { self == .links ? 3 : rawValue + 1 }
+    var shortcut: Int { rawValue >= 3 ? rawValue : rawValue + 1 }
 }
 
 @MainActor
@@ -26,7 +37,7 @@ final class FinderWorkspaceNavigation: ObservableObject {
     struct Request: Equatable {
         let id = UUID()
         let section: Int
-        var title: String { section == 3 ? "Opening Links…" : "Opening Browser…" }
+        var title: String { "Opening \(FinderWorkspaceSection(rawValue: section)?.title ?? "Browser")…" }
     }
 
     @Published private(set) var section = 0

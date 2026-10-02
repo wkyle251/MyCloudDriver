@@ -97,7 +97,7 @@ extension CloudDriveUndo {
         }
     }
     func extract(_ item: CloudDriveItem, password: String? = nil) {
-        guard kind == .icloud, let source = item.url else { return }
+        guard kind != .photos, let source = item.url else { return }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("MyCloudDriver-Extraction-\(UUID().uuidString)")
         let target = source.deletingLastPathComponent(), name = source.deletingPathExtension().lastPathComponent
         run("Extract \(item.name)") { [weak self] provider, progress in

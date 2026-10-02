@@ -3,13 +3,31 @@ set -euo pipefail
 
 SCRIPT_DIRECTORY="${0:A:h}"
 PROJECT_ROOT="${SCRIPT_DIRECTORY:h}"
+INSTALL_APP=0
+CLEAN_SWIFT=0
+for option in "$@"; do
+    case "${option}" in
+        --install) INSTALL_APP=1 ;;
+        --clean) CLEAN_SWIFT=1 ;;
+        --help|-h)
+            print "Usage: $0 [--clean] [--install]"
+            print "Reuses optimized Swift objects. --clean resets only the Swift cache."
+            print "Set MYCLOUD_BUILD_JOBS to override compiler concurrency."
+            exit 0 ;;
+        *) print -u2 "Unknown option: ${option}"; exit 2 ;;
+    esac
+done
+if [[ "${MYCLOUD_APP_BUILD_LOCK:-}" != "${PROJECT_ROOT}" ]]; then
+    exec python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --lock-build "$0" "$@"
+fi
 APP_NAME="MyCloudDriver"
 APP_EXECUTABLE="PikPakDownloader"
-APP_BUNDLE="${PROJECT_ROOT}/dist/${APP_NAME}.app"
-CONTENTS="${APP_BUNDLE}/Contents"
+# Keep developer builds out of Spotlight; ~/Applications holds the installed app.
+APP_BUNDLE="${PROJECT_ROOT}/dist/AppBuild.noindex/${APP_NAME}.app"
+SWIFT_CACHE="${PROJECT_ROOT}/.build/app-swift"
 
 case "${APP_BUNDLE}" in
-    "${PROJECT_ROOT}/dist/"*.app) ;;
+    "${PROJECT_ROOT}/dist/AppBuild.noindex/"*.app) ;;
     *)
         print -u2 "Refusing unsafe app output path: ${APP_BUNDLE}"
         exit 1
@@ -17,26 +35,33 @@ case "${APP_BUNDLE}" in
 esac
 
 cd "${PROJECT_ROOT}"
+if (( CLEAN_SWIFT )); then
+    rm -rf -- "${SWIFT_CACHE}"
+fi
+mkdir -p "${SWIFT_CACHE}" "${APP_BUNDLE:h}"
+# Assemble separately so failed builds leave the last signed bundle usable.
+STAGING_DIRECTORY="$(mktemp -d "${APP_BUNDLE:h}/.build-XXXXXX")"
+STAGED_BUNDLE="${STAGING_DIRECTORY}/${APP_NAME}.app"
+CONTENTS="${STAGED_BUNDLE}/Contents"
+trap 'rm -rf -- "${STAGING_DIRECTORY}"' EXIT
 python3 "${SCRIPT_DIRECTORY}/with-client-credentials.py" cargo build --release --locked
 cargo build --release --locked --manifest-path "${PROJECT_ROOT}/vendor/FileTwin/Cargo.toml" -p filetwin-worker
 python3 "${SCRIPT_DIRECTORY}/prepare-similarity-assets.py" --verify-only
 python3 "${SCRIPT_DIRECTORY}/prepare-torrent-engine.py" --verify-only
-
-if [[ -e "${APP_BUNDLE}" ]]; then
-    rm -rf -- "${APP_BUNDLE}"
-fi
+python3 "${SCRIPT_DIRECTORY}/prepare-libtorrent-engine.py" --verify-only
 
 mkdir -p "${CONTENTS}/MacOS" "${CONTENTS}/Resources"
 
-ARCHIVE_OBJECT="${PROJECT_ROOT}/dist/DriveArchive.o"
+ARCHIVE_OBJECT="${SWIFT_CACHE}/DriveArchive.o"
 xcrun clang -target arm64-apple-macos13.0 -O2 -Wall -Wextra -c \
     "${PROJECT_ROOT}/macos/DriveArchive.c" -o "${ARCHIVE_OBJECT}"
 
-swiftc \
+python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" -- \
     -swift-version 5 \
     -target arm64-apple-macos13.0 \
     -O \
     -parse-as-library \
+    "${PROJECT_ROOT}/macos/AutomaticRecovery.swift" \
     -framework SwiftUI \
     -framework AppKit \
     -framework AVFoundation \
@@ -67,9 +92,14 @@ swiftc \
     "${PROJECT_ROOT}/macos/LocalTorrentRelay.swift" \
     "${PROJECT_ROOT}/macos/TorrentMetadata.swift" \
     "${PROJECT_ROOT}/macos/TorrentPortMapping.swift" \
+    "${PROJECT_ROOT}/macos/TorrentDNSProbe.swift" \
+    "${PROJECT_ROOT}/macos/TorrentPeerCache.swift" \
+    "${PROJECT_ROOT}/macos/TorrentUPnP.swift" \
     "${PROJECT_ROOT}/macos/TorrentRAMDisk.swift" \
+    "${PROJECT_ROOT}/macos/TorrentRelayStorage.swift" \
     "${PROJECT_ROOT}/macos/TorrentRelayDrain.swift" \
     "${PROJECT_ROOT}/macos/TorrentRelayUpload.swift" \
+    "${PROJECT_ROOT}/macos/TorrentPaddingCleanup.swift" \
     "${PROJECT_ROOT}/macos/TorrentRelayViews.swift" \
     "${PROJECT_ROOT}/macos/CloudDriveHub.swift" \
     "${PROJECT_ROOT}/macos/ICloudDriveProvider.swift" \
@@ -85,6 +115,9 @@ swiftc \
     "${PROJECT_ROOT}/macos/NativeMediaThumbnail.swift" \
     "${PROJECT_ROOT}/macos/ImagePreview.swift" \
     "${PROJECT_ROOT}/macos/FolderThumbnails.swift" \
+    "${PROJECT_ROOT}/macos/FinderBookmarks.swift" \
+    "${PROJECT_ROOT}/macos/PikPakBookmarks.swift" \
+    "${PROJECT_ROOT}/macos/NativeDriveBookmarks.swift" \
     "${PROJECT_ROOT}/macos/WorkspaceSessions.swift" \
     "${PROJECT_ROOT}/macos/SimilarityResources.swift" \
     "${PROJECT_ROOT}/macos/SimilaritySession.swift" \
@@ -104,6 +137,8 @@ swiftc \
     "${PROJECT_ROOT}/macos/TransferScheduling.swift" \
     "${PROJECT_ROOT}/macos/BrowserDragDrop.swift" \
     "${PROJECT_ROOT}/macos/BrowserFolderExpansion.swift" \
+    "${PROJECT_ROOT}/macos/BrowserFileFilter.swift" \
+    "${PROJECT_ROOT}/macos/BrowserFileFilterViews.swift" \
     "${PROJECT_ROOT}/macos/BrowserContextMenuStyle.swift" \
     "${PROJECT_ROOT}/macos/BrowserNativeContextMenu.swift" \
     "${PROJECT_ROOT}/macos/FinderSettings.swift" \
@@ -114,8 +149,10 @@ swiftc \
     "${PROJECT_ROOT}/macos/FinderQuickLook.swift" \
     "${PROJECT_ROOT}/macos/FinderSidebar.swift" \
     "${PROJECT_ROOT}/macos/FinderWorkspaceChrome.swift" \
+    "${PROJECT_ROOT}/macos/FinderTransferLayout.swift" \
     "${PROJECT_ROOT}/macos/FinderPreviewPane.swift" \
     "${PROJECT_ROOT}/macos/MediaPlayback.swift" \
+    "${PROJECT_ROOT}/macos/VideoPreviewPreparation.swift" \
     "${PROJECT_ROOT}/macos/MediaPreviewView.swift" \
     "${PROJECT_ROOT}/macos/NativeMediaPreview.swift" \
     "${PROJECT_ROOT}/macos/NativeDriveTransfers.swift" \
@@ -134,10 +171,12 @@ swiftc \
     "${PROJECT_ROOT}/macos/PikPakLoginView.swift" \
     "${PROJECT_ROOT}/macos/ContentView.swift" \
     "${PROJECT_ROOT}/macos/PikPakDownloaderApp.swift" \
-    -o "${CONTENTS}/MacOS/${APP_EXECUTABLE}"
+    -o "${SWIFT_CACHE}/${APP_EXECUTABLE}"
 
+cp "${SWIFT_CACHE}/${APP_EXECUTABLE}" "${CONTENTS}/MacOS/${APP_EXECUTABLE}"
 cp "${PROJECT_ROOT}/target/release/pikpak" "${CONTENTS}/Resources/pikpak"
 python3 "${SCRIPT_DIRECTORY}/prepare-torrent-engine.py" --verify-only --destination "${CONTENTS}/Resources/TorrentEngine"
+python3 "${SCRIPT_DIRECTORY}/prepare-libtorrent-engine.py" --verify-only --destination "${CONTENTS}/Resources/TorrentEngine"
 cp "${PROJECT_ROOT}/vendor/FileTwin/target/release/filetwin-worker" "${CONTENTS}/Resources/filetwin-worker"
 cp "${PROJECT_ROOT}/vendor/FileTwin/LICENSE" "${CONTENTS}/Resources/FileTwin-LICENSE.txt"
 cp "${PROJECT_ROOT}/vendor/FileTwin/THIRD_PARTY_NOTICES.md" "${CONTENTS}/Resources/FileTwin-NOTICES.md"
@@ -155,6 +194,20 @@ plutil -lint "${CONTENTS}/Info.plist"
 codesign --force --sign - "${CONTENTS}/Resources/pikpak"
 codesign --force --sign - "${CONTENTS}/Resources/filetwin-worker"
 codesign --force --sign - "${CONTENTS}/Resources/TorrentEngine/aria2c"
-codesign --force --sign - "${APP_BUNDLE}"
+codesign --force --sign - "${CONTENTS}/Resources/TorrentEngine/mycloud-torrent"
+codesign --force --sign - "${STAGED_BUNDLE}"
+codesign --verify --strict "${STAGED_BUNDLE}"
 
-print "Built: ${APP_BUNDLE}"
+if [[ -e "${APP_BUNDLE}" ]]; then
+    mv -- "${APP_BUNDLE}" "${STAGING_DIRECTORY}/previous.app"
+fi
+if ! mv -- "${STAGED_BUNDLE}" "${APP_BUNDLE}"; then
+    if [[ -e "${STAGING_DIRECTORY}/previous.app" ]]; then
+        mv -- "${STAGING_DIRECTORY}/previous.app" "${APP_BUNDLE}"
+    fi
+    exit 1
+fi
+print "Built in ${SECONDS}s: ${APP_BUNDLE}"
+if (( INSTALL_APP )); then
+    python3 "${SCRIPT_DIRECTORY}/install-app.py"
+fi

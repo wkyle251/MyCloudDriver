@@ -20,32 +20,34 @@ struct FinderSidebarLayout<Sidebar: View, Workspace: View>: View {
     var body: some View {
         GeometryReader { geometry in
             let sidebarWidth = min(192, max(156, geometry.size.width * 0.2))
+            let hidesSidebar = automaticallyHidden || geometry.size.width < 880
             HStack(spacing: 0) {
-                if automaticallyHidden {
+                if hidesSidebar {
                     Rectangle().fill(FinderAppearance.sidebarBackground)
                         .overlay { Capsule().fill(Color.secondary.opacity(0.3)).frame(width: 2, height: 26) }
                         .frame(width: Self.edgeWidth)
                         .contentShape(Rectangle())
-                        .onHover { inside in handleHover(inside, revealing: true) }
-                        .help("Reveal sidebar · Option-Command-S keeps it visible")
+                        .onHover { inside in handleHover(inside, revealing: true, autoHide: hidesSidebar) }
+                        .help(automaticallyHidden ? "Reveal sidebar · Option-Command-S keeps it visible" : "Reveal sidebar · widen this window to keep it visible")
                 } else {
-                    sidebar().frame(width: sidebarWidth)
+                    scrollableSidebar(height: geometry.size.height).frame(width: sidebarWidth)
                     Divider()
                 }
                 workspace().frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .overlay(alignment: .leading) {
-                if automaticallyHidden && revealed {
-                    sidebar().frame(width: sidebarWidth)
+                if hidesSidebar && revealed {
+                    scrollableSidebar(height: geometry.size.height).frame(width: sidebarWidth)
                         .background(FinderAppearance.sidebarBackground)
                         .overlay(alignment: .trailing) { Divider() }
                         .shadow(color: .black.opacity(0.15), radius: 12, x: 6)
-                        .onHover { inside in handleHover(inside, revealing: false) }
+                        .onHover { inside in handleHover(inside, revealing: false, autoHide: hidesSidebar) }
                         .transition(.move(edge: .leading).combined(with: .opacity))
                         .zIndex(10)
                 }
             }
             .animation(.easeOut(duration: 0.16), value: revealed)
+            .onChange(of: hidesSidebar) { _ in pendingHover?.cancel(); revealed = false }
         }
         .onChange(of: automaticallyHidden) { _ in
             pendingHover?.cancel()
@@ -54,19 +56,25 @@ struct FinderSidebarLayout<Sidebar: View, Workspace: View>: View {
         .onDisappear { pendingHover?.cancel() }
     }
 
-    private func handleHover(_ inside: Bool, revealing: Bool) {
+    private func scrollableSidebar(height: CGFloat) -> some View {
+        ScrollView(.vertical) { sidebar().frame(minHeight: height) }
+            .scrollIndicators(.hidden)
+            .background(FinderAppearance.sidebarBackground)
+    }
+
+    private func handleHover(_ inside: Bool, revealing: Bool, autoHide: Bool) {
         pendingHover?.cancel()
-        guard automaticallyHidden else { return }
+        guard autoHide else { return }
         if inside && !revealing { return }
         // Finder/local and in-app drags must keep their existing drop target.
-        if inside && !FinderSidebarHoverPolicy.canReveal(automaticallyHidden: automaticallyHidden,
+        if inside && !FinderSidebarHoverPolicy.canReveal(automaticallyHidden: autoHide,
                                                         pressedMouseButtons: NSEvent.pressedMouseButtons) { return }
         pendingHover = Task { @MainActor in
             do { try await Task.sleep(nanoseconds: inside ? 250_000_000 : 400_000_000) }
             catch { return }
             guard !Task.isCancelled else { return }
             // A drag may have started during the dwell delay.
-            guard !inside || FinderSidebarHoverPolicy.canReveal(automaticallyHidden: automaticallyHidden,
+            guard !inside || FinderSidebarHoverPolicy.canReveal(automaticallyHidden: autoHide,
                                                                pressedMouseButtons: NSEvent.pressedMouseButtons) else { return }
             revealed = inside
         }
@@ -81,10 +89,12 @@ struct FinderSidebarTab: View {
 
     var body: some View {
         Button(action: action) {
-            Label {
+            HStack(spacing: 8) {
+                Image(systemName: symbol)
+                    .foregroundStyle(FinderAppearance.accent)
+                    .frame(width: 20)
+                    .accessibilityHidden(true)
                 Text(title)
-            } icon: {
-                Image(systemName: symbol).foregroundStyle(FinderAppearance.accent)
             }
                 .font(.system(size: 13, weight: selected ? .semibold : .regular))
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -95,6 +105,7 @@ struct FinderSidebarTab: View {
         }
         .buttonStyle(.plain).pointingHandCursor()
         .foregroundStyle(selected ? FinderAppearance.accent : Color.primary)
+        .accessibilityLabel(title)
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }

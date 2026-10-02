@@ -28,12 +28,16 @@ final class ImagePreviewModel: ObservableObject {
     @Published private(set) var error: NSError?
     private(set) var request: ImagePreviewRequest?
     private let load: Loader
+    private let loadThumbnail: Loader
     private var thumbnailTask: Task<Void, Never>?
     private var originalTask: Task<Void, Never>?
     private var thumbnailGeneration = UUID()
     private var originalGeneration = UUID()
 
-    init(load: @escaping Loader = ImagePreviewTransport.load) { self.load = load }
+    init(load: @escaping Loader = ImagePreviewTransport.load, loadThumbnail: Loader? = nil) {
+        self.load = load
+        self.loadThumbnail = loadThumbnail ?? load
+    }
 
     func reset(unlessFileID retainedFileID: String? = nil) {
         if let retainedFileID, request?.fileID == retainedFileID { return }
@@ -80,10 +84,10 @@ final class ImagePreviewModel: ObservableObject {
     private func start(url: URL, quality: Quality, request: ImagePreviewRequest,
                        onFailure: @escaping (Error) -> Void) {
         let generation = quality == .original ? originalGeneration : thumbnailGeneration
-        let load = self.load
+        let load = quality == .thumbnail ? loadThumbnail : self.load
         let task = Task { [weak self] in
             do {
-                let image = try await load(url, request.proxyURL)
+                let image = try await AutomaticRecovery.read { try await load(url, request.proxyURL) }
                 guard !Task.isCancelled, let self,
                       self.request?.fileID == request.fileID,
                       generation == (quality == .original ? self.originalGeneration : self.thumbnailGeneration) else { return }
@@ -147,12 +151,12 @@ enum ImagePreviewTransport {
         return NSImage(cgImage: bitmap, size: NSSize(width: bitmap.width, height: bitmap.height))
     }
 
-    static func decode(_ file: URL) throws -> NSImage {
-        let bitmap = try decodeBitmap(file)
+    static func decode(_ file: URL, maximumPixelSize: Int = 8192) throws -> NSImage {
+        let bitmap = try decodeBitmap(file, maximumPixelSize: maximumPixelSize)
         return NSImage(cgImage: bitmap, size: NSSize(width: bitmap.width, height: bitmap.height))
     }
 
-    private static func decodeBitmap(_ file: URL) throws -> CGImage {
+    static func decodeBitmap(_ file: URL, maximumPixelSize: Int = 8192) throws -> CGImage {
         let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
         let options = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -160,7 +164,7 @@ enum ImagePreviewTransport {
             kCGImageSourceShouldCacheImmediately: true,
             // Bounds decompression memory for unusually large originals while
             // keeping native-quality detail on Retina preview canvases.
-            kCGImageSourceThumbnailMaxPixelSize: 8192,
+            kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize,
         ] as CFDictionary
         guard let source = CGImageSourceCreateWithURL(file as CFURL, sourceOptions),
               let bitmap = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else {

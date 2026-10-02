@@ -44,11 +44,16 @@ const DESKTOP_USER_AGENT: &str = "MainWindow Mozilla/5.0 (Macintosh; Intel Mac O
 pub struct Client {
     http: reqwest::Client,
     upload_http: reqwest::Client,
-    api_base: String,
+    download_http: reqwest::Client,
+    guest_download_http: reqwest::Client,
+    pub(crate) api_base: String,
     auth_base: String,
     device_id: String,
     tokens: TokenManager,
     captcha: CaptchaManager,
+    proxy: Option<String>,
+    content_mode: crate::ContentMode,
+    guest: std::sync::Arc<crate::guest::GuestState>,
 }
 
 /// Result returned after PikPak accepts a server-side shared-item restore.
@@ -63,6 +68,7 @@ pub struct ShareRestoreResult {
 /// Builder for [`Client`].
 pub struct ClientBuilder {
     refresh_token: Option<String>,
+    personal_access_token: Option<String>,
     credentials: OAuthCredentials,
     device_id: Option<String>,
     auth_base_url: String,
@@ -77,6 +83,7 @@ impl Default for ClientBuilder {
     fn default() -> Self {
         Self {
             refresh_token: None,
+            personal_access_token: None,
             credentials: OAuthCredentials::default(),
             device_id: None,
             auth_base_url: DEFAULT_AUTH_BASE.into(),
@@ -98,6 +105,14 @@ impl ClientBuilder {
     /// Set the refresh token (required).
     pub fn refresh_token(mut self, token: impl Into<String>) -> Self {
         self.refresh_token = Some(token.into());
+        self
+    }
+
+    /// Authenticate with an official Personal Access Token, without OAuth
+    /// refresh or first-party captcha exchanges. Mutually exclusive with a
+    /// refresh token and its shared rotation store.
+    pub fn personal_access_token(mut self, token: impl Into<String>) -> Self {
+        self.personal_access_token = Some(token.into());
         self
     }
 
@@ -162,18 +177,26 @@ impl ClientBuilder {
 
     /// Finalize and build the [`Client`].
     pub fn build(self) -> Result<Client> {
-        let refresh_token = self
-            .refresh_token
-            .ok_or(Error::NotConfigured("refresh_token"))?;
+        if self.personal_access_token.is_some()
+            && (self.refresh_token.is_some() || self.shared_refresh_store.is_some()) {
+            return Err(Error::Auth("choose either a Personal Access Token or an OAuth refresh token".into()));
+        }
+        let personal_access_token = self.personal_access_token;
+        let credential = personal_access_token.as_ref().or(self.refresh_token.as_ref())
+            .ok_or(Error::NotConfigured("refresh_token or personal_access_token"))?;
+        if credential.trim().is_empty() || credential.chars().any(char::is_whitespace) {
+            return Err(Error::Auth("the configured credential is empty or contains whitespace".into()));
+        }
 
         let device_id = self
             .device_id
-            .unwrap_or_else(|| device_id_from(&refresh_token));
+            .unwrap_or_else(|| device_id_from(credential));
 
         let build_http = |timeout: Duration| -> Result<reqwest::Client> {
             let mut builder = reqwest::Client::builder()
+                .no_proxy()
                 .timeout(timeout)
-                .user_agent(&self.user_agent);
+                .user_agent(if personal_access_token.is_some() { "MyCloudDriver" } else { &self.user_agent });
             if let Some(proxy) = self.proxy.as_deref() {
                 builder = builder.proxy(reqwest::Proxy::all(proxy)?);
             }
@@ -184,19 +207,47 @@ impl ClientBuilder {
         // allowed enough time to finish an individual OSS part. Both clients
         // retain the same proxy configuration.
         let upload_http = build_http(Duration::from_secs(15 * 60))?;
+        // An original may take much longer than a metadata request. Bound
+        // connection/inactivity instead of timing out a healthy large file.
+        let build_download = |guest: bool| -> Result<reqwest::Client> {
+            let mut download_builder = reqwest::Client::builder()
+                // GUI helpers may inherit shell/system proxy variables. Only an
+                // explicitly chosen app/CLI proxy may route these requests.
+                .no_proxy()
+                .user_agent(if guest { DEFAULT_USER_AGENT } else { &self.user_agent })
+                .connect_timeout(Duration::from_secs(20))
+                .read_timeout(Duration::from_secs(90))
+                // Keep reusable connections between waves of originals. This is
+                // an idle-socket bound; active bodies have separate admission.
+                .pool_max_idle_per_host(32)
+                .pool_idle_timeout(Duration::from_secs(30));
+            if let Some(proxy) = self.proxy.as_deref() {
+                download_builder = download_builder.proxy(reqwest::Proxy::all(proxy)?);
+            }
+            if guest {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(REFERER, reqwest::header::HeaderValue::from_static("https://mypikpak.com/"));
+                download_builder = download_builder.default_headers(headers);
+            }
+            Ok(download_builder.build()?)
+        };
+        let download_http = build_download(false)?;
+        let guest_download_http = build_download(true)?;
 
         let auth_base = self.auth_base_url.trim_end_matches('/');
         let auth_endpoint = format!("{auth_base}/v1/auth/token");
         let captcha_endpoint = format!("{auth_base}/v1/shield/captcha/init");
 
-        let tokens = TokenManager::new_with_shared_store(
+        let tokens = if let Some(token) = personal_access_token {
+            TokenManager::personal_access_token(http.clone(), auth_endpoint, device_id.clone(), token)
+        } else { TokenManager::new_with_shared_store(
             http.clone(),
             auth_endpoint,
             self.credentials.clone(),
             &device_id,
-            refresh_token,
+            self.refresh_token.expect("credential checked above"),
             self.shared_refresh_store,
-        );
+        ) };
 
         let captcha = CaptchaManager::new(
             http.clone(),
@@ -209,16 +260,58 @@ impl ClientBuilder {
         Ok(Client {
             http,
             upload_http,
+            download_http,
+            guest_download_http,
             api_base: self.api_base_url,
             auth_base: self.auth_base_url,
             device_id,
             tokens,
             captcha,
+            proxy: self.proxy,
+            content_mode: crate::ContentMode::User,
+            guest: Default::default(),
         })
     }
 }
 
 impl Client {
+    /// Select anonymous original-share URLs for content operations. Metadata,
+    /// quota, uploads and account mutations retain their normal authorization.
+    pub fn with_guest_mode(mut self, enabled: bool) -> Self {
+        self.content_mode = if enabled { crate::ContentMode::Guest } else { crate::ContentMode::User };
+        self
+    }
+
+    pub fn guest_mode(&self) -> bool { self.content_mode == crate::ContentMode::Guest }
+
+    pub fn with_content_mode(mut self, mode: crate::ContentMode) -> Self {
+        self.content_mode = mode;
+        self
+    }
+
+    pub fn content_mode(&self) -> crate::ContentMode { self.content_mode }
+
+    /// Links downloads use the same policy as saved account files. The guest
+    /// and account clients keep separate authorization and captcha sessions.
+    pub fn share_client(&self, url: &str, pass_code: &str, token: &str) -> Result<crate::ShareClient> {
+        use crate::ContentMode;
+        match self.content_mode {
+            ContentMode::Guest => self.anonymous_share_client(url, pass_code, token),
+            ContentMode::User => Ok(crate::ShareClient::new_authenticated(url, pass_code, token, self.clone())?
+                .with_endpoints(&self.api_base, &self.auth_base)),
+            ContentMode::Dynamic => {
+                let user = self.clone().with_content_mode(ContentMode::User).share_client(url, pass_code, token)?;
+                Ok(self.anonymous_share_client(url, pass_code, token)?.with_user_fallback(user))
+            }
+        }
+    }
+
+    /// A separate transport/session: never copy account authorization headers.
+    pub fn anonymous_share_client(&self, url: &str, pass_code: &str, token: &str) -> Result<crate::ShareClient> {
+        Ok(crate::ShareClient::new(url, pass_code, token, None, self.proxy.as_deref())?
+            .with_endpoints(&self.api_base, &self.auth_base))
+    }
+
     /// Convenience for [`ClientBuilder::new`].
     pub fn builder() -> ClientBuilder {
         ClientBuilder::new()
@@ -247,24 +340,39 @@ impl Client {
         &self.upload_http
     }
 
+    /// Direct original downloads use inactivity limits, with the same proxy
+    /// and user agent as metadata requests. No account headers are attached.
+    pub fn download_http_client(&self) -> &reqwest::Client {
+        if self.content_mode.tries_guest() { &self.guest_download_http } else { &self.download_http }
+    }
+
     /// Read the signed-in user's display name from PikPak's account service.
     /// This is supplemental UI metadata, so keep its timeout shorter than a
     /// Drive request and never expose the rest of the account response.
     pub async fn account_profile(&self) -> Result<AccountProfile> {
-        let token = self.tokens.access_token().await?;
-        let response = self.http
-            .get(format!("{}/v1/user/me", self.auth_base.trim_end_matches('/')))
-            .bearer_auth(token)
-            .header("X-Device-Id", &self.device_id)
-            .timeout(Duration::from_secs(8))
-            .send().await?
-            .error_for_status()?;
-        let mut profile: AccountProfile = response.json().await?;
-        profile.name = profile.name.trim().to_owned();
-        if profile.sub != self.tokens.user_id().await? {
-            return Err(Error::Auth("account profile identity mismatch".into()));
+        for attempt in 0..2 {
+            let token = self.tokens.access_token().await?;
+            let response = self.http
+                .get(format!("{}/v1/user/me", self.auth_base.trim_end_matches('/')))
+                .bearer_auth(&token)
+                .header("X-Device-Id", &self.device_id)
+                .timeout(Duration::from_secs(8))
+                .send().await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                if self.tokens.is_personal_access_token() {
+                    return Err(Error::SessionRejected("Personal Access Token expired or revoked. Replace it in Settings > Accounts."));
+                }
+                if attempt == 0 {
+                    self.tokens.reject_access_token(&token).await?;
+                    continue;
+                }
+            }
+            let mut profile: AccountProfile = response.error_for_status()?.json().await?;
+            profile.name = profile.name.trim().to_owned();
+            self.tokens.confirm_user_id(&profile.sub).await?;
+            return Ok(profile);
         }
-        Ok(profile)
+        unreachable!("the second account request returns its result")
     }
 
     /// Return the user's storage quota.
@@ -278,6 +386,56 @@ impl Client {
             total: body.quota.limit,
             used: body.quota.usage,
         })
+    }
+
+    /// Return storage and account-wide monthly transfer counters.
+    pub async fn quota_details(&self) -> Result<crate::QuotaDetails> {
+        // Reuse the drive connection for the quantity request instead of
+        // opening concurrent TLS connections for two small metadata reads.
+        let storage = self.quota().await?;
+        let transfer = self.transfer_quota().await?;
+        Ok(crate::QuotaDetails { storage, transfer })
+    }
+
+    /// The official web app reads monthly traffic from the quantity service.
+    /// Desktop sessions do not consistently expose these counters in /about.
+    pub async fn transfer_quota(&self) -> Result<crate::TransferQuota> {
+        let url = format!("{}/vip/v1/quantity/list", self.api_base.trim_end_matches('/'));
+        let mut refreshed_auth = false;
+        let mut network_retries = 0;
+        loop {
+            let access = self.tokens.access_token().await?;
+            let request = self.http.get(&url)
+                .query(&[("type", "transfer")])
+                .bearer_auth(&access)
+                .header("X-Device-Id", &self.device_id)
+                .timeout(Duration::from_secs(10))
+                .send().await;
+            let response = match request {
+                Ok(response) => response,
+                Err(error) if network_retries < 2 && (error.is_connect() || error.is_timeout() || error.is_request() || error.is_body()) => {
+                    network_retries += 1;
+                    tokio::time::sleep(Duration::from_millis(250 * network_retries)).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refreshed_auth && !self.tokens.is_personal_access_token() {
+                refreshed_auth = true;
+                self.tokens.reject_access_token(&access).await?;
+                continue;
+            }
+            if response.status().is_server_error() && network_retries < 2 {
+                network_retries += 1;
+                tokio::time::sleep(Duration::from_millis(250 * network_retries)).await;
+                continue;
+            }
+            let body: Value = response.error_for_status()?.json().await?;
+            if !body["base"].is_object() || !body["transfer"].is_object() {
+                return Err(Error::Api { status: 200, message: "PikPak returned unrecognized transfer counters".into() });
+            }
+            return Ok(crate::TransferQuota::from_quantity(&body));
+        }
     }
 
     /// List the direct children of a folder. Pass `""` for the root.
@@ -305,6 +463,7 @@ impl Client {
             }
 
             let resp = self.drive_get(&url, action, &params).await?;
+            if self.content_mode.tries_guest() { self.guest.remember_listing(&resp); }
             let body: ListResponse = serde_json::from_str(&resp)?;
             all.extend(body.files);
 
@@ -315,6 +474,26 @@ impl Client {
         }
 
         Ok(all)
+    }
+
+    /// Upload recovery must also see incomplete placeholders. The normal
+    /// Browser listing deliberately filters those out.
+    pub(crate) async fn list_upload_candidates(&self, parent_id: &str) -> Result<Vec<FileInfo>> {
+        let url = format!("{}/drive/v1/files", self.api_base.trim_end_matches('/'));
+        let mut all = Vec::new();
+        let mut page: Option<String> = None;
+        let mut seen = HashSet::new();
+        loop {
+            let mut query = vec![("parent_id", parent_id.to_string()), ("limit", "500".into()),
+                ("filters", r#"{"trashed":{"eq":false}}"#.into())];
+            if let Some(token) = &page { query.push(("page_token", token.to_string())); }
+            let response = self.drive_get(&url, "GET:/drive/v1/files", &query).await?;
+            let body: ListResponse = serde_json::from_str(&response)?;
+            all.extend(body.files);
+            if all.len() > 200_000 { return Err(Error::InvalidPath("upload recovery folder is too large")); }
+            page = validated_next_page_token(body.next_page_token, &mut seen)?;
+            if page.is_none() { return Ok(all); }
+        }
     }
 
     /// List one bounded page of direct folder children for an interactive UI.
@@ -342,6 +521,7 @@ impl Client {
         }
 
         let resp = self.drive_get(&url, action, &params).await?;
+        if self.content_mode.tries_guest() { self.guest.remember_listing(&resp); }
         let body: ListResponse = serde_json::from_str(&resp)?;
         Ok(FilePage {
             files: body.files,
@@ -398,6 +578,11 @@ impl Client {
     }
 
     pub async fn file_undo_state(&self, id: &str) -> Result<crate::file_undo::CloudFileState> {
+        Ok(serde_json::from_value(self.file_metadata(id).await?)?)
+    }
+
+    /// Refresh an original's metadata without downloading its content.
+    pub async fn file_metadata(&self, id: &str) -> Result<serde_json::Value> {
         let mut url = reqwest::Url::parse(&format!("{}/drive/v1/files/", self.api_base.trim_end_matches('/')))
             .map_err(|_| Error::InvalidPath("invalid drive endpoint"))?;
         url.path_segments_mut().map_err(|_| Error::InvalidPath("invalid drive endpoint"))?.pop_if_empty().push(id);
@@ -444,6 +629,14 @@ impl Client {
     /// id. Folder trees are built a level at a time so local directory uploads
     /// can preserve their structure without flattening file names.
     pub async fn create_folder(&self, parent_id: &str, name: &str) -> Result<String> {
+        self.create_folder_retry(parent_id, name, true).await
+    }
+
+    pub(crate) async fn create_folder_once(&self, parent_id: &str, name: &str) -> Result<String> {
+        self.create_folder_retry(parent_id, name, false).await
+    }
+
+    async fn create_folder_retry(&self, parent_id: &str, name: &str, retry_network: bool) -> Result<String> {
         if name.trim().is_empty() {
             return Err(Error::InvalidPath("folder name must not be empty"));
         }
@@ -456,7 +649,7 @@ impl Client {
             "name": name
         });
         let response = self
-            .drive_request(reqwest::Method::POST, &url, action, &[], Some(&body))
+            .drive_request_with_retry(reqwest::Method::POST, &url, action, &[], Some(&body), retry_network)
             .await?;
         let response: CreateFolderResponse = serde_json::from_str(&response)?;
         response
@@ -602,6 +795,14 @@ impl Client {
         size: u64,
         gcid: &str,
     ) -> Result<UploadTask> {
+        self.create_upload_task_retry(parent_id, name, size, gcid, true).await
+    }
+
+    pub(crate) async fn create_upload_task_once(&self, parent_id: &str, name: &str, size: u64, gcid: &str) -> Result<UploadTask> {
+        self.create_upload_task_retry(parent_id, name, size, gcid, false).await
+    }
+
+    async fn create_upload_task_retry(&self, parent_id: &str, name: &str, size: u64, gcid: &str, retry_network: bool) -> Result<UploadTask> {
         if name.trim().is_empty() {
             return Err(Error::InvalidPath("upload file name must not be empty"));
         }
@@ -624,7 +825,7 @@ impl Client {
             "folder_type": "NORMAL"
         });
         let response = self
-            .drive_request(reqwest::Method::POST, &url, action, &[], Some(&body))
+            .drive_request_with_retry(reqwest::Method::POST, &url, action, &[], Some(&body), retry_network)
             .await?;
         let response: UploadTaskResponse = serde_json::from_str(&response)?;
         let file = response.file.ok_or_else(|| Error::Api {
@@ -684,6 +885,16 @@ impl Client {
         query: &[(&str, String)],
         body: Option<&Value>,
     ) -> Result<String> {
+        self.drive_request_with_retry(method, url, action, query, body, true).await
+    }
+
+    /// Creating a task or share is not idempotent. A lost response must not
+    /// silently submit the same mutation again. Definitive auth rejections
+    /// can still refresh credentials once before the service accepts it.
+    pub(crate) async fn drive_request_with_retry(
+        &self, method: reqwest::Method, url: &str, action: &str,
+        query: &[(&str, String)], body: Option<&Value>, retry_network: bool,
+    ) -> Result<String> {
         // 401 and captcha-expiry each get one targeted retry; transient
         // network failures and 5xx/429 get bounded exponential-backoff retries.
         let mut auth_retried = false;
@@ -692,14 +903,15 @@ impl Client {
 
         loop {
             let access = self.tokens.access_token().await?;
-            let captcha = self.captcha.token_for(action).await?;
+            let captcha = if self.tokens.is_personal_access_token() { None }
+                else { Some(self.captcha.token_for(action).await?) };
 
             let mut request = self
                 .http
                 .request(method.clone(), url)
                 .bearer_auth(&access)
-                .header("X-Device-Id", &self.device_id)
-                .header("X-Captcha-Token", &captcha);
+                .header("X-Device-Id", &self.device_id);
+            if let Some(captcha) = &captcha { request = request.header("X-Captcha-Token", captcha); }
             if !query.is_empty() {
                 request = request.query(query);
             }
@@ -710,7 +922,7 @@ impl Client {
 
             let resp = match send {
                 Ok(r) => r,
-                Err(e) if is_transient(&e) && net_retries < MAX_NET_RETRIES => {
+                Err(e) if retry_network && is_transient(&e) && net_retries < MAX_NET_RETRIES => {
                     let delay = backoff_delay(net_retries);
                     tracing::debug!(action = %action, error = %e, ?delay, "transient network error, retrying");
                     net_retries += 1;
@@ -721,9 +933,10 @@ impl Client {
             };
 
             let status = resp.status();
+            let retry_after = crate::download_policy::retry_after(resp.headers());
             let text = match resp.text().await {
                 Ok(t) => t,
-                Err(e) if is_transient(&e) && net_retries < MAX_NET_RETRIES => {
+                Err(e) if retry_network && is_transient(&e) && net_retries < MAX_NET_RETRIES => {
                     let delay = backoff_delay(net_retries);
                     net_retries += 1;
                     tokio::time::sleep(delay).await;
@@ -736,17 +949,21 @@ impl Client {
                 return Ok(text);
             }
 
+            if self.tokens.is_personal_access_token() && status == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(Error::SessionRejected("Personal Access Token expired or revoked. Replace it in Settings > Accounts."));
+            }
+
             if status == reqwest::StatusCode::UNAUTHORIZED && !auth_retried {
                 tracing::debug!(
                     action = %action,
                     "access token rejected, invalidating and retrying"
                 );
                 auth_retried = true;
-                self.tokens.invalidate().await;
+                self.tokens.reject_access_token(&access).await?;
                 continue;
             }
 
-            if !captcha_retried {
+            if !captcha_retried && !self.tokens.is_personal_access_token() {
                 if let Ok(err) = serde_json::from_str::<ApiError>(&text) {
                     if err.error_code == 9 {
                         tracing::debug!(
@@ -754,27 +971,29 @@ impl Client {
                             "captcha expired, refreshing and retrying"
                         );
                         captcha_retried = true;
-                        let prev = captcha.clone();
-                        let _ = self.captcha.refresh(action, Some(&prev)).await?;
+                        let _ = self.captcha.refresh(action, captcha.as_deref()).await?;
                         continue;
                     }
                 }
             }
 
             // Server-side transient failures (5xx, 429) are worth a backoff retry.
-            if (status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS)
-                && net_retries < MAX_NET_RETRIES
+            if crate::download_policy::transient_status(status.as_u16())
+                && retry_network && net_retries < MAX_NET_RETRIES
             {
-                let delay = backoff_delay(net_retries);
+                let delay = backoff_delay(net_retries).max(retry_after.unwrap_or_default());
                 tracing::debug!(action = %action, status = %status.as_u16(), ?delay, "server error, retrying");
                 net_retries += 1;
                 tokio::time::sleep(delay).await;
                 continue;
             }
 
+            if crate::download_policy::transient_status(status.as_u16()) {
+                if let Some(delay) = retry_after { return Err(Error::RetryAfter { status: status.as_u16(), delay }); }
+            }
             return Err(Error::Api {
                 status: status.as_u16(),
-                message: text,
+                message: text.replace(&access, "[credential redacted]"),
             });
         }
     }
@@ -950,7 +1169,41 @@ impl Client {
     }
 
     /// Get a download URL for a file by its id.
+    pub async fn similarity_file_revision(&self, file_id: &str, parent_id: &str) -> Result<(u64, Option<String>)> {
+        if self.content_mode.tries_guest() {
+            if let Some(file) = self.content_mode.guest_result(self.guest_metadata(file_id, Some(parent_id), true).await)? {
+                let file = file.info;
+                return Ok((file.size, file.hash.filter(|s| !s.trim().is_empty())
+                    .or_else(|| file.modified_time.filter(|s| !s.trim().is_empty()))));
+            }
+        }
+        let body = self.get_file_detail(file_id).await?;
+        if body.trashed { return Err(Error::Api { status:404, message:"The original is in Trash".into() }); }
+        Ok((body.size, body.hash.filter(|s| !s.trim().is_empty())
+            .or_else(|| body.modified_time.filter(|s| !s.trim().is_empty()))))
+    }
+
+    /// Bind a similarity original to the revision returned with its signed URL.
+    pub(crate) async fn similarity_download_info(&self, file_id: &str, parent_id: &str) -> Result<(DownloadInfo, Option<String>)> {
+        if self.content_mode.tries_guest() {
+            if let Some((download, file)) = self.content_mode.guest_result(self.guest_download_info(file_id, Some(parent_id)).await)? {
+                return Ok((download, file.info.hash));
+            }
+        }
+        let body = self.get_file_detail(file_id).await?;
+        if body.trashed { return Err(Error::Api { status:404, message:"The original is in Trash".into() }); }
+        let revision = body.hash.filter(|s| !s.trim().is_empty())
+            .or_else(|| body.modified_time.filter(|s| !s.trim().is_empty()));
+        Ok((DownloadInfo { web_content_link: body.web_content_link, name: body.name, size: body.size }, revision))
+    }
+
+    /// Get a download URL for a file by its id.
     pub async fn get_download_url(&self, file_id: &str) -> Result<DownloadInfo> {
+        if self.content_mode.tries_guest() {
+            if let Some((download, _)) = self.content_mode.guest_result(self.guest_download_info(file_id, None).await)? {
+                return Ok(download);
+            }
+        }
         let body = self.get_file_detail(file_id).await?;
 
         Ok(DownloadInfo {
@@ -963,6 +1216,15 @@ impl Client {
     /// Get display metadata and a short-lived content link suitable for an
     /// on-demand image, audio, or video preview.
     pub async fn get_preview_info(&self, file_id: &str) -> Result<PreviewInfo> {
+        self.get_preview_info_in_parent(file_id, None).await
+    }
+
+    pub async fn get_preview_info_in_parent(&self, file_id: &str, parent_id: Option<&str>) -> Result<PreviewInfo> {
+        if self.content_mode.tries_guest() {
+            if let Some((download, file)) = self.content_mode.guest_result(self.guest_download_info(file_id, parent_id).await)? {
+                return Ok(crate::share::original_preview(&file.info, download.web_content_link));
+            }
+        }
         let body = self.get_file_detail(file_id).await?;
         let mut sources = preview_sources(&body.medias, &body.web_content_link);
         enrich_avi_source_codec(
@@ -987,6 +1249,53 @@ impl Client {
             content_link,
             sources,
         })
+    }
+
+    /// Resolve in the known account folder even when the quota blocks the
+    /// account file-details endpoint. A saved ID alone cannot identify a share.
+    pub async fn get_download_url_for_file(&self, file: &FileInfo) -> Result<DownloadInfo> {
+        if self.content_mode.tries_guest() {
+            if let Some((download, _)) = self.content_mode.guest_result(self.guest_download_info(&file.id, file.parent_id.as_deref()).await)? {
+                return Ok(download);
+            }
+        }
+        // Use the saved account ID after a failed guest lookup, never an
+        // unverified original-share ID. Do not repeat the guest attempt here.
+        let body = self.get_file_detail(&file.id).await?;
+        Ok(DownloadInfo { web_content_link: body.web_content_link, name: body.name, size: body.size })
+    }
+
+    async fn guest_download_info(&self, file_id: &str, parent_id: Option<&str>) -> Result<(DownloadInfo, crate::guest::GuestFile)> {
+        let file = self.guest_metadata(file_id, parent_id, false).await?;
+        let download = self.guest.download(&file, self).await?;
+        Ok((download, file))
+    }
+
+    async fn guest_metadata(&self, file_id: &str, parent_id: Option<&str>, fresh: bool) -> Result<crate::guest::GuestFile> {
+        if !fresh {
+            if let Some(file) = self.guest.cached(file_id, parent_id) { return Ok(file); }
+        }
+        let parent = parent_id.ok_or(Error::Guest("The file's folder is unknown. Refresh its folder and try again."))?;
+        let url = format!("{}/drive/v1/files", self.api_base.trim_end_matches('/'));
+        let mut token: Option<String> = None;
+        let mut seen = HashSet::new();
+        loop {
+            let mut query = vec![("parent_id", parent.to_string()), ("limit", "500".into()),
+                ("filters", serde_json::json!({"id":{"eq":file_id},"trashed":{"eq":false},
+                    "phase":{"eq":"PHASE_TYPE_COMPLETE"}}).to_string())];
+            if let Some(token) = &token { query.push(("page_token", token.clone())); }
+            let raw = self.drive_get(&url, "GET:/drive/v1/files", &query).await?;
+            #[derive(Deserialize)]
+            struct Page { files: Vec<crate::guest::GuestFile>, #[serde(default)] next_page_token: Option<String> }
+            let page: Page = serde_json::from_str(&raw)?;
+            self.guest.remember_listing(&raw);
+            if let Some(file) = page.files.into_iter().find(|file| file.info.id == file_id
+                && file.info.parent_id.as_deref().unwrap_or("") == parent) { return Ok(file); }
+            match validated_next_page_token(page.next_page_token, &mut seen)? {
+                Some(next) => token = Some(next),
+                None => return Err(Error::Api { status: 404, message: "The file is no longer in this folder. Refresh it and try again.".into() }),
+            }
+        }
     }
 
     async fn get_file_detail(&self, file_id: &str) -> Result<FileDetailResponse> {
@@ -1278,6 +1587,10 @@ struct UploadFileResponse {
 #[derive(Debug, Deserialize)]
 struct FileDetailResponse {
     #[serde(default)]
+    trashed: bool,
+    #[serde(default)]
+    modified_time: Option<String>,
+    #[serde(default)]
     phase: Option<String>,
     #[serde(default)]
     name: String,
@@ -1436,6 +1749,17 @@ pub(crate) fn preview_sources(
         sources.push(direct_source);
     }
     sources
+}
+
+/// Visibility controls PikPak's playback menu, not original-file access. The
+/// guest API can issue an allowed original with is_visible=false. Honor the
+/// original and quota flags instead of reusing the transcode-first menu.
+pub(crate) fn original_download_url(medias: &[MediaResponse], direct: &str) -> Option<String> {
+    let usable = |url: &str| !url.trim().is_empty() && preview_link_is_fresh(url);
+    if usable(direct) { return Some(direct.trim().to_string()); }
+    medias.iter().filter(|media| media.is_origin && !media.need_more_quota)
+        .filter_map(|media| media.link.as_ref().map(|link| link.url.trim()))
+        .find(|url| usable(url)).map(str::to_string)
 }
 
 /// Inspect only the bounded AVI header when PikPak has not supplied codec

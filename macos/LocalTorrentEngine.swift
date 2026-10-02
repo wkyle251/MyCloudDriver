@@ -1,8 +1,26 @@
 import Foundation
+import Darwin
 
-enum LocalTorrentError: LocalizedError {
+enum LocalTorrentError: LocalizedError, Equatable {
     case message(String)
-    var errorDescription: String? { if case .message(let value) = self { return value }; return nil }
+    case ramDestinationMismatch
+    var errorDescription: String? {
+        switch self {
+        case .message(let value): return value
+        case .ramDestinationMismatch: return "The torrent engine is not targeting this transfer’s buffer. Stop and Resume to reconnect it."
+        }
+    }
+    /// A lost loopback reply says nothing about whether aria2 still has peers.
+    /// Keep retrying transport failures without pausing its live download.
+    static func isConnectionInterruption(_ error: Error) -> Bool {
+        guard let failure = error as? URLError else { return false }
+        switch failure.code {
+        case .timedOut, .networkConnectionLost, .cannotConnectToHost,
+             .notConnectedToInternet, .cannotFindHost, .dnsLookupFailed:
+            return true
+        default: return false
+        }
+    }
 }
 
 struct LocalTorrentWireFile {
@@ -13,6 +31,7 @@ struct LocalTorrentWireFile {
     /// is whole on the volume and may be handed to the uploader, long before
     /// the rest of its batch arrives.
     let completedLength: UInt64
+    var padding = false
 }
 
 struct LocalTorrentStatus {
@@ -26,6 +45,20 @@ struct LocalTorrentStatus {
     let uploadSpeed: UInt64
     let connections: Int
     let seeders: Int
+    /// `verifiedLength` is present throughout hashing, including at zero.
+    /// `verifyIntegrityPending` covers waiting for the hash-check slot.
+    let checkingPieces: Bool
+    /// Bytes re-read so far. Nil unless a check is actually running.
+    let verifiedLength: UInt64?
+    /// How far the check has read, against the whole torrent.
+    ///
+    /// `completedLength` cannot serve as the denominator: aria2 freezes it for
+    /// the duration of a check, so the count overtakes it partway through and
+    /// would report well over 100%.
+    var checkingFraction: Double? {
+        guard let verifiedLength, total > 0 else { return nil }
+        return min(1, Double(verifiedLength) / Double(total))
+    }
     let error: String
     let files: [LocalTorrentWireFile]
 
@@ -39,12 +72,15 @@ struct LocalTorrentStatus {
         total = count("totalLength"); completed = count("completedLength")
         downloadSpeed = count("downloadSpeed"); uploadSpeed = count("uploadSpeed")
         connections = Int(clamping: count("connections")); seeders = Int(clamping: count("numSeeders"))
+        verifiedLength = (value["verifiedLength"] as? String).flatMap(UInt64.init)
+        checkingPieces = verifiedLength != nil || value["verifyIntegrityPending"] as? String == "true"
         error = String((value["errorMessage"] as? String ?? "").prefix(500))
         files = (value["files"] as? [[String: Any]] ?? []).compactMap { file in
             guard let index = Int(file["index"] as? String ?? ""), index > 0,
                   let path = file["path"] as? String, let length = UInt64(file["length"] as? String ?? "") else { return nil }
             return .init(index: index, path: path, length: length,
-                         completedLength: UInt64(file["completedLength"] as? String ?? "") ?? 0)
+                         completedLength: UInt64(file["completedLength"] as? String ?? "") ?? 0,
+                         padding: file["padding"] as? String == "true")
         }
     }
 }
@@ -52,8 +88,9 @@ struct LocalTorrentStatus {
 /// Peers that finished the BitTorrent handshake.
 ///
 /// aria2's `connections` counts sockets it has opened, including ones still in
-/// SYN_SENT to a peer that will never answer, so it reads as a healthy swarm
-/// while nothing is actually connected. Only `aria2.getPeers` knows the truth.
+/// SYN_SENT to a peer that will never answer. Upstream `getPeers` also includes
+/// peers still negotiating; the bundled engine reports handshake completion
+/// explicitly for the current connection.
 ///
 /// Seed counts are not included: aria2's `numSeeders` already counts only peers
 /// that got far enough to send a bitfield, so it is honest and far cheaper.
@@ -61,6 +98,46 @@ struct LocalTorrentPeerCensus: Equatable {
     var connected = 0
     /// Sockets aria2 has open, from its `connections` field.
     var attempted = 0
+    /// The handshaked peers themselves, busiest first. Held in memory only.
+    var peers: [LocalTorrentPeer] = []
+}
+
+/// One handshaked peer and what it is worth right now: what it is sending to
+/// this Mac, and what this Mac is sending back to it.
+///
+/// Live details are separate from the saved queue. Public torrents may retain
+/// validated connection endpoints in the private, expiring peer cache.
+struct LocalTorrentPeer: Equatable {
+    let address: String
+    /// Bytes per second arriving from this peer.
+    let downloadSpeed: UInt64
+    /// Bytes per second this Mac is sending to this peer.
+    let uploadSpeed: UInt64
+    let seeder: Bool
+    var transport: String? = nil
+    var active: Bool { downloadSpeed > 0 || uploadSpeed > 0 }
+}
+
+/// Protocol counters only, kept in memory and never added to the saved queue.
+/// Reading these counters does not inspect torrent contents or file progress.
+struct LocalTorrentNetworkDiagnostics: Equatable {
+    let dhtEnabled: Bool
+    let dhtNodes: Int?
+    let knownPeers: Int
+    let trackerCount: Int
+    let trackersResponding: Int
+    let trackersFailed: Int
+    let lastPeerError: String
+
+    init(_ value: [String: Any], dht: [String: Any]) {
+        dhtEnabled = dht["enabled"] as? Bool ?? false
+        dhtNodes = dht["snapshotReady"] as? Bool == true ? dht["nodes"] as? Int : nil
+        knownPeers = value["knownPeers"] as? Int ?? 0
+        trackerCount = value["trackerCount"] as? Int ?? 0
+        trackersResponding = value["trackersResponding"] as? Int ?? 0
+        trackersFailed = value["trackersFailed"] as? Int ?? 0
+        lastPeerError = String((value["lastPeerError"] as? String ?? "").prefix(200))
+    }
 }
 
 @MainActor protocol LocalTorrentDriving: AnyObject {
@@ -71,8 +148,12 @@ struct LocalTorrentPeerCensus: Equatable {
     func addTorrent(_ data: Data, directory: URL, selection: [Int]?) async throws -> String
     func status(_ id: String, files: Bool) async throws -> LocalTorrentStatus
     func peerCensus(_ id: String, attempted: Int) async throws -> LocalTorrentPeerCensus
+    func networkDiagnostics(_ id: String) async throws -> LocalTorrentNetworkDiagnostics?
     func begin(_ id: String, directory: URL, selection: [Int]) async throws
+    func beginRelay(_ id: String, directory: URL, selection: [Int]) async throws
     func reselect(_ id: String, selection: [Int]) async throws
+    func releaseFiles(_ id: String, directory: URL, indexes: [Int]) async throws -> Set<Int>
+    func limitUpload(_ id: String, bytesPerSecond: UInt64) async throws
     func pause(_ id: String) async throws
     func remove(_ id: String) async throws
     func stop()
@@ -80,14 +161,92 @@ struct LocalTorrentPeerCensus: Equatable {
 
 extension LocalTorrentDriving {
     var portMapping: TorrentPortMapState { .idle }
+    func releaseFiles(_ id: String, directory: URL, indexes: [Int]) async throws -> Set<Int> {
+        throw LocalTorrentError.message("This torrent engine does not support live storage cleanup.")
+    }
+    func beginRelay(_ id: String, directory: URL, selection: [Int]) async throws {
+        try await validateRelayPaths(id, directory: directory)
+        try await begin(id, directory: directory, selection: selection)
+    }
+    /// Changing aria2's `dir` option does not relocate an existing torrent.
+    /// Check its actual file paths before allowing a RAM relay to run.
+    func validateRelayPaths(_ id: String, directory: URL) async throws {
+        let current = try await status(id, files: true)
+        let root = directory.standardizedFileURL.path + "/"
+        let canonical = directory.resolvingSymlinksInPath().standardizedFileURL.path + "/"
+        var rootInfo = stat(), checked = Set<String>()
+        let realDirectory = lstat(directory.path, &rootInfo) == 0 && (rootInfo.st_mode & S_IFMT) == S_IFDIR
+        let confined = realDirectory && !current.files.isEmpty && current.files.allSatisfy { file in
+            guard file.path.hasPrefix("/"), !file.path.split(separator: "/").contains("..") else { return false }
+            let path = URL(fileURLWithPath: file.path).standardizedFileURL.path
+            let prefix = path.hasPrefix(root) ? root : canonical
+            guard path.hasPrefix(prefix), path.count > prefix.count else { return false }
+            // resolvingSymlinksInPath leaves a path unchanged when its final
+            // file does not exist yet. Check existing ancestors with lstat,
+            // including dangling links, before aria2 creates any new files.
+            var candidate = directory
+            for part in path.dropFirst(prefix.count).split(separator: "/") {
+                candidate.appendPathComponent(String(part))
+                if checked.insert(candidate.path).inserted {
+                    var info = stat()
+                    if lstat(candidate.path, &info) == 0 {
+                        if (info.st_mode & S_IFMT) == S_IFLNK { return false }
+                    } else if errno != ENOENT { return false }
+                }
+            }
+            return true
+        }
+        guard confined else {
+            if !["paused", "complete", "error", "removed"].contains(current.state) { try await pauseAndWait(id) }
+            throw LocalTorrentError.ramDestinationMismatch
+        }
+    }
+    /// forcePause acknowledges the request before aria2 closes its files.
+    /// Wait for that closure before removing anything from the RAM volume.
+    func pauseAndWait(_ id: String) async throws {
+        try await pause(id)
+        for _ in 0..<200 {
+            let current = try await status(id, files: false)
+            if ["paused", "complete", "error", "removed"].contains(current.state) { return }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        throw LocalTorrentError.message("The torrent engine is still pausing. Resume to try again.")
+    }
+    func limitUpload(_ id: String, bytesPerSecond: UInt64) async throws {}
     func peerCensus(_ id: String, attempted: Int) async throws -> LocalTorrentPeerCensus {
         .init(connected: attempted, attempted: attempted)
     }
+    func networkDiagnostics(_ id: String) async throws -> LocalTorrentNetworkDiagnostics? { nil }
 }
 
-/// One app-owned aria2 process. Its authenticated RPC interface is restricted to
+/// One app-owned torrent process. Its authenticated RPC interface is restricted to
 /// loopback; PikPak tokens and shell proxy settings never reach this process.
-@MainActor final class Aria2TorrentEngine: LocalTorrentDriving {
+@MainActor class TorrentRPCEngine: LocalTorrentDriving {
+    enum Backend { case aria2, libtorrent }
+    private let backend: Backend
+    /// Peer-seeking tuning, separate from per-launch ports and paths.
+    ///
+    /// Both engines read `bt-max-peers`, but they scope it differently: aria2
+    /// applies it to each torrent, while the libtorrent helper maps it onto the
+    /// session-wide connection limit that every transfer shares.
+    ///
+    /// `bt-request-peer-speed-limit` is aria2-only. aria2 stops looking for more
+    /// peers once the download as a whole passes that rate — sensible when peers
+    /// are plentiful, exactly wrong when a handful of seeders exist and every
+    /// extra connection matters. Raising it past any real download rate keeps it
+    /// hunting. libtorrent has no equivalent throttle, so the key is withheld
+    /// there rather than written into a config that would silently ignore it and
+    /// leave a later reader believing the knob still does something.
+    ///
+    /// Announce timing is deliberately absent: trackers publish a `min interval`
+    /// and throttle clients that beat it, so each engine is left to obey every
+    /// tracker rather than given one interval for a list we do not control.
+    nonisolated static func peerTuning(_ backend: Backend) -> [String: String] {
+        var tuning = ["bt-max-peers": "100"]
+        if backend == .aria2 { tuning["bt-request-peer-speed-limit"] = "100M" }
+        return tuning
+    }
+
     /// Fallback announce URIs for torrents that carry none of their own.
     ///
     /// A trackerless torrent leaves DHT as the only way to find anyone, and DHT
@@ -100,7 +259,17 @@ extension LocalTorrentDriving {
         "udp://tracker.torrent.eu.org:451/announce",
         "udp://open.stealth.si:80/announce",
         "udp://explodie.org:6969/announce",
-        "udp://exodus.desync.com:6969/announce"
+        "udp://exodus.desync.com:6969/announce",
+        // TCP announces, which stay up where UDP is throttled, filtered, or captured
+        // by a fake-IP tunnel — the cases where a healthy swarm reads as empty.
+        // Several of them, because one TCP tracker is a single point of failure, and
+        // different trackers return different peers: the extra ones are what supply
+        // seeder candidates when the first tracker's peers are all leechers.
+        // Only hosts confirmed to answer an announce with live peers belong here.
+        "https://tracker.opentrackr.org:443/announce",
+        "http://tracker.opentrackr.org:1337/announce",
+        "http://t.overflow.biz:6969/announce",
+        "http://tracker.mywaifu.best:6969/announce"
     ]
 
     let executable: URL
@@ -116,18 +285,27 @@ extension LocalTorrentDriving {
     private let session: URLSession
     private(set) var portMapping: TorrentPortMapState = .idle
     private var mappingWatch: Task<Void, Never>?
+    private var peerCacheAllowed = Set<String>()
+    private var peerHashes: [String: String] = [:]
+    private var peerRestoredAt: [String: Date] = [:]
+    private var peerRestoreAttemptAt: [String: Date] = [:]
+    private var peerCacheWrittenAt: [String: Date] = [:]
+    private var cachedPeerAddresses: [String: Set<String>] = [:]
+    private var peerCache: TorrentPeerCache { .init(directory: directory.appendingPathComponent("Peers", isDirectory: true)) }
     var running: Bool { child?.isRunning == true }
 
     init(executable: URL? = nil, directory: URL, extraOptions: [String: String] = [:],
-         trackers: [String]? = nil, mapsPorts: Bool = true) {
-        self.executable = executable ?? Bundle.main.resourceURL!.appendingPathComponent("TorrentEngine/aria2c")
+         trackers: [String]? = nil, mapsPorts: Bool = true, backend: Backend) {
+        self.backend = backend
+        self.executable = executable ?? Bundle.main.resourceURL!.appendingPathComponent(
+            backend == .libtorrent ? "TorrentEngine/mycloud-torrent" : "TorrentEngine/aria2c")
         self.directory = directory; self.extraOptions = extraOptions
         self.trackers = trackers ?? Self.fallbackTrackers
         self.mapper = mapsPorts ? TorrentPortMapper() : nil
         let configuration = URLSessionConfiguration.ephemeral
         configuration.connectionProxyDictionary = [:]
-        configuration.timeoutIntervalForRequest = 5
-        configuration.timeoutIntervalForResource = 15
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 30
         configuration.httpMaximumConnectionsPerHost = 8
         session = URLSession(configuration: configuration)
     }
@@ -156,18 +334,32 @@ extension LocalTorrentDriving {
                 "enable-rpc":"true", "rpc-listen-all":"false", "rpc-allow-origin-all":"false",
                 "rpc-listen-port":"\(port)", "rpc-secret":secret, "rpc-max-request-size":"64M",
                 "max-concurrent-downloads":"3", "max-download-result":"2000", "seed-time":"0",
-                "max-overall-upload-limit":"1M", "bt-max-peers":"100", "file-allocation":"none",
+                "max-overall-upload-limit":"4M", "file-allocation":"none",
                 "auto-save-interval":"5", "allow-overwrite":"false", "auto-file-renaming":"false",
                 "check-integrity":"true", "bt-remove-unselected-file":"true", "pause-metadata":"true",
-                "enable-dht":"true", "enable-dht6":"false", "bt-enable-lpd":"false",
+                // A quiet swarm must remain eligible to discover new peers.
+                "bt-stop-timeout":"0",
+                // IPv6 DHT earns its keep on a CGNAT line, where no IPv4 port can be
+                // reached from outside and the v6 swarm holds the only peers able to
+                // open a connection inward. aria2 binds every v6 interface on its own,
+                // but it keeps a separate routing table and needs its own entry point.
+                "enable-dht":"true", "enable-dht6":"true", "bt-enable-lpd":"false",
                 "dht-entry-point":"dht.transmissionbt.com:6881",
+                "dht-entry-point6":"dht.transmissionbt.com:6881",
                 "dht-file-path":directory.appendingPathComponent("dht.dat").path,
+                "dht-file-path6":directory.appendingPathComponent("dht6.dat").path,
                 // Single ports, not ranges: a NAT-PMP mapping has to name one.
-                "listen-port":"\(ports.listen)", "dht-listen-port":"\(ports.dht)",
+                "listen-port":"\(ports.listen)",
                 "dir":directory.path, "no-netrc":"true", "all-proxy":"", "http-proxy":"", "https-proxy":"",
                 "console-log-level":"error", "summary-interval":"0", "enable-color":"false",
                 "stop-with-process":"\(ProcessInfo.processInfo.processIdentifier)"
             ]
+            // aria2 runs DHT on a socket of its own. The libtorrent helper serves
+            // DHT from its listen port, so a second port here would only describe
+            // a socket nothing binds — which is why the mapper below forwards the
+            // listen port for that backend.
+            if backend == .aria2 { options["dht-listen-port"] = "\(ports.dht)" }
+            options.merge(Self.peerTuning(backend)) { _, new in new }
             options.merge(extraOptions) { _, new in new }
             // Test overrides cannot expose or deauthenticate the RPC endpoint.
             options["rpc-listen-all"] = "false"; options["rpc-allow-origin-all"] = "false"
@@ -237,8 +429,10 @@ extension LocalTorrentDriving {
     private func beginMapping(_ ports: (listen: UInt16, dht: UInt16)) {
         guard let mapper else { return }
         mappingWatch?.cancel()
+        let udpPort = backend == .libtorrent ? ports.listen : ports.dht
         mappingWatch = Task { [weak self] in
-            await mapper.start(tcp: ports.listen, udp: ports.dht)
+            // libtorrent shares its listening port with µTP and DHT.
+            await mapper.start(tcp: ports.listen, udp: udpPort)
             while !Task.isCancelled {
                 let state = await mapper.state
                 guard let self else { return }
@@ -256,11 +450,117 @@ extension LocalTorrentDriving {
         return ["bt-tracker": trackers.joined(separator: ",")]
     }
 
+    /// What a PikPak relay may send to peers, per torrent.
+    ///
+    /// BitTorrent is reciprocal: most clients unchoke the peers that feed them,
+    /// so a download giving nothing back is choked in return and runs slower.
+    /// That argues for seeding generously — except on a relay, where peer
+    /// upload and the PikPak upload share one uplink and only the PikPak
+    /// upload returns RAM and lets the transfer advance. A relay therefore
+    /// stays a polite participant rather than a generous one; a download to
+    /// this Mac has no such competition and seeds under the shared ceiling.
+    static let relayUploadLimit: UInt64 = 256 * 1024
+
+    /// A swarm can hold thousands of peers. Only the ones doing work are worth
+    /// carrying into the UI, so the list is ranked and cut here rather than
+    /// grown without bound on every census.
+    static let maximumPeersListed = 50
+
+    /// libtorrent writes a peer off after three failed dials and revives it only
+    /// when a tracker lists it again. Cached peers are therefore offered again
+    /// on this cadence while a torrent runs, so a seeder that went offline is
+    /// redialed once it returns rather than at the next start.
+    static let peerRedialInterval: TimeInterval = 5 * 60
+
+    /// Whether this torrent's cached peers are due to be offered to the engine.
+    /// A failed offer is retried after five seconds: startup may not have
+    /// created the engine's peer store yet.
+    static func peerRestoreDue(restoredAt: Date?, attemptedAt: Date?, now: Date) -> Bool {
+        guard now.timeIntervalSince(attemptedAt ?? .distantPast) >= 5 else { return false }
+        return now.timeIntervalSince(restoredAt ?? .distantPast) >= peerRedialInterval
+    }
+
     func peerCensus(_ id: String, attempted: Int) async throws -> LocalTorrentPeerCensus {
         guard let peers = try await call("getPeers", [id]) as? [[String: Any]] else {
             throw LocalTorrentError.message("The torrent engine returned an unreadable peer list.")
         }
-        return .init(connected: peers.count, attempted: attempted)
+        let connected = peers.filter(Self.peerIsConnected)
+        let listed = Self.peerList(connected)
+        if peerCacheAllowed.contains(id), let hash = peerHashes[id], !listed.isEmpty {
+            let now = Date()
+            let addresses = Set(listed.compactMap { TorrentPeerCache.Hint(peer: $0, now: now)?.address })
+            if !addresses.isEmpty && (!addresses.isSubset(of: cachedPeerAddresses[id] ?? []) ||
+                now.timeIntervalSince(peerCacheWrittenAt[id] ?? .distantPast) >= 60) {
+                if (try? peerCache.record(hash, peers: listed, now: now)) != nil {
+                    peerCacheWrittenAt[id] = now
+                    cachedPeerAddresses[id] = Set(peerCache.load(hash, now: now).map(\.address))
+                }
+            }
+        }
+        return .init(connected: connected.count, attempted: attempted, peers: listed)
+    }
+
+    func networkDiagnostics(_ id: String) async throws -> LocalTorrentNetworkDiagnostics? {
+        guard backend == .libtorrent,
+              let value = try await call("getNetworkDiagnostics", []) as? [String: Any],
+              let dht = value["dht"] as? [String: Any],
+              let jobs = value["jobs"] as? [[String: Any]],
+              let job = jobs.first(where: { $0["gid"] as? String == id }) else { return nil }
+        return .init(job, dht: dht)
+    }
+
+    static func peerIsConnected(_ value: [String: Any]) -> Bool {
+        // A peer ID can survive a disconnect inside aria2. Prefer the engine's
+        // per-connection flag over interpreting an old ID as a new handshake.
+        if let completed = value["handshakeCompleted"] as? String { return completed == "true" }
+        if let completed = value["handshakeCompleted"] as? Bool { return completed }
+        // Compatibility with older engines: IDs are 20 opaque bytes, percent
+        // encoded by RPC, and start out all-zero before a peer replies.
+        guard let identity = value["peerId"] as? String else { return false }
+        let encoded = Array(identity.utf8)
+        var cursor = 0, count = 0, nonzero = false
+        func hex(_ byte: UInt8) -> UInt8? {
+            switch byte {
+            case 48...57: return byte - 48
+            case 65...70: return byte - 55
+            case 97...102: return byte - 87
+            default: return nil
+            }
+        }
+        while cursor < encoded.count {
+            let byte: UInt8
+            if encoded[cursor] == 37 {
+                guard cursor + 2 < encoded.count, let high = hex(encoded[cursor + 1]),
+                      let low = hex(encoded[cursor + 2]) else { return false }
+                byte = high * 16 + low; cursor += 3
+            } else { byte = encoded[cursor]; cursor += 1 }
+            count += 1; nonzero = nonzero || byte != 0
+            if count > 20 { return false }
+        }
+        return count == 20 && nonzero
+    }
+
+    static func peerList(_ values: [[String: Any]]) -> [LocalTorrentPeer] {
+        let peers: [LocalTorrentPeer] = values.compactMap { value in
+            guard peerIsConnected(value), let ip = (value["ip"] as? String), !ip.isEmpty else { return nil }
+            func rate(_ key: String) -> UInt64 { UInt64(value[key] as? String ?? "") ?? 0 }
+            // An IPv6 literal carries its own colons; bracket it so the port
+            // that follows is still readable as a port.
+            let host = ip.contains(":") ? "[\(ip)]" : ip
+            let port = value["port"] as? String ?? ""
+            return .init(address: port.isEmpty ? host : host + ":" + port,
+                         downloadSpeed: rate("downloadSpeed"), uploadSpeed: rate("uploadSpeed"),
+                         seeder: value["seeder"] as? String == "true",
+                         transport: ["tcp", "utp"].contains(value["transport"] as? String ?? "")
+                            ? value["transport"] as? String : nil)
+        }
+        func moving(_ peer: LocalTorrentPeer) -> UInt64 {
+            let (sum, overflow) = peer.downloadSpeed.addingReportingOverflow(peer.uploadSpeed)
+            return overflow ? .max : sum
+        }
+        return peers.sorted { left, right in
+            moving(left) == moving(right) ? left.address < right.address : moving(left) > moving(right)
+        }.prefix(maximumPeersListed).map { $0 }
     }
 
     func addMagnet(_ magnet: String, directory: URL) async throws -> String {
@@ -279,16 +579,33 @@ extension LocalTorrentDriving {
         var options = ["dir":directory.path, "pause":"true", "bt-metadata-only":"false", "seed-time":"0"]
         options.merge(trackerOption(data)) { _, new in new }
         if let selection { options["select-file"] = try LocalTorrentSource.selectionString(selection) }
-        return try gid(await call("addTorrent", [data.base64EncodedString(), [], options]))
+        let id = try gid(await call("addTorrent", [data.base64EncodedString(), [], options]))
+        if TorrentMetadata.privacy(data) == .shareable { peerCacheAllowed.insert(id) }
+        return id
     }
 
     func status(_ id: String, files: Bool = false) async throws -> LocalTorrentStatus {
-        var keys = ["status","bittorrent","infoHash","totalLength", "pieceLength","completedLength","downloadSpeed","uploadSpeed","connections","numSeeders","errorMessage"]
+        var keys = ["status","bittorrent","infoHash","totalLength", "pieceLength","completedLength","downloadSpeed","uploadSpeed","connections","numSeeders","errorMessage","verifiedLength","verifyIntegrityPending"]
         if files { keys.append("files") }
         guard let value = try await call("tellStatus", [id, keys]) as? [String: Any] else {
             throw LocalTorrentError.message("The torrent engine returned an unreadable status.")
         }
-        return .init(value)
+        let snapshot = LocalTorrentStatus(value)
+        if peerCacheAllowed.contains(id), TorrentPeerCache.validHash(snapshot.infoHash) {
+            peerHashes[id] = snapshot.infoHash
+            if snapshot.state == "paused" || snapshot.state == "waiting" || snapshot.checkingPieces {
+                peerRestoredAt[id] = nil
+            } else if snapshot.state == "active",
+                      Self.peerRestoreDue(restoredAt: peerRestoredAt[id], attemptedAt: peerRestoreAttemptAt[id], now: Date()) {
+                let now = Date()
+                peerRestoreAttemptAt[id] = now; peerRestoredAt[id] = now
+                let hints = peerCache.load(snapshot.infoHash)
+                if !hints.isEmpty, (try? await call("addPeers", [id, hints.map(\.rpcValue)])) == nil {
+                    peerRestoredAt[id] = nil // Startup may not have created the peer store yet.
+                }
+            }
+        }
+        return snapshot
     }
 
     func begin(_ id: String, directory: URL, selection: [Int]) async throws {
@@ -296,18 +613,57 @@ extension LocalTorrentDriving {
         _ = try await call("changeOption", [id, ["dir":directory.path, "select-file":indexes, "bt-metadata-only":"false", "seed-time":"0"]])
         _ = try await call("unpause", [id])
     }
-    /// Narrow a running download's file selection without resuming it.
-    /// `begin` unpauses as well; a mid-flight deselection must not, or pausing
-    /// a transfer would be undone by the next drained file.
+    func beginRelay(_ id: String, directory: URL, selection: [Int]) async throws {
+        let indexes = try LocalTorrentSource.selectionString(selection)
+        try await validateRelayPaths(id, directory: directory)
+        // Keep the GID available when the admitted files finish. The relay
+        // removes it as soon as every chosen file is committed to PikPak.
+        // aria2 requires a numeric seed-time; ten years is below its Int32
+        // seconds limit and is never the transfer's completion condition.
+        _ = try await call("changeOption", [id, ["dir":directory.path, "select-file":indexes,
+            "bt-metadata-only":"false", "seed-time":"5256000", "seed-ratio":"0",
+            "bt-remove-unselected-file":"false"]])
+        _ = try await call("unpause", [id])
+    }
+    func limitUpload(_ id: String, bytesPerSecond: UInt64) async throws {
+        _ = try await call("changeOption", [id, ["max-upload-limit":"\(bytesPerSecond)"]])
+    }
+
+    /// The bundled engine closes and unlinks only these verified files in its
+    /// event loop. It preserves selection, completion bits and peer sockets,
+    /// and stops advertising released pieces. No pause or recheck is needed.
+    func releaseFiles(_ id: String, directory: URL, indexes: [Int]) async throws -> Set<Int> {
+        guard !indexes.isEmpty, indexes.count <= 128, indexes.allSatisfy({ $0 > 0 }) else { return [] }
+        guard let result = try await call("releaseFiles", [id, indexes, directory.path]) as? [Int],
+              Set(result).isSubset(of: Set(indexes)) else {
+            throw LocalTorrentError.message("The torrent engine returned an unreadable cleanup result.")
+        }
+        return Set(result)
+    }
+
+    /// Apply the filter after aria2 closes its old selection. Preserve a
+    /// caller's pause; reopen only if the transfer was running at entry.
     func reselect(_ id: String, selection: [Int]) async throws {
         let indexes = try LocalTorrentSource.selectionString(selection)
+        if backend == .libtorrent {
+            _ = try await call("changeOption", [id, ["select-file": indexes]])
+            return
+        }
+        let wasRunning = ["active", "waiting"].contains(try await status(id, files: false).state)
+        if wasRunning { try await pauseAndWait(id) }
         _ = try await call("changeOption", [id, ["select-file": indexes]])
+        if wasRunning { _ = try await call("unpause", [id]) }
     }
-    func pause(_ id: String) async throws { _ = try await call("forcePause", [id]) }
+    func pause(_ id: String) async throws {
+        _ = try await call("forcePause", [id])
+        peerRestoredAt[id] = nil; peerRestoreAttemptAt[id] = nil
+    }
     func remove(_ id: String) async throws {
         let current = try await status(id, files: false)
         if ["complete", "error", "removed"].contains(current.state) { _ = try await call("removeDownloadResult", [id]) }
         else { _ = try await call("forceRemove", [id]) }
+        peerCacheAllowed.remove(id); peerHashes[id] = nil; peerRestoredAt[id] = nil
+        peerRestoreAttemptAt[id] = nil; peerCacheWrittenAt[id] = nil; cachedPeerAddresses[id] = nil
     }
 
     func stop() {
@@ -317,6 +673,8 @@ extension LocalTorrentDriving {
         portMapping = .idle
         if let child, child.isRunning { child.interrupt() }
         child = nil; endpoint = nil; secret = ""
+        peerCacheAllowed.removeAll(); peerHashes.removeAll(); peerRestoredAt.removeAll()
+        peerRestoreAttemptAt.removeAll(); peerCacheWrittenAt.removeAll(); cachedPeerAddresses.removeAll()
     }
 
     private func gid(_ result: Any) throws -> String {
@@ -346,5 +704,22 @@ extension LocalTorrentDriving {
         }
         guard let result = value["result"] else { throw LocalTorrentError.message("The torrent engine returned an incomplete reply.") }
         return result
+    }
+}
+
+/// Kept available for migration fixtures and rollback compatibility.
+@MainActor final class Aria2TorrentEngine: TorrentRPCEngine {
+    init(executable: URL? = nil, directory: URL, extraOptions: [String: String] = [:],
+         trackers: [String]? = nil, mapsPorts: Bool = true) {
+        super.init(executable: executable, directory: directory, extraOptions: extraOptions,
+                   trackers: trackers, mapsPorts: mapsPorts, backend: .aria2)
+    }
+}
+
+@MainActor final class LibtorrentEngine: TorrentRPCEngine {
+    init(executable: URL? = nil, directory: URL, extraOptions: [String: String] = [:],
+         trackers: [String]? = nil, mapsPorts: Bool = true) {
+        super.init(executable: executable, directory: directory, extraOptions: extraOptions,
+                   trackers: trackers, mapsPorts: mapsPorts, backend: .libtorrent)
     }
 }

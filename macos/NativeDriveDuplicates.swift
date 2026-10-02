@@ -4,7 +4,7 @@ import Foundation
 /// Exact checks need hashes, not media decoders or similarity vectors.
 enum NativeDriveDuplicates {
     static func scan(_ roots: [URL], progress: @escaping @Sendable ([String: Any]) -> Void) async throws -> SimilarityReport {
-        try await CloudDriveFiles.detached {
+        try await AutomaticRecovery.read { try await CloudDriveFiles.detached {
             let started = Date(), manager = FileManager.default
             var pending = roots, seen = Set<URL>(), files: [(URL, UInt64, Date?)] = [], issues: [SimilarityIssue] = []
             while let source = pending.popLast() {
@@ -18,7 +18,10 @@ enum NativeDriveDuplicates {
                     } else if values.isRegularFile == true {
                         files.append((source, UInt64(max(0, values.fileSize ?? 0)), values.contentModificationDate))
                     }
-                } catch { issues.append(.init(path: source.path, reason: error.localizedDescription)) }
+                } catch {
+                    if TransferFailure.isRetryable(error) { throw error }
+                    issues.append(.init(path: source.path, reason: error.localizedDescription))
+                }
             }
             let sizeCounts = Dictionary(grouping: files, by: { $0.1 }).mapValues(\.count)
             var byHash: [String: [SimilarityFile]] = [:], checked = 0, last = Date.distantPast
@@ -52,6 +55,7 @@ enum NativeDriveDuplicates {
                     checked += 1
                 } catch {
                     if Task.isCancelled || error is CancellationError { throw CancellationError() }
+                    if TransferFailure.isRetryable(error) { throw error }
                     issues.append(.init(path: url.path, reason: error.localizedDescription))
                     record.state = "failed"
                 }
@@ -70,6 +74,6 @@ enum NativeDriveDuplicates {
                 scannedFiles: UInt64(files.count), analysedFiles: UInt64(checked), skippedFiles: UInt64(issues.count), downloadedBytes: 0,
                 totalGroups: UInt64(matches.count), groups: groups, issues: Array(issues.prefix(500)), truncated: truncated || issues.count > 500,
                 coverage: "Files with equal sizes were compared using SHA-256. Hidden files and symbolic links are excluded.", elapsedSeconds: Date().timeIntervalSince(started), files: inventory)
-        }
+        } }
     }
 }

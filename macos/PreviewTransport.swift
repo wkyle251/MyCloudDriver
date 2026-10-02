@@ -2,10 +2,8 @@ import AVFoundation
 import Foundation
 import UniformTypeIdentifiers
 
-/// Shared network policy for native media preview. The command-line engine
-/// already honours the app's Proxy field; URLSession and AVPlayer need this
-/// explicit configuration because a Finder-launched app does not inherit the
-/// user's shell proxy environment.
+/// Native previews follow the engine's direct-by-default network policy.
+/// Only a proxy explicitly entered in the app may override that route.
 enum PreviewTransport {
     static let userAgent =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -19,19 +17,34 @@ enum PreviewTransport {
         "Accept-Encoding": "identity",
     ]
 
-    static func effectiveProxyURL(_ configuredValue: String) -> String {
-        let configured = configuredValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !configured.isEmpty { return configured }
+    /// PikPak can issue HTTP original-file links even though its download CDN
+    /// serves the same signed resource over HTTPS. Promote only that CDN; the
+    /// native image, player and Open/Quick Look transports still require TLS.
+    static func secureContentURL(_ rawValue: String) -> URL? {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard var components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host?.lowercased(), !host.isEmpty,
+              components.user == nil, components.password == nil else { return nil }
 
-        // This also supports developers launching the binary from Terminal.
-        // Finder/LaunchServices normally supplies none of these variables, so
-        // the persisted in-app Proxy field remains the authoritative setting.
-        let environment = ProcessInfo.processInfo.environment
-        for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
-            let value = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !value.isEmpty { return value }
+        switch scheme {
+        case "https":
+            break
+        case "http":
+            guard host.hasPrefix("dl-"), host.hasSuffix(".mypikpak.com"),
+                  components.port == nil || components.port == 80 else { return nil }
+            components.port = nil
+        default:
+            return nil
         }
-        return ""
+        // Leave the percent-encoded path and query intact: they carry the
+        // CDN signature and must not be decoded/re-encoded during promotion.
+        components.scheme = "https"
+        return components.url
+    }
+
+    static func effectiveProxyURL(_ configuredValue: String) -> String {
+        configuredValue.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func configuration(proxyURL: String) -> URLSessionConfiguration {
@@ -42,9 +55,10 @@ enum PreviewTransport {
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.httpShouldUsePipelining = true
         configuration.httpAdditionalHeaders = mediaHeaders
-        if let proxy = proxyDictionary(for: effectiveProxyURL(proxyURL)) {
-            configuration.connectionProxyDictionary = proxy
-        }
+        // nil inherits macOS proxy/PAC settings. An explicit empty dictionary
+        // keeps previews and Open With downloads on the direct route.
+        configuration.connectionProxyDictionary =
+            proxyDictionary(for: effectiveProxyURL(proxyURL)) ?? [:]
         return configuration
     }
 
@@ -350,6 +364,65 @@ final class PreviewResourceCache {
     }
 }
 
+/// Both cache readers and the background writer can report progress faster than
+/// SwiftUI can consume it. Keep one latest snapshot and at most one queued main
+/// queue delivery, including when a completed cache is read repeatedly.
+final class PreviewCacheProgressPublisher {
+    private let lock = NSLock()
+    private let onProgress: @MainActor (PreviewResourceCacheSnapshot) -> Void
+    private let interval: TimeInterval
+    private var pending: PreviewResourceCacheSnapshot?
+    private var lastDelivered: PreviewResourceCacheSnapshot?
+    private var nextDelivery = DispatchTime.now()
+    private var deliveryScheduled = false
+    private var invalidated = false
+
+    init(
+        interval: TimeInterval = 0.25,
+        onProgress: @escaping @MainActor (PreviewResourceCacheSnapshot) -> Void
+    ) {
+        precondition(interval.isFinite && interval > 0)
+        self.interval = interval
+        self.onProgress = onProgress
+    }
+
+    func publish(_ snapshot: PreviewResourceCacheSnapshot) {
+        lock.lock()
+        guard !invalidated, snapshot != (pending ?? lastDelivered) else {
+            lock.unlock()
+            return
+        }
+        pending = snapshot
+        guard !deliveryScheduled else { lock.unlock(); return }
+        deliveryScheduled = true
+        let deadline = nextDelivery
+        lock.unlock()
+        DispatchQueue.main.asyncAfter(deadline: deadline) { [weak self] in
+            self?.deliver()
+        }
+    }
+
+    func invalidate() {
+        lock.lock()
+        invalidated = true
+        pending = nil
+        lastDelivered = nil
+        lock.unlock()
+    }
+
+    @MainActor private func deliver() {
+        lock.lock()
+        deliveryScheduled = false
+        guard !invalidated, let snapshot = pending else { lock.unlock(); return }
+        pending = nil
+        guard snapshot != lastDelivered else { lock.unlock(); return }
+        lastDelivered = snapshot
+        nextDelivery = .now() + interval
+        lock.unlock()
+        onProgress(snapshot)
+    }
+}
+
 /// Continues filling the current progressive media cache even when AVPlayer has
 /// enough data for its own immediate needs or the user pauses playback. The
 /// interactive resource-loader requests keep normal priority; this sequential
@@ -372,8 +445,6 @@ private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate 
     private var taskCancellationShouldRetry = false
     private var isInvalidated = false
     private var startIsScheduled = false
-    private var lastPublishedCachedBytes: Int64 = -1
-    private var lastProgressPublication = Date.distantPast
 
     init(
         originalURL: URL,
@@ -437,13 +508,13 @@ private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate 
     private func startTaskIfNeeded() {
         guard !isInvalidated, task == nil,
               let offset = cache.firstMissingOffset() else {
-            publishCacheProgress(cache.snapshot, force: true)
+            publishCacheProgress(cache.snapshot)
             return
         }
 
         let metadata = cache.contentMetadata
         if let length = metadata.contentLength, offset >= length {
-            publishCacheProgress(cache.snapshot, force: true)
+            publishCacheProgress(cache.snapshot)
             return
         }
 
@@ -525,7 +596,7 @@ private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate 
             contentLength: totalLength,
             supportsByteRanges: supportsRanges
         )
-        publishCacheProgress(snapshot, force: true)
+        publishCacheProgress(snapshot)
         completionHandler(.allow)
     }
 
@@ -547,7 +618,7 @@ private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate 
             return
         }
         receivedBytes = newReceivedBytes
-        publishCacheProgress(snapshot, force: false)
+        publishCacheProgress(snapshot)
     }
 
     func urlSession(
@@ -558,7 +629,7 @@ private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate 
         guard completedTask.taskIdentifier == task?.taskIdentifier else { return }
         task = nil
         let snapshot = cache.snapshot
-        publishCacheProgress(snapshot, force: true)
+        publishCacheProgress(snapshot)
         guard !isInvalidated,
               cache.firstMissingOffset() != nil else { return }
 
@@ -567,29 +638,15 @@ private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate 
         }
         let wasCancelled = (error as NSError?)?.code == NSURLErrorCancelled
         guard taskCanRetry,
-              (!wasCancelled || taskCancellationShouldRetry),
-              retryCount < 3 else { return }
-        let delays: [TimeInterval] = [1, 3, 8]
-        let delay = delays[retryCount]
-        retryCount += 1
+              (!wasCancelled || taskCancellationShouldRetry) else { return }
+        let delay = AutomaticRecovery.delay(attempt: retryCount, schedule: [1, 3, 8, 30, 60])
+        retryCount = AutomaticRecovery.nextAttempt(retryCount)
         start(after: delay)
     }
 
     private func publishCacheProgress(
-        _ snapshot: PreviewResourceCacheSnapshot,
-        force: Bool
+        _ snapshot: PreviewResourceCacheSnapshot
     ) {
-        let now = Date()
-        let byteDelta = snapshot.cachedBytes - lastPublishedCachedBytes
-        let elapsed = now.timeIntervalSince(lastProgressPublication)
-        let isComplete = snapshot.contentLength.map {
-            snapshot.cachedBytes >= $0
-        } ?? false
-        guard force || byteDelta >= 512 * 1_024 || elapsed >= 0.25 || isComplete else {
-            return
-        }
-        lastPublishedCachedBytes = snapshot.cachedBytes
-        lastProgressPublication = now
         onCacheProgress(snapshot)
     }
 
@@ -621,18 +678,15 @@ final class PreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate,
     private final class RequestContext {
         let loadingRequest: AVAssetResourceLoadingRequest
         let networkOffset: Int64
-        let requestedEndOffset: Int64?
         var responseStartOffset: Int64
         var receivedNetworkBytes: Int64 = 0
 
         init(
             loadingRequest: AVAssetResourceLoadingRequest,
-            networkOffset: Int64,
-            requestedEndOffset: Int64?
+            networkOffset: Int64
         ) {
             self.loadingRequest = loadingRequest
             self.networkOffset = networkOffset
-            self.requestedEndOffset = requestedEndOffset
             responseStartOffset = networkOffset
         }
     }
@@ -640,30 +694,30 @@ final class PreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate,
     private let originalURL: URL
     private let headers: [String: String]
     private let cache: PreviewResourceCache
-    private let onCacheProgress: (PreviewResourceCacheSnapshot) -> Void
+    private let progressPublisher: PreviewCacheProgressPublisher
     private let prefetcher: PreviewResourcePrefetcher
     private let sessionDelegateQueue: OperationQueue
     private var session: URLSession!
     private var requestsByTaskID: [Int: RequestContext] = [:]
-    private var lastPublishedCachedBytes: Int64 = -1
-    private var lastProgressPublication = Date.distantPast
+    private var isInvalidated = false
 
     init(
         originalURL: URL,
         proxyURL: String,
         cache: PreviewResourceCache,
-        onCacheProgress: @escaping (PreviewResourceCacheSnapshot) -> Void,
+        onCacheProgress: @escaping @MainActor (PreviewResourceCacheSnapshot) -> Void,
         headers: [String: String] = PreviewTransport.mediaHeaders
     ) {
         self.originalURL = originalURL
         self.headers = headers
         self.cache = cache
-        self.onCacheProgress = onCacheProgress
+        let publisher = PreviewCacheProgressPublisher(onProgress: onCacheProgress)
+        progressPublisher = publisher
         prefetcher = PreviewResourcePrefetcher(
             originalURL: originalURL,
             proxyURL: proxyURL,
             cache: cache,
-            onCacheProgress: onCacheProgress,
+            onCacheProgress: { publisher.publish($0) },
             headers: headers
         )
         delegateQueue = DispatchQueue(
@@ -691,14 +745,17 @@ final class PreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate,
     }
 
     deinit {
+        progressPublisher.invalidate()
         prefetcher.invalidate()
         session?.invalidateAndCancel()
     }
 
     func invalidate() {
+        progressPublisher.invalidate()
         prefetcher.invalidate()
         delegateQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self, !self.isInvalidated else { return }
+            self.isInvalidated = true
             let cancellation = NSError(
                 domain: NSURLErrorDomain,
                 code: NSURLErrorCancelled,
@@ -718,6 +775,10 @@ final class PreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate,
         shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
     ) -> Bool {
         guard loadingRequest.request.url?.scheme == assetURL.scheme else { return false }
+        guard !isInvalidated else {
+            loadingRequest.finishLoading(with: URLError(.cancelled))
+            return true
+        }
 
         let cachedMetadata = cache.contentMetadata
         populateContentInformation(
@@ -728,7 +789,7 @@ final class PreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate,
         if loadingRequest.dataRequest == nil,
            cachedMetadata.contentLength != nil {
             loadingRequest.finishLoading()
-            publishCacheProgress(cache.snapshot, force: true)
+            publishCacheProgress(cache.snapshot)
             return true
         }
 
@@ -737,7 +798,7 @@ final class PreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate,
             to: loadingRequest,
             requestedEndOffset: requestedEndOffset
         ) {
-            publishCacheProgress(cache.snapshot, force: true)
+            publishCacheProgress(cache.snapshot)
             return true
         }
 
@@ -769,8 +830,7 @@ final class PreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate,
         let task = session.dataTask(with: request)
         requestsByTaskID[task.taskIdentifier] = RequestContext(
             loadingRequest: loadingRequest,
-            networkOffset: offset,
-            requestedEndOffset: requestedEndOffset
+            networkOffset: offset
         )
         task.resume()
         return true
@@ -822,7 +882,7 @@ final class PreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate,
             contentLength: metadata.contentLength,
             supportsByteRanges: metadata.supportsByteRanges
         )
-        publishCacheProgress(snapshot, force: true)
+        publishCacheProgress(snapshot)
 
         if let http = response as? HTTPURLResponse, http.statusCode == 200 {
             context.responseStartOffset = 0
@@ -846,7 +906,7 @@ final class PreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate,
 
         if respondFromCache(
             to: context.loadingRequest,
-            requestedEndOffset: context.requestedEndOffset
+            requestedEndOffset: requestedEndOffset(for: context.loadingRequest.dataRequest)
         ) {
             requestsByTaskID.removeValue(forKey: dataTask.taskIdentifier)
             completionHandler(.cancel)
@@ -883,11 +943,11 @@ final class PreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate,
             return
         }
         context.receivedNetworkBytes = receivedBytes
-        publishCacheProgress(snapshot, force: false)
+        publishCacheProgress(snapshot)
 
         if respondFromCache(
             to: context.loadingRequest,
-            requestedEndOffset: context.requestedEndOffset
+            requestedEndOffset: requestedEndOffset(for: context.loadingRequest.dataRequest)
         ) {
             finish(dataTask: dataTask, context: context)
         }
@@ -903,17 +963,23 @@ final class PreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate,
         ) else { return }
         guard !context.loadingRequest.isCancelled,
               !context.loadingRequest.isFinished else { return }
+        // The content length is commonly unknown when a request arrives and
+        // known by the time its response ends. Reading it again here keeps a
+        // response that stopped short of the resource from being reported as a
+        // complete one, which would leave AVFoundation reading bytes that never
+        // arrived.
+        let requestedEnd = requestedEndOffset(for: context.loadingRequest.dataRequest)
         if respondFromCache(
             to: context.loadingRequest,
-            requestedEndOffset: context.requestedEndOffset
+            requestedEndOffset: requestedEnd
         ) {
-            publishCacheProgress(cache.snapshot, force: true)
+            publishCacheProgress(cache.snapshot)
             return
         }
         if let error {
             context.loadingRequest.finishLoading(with: error)
-        } else if let requestedEndOffset = context.requestedEndOffset,
-                  nextOffset(for: context.loadingRequest.dataRequest) < requestedEndOffset {
+        } else if let requestedEnd,
+                  nextOffset(for: context.loadingRequest.dataRequest) < requestedEnd {
             let truncated = NSError(
                 domain: NSURLErrorDomain,
                 code: NSURLErrorNetworkConnectionLost,
@@ -926,7 +992,7 @@ final class PreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate,
         } else {
             context.loadingRequest.finishLoading()
         }
-        publishCacheProgress(cache.snapshot, force: true)
+        publishCacheProgress(cache.snapshot)
     }
 
     private func finish(dataTask: URLSessionDataTask, context: RequestContext) {
@@ -934,7 +1000,7 @@ final class PreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate,
         if !context.loadingRequest.isFinished {
             context.loadingRequest.finishLoading()
         }
-        publishCacheProgress(cache.snapshot, force: true)
+        publishCacheProgress(cache.snapshot)
         dataTask.cancel()
     }
 
@@ -1053,21 +1119,9 @@ final class PreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate,
     }
 
     private func publishCacheProgress(
-        _ snapshot: PreviewResourceCacheSnapshot,
-        force: Bool
+        _ snapshot: PreviewResourceCacheSnapshot
     ) {
-        let now = Date()
-        let byteDelta = snapshot.cachedBytes - lastPublishedCachedBytes
-        let elapsed = now.timeIntervalSince(lastProgressPublication)
-        let isComplete = snapshot.contentLength.map {
-            snapshot.cachedBytes >= $0
-        } ?? false
-        guard force || byteDelta >= 512 * 1_024 || elapsed >= 0.25 || isComplete else {
-            return
-        }
-        lastPublishedCachedBytes = snapshot.cachedBytes
-        lastProgressPublication = now
-        onCacheProgress(snapshot)
+        progressPublisher.publish(snapshot)
     }
 
     private func contentRangeStart(_ response: HTTPURLResponse) -> Int64? {

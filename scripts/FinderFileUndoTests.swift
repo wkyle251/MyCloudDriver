@@ -59,5 +59,6 @@ struct FinderFileUndoTests {
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         DownloaderModel.testFileUndoModel(defaults: defaults)
+        try DownloaderModel.testTrashUndoOutline(defaults: defaults)
     }
 }

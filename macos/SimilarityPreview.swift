@@ -35,7 +35,7 @@ import SwiftUI
                     guard let prepare else { throw CloudDriveError.message("Open this file from its drive to preview it.") }
                     let folder = FileManager.default.temporaryDirectory.appendingPathComponent("MyCloudDriver-SimilarityPreview-\(UUID().uuidString)")
                     try CloudDriveFiles.privateDirectory(folder); created = folder
-                    url = try await prepare(file, folder)
+                    url = try await AutomaticRecovery.read { try await prepare(file, folder) }
                 }
                 try Task.checkCancellation()
                 guard self.generation == token else { throw CancellationError() }

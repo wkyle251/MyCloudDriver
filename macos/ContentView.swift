@@ -3,12 +3,6 @@ import AVKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-private enum PreviewResizeAxis {
-    case horizontal
-    case vertical
-    case both
-}
-
 private enum BrowserViewMode: Int {
     case list
     case thumbnails
@@ -18,23 +12,6 @@ private enum BrowserItemZoom {
     static let minimum = 0.75
     static let maximum = 1.80
     static let step = 0.15
-}
-
-private enum BrowserWorkspaceLayout {
-    static let folderMinimumWidth: CGFloat = 360
-    static let previewMinimumWidth: CGFloat = 300
-    static let splitDividerAllowance: CGFloat = 8
-
-    static let splitMinimumWidth = folderMinimumWidth
-        + previewMinimumWidth
-        + splitDividerAllowance
-}
-
-private enum TransferWorkspaceLayout {
-    /// Keeps the settings card and the complete four-metric dashboard visible
-    /// as designed. The app window itself remains freely resizable; narrower
-    /// windows scroll this workspace horizontally instead of clipping values.
-    static let minimumWidth: CGFloat = 940
 }
 
 /// Carry the complete merge choice into the sheet as one value. Presenting an
@@ -106,6 +83,7 @@ private struct FinderFooterStatus: View {
     let isBusy: Bool
     let diagnostic: AppErrorDiagnostic?
     let compact: Bool
+    let openTransfers: () -> Void
     let openActivity: (() -> Void)?
     @State private var isHovered = false
 
@@ -190,6 +168,11 @@ private struct FinderFooterStatus: View {
                 .frame(maxHeight: activity.tasks.isEmpty ? 260 : 420)
                 .fixedSize(horizontal: false, vertical: true)
                 HStack {
+                    Button {
+                        activity.showsDetails = false
+                        openTransfers()
+                    } label: { Label("Transfers", systemImage: "arrow.up.arrow.down") }
+                        .buttonStyle(.borderless).pointingHandCursor()
                     if diagnostic == nil {
                         Button {
                             NSPasteboard.general.clearContents()
@@ -377,12 +360,18 @@ struct ContentView: View {
     @State private var advancedExpanded = false
     @State private var activityExpanded = false
     @StateObject private var workspaceNavigation = FinderWorkspaceNavigation()
+    @ObservedObject private var bookmarks = FinderBookmarkStore.shared
     init(navigation: FinderWorkspaceNavigation? = nil) {
         _workspaceNavigation = StateObject(wrappedValue: navigation ?? FinderWorkspaceNavigation())
     }
     private var selectedTab: Int {
         get { workspaceNavigation.section }
-        nonmutating set { workspaceNavigation.showImmediately(newValue) }
+        nonmutating set {
+            workspaceNavigation.showImmediately(newValue)
+        }
+    }
+    private var browserSourceIsReady: Bool {
+        selectedTab == 1 || selectedTab >= 4 || model.isBrowsingSharedLink == (selectedTab == 3)
     }
     @AppStorage("selectedTransferMode") private var selectedTransferMode = 0
     @AppStorage("browserViewMode") private var browserViewModeRaw = BrowserViewMode.list.rawValue
@@ -417,12 +406,8 @@ struct ContentView: View {
     @State private var renameItemName = ""
     @State private var isRenameItemPresented = false
     @State private var editSharedLinkRequest: EditSharedLinkRequest?
+    @State private var createOwnedShareRequest: PikPakShareDraft?
     @State private var isChoosingUploadDestination = false
-    @AppStorage("previewCanvasWidth") private var previewCanvasWidth = 720.0
-    @AppStorage("previewCanvasHeight") private var previewCanvasHeight = 440.0
-    @State private var previewResizeStartSize: CGSize?
-    @State private var livePreviewCanvasSize: CGSize?
-    @State private var isPreviewResizeHovered = false
     @FocusState private var browserListFocused: Bool
 
     #if HEADER_LAYOUT_TESTS
@@ -434,19 +419,30 @@ struct ContentView: View {
     }
     #else
     var body: some View {
+        workspaceBody
+    }
+    private var workspaceBody: some View {
         ZStack {
             Color(nsColor: .windowBackgroundColor).ignoresSafeArea()
 
             FinderSidebarLayout(automaticallyHidden: finderSettings.autoHideSidebar) {
                 finderSidebar
             } workspace: {
-              VStack(alignment: .leading, spacing: 8) {
+              FinderWorkspaceBody {
                 GeometryReader { workspace in
                     Group {
-                        if selectedTab == 0 {
+                        if !browserSourceIsReady {
+                            FinderWorkspaceLoadingOverlay(title: "Waiting for the current PikPak request…")
+                        } else if selectedTab == 0 {
                             cloudBrowser
                         } else if selectedTab == 1 {
                             downloader
+                        } else if selectedTab == FinderWorkspaceSection.bookmarks.rawValue {
+                            bookmarkWorkspace
+                        } else if selectedTab >= 4 {
+                            PikPakManagementWorkspace(model: model, management: model.pikpakManagement, section: selectedTab,
+                                openBrowser: { selectFinderSection(0) },
+                                openLocalTransfers: { selectedTransferMode = 2; selectFinderSection(1) })
                         } else {
                             sharedLinkBrowser
                         }
@@ -470,9 +466,16 @@ struct ContentView: View {
                     }
                 }
 
-                workspaceFooter
+            } footer: {
+                if FinderWorkspaceSection(rawValue: selectedTab)?.isPikPakManagement == true || selectedTab == FinderWorkspaceSection.bookmarks.rawValue {
+                    HStack {
+                        Label(model.accountDisplayName ?? "PikPak", systemImage: "person.crop.circle")
+                        Spacer()
+                        Text("\(FinderWorkspaceSection(rawValue: selectedTab)?.title ?? "PikPak") · Current account")
+                    }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 10)
+                        .finderFooterSurface()
+                } else { workspaceFooter }
             }
-              .padding(10)
               .overlay { FinderWorkspaceTransitionOverlay(loading: workspaceNavigation.loading) }
             }
         }
@@ -494,12 +497,28 @@ struct ContentView: View {
         .accentColor(FinderAppearance.accent)
         .buttonStyle(FinderButtonStyle())
         .focusedSceneValue(\.finderWindowActions, finderWindowActions)
+        .background(FinderWindowActionRegistration(actions: finderWindowActions))
+        .task(id: "\(selectedTab):\(model.isRunning):\(model.isBrowsingSharedLink)") {
+            // A drive switch preserves the chosen tab even while PikPak's
+            // foreground request owns its previous source. Activate the
+            // requested source as soon as that request releases it.
+            guard !browserSourceIsReady, !model.isRunning else { return }
+            _ = prepareBrowserSource(for: selectedTab)
+        }
         #if WORKSPACE_SWITCH_PROFILING
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name("PikPakSwitchBenchmark"))) { note in
             if let section = note.object as? Int { selectFinderSection(section) }
         }
         #endif
         .disabled(model.isChangingAccount)
+        .onChange(of: finderSettings.layoutResetRevision) { _ in
+            isPreviewExpanded = false
+            liveBrowserNameColumnWidth = nil; liveBrowserSizeColumnWidth = nil
+            liveBrowserKindColumnWidth = nil; liveBrowserModifiedColumnWidth = nil
+        }
+        .onChange(of: browserViewModeRaw) { value in
+            model.setBrowserFilterViewMode(includingExpanded: value == BrowserViewMode.list.rawValue)
+        }
         .onChange(of: model.activeAccountID) { _ in
             selectedTab = 0
             isChoosingUploadDestination = false
@@ -508,6 +527,8 @@ struct ContentView: View {
             isDSStoreConfirmationPresented = false; pendingDSStoreScope = nil
             mergeFoldersRequest = nil; pendingNewFolderParent = nil; isNewFolderPresented = false
             pendingRenameItem = nil; editSharedLinkRequest = nil
+            createOwnedShareRequest = nil
+            model.preparePikPakManagement()
         }
         .onDisappear { workspaceNavigation.cancel() }
         .background {
@@ -517,6 +538,7 @@ struct ContentView: View {
         .onAppear {
             browserViewModeRaw = BrowserViewMode(rawValue: browserViewModeRaw)?.rawValue
                 ?? BrowserViewMode.list.rawValue
+            model.setBrowserFilterViewMode(includingExpanded: browserViewModeRaw == BrowserViewMode.list.rawValue)
             linksViewModeRaw = BrowserViewMode(rawValue: linksViewModeRaw)?.rawValue
                 ?? BrowserViewMode.list.rawValue
             if legacyBrowserItemZoom > 0 {
@@ -534,16 +556,21 @@ struct ContentView: View {
                 max(browserThumbnailItemZoom, BrowserItemZoom.minimum),
                 BrowserItemZoom.maximum
             )
+            _ = prepareBrowserSource(for: selectedTab)
             model.loadBrowserIfReady()
         }
         // Leaving this drive must not cancel transfers. AppDelegate owns shutdown.
         .onDisappear { _ = model.cancelQuickLook(); model.previewPlayer?.pause() }
+        .sheet(item: $createOwnedShareRequest) { draft in
+            PikPakCreateShareSheet(management: model.pikpakManagement, initialFiles: draft.files)
+        }
         .sheet(isPresented: Binding(get: { model.isLoginPresented && !model.loginFromSettings }, set: {
             if !$0 && model.isLoginPresented && !model.loginFromSettings { model.cancelLogin() }
         })) {
             PikPakLoginView(
                 reason: model.loginReason,
                 currentDeviceID: model.loginDeviceID,
+                initialCredentialKind: model.loginCredentialKind,
                 onSession: { session in
                     model.completeWebLogin(with: session)
                 },
@@ -685,27 +712,10 @@ struct ContentView: View {
     #endif
 
     private var finderSidebar: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Image(nsImage: NSApplication.shared.applicationIconImage)
-                    .resizable().frame(width: 29, height: 29)
-                Text("MyCloudDriver").font(.headline)
-            }
-            .padding(.horizontal, 12).padding(.top, 16).padding(.bottom, 16)
-
-            Text("WORKSPACES").font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary).padding(.horizontal, 12)
-            ForEach(FinderWorkspaceSection.allCases) { section in
-                FinderWorkspaceSidebarTab(loading: workspaceNavigation.loading, title: section.title, symbol: section.symbol,
-                    section: section.rawValue, currentSection: selectedTab) {
-                    selectFinderSection(section.rawValue)
-                }
-            }
-            Divider().padding(.vertical, 8)
-            FinderSettingsButton()
-                .buttonStyle(.plain).pointingHandCursor()
-                .help("Settings · Command-Comma")
-            Spacer(minLength: 12)
+        FinderDriveSidebar(navigation: workspaceNavigation, settings: finderSettings,
+            accountTitle: sessionNeedsAttention ? "Sign In / Account" : "Account",
+            accountSubtitle: model.accountDisplayName ?? "PikPak", showsContentMode: true, pikpakAccount: model,
+            sections: FinderWorkspaceSection.allCases, select: selectFinderSection) {
             if hasStoredSession {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
@@ -721,45 +731,43 @@ struct ContentView: View {
                             .font(.caption2).monospacedDigit()
                     }
                     Text(quotaRemainingLabel).font(.caption2).foregroundStyle(.secondary)
-                }
-                .padding(12)
+                    PikPakTransferQuotaSidebar(model: model, monitor: model.transferQuotaMonitor)
+                }.padding(.horizontal, 12).padding(.vertical, 6)
             }
-            FinderAccountSettingsLink(settings: finderSettings) {
-                Label {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(sessionNeedsAttention ? "Sign In / Account" : "Account")
-                        if hasStoredSession, !sessionNeedsAttention {
-                            Text(model.accountDisplayName ?? "Signed in to PikPak")
-                                .font(.caption).foregroundStyle(.secondary)
-                                .lineLimit(1).truncationMode(.tail)
-                        }
-                    }
-                } icon: {
-                    Image(systemName: "person.crop.circle").foregroundStyle(FinderAppearance.accent)
-                }
-                    .font(.system(size: 13))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12).contentShape(Rectangle())
-            }
-            .buttonStyle(.plain).pointingHandCursor()
-            .help([model.accountDisplayName, accountStateSubtitle].compactMap { $0 }.joined(separator: "\n"))
         }
-        .padding(.horizontal, 8).padding(.bottom, 8)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(FinderAppearance.sidebarBackground)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Sidebar")
     }
 
     private func selectFinderSection(_ section: Int) {
+        if section == 1 { showTransfers(); return }
+        if section == FinderWorkspaceSection.bookmarks.rawValue {
+            workspaceNavigation.showImmediately(section)
+            return
+        }
+        if section >= 4 {
+            model.preparePikPakManagement()
+            workspaceNavigation.showImmediately(section)
+            return
+        }
         workspaceNavigation.select(section, needsLoading: model.workspaceSwitchNeedsLoading(to: section)) {
             prepareBrowserSource(for: section)
         }
     }
 
+    private var bookmarkWorkspace: some View {
+        FinderBookmarksWorkspace(store: bookmarks, provider: "pikpak", scope: model.bookmarkScope,
+            sourceTitle: model.accountDisplayName ?? "PikPak", canOpen: model.canOpenBookmarks,
+            open: { bookmark in
+                if model.openBookmark(bookmark) { selectedTab = 0 }
+            }, showBrowser: { selectFinderSection(0) })
+    }
+
+    private func showTransfers() {
+        workspaceNavigation.showImmediately(FinderWorkspaceSection.transfers.rawValue)
+    }
+
     private var finderWindowActions: FinderWindowActions {
-        let fileWorkspace = selectedTab == 0 || selectedTab == 3
-        let maintenanceAllowed = selectedTab == 0 && !workspaceNavigation.isSwitching && !isChoosingUploadDestination
+        let fileWorkspace = browserSourceIsReady && (selectedTab == 0 || selectedTab == 3)
+        let maintenanceAllowed = browserSourceIsReady && selectedTab == 0 && !workspaceNavigation.isSwitching && !isChoosingUploadDestination
         return FinderWindowActions(section: selectedTab, viewMode: browserViewMode.rawValue,
             zoom: browserItemZoom,
             undoTitle: model.fileUndoHistory.undoTitle, redoTitle: model.fileUndoHistory.redoTitle,
@@ -804,7 +812,12 @@ struct ContentView: View {
                 model.downloadSelectedBrowserItem(); selectedTransferMode = 0; selectedTab = 1
             },
             newFolder: { if !workspaceNavigation.isSwitching { requestNewFolder() } },
-            trash: { if !workspaceNavigation.isSwitching { requestTrashForBrowserSelection() } })
+            trash: { if !workspaceNavigation.isSwitching { requestTrashForBrowserSelection() } },
+            supportsPikPakManagement: true,
+            canToggleFolder: fileWorkspace && browserViewMode == .list && !workspaceNavigation.isSwitching
+                && !isChoosingUploadDestination && model.canToggleFocusedBrowserFolder,
+            toggleFolderTitle: model.focusedBrowserFolderToggleTitle,
+            toggleFolder: { model.toggleFocusedBrowserFolder() })
     }
 
     private func setFinderViewMode(_ value: Int) {
@@ -896,7 +909,7 @@ struct ContentView: View {
     /// Narrow windows keep an explicit Error label and put long text in details.
     private var workspaceFooter: some View {
         GeometryReader { geometry in
-            let fileWorkspace = selectedTab == 0 || selectedTab == 3
+            let fileWorkspace = browserSourceIsReady && (selectedTab == 0 || selectedTab == 3)
             let compact = fileWorkspace && geometry.size.width < 880
             let compactPath = geometry.size.width < 700
             HStack(spacing: 10) {
@@ -917,6 +930,7 @@ struct ContentView: View {
                     isBusy: model.isRunning || model.hasOtherBackgroundActivity || model.isPreparingQuickLook,
                     diagnostic: model.statusErrorDiagnostic,
                     compact: compact,
+                    openTransfers: showTransfers,
                     openActivity: model.log.isEmpty ? nil : showActivityLog
                 )
                 .frame(maxWidth: fileWorkspace && !compact ? 280 : (compact ? nil : .infinity))
@@ -946,11 +960,7 @@ struct ContentView: View {
             .padding(.horizontal, 10)
             .frame(width: geometry.size.width, height: geometry.size.height)
         }
-        .frame(height: 34)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .overlay(alignment: .top) { Divider() }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Workspace footer")
+        .finderFooterSurface()
     }
 
     private func showActivityLog() {
@@ -962,7 +972,11 @@ struct ContentView: View {
         let count = model.browserActionSelectionCount
         if count > 0 { return "\(count.formatted()) selected" }
         if model.isBrowsingSharedLink { return "\(model.sharedLinks.count.formatted()) links" }
-        return "\(model.visibleBrowserItemCount.formatted()) shown"
+        return "\(displayedBrowserItemCount.formatted()) shown"
+    }
+
+    private var displayedBrowserItemCount: Int {
+        browserViewMode == .thumbnails ? model.displayedBrowserItems.count : model.displayedBrowserTreeEntries.count
     }
 
 
@@ -1126,102 +1140,23 @@ struct ContentView: View {
 
     private var cloudBrowser: some View {
         VStack(spacing: 12) {
-            if isChoosingUploadDestination {
-                uploadDestinationChooserBar
-                    .appCard(padding: 10)
-            }
-
+            if !model.showsSharedLinkOverview { browserToolbar }
+            if isChoosingUploadDestination { uploadDestinationChooserBar.appCard(padding: 10) }
             if !model.isBrowsingSharedLink && !hasStoredSession {
-                VStack(spacing: 12) {
-                    ZStack {
-                        Circle()
-                            .fill(Color.blue.opacity(0.1))
-                        Image(systemName: "cloud.fill")
-                            .font(.system(size: 34))
-                            .foregroundStyle(.blue)
-                    }
-                    .frame(width: 72, height: 72)
-                    Text("Your cloud files are one sign-in away")
-                        .font(.title3.weight(.semibold))
-                    Text("PikPak opens temporarily to create a desktop session used only by this app.")
-                        .foregroundStyle(.secondary)
-                    Button("Sign In to PikPak…") {
-                        model.signIn()
-                    }
-                    .buttonStyle(.borderedProminent).pointingHandCursor()
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .appCard(padding: 24)
+                FinderDriveConnection(kind: .pikpak, busy: model.isLoginPresented) { model.signIn() }
             } else {
-                GeometryReader { viewport in
-                    let requiredWidth = !finderSettings.showsPreviewPane
-                        ? BrowserWorkspaceLayout.folderMinimumWidth
-                        : isPreviewExpanded && model.selectedBrowserItem != nil
-                        ? BrowserWorkspaceLayout.previewMinimumWidth
-                        : BrowserWorkspaceLayout.splitMinimumWidth
-                    let workspaceWidth = max(viewport.size.width, requiredWidth)
-
-                    ScrollView(.horizontal) {
-                        Group {
-                            if !finderSettings.showsPreviewPane {
-                                browserContent
-                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                                    .background(Color(nsColor: .controlBackgroundColor))
-                            } else if isPreviewExpanded, model.selectedBrowserItem != nil {
-                                previewPane
-                                    .frame(
-                                        minWidth: BrowserWorkspaceLayout.previewMinimumWidth,
-                                        maxWidth: .infinity,
-                                        maxHeight: .infinity
-                                    )
-                                    .background(Color(nsColor: .controlBackgroundColor).opacity(0.72))
-                                    .transition(.opacity.combined(with: .scale(scale: 0.985)))
-                            } else {
-                                HSplitView {
-                                    browserContent
-                                        .frame(
-                                            minWidth: BrowserWorkspaceLayout.folderMinimumWidth,
-                                            idealWidth: 650,
-                                            maxWidth: .infinity
-                                        )
-                                        .background(Color(nsColor: .controlBackgroundColor))
-                                    previewPane
-                                        .frame(
-                                            minWidth: BrowserWorkspaceLayout.previewMinimumWidth,
-                                            idealWidth: 340,
-                                            maxWidth: .infinity
-                                        )
-                                        .background(Color(nsColor: .controlBackgroundColor).opacity(0.72))
-                                }
-                            }
-                        }
-                        .frame(
-                            width: workspaceWidth,
-                            height: viewport.size.height,
-                            alignment: .topLeading
-                        )
-                    }
-                    .scrollIndicators(.automatic)
-                }
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(Color.primary.opacity(0.09), lineWidth: 1)
-                }
-                .shadow(color: .black.opacity(0.055), radius: 12, y: 4)
-                .onChange(of: model.selectedBrowserItemID) { selectedID in
-                    if selectedID == nil {
-                        isPreviewExpanded = false
-                    }
-                }
+                FinderBrowserSplit(showsPreview: finderSettings.showsPreviewPane,
+                    expanded: isPreviewExpanded && model.selectedBrowserItem != nil,
+                    resetRevision: finderSettings.layoutResetRevision) {
+                    browserContent
+                } preview: { previewPane }
+                .onChange(of: model.selectedBrowserItemID) { if $0 == nil { isPreviewExpanded = false } }
             }
         }
     }
 
     private var uploadDestinationCandidate: BrowserLocation {
-        if let item = model.selectedBrowserItem, item.isFolder {
-            return model.browserLocation(for: item)
-        }
+        if let item = model.selectedBrowserItem, item.isFolder { return model.browserLocation(for: item) }
         return model.browserStack.last ?? .root
     }
 
@@ -1277,12 +1212,18 @@ struct ContentView: View {
         guard model.canChooseUploadDestination,
               model.activateAccountBrowser()
         else { return }
+        model.browserFileFilter = .all
         isChoosingUploadDestination = true
         selectedTab = 0
     }
 
     private var browserContent: some View {
         VStack(spacing: 0) {
+            if model.activeBrowserFileFilter.isActive {
+                BrowserFileFilterBar(filter: $model.browserFileFilter,
+                    count: model.displayedBrowserFileCount(includingExpanded: browserViewMode == .list))
+                Divider()
+            }
             if let progress = model.browserFolderExpansionProgress {
                 BrowserFolderExpansionBar(progress: progress) {
                     model.cancelBrowserFolderExpansion()
@@ -1290,14 +1231,14 @@ struct ContentView: View {
                 Divider()
             }
             if browserViewMode == .thumbnails {
-                if model.isBrowsingSharedLink { sharedLinkThumbnailGrid }
+                if model.showsSharedLinkOverview { sharedLinkThumbnailGrid }
                 else { browserThumbnailGrid }
             } else {
                 browserList
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            if !model.isBrowsingSharedLink, browserViewMode == .list,
+            if !model.showsSharedLinkOverview,
                model.hasMoreBrowserItems || (model.isBrowserLoading && !model.browserItems.isEmpty) {
                 browserThumbnailPaginationFooter
             }
@@ -1455,208 +1396,30 @@ struct ContentView: View {
     }
 
     private var browserToolbar: some View {
-        HStack(spacing: 9) {
-            Button {
-                model.goBack()
-            } label: {
-                Image(systemName: "chevron.left")
-                    .frame(width: 24, height: 24)
+        FinderBrowserToolbar(viewMode: Binding(
+            get: { model.isBrowsingSharedLink ? linksViewModeRaw : browserViewModeRaw },
+            set: setFinderViewMode), zoom: browserItemZoom,
+            connected: model.canBrowse, canGoBack: model.canGoBack,
+            canImport: model.canUploadFiles && !isChoosingUploadDestination,
+            canExport: model.canDownloadSelectedBrowserItem && !isChoosingUploadDestination,
+            canTrash: model.canTrashSelectedBrowserItem && !isChoosingUploadDestination,
+            canCreate: model.canCreateFolder && !isChoosingUploadDestination,
+            share: model.isBrowsingSharedLink ? nil : { requestOwnedShare() },
+            canShare: !model.selectedBrowserItems.isEmpty && !model.isManagingCloudItems && !isChoosingUploadDestination,
+            merge: model.isBrowsingSharedLink ? nil : { requestMergeSelectedFolders() },
+            canMerge: finderWindowActions.canMergeFolders,
+            fileTypeFilter: model.isBrowsingSharedLink ? nil : $model.browserFileFilter,
+            fileExtensions: model.availableBrowserFileExtensions(includingExpanded: browserViewMode == .list),
+            back: { model.goBack() }, search: { model.presentFileSearch(scope: .expanded) },
+            importFiles: {
+                if model.chooseFilesToUploadInCurrentBrowserFolder() { selectedTransferMode = 1; selectedTab = 1 }
+            }, exportFiles: {
+                model.downloadSelectedBrowserItem(); selectedTransferMode = 0; selectedTab = 1
+            }, trash: requestTrashForBrowserSelection, create: { requestNewFolder() },
+            refresh: { model.refreshBrowser() }, adjustZoom: adjustBrowserZoom, resetZoom: resetBrowserZoom,
+            sort: model.toggleBrowserSort) {
+                browserBreadcrumb
             }
-            .help("Back")
-            .disabled(!model.canGoBack)
-
-            ZStack {
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Color.blue.opacity(0.1))
-                Image(systemName: model.isBrowsingSharedLink ? "link" : "folder.fill")
-                    .foregroundStyle(.blue)
-            }
-            .frame(width: 30, height: 30)
-            .browserDropCanvas(
-                model: model,
-                destination: model.browserStack.last,
-                compact: true
-            ) {
-                selectedTransferMode = 1
-                selectedTab = 1
-            }
-            .help("Current folder; drop Finder files to upload, or PikPak items to move here")
-
-            browserBreadcrumb
-                .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
-                .layoutPriority(1)
-
-            if !model.isBrowsingSharedLink {
-                Picker("Browser view", selection: $browserViewModeRaw) {
-                    Image(systemName: "list.bullet")
-                        .accessibilityLabel("List")
-                        .tag(BrowserViewMode.list.rawValue)
-                    Image(systemName: "square.grid.3x3.fill")
-                        .accessibilityLabel("Thumbnails")
-                        .tag(BrowserViewMode.thumbnails.rawValue)
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 76)
-                .help("Switch between List and Thumbnails")
-            }
-
-            Menu {
-                Button("Make Items Larger") {
-                    adjustBrowserZoom(by: BrowserItemZoom.step)
-                }
-                .keyboardShortcut("+", modifiers: .command)
-                .disabled(browserItemZoom >= BrowserItemZoom.maximum)
-
-                Button("Make Items Smaller") {
-                    adjustBrowserZoom(by: -BrowserItemZoom.step)
-                }
-                .keyboardShortcut("-", modifiers: .command)
-                .disabled(browserItemZoom <= BrowserItemZoom.minimum)
-
-                Divider()
-
-                Button("Actual Size") {
-                    resetBrowserZoom()
-                }
-                .keyboardShortcut("0", modifiers: .command)
-                .disabled(abs(browserItemZoom - 1) < 0.001)
-
-                Text(
-                    "\(zoomedBrowserViewMode == .thumbnails ? "Thumbnails" : "List") "
-                        + "item size: \(browserZoomPercent)%"
-                )
-            } label: {
-                Image(systemName: "textformat.size")
-                    .frame(width: 22, height: 22)
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("Item size: \(browserZoomPercent)% (Command-Plus / Command-Minus)")
-
-            Text(browserSelectionSummary)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-                .layoutPriority(2)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(Color.primary.opacity(0.05), in: Capsule())
-
-            if model.isScanningDuplicates {
-                Button {
-                    model.cancelDuplicateScan()
-                } label: {
-                    Label("Cancel Scan", systemImage: "xmark.circle")
-                }
-                .keyboardShortcut("d", modifiers: [.command, .shift])
-                .help("Stop checking this folder for duplicate files")
-            }
-
-            if !model.isBrowsingSharedLink {
-                Button {
-                    if model.chooseFilesToUploadInCurrentBrowserFolder() {
-                        selectedTransferMode = 1
-                        selectedTab = 1
-                    }
-                } label: {
-                    Label("Upload", systemImage: "arrow.up.circle.fill")
-                        .labelStyle(.titleAndIcon)
-                        .fixedSize()
-                }
-                .disabled(!model.canUploadFiles || isChoosingUploadDestination)
-                .help("Choose local files or folders to upload into \(model.currentBrowserPath)")
-            }
-
-            if model.isBrowsingSharedLink {
-                Button {
-                    model.saveSelectedSharedItems()
-                } label: {
-                    if model.isSavingSelectedSharedSelection {
-                        HStack(spacing: 6) {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text("Saving…")
-                        }
-                    } else if model.isSelectedSharedSelectionSaved {
-                        Label(
-                            "Saved to My PikPak",
-                            systemImage: "checkmark.circle.fill"
-                        )
-                        .labelStyle(.titleAndIcon)
-                        .fixedSize()
-                    } else {
-                        Label(
-                            model.browserActionSelectionCount > 1
-                                ? "Save \(model.browserActionSelectionCount) Items to My PikPak"
-                                : "Save to My PikPak",
-                            systemImage: "square.and.arrow.down.fill"
-                        )
-                        .labelStyle(.titleAndIcon)
-                        .fixedSize()
-                    }
-                }
-                .disabled(!model.canSaveSharedSelection)
-                .help("Save the selected shared files or folders to Pack From Shared in My PikPak")
-                .fixedSize()
-                .layoutPriority(4)
-            }
-
-            Button {
-                model.downloadSelectedBrowserItem()
-                selectedTransferMode = 0
-                selectedTab = 1
-            } label: {
-                Label("Download", systemImage: "arrow.down.circle.fill")
-                    .labelStyle(.titleAndIcon)
-                    .fixedSize()
-            }
-            .buttonStyle(.borderedProminent).pointingHandCursor()
-            .disabled(!model.canDownloadSelectedBrowserItem || isChoosingUploadDestination)
-            .help("Add the selected file or folder to the download queue")
-
-            if !model.isBrowsingSharedLink {
-                Button(role: .destructive) {
-                    requestTrashForBrowserSelection()
-                } label: {
-                    Label("Trash", systemImage: "trash")
-                        .labelStyle(.titleAndIcon)
-                        .fixedSize()
-                }
-                .keyboardShortcut(.delete, modifiers: .command)
-                .disabled(!model.canTrashSelectedBrowserItem || isChoosingUploadDestination)
-                .help("Move selected items to PikPak Trash (Command-Delete)")
-                .accessibilityLabel("Move Selected Items to Trash")
-
-                Button {
-                    requestNewFolder()
-                } label: {
-                    Image(systemName: "folder.badge.plus")
-                        .frame(width: 22, height: 22)
-                }
-                .keyboardShortcut("n", modifiers: [.command, .shift])
-                .disabled(!model.canCreateFolder || isChoosingUploadDestination)
-                .help("Create a folder in the current PikPak folder")
-                .accessibilityLabel("New Folder")
-            }
-
-            if model.hasMoreBrowserItems {
-                Button("Load More") {
-                    model.loadMoreBrowserItems()
-                }
-                .disabled(!model.canBrowse)
-            }
-
-            Button {
-                model.refreshBrowser()
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .frame(width: 22, height: 22)
-            }
-            .help("Refresh folder")
-            .disabled(!model.canBrowse)
-        }
     }
 
     /// Finder-style path control. `ViewThatFits` tests the complete intrinsic
@@ -1781,8 +1544,8 @@ struct ContentView: View {
     }
 
     private var browserList: some View {
-        let entries = model.browserTreeEntries
-        let hasOutlineRows = model.isBrowsingSharedLink
+        let entries = model.displayedBrowserTreeEntries
+        let hasOutlineRows = model.showsSharedLinkOverview
             ? !model.sharedLinks.isEmpty
             : !entries.isEmpty
         return ScrollViewReader { scrollProxy in
@@ -1809,6 +1572,9 @@ struct ContentView: View {
                                 ZStack {
                                     browserBlankSelectionTarget
 
+                                    if model.activeBrowserFileFilter.isActive {
+                                        BrowserFileFilterEmptyState(filter: $model.browserFileFilter, hasMore: model.hasMoreBrowserItems)
+                                    } else {
                                     VStack(spacing: 10) {
                                         ZStack {
                                             Circle()
@@ -1828,6 +1594,7 @@ struct ContentView: View {
                                         }
                                         .disabled(!model.canBrowse)
                                     }
+                                    }
                                 }
                                 .frame(width: columns.tableWidth, alignment: .center)
                                 .frame(maxHeight: .infinity, alignment: .center)
@@ -1837,7 +1604,7 @@ struct ContentView: View {
                                         browserBlankSelectionTarget
 
                                         Group {
-                                            if model.isBrowsingSharedLink {
+                                            if model.showsSharedLinkOverview {
                                                 sharedLinkTreeRows(
                                                     columns: columns
                                                 )
@@ -1870,18 +1637,9 @@ struct ContentView: View {
                     maxHeight: .infinity,
                     alignment: .topLeading
                 )
-                // Identity resets the scroll offset, which the account Browser
-                // wants when it navigates into a different folder. The Links
-                // outline renders every link at once, so making the active
-                // link or its restored `browserStack` part of this identity
-                // tore the whole scroll view down — and with it the scroll
-                // position and keyboard focus — merely for expanding a folder
-                // under a link that was not the active one.
-                .id(
-                    model.isBrowsingSharedLink
-                        ? "shared-links"
-                        : "account|\(model.currentBrowserPath)"
-                )
+                // The Links overview keeps its scroll/focus while another
+                // link is selected. Entered folders reset just like Browser.
+                .id(model.browserPresentationIdentity)
                 .focusable()
                 .focused($browserListFocused)
                 .hideKeyboardFocusEffectWhenAvailable()
@@ -1897,8 +1655,8 @@ struct ContentView: View {
                 }
                 .accessibilityLabel("Cloud files")
                 .accessibilityHint(
-                    model.isBrowsingSharedLink
-                        ? "Each top-level URL is an expandable shared-link root. Its files and folders appear directly beneath it."
+                    model.showsSharedLinkOverview
+                        ? "Each link shows its files and folders. Use folder disclosure buttons to expand or collapse, or double-click a folder to open it."
                         : "Use Up and Down to select rows, Shift with Up or Down to extend the selection, Left and Right to collapse or expand folders, Return to open a folder, Space to Quick Look the selected file, and Command Delete to move selected items to Trash."
                 )
                 .onChange(of: model.selectedBrowserItemID) { _ in
@@ -1959,7 +1717,13 @@ struct ContentView: View {
                             return model.toggleQuickLookForSelection(in: window)
                         },
                         onCancelQuickLook: model.cancelQuickLook,
-                        ownsQuickLookPanel: model.ownsQuickLookPanel
+                        ownsQuickLookPanel: model.ownsQuickLookPanel,
+                        handlesSelectAll: canSelectAllBrowserFolders,
+                        onSelectAllFolders: selectAllBrowserFolders,
+                        handlesPreviewNavigation: canMovePreviewSelection && !browserListFocused,
+                        onPreviewMove: { offset in
+                            movePreviewSelection(by: offset, scrollProxy: scrollProxy)
+                        }
                     )
                     .frame(width: 0, height: 0)
                 }
@@ -1995,7 +1759,8 @@ struct ContentView: View {
                     entry,
                     rowIndex: index,
                     columns: columns,
-                    actionSelectionCount: actionSelectionCount
+                    actionSelectionCount: actionSelectionCount,
+                    sharedLinkID: model.isBrowsingSharedLink ? model.activeSharedLinkID : nil
                 )
             }
         }
@@ -2013,7 +1778,6 @@ struct ContentView: View {
                     zoomScale: browserZoomScale,
                     columns: columns,
                     isSelected: model.selectedSharedLinkRootID == link.id,
-                    isExpanded: sharedLinkIsExpanded(link),
                     usesAlternateBackground: linkIndex.isMultiple(of: 2),
                     measurement: model.cachedSharedLinkMeasurement(for: link.id),
                     isMeasuring: model.isMeasuringSharedLink(link.id),
@@ -2024,11 +1788,7 @@ struct ContentView: View {
                     onSelect: {
                         activateSharedLinkRoot(link)
                     },
-                    onToggle: {
-                        toggleSharedLinkRoot(link)
-                    },
                     onMeasure: {
-                        model.setSharedLinkExpanded(link.id, expanded: true)
                         model.measureSharedLink(link.id)
                     },
                     onEditLink: {
@@ -2038,7 +1798,6 @@ struct ContentView: View {
                         model.copySharedLinkURL(link.id)
                     },
                     onRetry: {
-                        model.setSharedLinkExpanded(link.id, expanded: true)
                         model.retrySharedLink(link.id)
                     },
                     onDisconnect: {
@@ -2047,7 +1806,7 @@ struct ContentView: View {
                 )
                 .id("shared-link-\(link.id.uuidString)")
 
-                if sharedLinkIsExpanded(link) {
+                if model.sharedLinkHasContents(link.id) {
                     let linkEntries = model.sharedLinkTreeEntries(for: link.id)
                     ForEach(Array(linkEntries.enumerated()), id: \.element.id) { itemIndex, entry in
                         browserTreeRow(
@@ -2064,89 +1823,73 @@ struct ContentView: View {
     }
 
     /// The View menu can switch Links to thumbnails without dropping other
-    /// expanded link roots or borrowing the active link's metadata/selection.
+    /// link headers or borrowing the active link's metadata/selection.
     private var sharedLinkThumbnailGrid: some View {
-        GeometryReader { viewport in
-            ScrollView {
-                ZStack(alignment: .topLeading) {
-                    browserBlankSelectionTarget
-                    LazyVStack(alignment: .leading, spacing: 16) {
-                        ForEach(sortedSharedLinks) { link in
-                            VStack(alignment: .leading, spacing: 12) {
-                                HStack(spacing: 8) {
-                                    Button { toggleSharedLinkRoot(link) } label: {
-                                        Image(systemName: sharedLinkIsExpanded(link) ? "chevron.down" : "chevron.right")
-                                    }
-                                    .buttonStyle(.borderless).pointingHandCursor()
-                                    .accessibilityLabel(sharedLinkIsExpanded(link) ? "Collapse link" : "Expand link")
-                                    FinderRowAction(title: "Remove link from this app (keeps cloud files)",
-                                        symbol: "xmark", tint: .red, enabled: model.canDisconnectSharedLink(link.id), hintOnRight: true) {
-                                        model.removeSharedLink(link.id)
-                                    }
-                                    .accessibilityLabel("Disconnect shared link \(link.url)")
-                                    Button { activateSharedLinkRoot(link) } label: {
-                                        Label(link.url, systemImage: "link")
-                                            .lineLimit(1).truncationMode(.middle)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                    }
-                                    .buttonStyle(.plain).pointingHandCursor().help(link.url)
-                                    if link.state == .loading { ProgressView().controlSize(.small) }
-                                }
-                                .padding(10)
-                                .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
-                                if sharedLinkIsExpanded(link) {
-                                    let entries = model.sharedLinkTreeEntries(for: link.id)
-                                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 132 * browserZoomScale), spacing: 12)], spacing: 12) {
-                                        ForEach(entries) { entry in
-                                            browserThumbnailItem(entry.item, scale: browserZoomScale,
-                                                actionSelectionCount: model.browserActionSelectionCount,
-                                                sharedLinkID: link.id)
-                                            .id("\(link.id.uuidString)|\(entry.item.id)")
+        ScrollViewReader { scrollProxy in
+            GeometryReader { viewport in
+                ScrollView {
+                    ZStack(alignment: .topLeading) {
+                        browserBlankSelectionTarget
+                        LazyVStack(alignment: .leading, spacing: 16) {
+                            ForEach(sortedSharedLinks) { link in
+                                VStack(alignment: .leading, spacing: 12) {
+                                    HStack(spacing: 8) {
+                                        FinderRowAction(title: "Remove link from this app (keeps cloud files)",
+                                            symbol: "xmark", tint: .red, enabled: model.canDisconnectSharedLink(link.id), hintOnRight: true) {
+                                            model.removeSharedLink(link.id)
                                         }
+                                        .accessibilityLabel("Disconnect shared link \(link.url)")
+                                        Button { activateSharedLinkRoot(link) } label: {
+                                            Label(link.url, systemImage: "link")
+                                                .lineLimit(1).truncationMode(.middle)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                        }
+                                        .buttonStyle(.plain).pointingHandCursor().help(link.url)
+                                        if link.state == .loading { ProgressView().controlSize(.small) }
                                     }
-                                    if entries.isEmpty {
-                                        Text("This folder is empty").font(.caption).foregroundStyle(.secondary).padding(10)
+                                    .padding(10)
+                                    .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
+                                    if model.sharedLinkHasContents(link.id) {
+                                        let entries = model.sharedLinkTreeEntries(for: link.id)
+                                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 132 * browserZoomScale), spacing: 12)], spacing: 12) {
+                                            ForEach(entries) { entry in
+                                                browserThumbnailItem(entry.item, scale: browserZoomScale,
+                                                    actionSelectionCount: model.browserActionSelectionCount,
+                                                    sharedLinkID: link.id)
+                                                .id("\(link.id.uuidString)|\(entry.item.id)")
+                                            }
+                                        }
+                                        if entries.isEmpty {
+                                            Text("This folder is empty").font(.caption).foregroundStyle(.secondary).padding(10)
+                                        }
+                                    } else if case .failed = link.state {
+                                        Button("Retry Link") { model.retrySharedLink(link.id) }
                                     }
-                                } else if case .failed = link.state {
-                                    Button("Retry Link") { model.retrySharedLink(link.id) }
                                 }
                             }
                         }
+                        .padding(14)
                     }
-                    .padding(14)
+                    .frame(minHeight: viewport.size.height, alignment: .topLeading)
                 }
-                .frame(minHeight: viewport.size.height, alignment: .topLeading)
+            }
+            .accessibilityLabel("Shared-link thumbnails")
+            .task(id: model.browserScrollRestoreRequest?.id) {
+                guard let request = model.browserScrollRestoreRequest else { return }
+                try? await Task.sleep(nanoseconds: 60_000_000)
+                guard !Task.isCancelled,
+                      model.browserScrollRestoreRequest?.id == request.id else { return }
+                scrollProxy.scrollTo(browserRowScrollID(request.itemID), anchor: .center)
+                if request.focusesBrowser { browserListFocused = true }
+                model.completeBrowserScrollRestoration(request.id)
             }
         }
-        .accessibilityLabel("Shared-link thumbnails")
     }
 
     private var sortedSharedLinks: [SharedLinkEntry] { model.sortedSharedLinks }
 
-    private func sharedLinkIsExpanded(_ entry: SharedLinkEntry) -> Bool {
-        model.isSharedLinkExpanded(entry.id)
-    }
-
     private func activateSharedLinkRoot(_ entry: SharedLinkEntry) {
-        model.setSharedLinkExpanded(entry.id, expanded: true)
         model.selectSharedLinkRoot(entry.id)
-    }
-
-    private func toggleSharedLinkRoot(_ entry: SharedLinkEntry) {
-        switch entry.state {
-        case .loading:
-            return
-        case .failed:
-            model.setSharedLinkExpanded(entry.id, expanded: true)
-            model.retrySharedLink(entry.id)
-        case .ready:
-            if model.isSharedLinkExpanded(entry.id) {
-                model.setSharedLinkExpanded(entry.id, expanded: false)
-            } else {
-                model.setSharedLinkExpanded(entry.id, expanded: true)
-                model.activateSharedLink(entry.id)
-            }
-        }
     }
 
     /// Child rows from inactive expanded links render from their own cached
@@ -2163,11 +1906,14 @@ struct ContentView: View {
     }
 
     private var browserThumbnailGrid: some View {
-        let items = model.browserItems
+        let items = model.displayedBrowserItems
         let scale = browserZoomScale
         return ScrollViewReader { scrollProxy in
             ZStack {
                 if items.isEmpty && !model.isBrowserLoading {
+                    if model.activeBrowserFileFilter.isActive {
+                        BrowserFileFilterEmptyState(filter: $model.browserFileFilter, hasMore: model.hasMoreBrowserItems)
+                    } else {
                     VStack(spacing: 10) {
                         ZStack {
                             Circle()
@@ -2188,6 +1934,7 @@ struct ContentView: View {
                         .disabled(!model.canBrowse)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
                 } else {
                     GeometryReader { viewport in
                         let spacing = max(8, 12 * scale)
@@ -2228,8 +1975,10 @@ struct ContentView: View {
                                         browserThumbnailItem(
                                             item,
                                             scale: scale,
-                                            actionSelectionCount: actionSelectionCount
+                                            actionSelectionCount: actionSelectionCount,
+                                            sharedLinkID: model.isBrowsingSharedLink ? model.activeSharedLinkID : nil
                                         )
+                                        .id(browserRowScrollID(item.id))
                                     }
                                 }
                                 .padding(.horizontal, horizontalPadding)
@@ -2241,13 +1990,7 @@ struct ContentView: View {
                                 alignment: .topLeading
                             )
                         }
-                        .safeAreaInset(edge: .bottom, spacing: 0) {
-                            if model.hasMoreBrowserItems
-                                || (model.isBrowserLoading && !items.isEmpty) {
-                                browserThumbnailPaginationFooter
-                            }
-                        }
-                        .id("thumbnails-\(model.currentBrowserPath)")
+                        .id("thumbnails-\(model.browserPresentationIdentity)")
                         .focusable()
                         .focused($browserListFocused)
                         .hideKeyboardFocusEffectWhenAvailable()
@@ -2269,7 +2012,7 @@ struct ContentView: View {
                         .onChange(of: model.selectedBrowserItemID) { _ in
                             model.browserSelectionChanged()
                             if model.isQuickLookSessionActive, let selected = model.selectedBrowserItemID {
-                                scrollProxy.scrollTo(selected, anchor: .center)
+                                scrollProxy.scrollTo(browserRowScrollID(selected), anchor: .center)
                             }
                         }
                         .task(id: model.browserScrollRestoreRequest?.id) {
@@ -2279,7 +2022,7 @@ struct ContentView: View {
                                 !Task.isCancelled,
                                 model.browserScrollRestoreRequest?.id == request.id
                             else { return }
-                            scrollProxy.scrollTo(request.itemID, anchor: .center)
+                            scrollProxy.scrollTo(browserRowScrollID(request.itemID), anchor: .center)
                             if request.focusesBrowser { browserListFocused = true }
                             model.completeBrowserScrollRestoration(request.id)
                         }
@@ -2320,7 +2063,13 @@ struct ContentView: View {
                                     return model.toggleQuickLookForSelection(in: window)
                                 },
                                 onCancelQuickLook: model.cancelQuickLook,
-                                ownsQuickLookPanel: model.ownsQuickLookPanel
+                                ownsQuickLookPanel: model.ownsQuickLookPanel,
+                                handlesSelectAll: canSelectAllBrowserFolders,
+                                onSelectAllFolders: selectAllBrowserFolders,
+                                handlesPreviewNavigation: canMovePreviewSelection && !browserListFocused,
+                                onPreviewMove: { offset in
+                                    movePreviewSelection(by: offset, scrollProxy: scrollProxy)
+                                }
                             )
                             .frame(width: 0, height: 0)
                         }
@@ -2381,7 +2130,7 @@ struct ContentView: View {
                 Button {
                     model.loadMoreBrowserItems()
                 } label: {
-                    Label("Load Next 200", systemImage: "ellipsis.circle")
+                    Label("Load Next \(DownloaderModel.browserPageSize)", systemImage: "ellipsis.circle")
                         .labelStyle(.titleAndIcon)
                 }
                 .buttonStyle(.borderedProminent).pointingHandCursor()
@@ -2421,7 +2170,7 @@ struct ContentView: View {
             isSavedToPikPak: model.isSharedItemSaved(item.id, in: sharedLinkID),
             onSelect: {
                 guard activateSharedLinkContext(sharedLinkID) else { return }
-                selectBrowserItem(item, visibleItems: sharedLinkID == nil ? model.browserItems : model.browserTreeEntries.map(\.item))
+                selectBrowserItem(item, visibleItems: model.showsSharedLinkOverview ? model.browserTreeEntries.map(\.item) : model.displayedBrowserItems)
             },
             onToggleSelection: {
                 guard activateSharedLinkContext(sharedLinkID) else { return }
@@ -2431,21 +2180,26 @@ struct ContentView: View {
             onActivate: {
                 guard activateSharedLinkContext(sharedLinkID) else { return }
                 activateBrowserItem(item)
-            }
+            },
+            thumbnailProxyURL: model.proxyURL,
+            thumbnailCache: model.thumbnailCache
         )
         .accessibilityHint(
             item.isFolder
                 ? "Use the checkbox to include this folder and all its contents. Double-click or press Return to open it."
                 : "Use the checkbox to add this file to the selection. Double-click to preview it."
         )
-        .contextMenu {
+        .browserContextMenu(nativeMenu: item.isFolder ? {
+            browserFolderNativeMenu(item, sharedLinkID: sharedLinkID, actionSelectionCount: actionSelectionCount, showsCollapse: false)
+        } : nil) {
             if !item.isFolder {
                 browserFileOpenMenu(item, sharedLinkID: sharedLinkID)
             }
             if item.isFolder {
-                BrowserFolderExpansionMenu { levels in
+                let targets = browserExpansionTargets(for: item, sharedLinkID: sharedLinkID)
+                BrowserFolderExpansionAction(folderCount: targets.count) { levels in
                     guard activateSharedLinkContext(sharedLinkID) else { return }
-                    expandBrowserSubfolders(item, levels: levels)
+                    expandBrowserSubfolders(targets, levels: levels)
                 }
                 .disabled(!model.canExpandBrowserSubfolders(in: sharedLinkID))
 
@@ -2465,18 +2219,7 @@ struct ContentView: View {
                     }
                     .disabled(!model.canCreateFolder)
 
-                    if model.isBrowserItemSelected(item.id),
-                       model.selectedFoldersForMerge.count >= 2 {
-                        Button {
-                            requestMergeSelectedFolders(preferredDestination: item)
-                        } label: {
-                            BrowserContextMenuStyle.label(
-                                "Merge \(model.selectedFoldersForMerge.count.formatted()) Folders…",
-                                systemImage: "arrow.triangle.merge"
-                            )
-                        }
-                        .disabled(!model.canMergeSelectedFolders)
-                    }
+                    browserMergeFoldersButton(item)
                 }
 
                 Button {
@@ -2500,6 +2243,10 @@ struct ContentView: View {
             }
 
             if !model.isBrowsingSharedLink {
+                Button { requestOwnedShare(item) } label: {
+                    BrowserContextMenuStyle.label("Create Shared Link…", systemImage: "link")
+                }.disabled(!model.hasAccountSession || model.isManagingCloudItems)
+
                 Button {
                     requestRename(item)
                 } label: {
@@ -2695,14 +2442,17 @@ struct ContentView: View {
                 ? "Use the checkbox to add this folder and all of its contents to the selection. Use its disclosure button to expand it inline, or double-click or press Return to open it."
                 : "Use the checkbox to add this file to the selection. Double-click to preview it."
         )
-        .contextMenu {
+        .browserContextMenu(nativeMenu: item.isFolder ? {
+            browserFolderNativeMenu(item, sharedLinkID: sharedLinkID, actionSelectionCount: actionSelectionCount)
+        } : nil) {
             if !item.isFolder {
                 browserFileOpenMenu(item, sharedLinkID: sharedLinkID)
             }
             if item.isFolder {
-                BrowserFolderExpansionMenu { levels in
+                let targets = browserExpansionTargets(for: item, sharedLinkID: sharedLinkID)
+                BrowserFolderExpansionAction(folderCount: targets.count) { levels in
                     guard activateSharedLinkContext(sharedLinkID) else { return }
-                    expandBrowserSubfolders(item, levels: levels)
+                    expandBrowserSubfolders(targets, levels: levels)
                 }
                 .disabled(!model.canExpandBrowserSubfolders(in: sharedLinkID))
 
@@ -2732,18 +2482,7 @@ struct ContentView: View {
                     }
                     .disabled(!model.canCreateFolder)
 
-                    if model.isBrowserItemSelected(item.id),
-                       model.selectedFoldersForMerge.count >= 2 {
-                        Button {
-                            requestMergeSelectedFolders(preferredDestination: item)
-                        } label: {
-                            BrowserContextMenuStyle.label(
-                                "Merge \(model.selectedFoldersForMerge.count.formatted()) Folders…",
-                                systemImage: "arrow.triangle.merge"
-                            )
-                        }
-                        .disabled(!model.canMergeSelectedFolders)
-                    }
+                    browserMergeFoldersButton(item)
                 }
 
                 Button {
@@ -2761,6 +2500,10 @@ struct ContentView: View {
             }
 
             if sharedLinkID == nil, !model.isBrowsingSharedLink {
+                Button { requestOwnedShare(item) } label: {
+                    BrowserContextMenuStyle.label("Create Shared Link…", systemImage: "link")
+                }.disabled(!model.hasAccountSession || model.isManagingCloudItems)
+
                 Button {
                     requestRename(item)
                 } label: {
@@ -2839,6 +2582,17 @@ struct ContentView: View {
 
     @ViewBuilder
     private func browserFileOpenMenu(_ item: BrowserItem, sharedLinkID: UUID?) -> some View {
+        if sharedLinkID == nil, !model.isBrowsingSharedLink {
+            Button {
+                model.toggleBookmark(item, store: bookmarks)
+            } label: {
+                BrowserContextMenuStyle.label(
+                    bookmarks.contains(provider: "pikpak", scope: model.bookmarkScope, itemID: item.id)
+                        ? "Remove from Bookmarks" : "Add to Bookmarks",
+                    systemImage: "bookmark")
+            }.disabled(model.bookmarkScope == nil)
+            Divider()
+        }
         FinderFileOpenMenu(item: item,
             enabled: model.canOpenBrowserFile(item, in: sharedLinkID),
             open: { application in
@@ -2857,6 +2611,111 @@ struct ContentView: View {
         .disabled(!model.canRequestQuickLook(for: item))
         .help("Preview this file · Space")
         Divider()
+    }
+
+    private func browserMergeFoldersButton(_ item: BrowserItem) -> some View {
+        Button { requestMergeSelectedFolders(preferredDestination: item) } label: {
+            BrowserContextMenuStyle.label("Merge Selected Folders…", systemImage: "arrow.triangle.merge")
+        }
+        .disabled(!model.canMergeSelectedFolders || !model.selectedFoldersForMerge.contains(where: { $0.id == item.id }))
+        .help("Select two or more sibling folders to merge")
+    }
+
+    /// Read current capabilities when the menu opens. Its native items stay
+    /// fixed until dismissal; commands still validate against the live model.
+    private func browserFolderNativeMenu(_ item: BrowserItem, sharedLinkID: UUID?,
+                                         actionSelectionCount: Int, showsCollapse: Bool = true) -> NSMenu {
+        let menu = BrowserNativeMenu()
+        let expansionTargets = browserExpansionTargets(for: item, sharedLinkID: sharedLinkID)
+        BrowserFolderExpansionAction.add(to: menu, enabled: model.canExpandBrowserSubfolders(in: sharedLinkID),
+                                         folderCount: expansionTargets.count) { levels in
+            guard model.canExpandBrowserSubfolders(in: sharedLinkID), activateSharedLinkContext(sharedLinkID) else { return }
+            expandBrowserSubfolders(expansionTargets, levels: levels)
+        }
+        let expanded = sharedLinkID.map { model.isSharedLinkFolderExpanded(item.id, in: $0) }
+            ?? model.isBrowserFolderExpanded(item.id)
+        if showsCollapse && expanded {
+            menu.addAction("Collapse Folder", symbol: "chevron.down", enabled: model.canChangeBrowserSelection) {
+                guard model.canChangeBrowserSelection, activateSharedLinkContext(sharedLinkID) else { return }
+                model.toggleBrowserFolderExpansion(item)
+            }
+        }
+        menu.addAction("Open Folder", symbol: "folder", enabled: !model.isRunning) {
+            guard !model.isRunning, activateSharedLinkContext(sharedLinkID) else { return }
+            model.openFolder(item)
+        }
+        let accountFolder = sharedLinkID == nil && !model.isBrowsingSharedLink
+        if accountFolder {
+            menu.addAction(bookmarks.contains(provider: "pikpak", scope: model.bookmarkScope, itemID: item.id)
+                           ? "Remove from Bookmarks" : "Add to Bookmarks", symbol: "bookmark", enabled: model.bookmarkScope != nil) {
+                model.toggleBookmark(item, store: bookmarks)
+            }
+            menu.addAction("New Folder Inside…", symbol: "folder.badge.plus", enabled: model.canCreateFolder) {
+                guard model.canCreateFolder else { return }
+                requestNewFolder(in: model.browserLocation(for: item))
+            }
+            let merge = menu.addAction("Merge Selected Folders…", symbol: "arrow.triangle.merge",
+                enabled: model.canMergeSelectedFolders && model.selectedFoldersForMerge.contains(where: { $0.id == item.id })) {
+                    requestMergeSelectedFolders(preferredDestination: item)
+                }
+            merge.toolTip = "Select two or more sibling folders to merge"
+        }
+        menu.addAction(model.cachedFolderMeasurement(for: item.id, in: sharedLinkID) == nil
+                       ? "Calculate Folder Size" : "Recalculate Folder Size", symbol: "sum",
+                       enabled: model.canMeasureFolder(item, in: sharedLinkID)) {
+            guard model.canMeasureFolder(item, in: sharedLinkID), activateSharedLinkContext(sharedLinkID) else { return }
+            model.measureFolder(item)
+        }
+        if let sharedLinkID, model.sharedLinkFolderHasMoreItems(item.id, in: sharedLinkID) {
+            menu.addAction("Load More Contents") {
+                guard activateSharedLinkContext(sharedLinkID) else { return }
+                model.loadMoreBrowserTreeItems(in: item)
+            }
+        }
+        if accountFolder {
+            menu.addAction("Create Shared Link…", symbol: "link", enabled: model.hasAccountSession && !model.isManagingCloudItems) {
+                requestOwnedShare(item)
+            }
+            menu.addAction("Rename…", symbol: "pencil", enabled: model.canRenameBrowserItem(item)) {
+                guard model.canRenameBrowserItem(item) else { return }
+                requestRename(item)
+            }
+            menu.addItem(.separator())
+        }
+        if let sharedLinkID {
+            menu.addAction(model.sharedSaveContextMenuTitle(for: item, in: sharedLinkID), symbol: "icloud.and.arrow.up",
+                           enabled: model.canSaveSharedItemsFromContextMenu(item, in: sharedLinkID)) {
+                model.saveSharedItemsFromContextMenu(item, in: sharedLinkID)
+            }
+        }
+        menu.addAction(actionSelectionCount > 1 ? "Add Selected Items to Queue" : "Add Folder to Queue",
+                       symbol: "arrow.down.circle", enabled: model.canQueueBrowserDownload) {
+            guard model.canQueueBrowserDownload, activateSharedLinkContext(sharedLinkID) else { return }
+            if !model.isBrowserItemSelected(item.id) { model.selectBrowserItem(item) }
+            model.downloadSelectedBrowserItem()
+            selectedTransferMode = 0; selectedTab = 1
+        }
+        if accountFolder {
+            menu.addItem(.separator())
+            menu.addAction(actionSelectionCount > 1 ? "Move Selected Items to Trash" : "Move to Trash",
+                           symbol: "trash", enabled: model.canTrashBrowserItem(item)) {
+                guard model.canTrashBrowserItem(item) else { return }
+                if !model.isBrowserItemSelected(item.id) { model.selectBrowserItem(item) }
+                requestTrashForBrowserSelection()
+            }
+        }
+        return menu
+    }
+
+    private func requestOwnedShare(_ item: BrowserItem? = nil) {
+        guard model.hasAccountSession, !model.isChangingAccount, !model.isBrowsingSharedLink, !model.isManagingCloudItems else { return }
+        if let item, !model.isBrowserItemSelected(item.id) { model.selectBrowserItem(item) }
+        let files = model.browserItemActionRoots.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }.map {
+            PikPakManagedFile(id: $0.id, name: $0.name, isFolder: $0.isFolder, size: $0.size)
+        }
+        guard !files.isEmpty, files.count <= 100 else { return }
+        model.preparePikPakManagement()
+        createOwnedShareRequest = .init(files: files)
     }
 
     private func moveBrowserSelection(
@@ -2915,11 +2774,11 @@ struct ContentView: View {
         guard let targetID = model.selectAdjacentBrowserItem(
             by: offset,
             extendingSelection: extendingSelection,
-            visibleItems: model.browserItems
+            visibleItems: model.displayedBrowserItems
         ) else { return }
 
         withAnimation(.easeOut(duration: 0.12)) {
-            scrollProxy.scrollTo(targetID, anchor: .center)
+            scrollProxy.scrollTo(browserRowScrollID(targetID), anchor: .center)
         }
     }
 
@@ -2962,7 +2821,12 @@ struct ContentView: View {
     @ViewBuilder
     private var previewPane: some View {
         if let item = model.selectedBrowserItem {
-            VStack(alignment: .leading, spacing: 12) {
+            FinderPreviewPane(resetRevision: finderSettings.layoutResetRevision,
+                mediaPlayback: item.mediaKind == .video || item.mediaKind == .audio ? model.mediaPlayback : nil,
+                onPreviewMove: { offset in
+                    guard canMovePreviewSelection else { return }
+                    model.movePreviewSelection(by: offset)
+                }) {
                 HStack(alignment: .center, spacing: 11) {
                     ZStack {
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -3019,223 +2883,201 @@ struct ContentView: View {
                 .padding(10)
                 .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
 
-                previewSurface(for: item)
+            } media: {
+                previewCanvas(for: item)
+            } details: {
+                VStack(alignment: .leading, spacing: 10) {
+                    if !item.isFolder,
+                       model.previewFileID == item.id,
+                       let previewError = model.previewPlaybackError {
+                        previewFailureSection(for: item, message: previewError)
+                    }
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 10) {
-                        if !item.isFolder,
-                           model.previewFileID == item.id,
-                           let previewError = model.previewPlaybackError {
-                            previewFailureSection(for: item, message: previewError)
+                    if !item.isFolder,
+                       (item.mediaKind == .video || item.mediaKind == .audio),
+                       model.previewFileID == item.id {
+                        previewStreamingPanel(for: item)
+                    }
+
+                    if item.isFolder {
+                        Button {
+                            model.openFolder(item)
+                        } label: {
+                            Label("Open Folder", systemImage: "folder")
                         }
+                        .buttonStyle(.borderedProminent).pointingHandCursor()
+                        .keyboardShortcut(.return, modifiers: [])
+                        .disabled(model.isRunning)
+                    } else {
+                        if !model.isBrowsingSharedLink, item.isCloudExtractableArchive {
+                            HStack {
+                                Button {
+                                    requestArchiveExtraction(for: item)
+                                } label: {
+                                    Label(
+                                        extractionActionTitle(for: item),
+                                        systemImage: "archivebox"
+                                    )
+                                }
+                                .buttonStyle(.borderedProminent).pointingHandCursor()
+                                .disabled(!model.canOpenArchiveExtraction(item))
 
-                        if !item.isFolder,
-                           (item.mediaKind == .video || item.mediaKind == .audio),
-                           model.previewFileID == item.id {
-                            previewStreamingPanel(for: item)
-                        }
+                                Spacer()
 
-                        if item.isFolder {
-                            Button {
-                                model.openFolder(item)
-                            } label: {
-                                Label("Open Folder", systemImage: "folder")
+                                Label("Server-side extraction", systemImage: "cloud")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
-                            .buttonStyle(.borderedProminent).pointingHandCursor()
-                            .keyboardShortcut(.return, modifiers: [])
-                            .disabled(model.isRunning)
-                        } else {
-                            if !model.isBrowsingSharedLink, item.isCloudExtractableArchive {
-                                HStack {
+                        }
+
+                        HStack {
+                            if item.supportsInlinePreview {
+                                Button {
+                                    model.requestPreview(for: item)
+                                } label: {
+                                    Label(
+                                        item.mediaKind == .video || item.mediaKind == .audio
+                                            ? (model.previewFileID == item.id ? "Reload" : "Load Preview")
+                                            : (model.previewFileID == item.id ? "Reload Preview" : "Load Preview"),
+                                        systemImage: item.isTextPreviewable
+                                            ? "doc.plaintext"
+                                            : (item.mediaKind == .image ? "photo" : "play.rectangle")
+                                    )
+                                }
+                                .buttonStyle(.borderedProminent).pointingHandCursor()
+                                .disabled(model.isRunning)
+                            }
+
+                            if item.mediaKind == .video || item.mediaKind == .audio {
+                                if let playerName = model.externalPreviewPlayerName {
                                     Button {
-                                        requestArchiveExtraction(for: item)
+                                        model.openPreviewExternally()
                                     } label: {
-                                        Label(
-                                            extractionActionTitle(for: item),
-                                            systemImage: "archivebox"
-                                        )
+                                        Label(playerName, systemImage: "play.rectangle.on.rectangle")
                                     }
-                                    .buttonStyle(.borderedProminent).pointingHandCursor()
-                                    .disabled(!model.canOpenArchiveExtraction(item))
+                                    .disabled(!model.canOpenPreviewExternally)
+                                    .help("Stream this signed PikPak source in \(playerName)")
+                                }
+                            }
 
-                                    Spacer()
-
-                                    Label("Server-side extraction", systemImage: "cloud")
+                            // Quick Look has no standing button: Space and
+                            // the row's context menu drive it, as in Finder.
+                            // Only its preparing state stays visible here.
+                            if model.isPreparingQuickLook {
+                                HStack(spacing: 6) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Preparing Quick Look…")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
                             }
 
-                            HStack {
-                                if item.supportsInlinePreview {
-                                    Button {
-                                        model.requestPreview(for: item)
-                                    } label: {
-                                        Label(
-                                            model.previewFileID == item.id ? "Reload Preview" : "Load Preview",
-                                            systemImage: item.isTextPreviewable
-                                                ? "doc.plaintext"
-                                                : (item.mediaKind == .image ? "photo" : "play.rectangle")
-                                        )
-                                    }
-                                    .buttonStyle(.borderedProminent).pointingHandCursor()
-                                    .disabled(model.isRunning)
-                                }
-
-                                if item.mediaKind == .video || item.mediaKind == .audio {
-                                    if let playerName = model.externalPreviewPlayerName {
-                                        Button {
-                                            model.openPreviewExternally()
-                                        } label: {
-                                            Label("Open in \(playerName)", systemImage: "play.rectangle.on.rectangle")
-                                        }
-                                        .disabled(!model.canOpenPreviewExternally)
-                                        .help("Stream this signed PikPak source in \(playerName)")
-                                    }
-                                }
-
-                                // Quick Look has no standing button: Space and
-                                // the row's context menu drive it, as in Finder.
-                                // Only its preparing state stays visible here.
-                                if model.isPreparingQuickLook {
-                                    HStack(spacing: 6) {
-                                        ProgressView()
-                                            .controlSize(.small)
-                                        Text("Preparing Quick Look…")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-
-                                Spacer()
-
-                                if item.isTextPreviewable,
-                                   model.previewFileID == item.id,
-                                   model.previewText != nil {
-                                    HStack(spacing: 5) {
-                                        Image(systemName: "text.quote")
-                                        Text(
-                                            model.previewTextWasTruncated
-                                                ? "Selectable text • first 2 MB • \(model.previewTextEncodingName ?? "Text")"
-                                                : "Selectable text • \(model.previewTextEncodingName ?? "Text")"
-                                        )
-                                        .lineLimit(1)
-                                        .help(
-                                            model.previewTextWasTruncated
-                                                ? "The file is larger than 2 MB; this native preview shows its first 2 MB. Quick Look opens the complete temporary file."
-                                                : "The text can be selected and copied."
-                                        )
-                                    }
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                } else {
-                                    Label(
-                                        item.supportsInlinePreview
-                                            ? "Secure on-demand preview"
-                                            : "Press Space for Quick Look",
-                                        systemImage: item.supportsInlinePreview
-                                            ? "lock.shield"
-                                            : "eye"
-                                    )
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                }
-                            }
-
-                            if !item.supportsInlinePreview,
-                               !item.isCloudExtractableArchive || model.isBrowsingSharedLink {
-                                Text("This type has no inline renderer. Press Space, or right-click the file, to open a private temporary copy in Quick Look.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-
-                        Divider()
-
-                        VStack(alignment: .leading, spacing: 5) {
-                            Label("Download destination", systemImage: "folder.badge.arrow.down")
-                                .font(.caption.weight(.semibold))
-                            Text(model.outputURL.path)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                                .truncationMode(.middle)
-                                .textSelection(.enabled)
-                        }
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
-
-                        HStack {
-                            Button("Choose…") {
-                                model.chooseOutputFolder()
-                            }
-                            .disabled(model.isRunning || model.isDownloading)
-
-                            if !model.isBrowsingSharedLink {
-                                Button(role: .destructive) {
-                                    requestTrashForBrowserSelection()
-                                } label: {
-                                    Label(
-                                        model.browserActionSelectionCount > 1
-                                            ? "Trash Selected"
-                                            : "Trash",
-                                        systemImage: "trash"
-                                    )
-                                }
-                                .disabled(
-                                    !model.canTrashBrowserItem(item)
-                                )
-                                .help("Move selected items to PikPak Trash")
-                            }
-
                             Spacer()
 
-                            Button {
-                                model.downloadSelectedBrowserItem()
-                                selectedTransferMode = 0
-                                selectedTab = 1
+                            if item.isTextPreviewable,
+                               model.previewFileID == item.id,
+                               model.previewText != nil {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "text.quote")
+                                    Text(
+                                        model.previewTextWasTruncated
+                                            ? "Selectable text • first 2 MB • \(model.previewTextEncodingName ?? "Text")"
+                                            : "Selectable text • \(model.previewTextEncodingName ?? "Text")"
+                                    )
+                                    .lineLimit(1)
+                                    .help(
+                                        model.previewTextWasTruncated
+                                            ? "The file is larger than 2 MB; this native preview shows its first 2 MB. Quick Look opens the complete temporary file."
+                                            : "The text can be selected and copied."
+                                    )
+                                }
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            } else if item.mediaKind != .video && item.mediaKind != .audio {
+                                Label(
+                                    item.supportsInlinePreview
+                                        ? "Secure on-demand preview"
+                                        : "Press Space for Quick Look",
+                                    systemImage: item.supportsInlinePreview
+                                        ? "lock.shield"
+                                        : "eye"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        if !item.supportsInlinePreview,
+                           !item.isCloudExtractableArchive || model.isBrowsingSharedLink {
+                            Text("This type has no inline renderer. Press Space, or right-click the file, to open a private temporary copy in Quick Look.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        Label("Download destination", systemImage: "folder.badge.arrow.down")
+                            .font(.caption.weight(.semibold))
+                        Text(model.outputURL.path)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
+
+                    HStack {
+                        Button("Choose…") {
+                            model.chooseOutputFolder()
+                        }
+                        .disabled(model.isRunning || model.isDownloading)
+
+                        if !model.isBrowsingSharedLink {
+                            Button(role: .destructive) {
+                                requestTrashForBrowserSelection()
                             } label: {
                                 Label(
                                     model.browserActionSelectionCount > 1
-                                        ? "Add Selected to Queue"
-                                        : (item.isFolder ? "Add Folder to Queue" : "Add File to Queue"),
-                                    systemImage: "arrow.down.circle.fill"
+                                        ? "Trash Selected"
+                                        : "Trash",
+                                    systemImage: "trash"
                                 )
                             }
-                            .buttonStyle(.borderedProminent).pointingHandCursor()
                             .disabled(
-                                !model.canDownloadSelectedBrowserItem
+                                !model.canTrashBrowserItem(item)
+                            )
+                            .help("Move selected items to PikPak Trash")
+                        }
+
+                        Spacer()
+
+                        Button {
+                            model.downloadSelectedBrowserItem()
+                            selectedTransferMode = 0
+                            selectedTab = 1
+                        } label: {
+                            Label(
+                                model.browserActionSelectionCount > 1
+                                    ? "Add Selected to Queue"
+                                    : (item.isFolder ? "Add Folder to Queue" : "Add File to Queue"),
+                                systemImage: "arrow.down.circle.fill"
                             )
                         }
+                        .buttonStyle(.borderedProminent).pointingHandCursor()
+                        .disabled(
+                            !model.canDownloadSelectedBrowserItem
+                        )
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.trailing, 2)
-                    .padding(.bottom, 2)
                 }
-                .scrollIndicators(.automatic)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(16)
-        } else {
-            VStack(spacing: 12) {
-                ZStack {
-                    Circle()
-                        .fill(Color.blue.opacity(0.08))
-                    Image(systemName: "doc.richtext")
-                        .font(.system(size: 34))
-                        .foregroundStyle(.blue.opacity(0.8))
-                }
-                .frame(width: 74, height: 74)
-                Text("Select a file or folder")
-                    .font(.title3.weight(.semibold))
-                Text("Use ↑ or ↓ to select files and folders. Press Return to open a folder.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-            }
-            .padding(24)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
+        } else { FinderPreviewEmptyState() }
     }
 
     @ViewBuilder
@@ -3296,6 +3138,14 @@ struct ContentView: View {
     }
 
     private func previewStreamingPanel(for item: BrowserItem) -> some View {
+        DisclosureGroup {
+            previewStreamingDetails(for: item)
+        } label: {
+            Label("Streaming details", systemImage: "network").font(.caption.weight(.medium))
+        }
+    }
+
+    private func previewStreamingDetails(for item: BrowserItem) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Label(
@@ -3304,53 +3154,54 @@ struct ContentView: View {
                 )
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(previewStreamingStateColor)
+                .fixedSize()
+
+                Spacer(minLength: 4)
 
                 if let sourceLabel = model.previewSourceLabel {
                     Text(sourceLabel)
                         .font(.caption2.weight(.medium))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .help(sourceLabel)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
                         .background(Color.primary.opacity(0.055), in: Capsule())
                 }
 
-                if model.previewStreamingState == .paused {
-                    Text("Buffering continues")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.cyan)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(Color.cyan.opacity(0.09), in: Capsule())
-                }
+            }
 
-                Spacer(minLength: 4)
+            if model.previewStreamingState == .paused {
+                Text("Buffering continues while paused")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.cyan)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
-                if model.previewStreamingState == .compatibility {
-                    Text(model.previewCompatibilityPlayerName ?? "Compatibility player")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                } else {
-                    VStack(alignment: .trailing, spacing: 1) {
-                        Text(
-                            model.previewStreamedBytes > 0
-                                ? model.previewUsesRetainedCache
-                                    ? "\(formatBytes(model.previewRetainedBytes)) retained"
-                                    : "\(formatBytes(model.previewStreamedBytes)) streamed"
-                                : "Waiting for media data"
-                        )
-                        .font(.caption.weight(.semibold))
-                        .monospacedDigit()
-                        if model.previewTransferBytesPerSecond > 0 {
-                            Text("\(formatByteRate(model.previewTransferBytesPerSecond)) now")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                        } else if model.previewStreamedBytes > 0 {
-                            Text("No network activity")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
+            if model.previewStreamingState == .compatibility {
+                Text(model.previewCompatibilityPlayerName ?? "Compatibility player")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            } else {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(
+                        model.previewStreamedBytes > 0
+                            ? model.previewUsesRetainedCache
+                                ? "\(formatBytes(model.previewRetainedBytes)) retained"
+                                : "\(formatBytes(model.previewStreamedBytes)) streamed"
+                            : "Waiting for media data"
+                    )
+                    .font(.caption.weight(.semibold))
+                    .monospacedDigit()
+                    if model.previewTransferBytesPerSecond > 0 {
+                        Text("\(formatByteRate(model.previewTransferBytesPerSecond)) now")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    } else if model.previewStreamedBytes > 0 {
+                        Text("No network activity")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -3381,18 +3232,10 @@ struct ContentView: View {
                     )
                 }
 
-                previewProgressRow(
-                    title: "Playback",
-                    systemImage: "play.fill",
-                    fraction: model.previewPlaybackFraction,
-                    detail: previewPlaybackDetail,
-                    color: .blue
-                )
-
                 Text(
                     model.previewUsesRetainedCache
-                        ? "Background buffering continues when playback is paused. Each cyan segment is a byte range actually held, drawn where it sits in the file — a gap is a range not retained, and a segment at the right edge is usually the movie header AVPlayer fetched first. Seeking backward into a segment reuses it; segments are cleared only when another file is previewed. Optimized streams can be smaller than the original \(formatBytes(item.size)) file."
-                        : "Buffering continues when playback is paused. Available buffer combines the timeline ranges AVPlayer currently reports as ready. HLS may replace those ranges while seeking."
+                        ? "Buffering continues while paused. Cyan segments show downloaded parts of this file; gaps are still loading. The buffer is cleared when you choose another file."
+                        : "Buffering continues while paused. Available ranges may change when you seek."
                 )
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
@@ -3505,11 +3348,8 @@ struct ContentView: View {
         detail: String,
         color: Color
     ) -> some View {
-        HStack(spacing: 9) {
-            Label(title, systemImage: systemImage)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(width: 102, alignment: .leading)
+        VStack(alignment: .leading, spacing: 5) {
+            previewProgressLabel(title: title, systemImage: systemImage, detail: detail)
 
             GeometryReader { geometry in
                 let width = max(geometry.size.width, 0)
@@ -3528,14 +3368,9 @@ struct ContentView: View {
                 .frame(height: 6)
                 .frame(maxHeight: .infinity, alignment: .center)
             }
-            .frame(height: 14)
+            .frame(height: 6)
             .accessibilityLabel(title)
             .accessibilityValue(detail)
-
-            Text(detail)
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(width: 145, alignment: .trailing)
         }
     }
 
@@ -3546,11 +3381,8 @@ struct ContentView: View {
         detail: String,
         color: Color
     ) -> some View {
-        HStack(spacing: 9) {
-            Label(title, systemImage: systemImage)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(width: 102, alignment: .leading)
+        VStack(alignment: .leading, spacing: 5) {
+            previewProgressLabel(title: title, systemImage: systemImage, detail: detail)
 
             if let fraction {
                 ProgressView(value: fraction)
@@ -3561,12 +3393,17 @@ struct ContentView: View {
                     .progressViewStyle(.linear)
                     .tint(color)
             }
-
-            Text(detail)
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(width: 145, alignment: .trailing)
         }
+    }
+
+    private func previewProgressLabel(title: String, systemImage: String, detail: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Label(title, systemImage: systemImage)
+            Spacer(minLength: 0)
+            Text(detail).monospacedDigit().multilineTextAlignment(.trailing)
+        }
+        .font(.caption).foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var previewBufferDetail: String {
@@ -3631,42 +3468,6 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private func previewSurface(for item: BrowserItem) -> some View {
-        GeometryReader { geometry in
-            let canvasSize = effectivePreviewCanvasSize(availableWidth: geometry.size.width)
-            previewCanvas(for: item)
-                .frame(width: canvasSize.width, height: canvasSize.height)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(
-                            Color(nsColor: .separatorColor)
-                                .opacity(isPreviewResizeHovered ? 0.72 : 0.42),
-                            lineWidth: 1
-                        )
-                        .allowsHitTesting(false)
-                }
-                .overlay(alignment: .trailing) {
-                    previewResizeEdge(axis: .horizontal, canvasSize: canvasSize)
-                        .frame(width: 10)
-                        .offset(x: 5)
-                }
-                .overlay(alignment: .bottom) {
-                    previewResizeEdge(axis: .vertical, canvasSize: canvasSize)
-                        .frame(height: 10)
-                        .offset(y: 5)
-                }
-                .overlay(alignment: .bottomTrailing) {
-                    previewResizeCorner(canvasSize: canvasSize)
-                        .offset(x: 5, y: 5)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        }
-        .frame(height: effectivePreviewHeight)
-        .padding(.trailing, 5)
-        .padding(.bottom, 5)
-    }
-
-    @ViewBuilder
     private func previewCanvas(for item: BrowserItem) -> some View {
         ZStack {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -3709,7 +3510,9 @@ struct ContentView: View {
                 RemoteArtwork(
                     url: item.artworkURL,
                     systemName: previewSymbol(for: item),
-                    fit: true
+                    fit: true,
+                    proxyURL: model.proxyURL,
+                    cache: model.thumbnailCache
                 )
                 .padding(8)
             } else if item.isTextPreviewable,
@@ -3720,14 +3523,19 @@ struct ContentView: View {
                     .padding(8)
             } else if item.mediaKind == .video || item.mediaKind == .audio,
                       model.previewFileID == item.id,
-                      let player = model.previewPlayer {
-                VideoPlayer(player: player)
+                      model.previewPlayer != nil {
+                MediaPreviewView(playback: model.mediaPlayback, isAudio: item.mediaKind == .audio,
+                    onVideoFailure: { error, player in
+                        model.reportVideoPreviewFailure(error, fileID: item.id, player: player)
+                    })
                     .clipShape(RoundedRectangle(cornerRadius: 10))
             } else {
                 RemoteArtwork(
                     url: item.artworkURL,
                     systemName: previewSymbol(for: item),
-                    fit: true
+                    fit: true,
+                    proxyURL: model.proxyURL,
+                    cache: model.thumbnailCache
                 )
                 .padding(8)
             }
@@ -3735,9 +3543,9 @@ struct ContentView: View {
             if !item.isFolder,
                (item.mediaKind == .video || item.mediaKind == .audio),
                model.previewFileID == item.id,
-               model.isPreviewLoading {
+               model.isPreviewLoading, model.previewPlayer == nil {
                 VStack(spacing: 10) {
-                    ProgressView()
+                    ProgressView(value: model.previewPreparationFraction)
                         .controlSize(.large)
                     Text("Loading \(item.mediaKind == .audio ? "audio" : "video") preview…")
                         .font(.callout.weight(.semibold))
@@ -3810,195 +3618,29 @@ struct ContentView: View {
         .shadow(color: .black.opacity(0.055), radius: 8, y: 3)
     }
 
-    private var effectivePreviewHeight: CGFloat {
-        let liveHeight = livePreviewCanvasSize.map { Double($0.height) }
-        let configured = liveHeight
-            ?? (previewCanvasHeight.isFinite ? previewCanvasHeight : 440)
-        return CGFloat(max(configured, 180))
-    }
-
-    private func effectivePreviewCanvasSize(availableWidth: CGFloat) -> CGSize {
-        let maximumWidth = max(availableWidth - 5, 1)
-        let liveWidth = livePreviewCanvasSize?.width
-        let configuredWidth = liveWidth
-            ?? (previewCanvasWidth.isFinite ? CGFloat(previewCanvasWidth) : maximumWidth)
-        return CGSize(
-            width: min(max(configuredWidth, 1), maximumWidth),
-            height: effectivePreviewHeight
-        )
-    }
-
-    private func previewResizeEdge(
-        axis: PreviewResizeAxis,
-        canvasSize: CGSize
-    ) -> some View {
-        Rectangle()
-            .fill(Color.clear)
-            .contentShape(Rectangle())
-            .onHover { hovering in
-                isPreviewResizeHovered = hovering
-                if hovering {
-                    (axis == .horizontal ? NSCursor.resizeLeftRight : NSCursor.resizeUpDown).set()
-                } else {
-                    NSCursor.arrow.set()
-                }
-            }
-            .gesture(previewResizeGesture(axis: axis, canvasSize: canvasSize))
-            .help(axis == .horizontal ? "Drag to resize preview width" : "Drag to resize preview height")
-    }
-
-    private func previewResizeCorner(canvasSize: CGSize) -> some View {
-        Canvas { context, size in
-            var path = Path()
-            for inset in stride(from: CGFloat(4), through: 12, by: 4) {
-                path.move(to: CGPoint(x: size.width - inset, y: size.height))
-                path.addLine(to: CGPoint(x: size.width, y: size.height - inset))
-            }
-            context.stroke(
-                path,
-                with: .color(
-                    Color.secondary.opacity(isPreviewResizeHovered ? 0.8 : 0.48)
-                ),
-                lineWidth: 1
-            )
-        }
-        .frame(width: 16, height: 16)
-        .padding(4)
-        .contentShape(Rectangle())
-        .onHover { hovering in
-            isPreviewResizeHovered = hovering
-            (hovering ? NSCursor.crosshair : NSCursor.arrow).set()
-        }
-        .gesture(previewResizeGesture(axis: .both, canvasSize: canvasSize))
-        .help("Drag to resize preview")
-        .accessibilityLabel("Resize Preview")
-        .accessibilityHint("Drag to change the preview width and height")
-    }
-
-    private func previewResizeGesture(
-        axis: PreviewResizeAxis,
-        canvasSize: CGSize
-    ) -> some Gesture {
-        // The handle moves as the preview changes size. Global translation
-        // excludes that movement and prevents feedback under the pointer.
-        DragGesture(minimumDistance: 1, coordinateSpace: .global)
-            .onChanged { value in
-                let startSize = previewResizeStartSize ?? canvasSize
-                if previewResizeStartSize == nil { previewResizeStartSize = startSize }
-                livePreviewCanvasSize = resizedPreviewCanvas(
-                    from: startSize,
-                    translation: value.translation,
-                    axis: axis
-                )
-            }
-            .onEnded { value in
-                let startSize = previewResizeStartSize ?? canvasSize
-                let finalSize = resizedPreviewCanvas(
-                    from: startSize,
-                    translation: value.translation,
-                    axis: axis
-                )
-                if axis == .horizontal || axis == .both {
-                    previewCanvasWidth = Double(finalSize.width)
-                }
-                if axis == .vertical || axis == .both {
-                    previewCanvasHeight = Double(finalSize.height)
-                }
-                livePreviewCanvasSize = nil
-                previewResizeStartSize = nil
-                NSCursor.arrow.set()
-            }
-    }
-
-    private func resizedPreviewCanvas(
-        from startSize: CGSize,
-        translation: CGSize,
-        axis: PreviewResizeAxis
-    ) -> CGSize {
-        var result = startSize
-        if axis == .horizontal || axis == .both {
-            result.width = min(max(startSize.width + translation.width, 1), 1_600)
-        }
-        if axis == .vertical || axis == .both {
-            result.height = max(startSize.height + translation.height, 180)
-        }
-        return result
-    }
-
     private var downloader: some View {
         VStack(alignment: .leading, spacing: 12) {
-            transferModeHeader
-            GeometryReader { viewport in
-                ScrollView(.horizontal) {
-                    Group {
-                        if selectedTransferMode == 0 {
-                            downloadWorkspace
-                        } else {
-                            uploadWorkspace
-                        }
-                    }
-                    .frame(
-                        width: max(viewport.size.width, TransferWorkspaceLayout.minimumWidth),
-                        height: viewport.size.height,
-                        alignment: .topLeading
-                    )
-                }
-                .scrollIndicators(.automatic)
+            FinderTransferHeader(direction: $selectedTransferMode,
+                destination: selectedTransferMode == 2 ? "BitTorrent → This Mac or PikPak" : selectedTransferMode == 1 ? model.effectiveUploadDestination.path : model.outputURL.path)
+            FinderTransferCanvas {
+                if selectedTransferMode == 0 { downloadWorkspace }
+                else if selectedTransferMode == 2 { LocalTorrentWorkspace(pikpak: model) }
+                else { uploadWorkspace }
             }
-            activity
+            if selectedTransferMode != 2 { activity }
         }
-    }
-
-    private var transferModeHeader: some View {
-        HStack(spacing: 12) {
-            Picker("Transfer direction", selection: $selectedTransferMode) {
-                Label("Downloads", systemImage: "arrow.down.circle.fill").tag(0)
-                Label("Uploads", systemImage: "arrow.up.circle.fill").tag(1)
-            }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .frame(width: 260)
-
-            Spacer()
-
-            if selectedTransferMode == 1 {
-                Label(
-                    model.effectiveUploadDestination.path,
-                    systemImage: "folder.fill"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .help("Upload destination")
-            } else {
-                Label(model.outputURL.path, systemImage: "externaldrive.fill")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help("Download destination")
-            }
-        }
-        .appCard(padding: 9)
     }
 
     private var downloadWorkspace: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 12) {
-                downloadSettings
-                    .frame(minWidth: 520, maxWidth: .infinity)
-                downloadProgressDashboard
-                    .frame(width: 400)
-            }
+        FinderTransferWorkspace {
+            FinderTransferOverview { downloadSettings } progress: { downloadProgressDashboard }
             controls
                 .appCard(padding: 11)
             if model.restoredDownloadQueue || model.interruptedDownloadCount > 0 {
-                HStack(spacing: 10) {
+                FinderTransferActionLayout(spacing: 10) {
                     Label("Unfinished downloads are saved across app restarts.", systemImage: "arrow.clockwise.circle")
                     Text("Resume uses existing partial files; completed files are skipped.")
                         .foregroundStyle(.secondary)
-                    Spacer()
                     if model.interruptedDownloadCount > 0 {
                         Button("Return \(model.interruptedDownloadCount) Interrupted to Queue") {
                             model.requeueInterruptedDownloads()
@@ -4009,25 +3651,18 @@ struct ContentView: View {
                 .appCard(padding: 11)
             }
             downloadTransferBoard
-                .frame(minHeight: 260, maxHeight: .infinity)
         }
     }
 
     private var uploadWorkspace: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 12) {
-                uploadSettings
-                    .frame(minWidth: 520, maxWidth: .infinity)
-                uploadProgressDashboard
-                    .frame(width: 400)
-            }
+        FinderTransferWorkspace {
+            FinderTransferOverview { uploadSettings } progress: { uploadProgressDashboard }
             uploadControls
                 .appCard(padding: 11)
             if !model.resumableUploadBatches.isEmpty {
                 savedUploadBatches
             }
             uploadTransferBoard
-                .frame(minHeight: 260, maxHeight: .infinity)
         }
     }
 
@@ -4097,7 +3732,7 @@ struct ContentView: View {
 
     private var savedUploadBatches: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Saved Uploads", systemImage: "arrow.clockwise.circle")
+            Label("Queued & Paused Uploads", systemImage: "tray.full")
                 .font(.headline)
             Text("Resume after quitting or stopping. Completed files and cloud folders are reused; an interrupted file may restart. Keep the original local files in place.")
                 .font(.caption)
@@ -4120,11 +3755,13 @@ struct ContentView: View {
                                     .textSelection(.enabled)
                             }
                             Spacer()
-                            Button("Resume") { model.resumeSavedUpload(batch.id) }
-                                .buttonStyle(.borderedProminent).pointingHandCursor()
-                                .disabled(!model.canUploadFiles)
-                            Button("Remove", role: .destructive) { model.discardSavedUpload(batch.id) }
-                                .help("Forget this saved batch without deleting any local or cloud files")
+                            let queued = model.automaticUploadBatchIDs.contains(batch.id)
+                            Button(queued ? "Pause" : "Resume") {
+                                if queued { model.pauseSavedUpload(batch.id) } else { model.resumeSavedUpload(batch.id) }
+                            }.buttonStyle(.borderedProminent).pointingHandCursor()
+                                .disabled(!queued && !model.canUploadFiles)
+                            Button("Cancel", role: .destructive) { model.discardSavedUpload(batch.id) }
+                                .help("Cancel this queued upload; local originals and completed cloud files are kept")
                         }
                         .padding(8)
                         .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
@@ -4137,7 +3774,7 @@ struct ContentView: View {
     }
 
     private var uploadControls: some View {
-        HStack {
+        FinderTransferActionLayout {
             Button {
                 _ = model.chooseFilesToUpload()
             } label: {
@@ -4164,7 +3801,7 @@ struct ContentView: View {
             .disabled(model.isUploadPaused ? !model.canResumeUpload : !model.canPauseUpload)
 
             Button(role: .destructive) {
-                model.stopUpload()
+                model.cancelAllUploads()
             } label: {
                 Label("Cancel Upload", systemImage: "stop.circle")
             }
@@ -4175,8 +3812,6 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-
-            Spacer()
 
             Button {
                 selectedTab = 0
@@ -4260,7 +3895,7 @@ struct ContentView: View {
     }
 
     private var uploadTransferBoard: some View {
-        HStack(alignment: .top, spacing: 12) {
+        FinderTransferBoardLayout(finishedMinimumHeight: model.failedUploadTransfers.isEmpty ? 210 : 330) {
             uploadStack(
                 title: "Uploading",
                 systemImage: "arrow.up.circle.fill",
@@ -4292,6 +3927,7 @@ struct ContentView: View {
                     visibleSubsetLabel: "Latest",
                     transfers: model.completedUploadTransfers.reversed()
                 )
+                .frame(minHeight: 160)
                 .layoutPriority(1)
 
                 if !model.failedUploadTransfers.isEmpty {
@@ -4308,7 +3944,7 @@ struct ContentView: View {
                     .frame(minHeight: 150, idealHeight: 210, maxHeight: 250)
                 }
             }
-            .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -4376,7 +4012,7 @@ struct ContentView: View {
                 .scrollContentBackground(.hidden)
             }
         }
-        .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .appCard(padding: 0)
     }
 
@@ -4394,7 +4030,7 @@ struct ContentView: View {
                         .truncationMode(.middle)
                         .help(transfer.name)
                     Spacer()
-                    Text(uploadTransferStateTitle(transfer.state))
+                    Text(model.cancelledUploadIDs.contains(transfer.id) ? "Cancelled" : model.pausedUploadIDs.contains(transfer.id) ? "Paused" : uploadTransferStateTitle(transfer.state))
                         .font(.caption2.weight(.medium))
                         .foregroundStyle(uploadTransferColor(transfer.state))
                 }
@@ -4413,6 +4049,17 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
 
+                if transfer.state != .completed && transfer.state != .instant && !model.cancelledUploadIDs.contains(transfer.id) {
+                    HStack(spacing: 10) {
+                        Spacer()
+                        let paused = model.pausedUploadIDs.contains(transfer.id)
+                        Button { if paused { model.resumeUploadFile(transfer) } else { model.pauseUploadFile(transfer) } } label: {
+                            Label(paused ? "Resume" : "Pause", systemImage: paused ? "play.circle" : "pause.circle")
+                        }.help(paused ? "Resume this file" : "Pause this file")
+                        Button(role: .destructive) { model.cancelUploadFile(transfer) } label: { Label("Cancel", systemImage: "xmark.circle") }
+                            .help("Cancel this upload; the local source is kept")
+                    }.font(.caption).buttonStyle(.borderless).pointingHandCursor()
+                }
                 if let diagnostic = transfer.failureDiagnostic {
                     ErrorDiagnosticBlock(
                         diagnostic: diagnostic,
@@ -4620,7 +4267,7 @@ struct ContentView: View {
         case .queued: return "Waiting"
         case .hashing: return "Hashing"
         case .uploading: return "Uploading"
-        case .retrying(let attempt, let maximum): return "Retry \(attempt) of \(maximum)"
+        case .retrying(let attempt, let maximum): return maximum > 0 ? "Retry \(attempt) of \(maximum)" : "Retry \(attempt)"
         case .instant: return "Instant"
         case .completed: return "Complete"
         case .failed: return "Failed"
@@ -4698,7 +4345,7 @@ struct ContentView: View {
     }
 
     private var controls: some View {
-        HStack {
+        FinderTransferActionLayout {
             Button {
                 selectedTab = model.isBrowsingSharedLink ? 3 : 0
             } label: {
@@ -4712,7 +4359,7 @@ struct ContentView: View {
             Button {
                 model.startPendingDownloads()
             } label: {
-                Label(model.restoredDownloadQueue ? "Resume Downloads" : "Start Download", systemImage: "play.circle.fill")
+                Label("Resume Downloads", systemImage: "play.circle.fill")
             }
             .buttonStyle(.borderedProminent).pointingHandCursor()
             .keyboardShortcut(.return, modifiers: [.command])
@@ -4722,18 +4369,23 @@ struct ContentView: View {
             Button(role: .destructive) {
                 model.stop()
             } label: {
-                Label("Stop and Keep Partial", systemImage: "stop.circle")
+                Label("Pause All", systemImage: "pause.circle")
             }
             .disabled(!model.isDownloading)
 
-            if model.pendingDownloadBatchCount > 0 {
+            Button(role: .destructive) { model.cancelAllDownloads() } label: {
+                Label("Cancel All", systemImage: "xmark.circle")
+            }.disabled(!model.isDownloading && model.pendingDownloadItems.isEmpty && model.interruptedDownloadCount == 0)
+                .help("Cancel unfinished downloads and delete their partial files")
+
+            if model.pendingDownloadItemCount > 0 {
                 Label(
                     "\(model.pendingDownloadItemCount.formatted()) queued item(s)",
                     systemImage: "tray.full"
                 )
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-                .help("Compatible selections share the next concurrent worker batch. You can remove these items before that batch starts.")
+                .help("Files start as soon as a connection is available. Paused items wait until resumed.")
             }
 
             if !model.failedDownloadTransfers.isEmpty {
@@ -4747,7 +4399,6 @@ struct ContentView: View {
                 .help("Retry every failed file in its original local destination")
             }
 
-            Spacer()
             Button("Open Download Folder") {
                 model.openOutputFolder()
             }
@@ -4824,12 +4475,12 @@ struct ContentView: View {
     }
 
     private var downloadTransferBoard: some View {
-        HStack(alignment: .top, spacing: 12) {
+        FinderTransferBoardLayout(finishedMinimumHeight: model.failedDownloadTransfers.isEmpty ? 210 : 330) {
             downloadStack(
                 title: "Downloading",
                 systemImage: "arrow.down.circle.fill",
                 color: .blue,
-                emptyTitle: model.isDownloading ? "Waiting for a worker" : "No active downloads",
+                emptyTitle: model.isDownloading ? "Preparing downloads" : "No active downloads",
                 emptySystemImage: "bolt.horizontal.circle",
                 transfers: model.downloadingTransfers
             )
@@ -4843,6 +4494,7 @@ struct ContentView: View {
                     emptySystemImage: "checkmark.circle",
                     transfers: model.successfulDownloadTransfers.reversed()
                 )
+                .frame(minHeight: 160)
                 .layoutPriority(1)
 
                 if !model.failedDownloadTransfers.isEmpty {
@@ -4857,12 +4509,12 @@ struct ContentView: View {
                     .frame(minHeight: 140, idealHeight: 195, maxHeight: 235)
                 }
             }
-            .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
     private var downloadQueueStack: some View {
-        let totalCount = model.pendingDownloadItemCount + model.queuedDownloadCount
+        let totalCount = model.pendingDownloadItemCount + model.queuedDownloadCount + model.preparingDownloadItems.count
         return VStack(spacing: 0) {
             HStack(spacing: 9) {
                 Image(systemName: "text.line.first.and.arrowtriangle.forward")
@@ -4911,6 +4563,11 @@ struct ContentView: View {
                 .padding(16)
             } else {
                 List {
+                    ForEach(model.preparingDownloadItems) { item in
+                        pendingDownloadRow(item, preparing: true)
+                            .padding(.vertical, 4)
+                            .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12))
+                    }
                     ForEach(model.pendingDownloadItems) { item in
                         pendingDownloadRow(item)
                             .padding(.vertical, 4)
@@ -4930,11 +4587,11 @@ struct ContentView: View {
                 .scrollContentBackground(.hidden)
             }
         }
-        .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .appCard(padding: 0)
     }
 
-    private func pendingDownloadRow(_ item: PendingDownloadItem) -> some View {
+    private func pendingDownloadRow(_ item: PendingDownloadItem, preparing: Bool = false) -> some View {
         HStack(spacing: 9) {
             Image(systemName: item.isFolder ? "folder.fill" : "doc.fill")
                 .foregroundStyle(item.isFolder ? Color.blue : Color.secondary)
@@ -4948,12 +4605,12 @@ struct ContentView: View {
                         .truncationMode(.middle)
                         .help(item.name)
                     Spacer()
-                    Text(model.isDownloading ? "Next batch" : "Ready")
+                    Text(model.pausedPendingDownloadIDs.contains(item.id) ? "Paused" : preparing ? "Preparing…" : model.downloadsPaused ? "Paused" : "Queued")
                         .font(.caption2.weight(.medium))
-                        .foregroundStyle(.orange)
-                        .help(model.isDownloading
-                            ? "Starts automatically in the next compatible worker batch. The current batch is not interrupted."
-                            : "Press Start Download to run compatible queued selections together.")
+                        .foregroundStyle(preparing ? Color.blue : .orange)
+                        .help(preparing ? "Preparing this selection for download; its files appear as they become ready." : model.isDownloading
+                            ? "Starts as soon as a download connection is available."
+                            : "Files start automatically. Use Resume Downloads if the queue is paused.")
                 }
                 Text((item.isShared ? "Shared link • " : "PikPak • ") + item.remotePath)
                     .font(.caption2)
@@ -4963,16 +4620,15 @@ struct ContentView: View {
                     .help("Cloud source: \(item.remotePath)\nLocal destination: \(item.destinationPath)")
             }
 
-            Button {
-                model.removePendingDownloadItem(item.id)
-            } label: {
-                Label("Remove", systemImage: "xmark.circle")
-            }
-            .buttonStyle(.borderless).pointingHandCursor()
-            .controlSize(.small)
-            .foregroundStyle(.red)
-            .help("Remove \(item.name) from the download queue")
-            .accessibilityLabel("Remove \(item.name) from download queue")
+            let paused = model.pausedPendingDownloadIDs.contains(item.id)
+            Button { if paused { model.resumePendingDownload(item) } else { model.pausePendingDownload(item) } } label: {
+                Image(systemName: paused ? "play.circle" : "pause.circle")
+            }.help(paused ? "Resume \(item.name)" : "Pause \(item.name)")
+                .accessibilityLabel(paused ? "Resume \(item.name)" : "Pause \(item.name)")
+            Button(role: .destructive) { model.cancelPendingDownload(item) } label: { Image(systemName: "xmark.circle") }
+                .help("Cancel \(item.name) and remove any partial download")
+                .accessibilityLabel("Cancel \(item.name)")
+
         }
         .accessibilityElement(children: .contain)
     }
@@ -5032,7 +4688,7 @@ struct ContentView: View {
                 .scrollContentBackground(.hidden)
             }
         }
-        .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .appCard(padding: 0)
     }
 
@@ -5063,17 +4719,41 @@ struct ContentView: View {
                         .truncationMode(.middle)
                         .help(transfer.name)
                     Spacer()
-                    Text(downloadTransferStateTitle(transfer.state))
+                    Text(model.cancelledDownloadIDs.contains(transfer.id) ? "Cancelled" : model.pausedDownloadIDs.contains(transfer.id) || model.downloadsPaused ? "Paused" : downloadTransferStateTitle(transfer.state))
                         .font(.caption2.weight(.medium))
                         .foregroundStyle(downloadTransferColor(transfer.state))
                 }
                 downloadTransferProgress(transfer)
-                Text(transferBytesSummary(transfer))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
+                HStack(spacing: 8) {
+                    Text(transferBytesSummary(transfer))
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    if transfer.state == .downloading {
+                        let speed = "\(formatBytes(UInt64(max(0, min(transfer.bytesPerSecond, Double(Int64.max))))))/s"
+                        Text(speed).fixedSize()
+                            .help("Current network speed for this file")
+                            .accessibilityLabel("Download speed: \(speed)")
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
 
-                if transfer.state == .failed || transfer.state == .stopped {
+                if transfer.state != .completed && transfer.state != .skipped && !model.cancelledDownloadIDs.contains(transfer.id) {
+                    HStack(spacing: 10) {
+                        Spacer()
+                        let paused = model.pausedDownloadIDs.contains(transfer.id) || transfer.state == .stopped || model.downloadsPaused
+                        Button { if paused { model.resumeDownloadFile(transfer) } else { model.pauseDownloadFile(transfer) } } label: {
+                            Label(paused ? "Resume" : "Pause", systemImage: paused ? "play.circle" : "pause.circle")
+                        }.help(paused ? "Resume this file" : "Pause this file and keep its partial download")
+                        Button(role: .destructive) { model.cancelDownloadFile(transfer) } label: { Label("Cancel", systemImage: "xmark.circle") }
+                            .help("Cancel this file and delete its partial download")
+                    }.font(.caption).buttonStyle(.borderless).pointingHandCursor()
+                }
+                if transfer.state == .failed && !model.cancelledDownloadIDs.contains(transfer.id) {
+                    if let error = transfer.error {
+                        Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                    }
                     HStack {
                         Spacer()
                         Button {
@@ -5329,10 +5009,10 @@ struct ContentView: View {
             let containsFolder = model.browserSelectionIncludesFolders
             return "\(count.formatted()) selected" + (containsFolder ? " + contents" : "")
         }
-        if model.isBrowsingSharedLink {
+        if model.showsSharedLinkOverview {
             let linkCount = model.sharedLinks.count
             let visibleItemCount = model.sharedLinks.reduce(into: 0) { count, link in
-                guard model.isSharedLinkExpanded(link.id) else { return }
+                guard model.sharedLinkHasContents(link.id) else { return }
                 count += model.sharedLinkTreeEntries(for: link.id).count
             }
             let linkLabel = "\(linkCount.formatted()) \(linkCount == 1 ? "link" : "links")"
@@ -5340,7 +5020,7 @@ struct ContentView: View {
             return linkLabel
                 + " • \(visibleItemCount.formatted()) \(visibleItemCount == 1 ? "item" : "items")"
         }
-        return "\(model.visibleBrowserItemCount) shown"
+        return "\(displayedBrowserItemCount) shown"
             + (model.hasMoreBrowserItems ? " + more" : "")
     }
 
@@ -5352,13 +5032,51 @@ struct ContentView: View {
         isBrowserTrashConfirmationPresented = true
     }
 
-    private func expandBrowserSubfolders(_ item: BrowserItem, levels: Int?) {
+    private func expandBrowserSubfolders(_ items: [BrowserItem], levels: Int?) {
         // Nested contents need an outline; preserve the current location and
         // selection while switching a thumbnail context-menu action to List.
         setFinderViewMode(BrowserViewMode.list.rawValue)
         isPreviewExpanded = false
         browserListFocused = true
-        model.expandBrowserSubfolders(item, levels: levels)
+        model.expandBrowserSubfolders(items, levels: levels)
+    }
+
+    /// Finder-style: a menu opened on a row that is part of the selection acts
+    /// on the whole selection; one opened elsewhere acts on that row alone.
+    /// Link rows in the Links overview keep their own per-link selection.
+    private func browserExpansionTargets(for item: BrowserItem, sharedLinkID: UUID?) -> [BrowserItem] {
+        guard sharedLinkID == nil, model.isBrowserItemSelected(item.id) else { return [item] }
+        let folders = model.selectedBrowserItems.filter(\.isFolder)
+        return folders.contains { $0.id == item.id } ? folders : [item]
+    }
+
+    private var canSelectAllBrowserFolders: Bool {
+        selectedTab == 0 && !workspaceNavigation.isSwitching
+            && model.canChangeBrowserSelection && !model.showsSharedLinkOverview
+            && !model.isLoginPresented && !isBrowserTrashConfirmationPresented
+    }
+
+    private func selectAllBrowserFolders() {
+        guard canSelectAllBrowserFolders else { return }
+        if model.selectAllBrowserFolders() > 0 { browserListFocused = true }
+    }
+
+    /// The preview pane is the context these arrows belong to, so its being
+    /// open is the gate — not whether a preview happens to be loaded at the
+    /// moment a key arrives.
+    private var canMovePreviewSelection: Bool {
+        selectedTab == 0 && !workspaceNavigation.isSwitching && !isChoosingUploadDestination
+            && finderSettings.showsPreviewPane && model.canChangeBrowserSelection
+            && !model.isLoginPresented && !isBrowserTrashConfirmationPresented
+    }
+
+    /// Keep the row the preview moved to on screen, so the list still follows
+    /// along while the pane holds focus.
+    private func movePreviewSelection(by offset: Int, scrollProxy: ScrollViewProxy) {
+        guard canMovePreviewSelection, let targetID = model.movePreviewSelection(by: offset) else { return }
+        withAnimation(.easeOut(duration: 0.12)) {
+            scrollProxy.scrollTo(browserRowScrollID(targetID), anchor: .center)
+        }
     }
 
     private func requestMergeSelectedFolders(preferredDestination: BrowserItem? = nil) {
@@ -6149,6 +5867,15 @@ private struct BrowserKeyboardMonitor: NSViewRepresentable {
     let onQuickLook: (NSWindow?) -> Bool
     let onCancelQuickLook: () -> Bool
     let ownsQuickLookPanel: (NSWindow) -> Bool
+    /// Command-A is only ours once the guards above have ruled out text
+    /// editing; a rename field or the search bar keeps the system behaviour.
+    var handlesSelectAll = false
+    var onSelectAllFolders: () -> Void = {}
+    /// Up/Down reach the file list through SwiftUI's own focus. They are only
+    /// ours once the list has given focus away — to the preview pane, its
+    /// player or its buttons — and a preview is on screen to step through.
+    var handlesPreviewNavigation = false
+    var onPreviewMove: (Int) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -6182,6 +5909,7 @@ private struct BrowserKeyboardMonitor: NSViewRepresentable {
             guard eventMonitor == nil else { return }
             eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
                 [weak self] event in
+                if MediaPreviewKeyView.handle(event) { return nil }
                 guard let self, let browserWindow = self.monitoredView?.window,
                       let eventWindow = event.window ?? NSApp.keyWindow else { return event }
                 let isFileWindow = eventWindow === browserWindow
@@ -6205,7 +5933,7 @@ private struct BrowserKeyboardMonitor: NSViewRepresentable {
                 }
                 guard isFileWindow, !eventWindow.isSheet, eventWindow.attachedSheet == nil else { return event }
                 // Native editing, including quick-open, owns text shortcuts.
-                if NSApp.keyWindow?.firstResponder is NSText { return event }
+                if NSApp.keyWindow?.firstResponder is NSText || NSApp.keyWindow?.firstResponder is MediaSliderControl { return event }
                 let modifiers = event.modifierFlags.intersection(
                     .deviceIndependentFlagsMask
                 )
@@ -6235,6 +5963,20 @@ private struct BrowserKeyboardMonitor: NSViewRepresentable {
                    !modifiers.contains(.option),
                    (event.keyCode == 51 || event.keyCode == 117) {
                     self.parent.onCommandDelete()
+                    return nil
+                }
+
+                if self.parent.handlesPreviewNavigation,
+                   event.keyCode == 126 || event.keyCode == 125,
+                   modifiers.intersection([.command, .shift, .option, .control]).isEmpty {
+                    self.parent.onPreviewMove(event.keyCode == 125 ? 1 : -1)
+                    return nil
+                }
+
+                if self.parent.handlesSelectAll,
+                   event.charactersIgnoringModifiers?.lowercased() == "a",
+                   modifiers.intersection([.command, .shift, .option, .control]) == .command {
+                    self.parent.onSelectAllFolders()
                     return nil
                 }
 
@@ -6271,7 +6013,7 @@ private struct BrowserKeyboardMonitor: NSViewRepresentable {
     }
 }
 
-private enum BrowserTreeColumnLimits {
+enum BrowserTreeColumnLimits {
     static let name: ClosedRange<CGFloat> = 150...720
     static let size: ClosedRange<CGFloat> = 58...180
     static let kind: ClosedRange<CGFloat> = 72...280
@@ -6295,7 +6037,7 @@ private enum BrowserTreeColumnLimits {
 /// One resolved set of column dimensions shared by the sticky header and
 /// every outline row. Keeping one source of truth prevents the header from
 /// drifting out of alignment when a column is resized or hidden.
-private struct BrowserTreeColumnLayout {
+struct BrowserTreeColumnLayout {
     var name: CGFloat
     let size: CGFloat
     let kind: CGFloat
@@ -6361,7 +6103,7 @@ private struct BrowserTreeColumnLayout {
     }
 }
 
-private struct BrowserTreeHeader: View {
+struct BrowserTreeHeader: View {
     @State private var hoveredColumn: BrowserSortColumn?
 
     let columns: BrowserTreeColumnLayout
@@ -6414,7 +6156,7 @@ private struct BrowserTreeHeader: View {
         .background(Color(nsColor: .windowBackgroundColor).opacity(0.82))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("File columns")
-        .contextMenu {
+        .browserContextMenu {
             columnVisibilityMenu
         }
     }
@@ -6594,19 +6336,16 @@ private struct BrowserColumnResizeHandle: View {
     }
 }
 
-/// A shared URL behaves like a virtual filesystem root. Its disclosure reveals
-/// the active link's ordinary BrowserTreeRow children, while the leading tool
-/// disconnects only the local link session and never deletes cloud content.
+/// A shared URL is a permanent section header above its folder/file rows.
+/// The leading tool disconnects only the local link session.
 private struct SharedLinkTreeRow: View {
     @State private var isRowHovered = false
-    @State private var isDisclosureHovered = false
     @State private var isDisconnectHovered = false
 
     let entry: SharedLinkEntry
     let zoomScale: CGFloat
     let columns: BrowserTreeColumnLayout
     let isSelected: Bool
-    let isExpanded: Bool
     let usesAlternateBackground: Bool
     let measurement: FolderMeasurement?
     let isMeasuring: Bool
@@ -6615,7 +6354,6 @@ private struct SharedLinkTreeRow: View {
     let canEditLink: Bool
     let canDisconnect: Bool
     let onSelect: () -> Void
-    let onToggle: () -> Void
     let onMeasure: () -> Void
     let onEditLink: () -> Void
     let onCopyLink: () -> Void
@@ -6629,7 +6367,7 @@ private struct SharedLinkTreeRow: View {
     var body: some View {
         HStack(spacing: 0) {
             HStack(spacing: 5 * scale) {
-                disclosure
+                linkStatus
 
                 // Use the checkbox slot beside the link icon, preserving the
                 // name alignment with the nested file/folder rows.
@@ -6711,7 +6449,7 @@ private struct SharedLinkTreeRow: View {
         .onHover { hovering in
             isRowHovered = hovering
         }
-        .contextMenu {
+        .browserContextMenu {
             Button(action: onEditLink) {
                 BrowserContextMenuStyle.label("Edit Link…", systemImage: "pencil")
             }
@@ -6740,57 +6478,23 @@ private struct SharedLinkTreeRow: View {
     }
 
     @ViewBuilder
-    private var disclosure: some View {
-        Button(action: disclosureAction) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 5, style: .continuous)
-                    .fill(
-                        isDisclosureHovered
-                            ? Color.accentColor.opacity(0.14)
-                            : Color.clear
-                    )
-
-                switch entry.state {
-                case .loading:
-                    ProgressView()
-                        .controlSize(.mini)
-                case .ready:
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 10 * scale, weight: .bold))
-                        .foregroundStyle(
-                            isDisclosureHovered ? Color.accentColor : Color.secondary
-                        )
-                case .failed:
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 10 * scale, weight: .semibold))
-                        .foregroundStyle(.red)
-                }
-            }
-            .frame(width: max(20, 24 * scale), height: max(20, 24 * scale))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain).pointingHandCursor()
-        .onHover { isDisclosureHovered = $0 }
-        .help(disclosureHelp)
-        .accessibilityLabel(disclosureHelp)
-    }
-
-    private func disclosureAction() {
-        if case .failed = entry.state {
-            onRetry()
-        } else {
-            onToggle()
-        }
-    }
-
-    private var disclosureHelp: String {
+    private var linkStatus: some View {
         switch entry.state {
         case .loading:
-            return "Loading shared link"
+            ProgressView().controlSize(.mini)
+                .frame(width: max(20, 24 * scale))
+                .accessibilityLabel("Loading shared link")
         case .ready:
-            return isExpanded ? "Collapse shared link" : "Expand shared link"
+            EmptyView()
         case .failed(let message):
-            return "Retry shared link: \(message)"
+            Button(action: onRetry) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10 * scale, weight: .semibold)).foregroundStyle(.red)
+                    .frame(width: max(20, 24 * scale), height: max(20, 24 * scale))
+            }
+            .buttonStyle(.plain).pointingHandCursor()
+            .help("Retry shared link: \(message)")
+            .accessibilityLabel("Retry shared link: \(message)")
         }
     }
 
@@ -6859,7 +6563,7 @@ private struct SharedLinkTreeRow: View {
     }
 }
 
-private struct BrowserTreeRow: View {
+struct BrowserTreeRow: View {
     @State private var isRowHovered = false
     @State private var isDisclosureHovered = false
     @State private var isCheckboxHovered = false
@@ -6895,6 +6599,9 @@ private struct BrowserTreeRow: View {
     let onMeasure: () -> Void
     let onSave: () -> Void
     let onDownload: () -> Void
+    var kindOverride: String? = nil
+    var sizeOverride: String? = nil
+    var downloadHelp: String? = nil
 
     private var scale: CGFloat {
         min(max(zoomScale, CGFloat(BrowserItemZoom.minimum)), CGFloat(BrowserItemZoom.maximum))
@@ -7018,7 +6725,7 @@ private struct BrowserTreeRow: View {
                         busy: isSavingToPikPak, enabled: canSaveToPikPak && !isSavedToPikPak,
                         side: max(21, 24 * scale), onHover: { isActionHovered = $0 }, action: onSave)
                 }
-                FinderRowAction(title: "Add \(item.isFolder ? "folder" : "file") to download queue",
+                FinderRowAction(title: downloadHelp ?? "Add \(item.isFolder ? "folder" : "file") to download queue",
                     symbol: "arrow.down.circle", enabled: canDownload,
                     side: max(21, 24 * scale), onHover: { isActionHovered = $0 }, action: onDownload)
             }
@@ -7045,7 +6752,9 @@ private struct BrowserTreeRow: View {
 
     @ViewBuilder
     private var folderSizeCell: some View {
-        if !item.isFolder {
+        if let sizeOverride {
+            selectableCell(Text(sizeOverride).monospacedDigit().foregroundStyle(.secondary).lineLimit(1))
+        } else if !item.isFolder {
             selectableCell(
                 Text(formatBytes(item.size))
                     .monospacedDigit()
@@ -7167,7 +6876,7 @@ private struct BrowserTreeRow: View {
     }
 
     private var kindTitle: String {
-        item.kindDisplayTitle
+        kindOverride ?? item.kindDisplayTitle
     }
 
     private var modifiedTitle: String {
@@ -7219,7 +6928,7 @@ private struct BrowserTreeRow: View {
     }
 }
 
-private struct BrowserThumbnailTile: View {
+struct BrowserThumbnailTile: View {
     @State private var isHovered = false
     @State private var isCheckboxHovered = false
 
@@ -7235,6 +6944,9 @@ private struct BrowserThumbnailTile: View {
     let onSelect: () -> Void
     let onToggleSelection: () -> Void
     let onActivate: () -> Void
+    var thumbnailContent: AnyView? = nil
+    var thumbnailProxyURL: String = ""
+    var thumbnailCache: ThumbnailCache? = nil
 
     private var thumbnailSide: CGFloat { 82 * scale }
 
@@ -7359,11 +7071,14 @@ private struct BrowserThumbnailTile: View {
                     .padding(10 * scale)
                     .shadow(color: .blue.opacity(0.18), radius: 3 * scale, y: 2 * scale)
             }
-        } else {
+        } else if let thumbnailContent { thumbnailContent }
+        else {
             RemoteArtwork(
                 url: item.artworkURL,
                 systemName: systemImage,
-                fit: item.mediaKind == .audio || item.mediaKind == .other
+                fit: item.mediaKind == .audio || item.mediaKind == .other,
+                proxyURL: thumbnailProxyURL,
+                cache: thumbnailCache
             )
             .frame(width: thumbnailSide, height: thumbnailSide)
             .background(Color.secondary.opacity(0.055))
@@ -7411,27 +7126,35 @@ private struct RemoteArtwork: View {
     let url: URL?
     let systemName: String
     let fit: Bool
+    var proxyURL: String = ""
+    var cache: ThumbnailCache? = nil
+    @State private var image: NSImage?
+    @State private var isLoading = false
+    @State private var loadedKey: ThumbnailCache.Key?
+
+    private var requestKey: ThumbnailCache.Key? {
+        url.map { ThumbnailCache.Key(url: $0, proxy: PreviewTransport.effectiveProxyURL(proxyURL)) }
+    }
 
     var body: some View {
-        if let url {
-            AsyncImage(url: url, transaction: Transaction(animation: nil)) { phase in
-                switch phase {
-                case .empty:
-                    placeholder
-                        .overlay { ProgressView().controlSize(.small) }
-                case .success(let image):
-                    image
-                        .resizable()
-                        .aspectRatio(contentMode: fit ? .fit : .fill)
-                case .failure:
-                    placeholder
-                @unknown default:
-                    placeholder
-                }
+        ZStack {
+            if let image, loadedKey == requestKey {
+                Image(nsImage: image).resizable().aspectRatio(contentMode: fit ? .fit : .fill)
+            } else {
+                placeholder.overlay { if isLoading { ProgressView().controlSize(.small) } }
             }
-        } else {
-            placeholder
         }
+        .task(id: requestKey) {
+            image = nil
+            loadedKey = requestKey
+            guard let key = requestKey else { isLoading = false; return }
+            isLoading = true
+            let result = try? await (cache ?? ThumbnailCache.shared).image(at: key.url, proxyURL: key.proxy)
+            guard !Task.isCancelled else { return }
+            image = result
+            isLoading = false
+        }
+        .transaction { $0.animation = nil; $0.disablesAnimations = true }
     }
 
     private var placeholder: some View {
@@ -7479,15 +7202,26 @@ struct BrowserMoveDragSourceModifier: ViewModifier {
                     }
                     return provider
                 } preview: {
-                    BrowserMoveDragPreview(
-                        title: model.browserDragTitle(startingWith: item),
-                        itemCount: model.browserDragItemCount(startingWith: item),
-                        containsFolder: model.browserDragContainsFolder(startingWith: item)
-                    )
+                    // SwiftUI builds this closure with every row render. Summarize
+                    // the selection only when a drag actually draws the preview.
+                    BrowserMoveDragPreviewSource(model: model, item: item)
                 }
         } else {
             content
         }
+    }
+}
+
+private struct BrowserMoveDragPreviewSource: View {
+    let model: DownloaderModel
+    let item: BrowserItem
+
+    var body: some View {
+        BrowserMoveDragPreview(
+            title: model.browserDragTitle(startingWith: item),
+            itemCount: model.browserDragItemCount(startingWith: item),
+            containsFolder: model.browserDragContainsFolder(startingWith: item)
+        )
     }
 }
 
@@ -7548,20 +7282,5 @@ private extension View {
         modifier(BrowserMoveDragSourceModifier(model: model, item: item))
     }
 
-    func appCard(padding: CGFloat) -> some View {
-        self
-            .padding(padding)
-            .background(
-                Color(nsColor: .controlBackgroundColor).opacity(0.96),
-                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-            )
-            .overlay {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.primary.opacity(0.075), lineWidth: 1)
-                    // Decorative outlines must not compete with the card's
-                    // buttons, checkboxes or scroll view for pointer events.
-                    .allowsHitTesting(false)
-            }
-            .shadow(color: .black.opacity(0.045), radius: 10, y: 3)
-    }
+    func appCard(padding: CGFloat) -> some View { finderCard(padding: padding) }
 }

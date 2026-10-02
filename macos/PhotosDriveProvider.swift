@@ -1,20 +1,38 @@
 import AppKit
 import Foundation
+import Darwin
 @preconcurrency import Photos
 import UniformTypeIdentifiers
 
+/// Keep permission checks separate from connecting a browser to its library.
+/// Tests supply an in-memory client and never request access to personal Photos.
+@MainActor struct PhotosAccessClient {
+    var status: () -> PHAuthorizationStatus
+    var request: () async -> PHAuthorizationStatus
+    var provider: () -> any NativeCloudDrive
+
+    static var system: Self {
+        .init(status: { PHPhotoLibrary.authorizationStatus(for: .readWrite) },
+              request: { await PHPhotoLibrary.requestAuthorization(for: .readWrite) },
+              provider: { PhotosDriveProvider() })
+    }
+}
+
 final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
     let kind = CloudDriveKind.photos
+    let supportsSimilarityPreviews = true
     let root = CloudDriveLocation(id: "photos:root", title: "Apple Photos", isLibrary: true)
     static var authorized: Bool { PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized || PHPhotoLibrary.authorizationStatus(for: .readWrite) == .limited }
-    static func connect() async throws {
-        let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
-        guard status == .authorized || status == .limited else {
-            throw CloudDriveError.message("Allow MyCloudDriver to access Photos in System Settings → Privacy & Security → Photos, then reconnect.")
-        }
-    }
     private func checkAccess() throws {
         guard Self.authorized else { throw CloudDriveError.message("Photos access is unavailable. Reconnect Apple Photos to review its permission.") }
+    }
+    func previewForSimilarity(_ item: CloudDriveItem, progress: @escaping CloudDriveProgressHandler) async throws -> Data {
+        try checkAccess()
+        let asset = try await CloudDriveFiles.detached { try Self.asset(item.id) }
+        let request = PhotosSimilarityPreview()
+        return try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { request.start(asset, progress: progress, continuation: $0) }
+        }, onCancel: { request.cancel() })
     }
     private static func asset(_ id: String) throws -> PHAsset {
         guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [String(id.dropFirst("asset:".count))], options: nil).firstObject else {
@@ -36,7 +54,7 @@ final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
     private static func item(_ asset: PHAsset) -> CloudDriveItem {
         let resource = resource(asset)
         return .init(id: "asset:" + asset.localIdentifier, name: resource?.originalFilename ?? "Untitled media",
-            isFolder: false, modified: asset.creationDate, mediaType: asset.mediaType == .video ? "video" : "image",
+            isFolder: false, modified: asset.modificationDate ?? asset.creationDate, mediaType: asset.mediaType == .video ? "video" : "image",
             canRename: false, canDelete: asset.canPerform(.delete))
     }
     private static func fetch(_ location: CloudDriveLocation) throws -> PHFetchResult<PHAsset> {
@@ -47,6 +65,15 @@ final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
         else { options.predicate = NSPredicate(format: "mediaType == %d OR mediaType == %d", PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue) }
         if location.id.hasPrefix("album:") { return PHAsset.fetchAssets(in: try album(location.id), options: options) }
         return PHAsset.fetchAssets(with: options)
+    }
+    func refreshedItems(_ items: [CloudDriveItem]) async throws -> [CloudDriveItem] {
+        try checkAccess()
+        return try await CloudDriveFiles.detached {
+            try items.map { item in
+                try CloudDriveFiles.checkCancellation()
+                return Self.item(try Self.asset(item.id))
+            }
+        }
     }
     func list(_ location: CloudDriveLocation, offset: Int, search: String) async throws -> CloudDrivePage {
         try checkAccess()
@@ -65,7 +92,7 @@ final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
             let assets = try Self.fetch(location)
             var items: [CloudDriveItem] = [], cursor = max(0, offset)
             while cursor < assets.count && items.count < 500 {
-                try Task.checkCancellation()
+                try CloudDriveFiles.checkCancellation()
                 let item = Self.item(assets.object(at: cursor)); cursor += 1
                 if search.isEmpty || item.name.localizedStandardContains(search) { items.append(item) }
             }
@@ -73,21 +100,35 @@ final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
         }
     }
     func scanItems(_ items: [CloudDriveItem], location: CloudDriveLocation, progress: @escaping CloudDriveProgressHandler) async throws -> [CloudDriveItem] {
+        let collector = CloudDriveScanCollector()
+        try await discoverItems(items, location: location, progress: progress) { collector.append($0) }
+        return collector.items
+    }
+    func discoverItems(_ items: [CloudDriveItem], location: CloudDriveLocation, progress: @escaping CloudDriveProgressHandler,
+                       found: @escaping @Sendable (CloudDriveItem) -> Void) async throws {
         try checkAccess()
-        return try await CloudDriveFiles.detached {
-            var result: [CloudDriveItem] = [], seen = Set<String>()
+        try await CloudDriveFiles.detached {
+            var count = 0, seen = Set<String>()
             let scopes = items.isEmpty ? [CloudDriveItem(id: location.id, name: location.title, isFolder: true)] : items
             for item in scopes {
-                if !item.isFolder { if seen.insert(item.id).inserted { result.append(item) }; continue }
+                if !item.isFolder {
+                    // Selection metadata can outlive an edit or deletion.
+                    guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [String(item.id.dropFirst("asset:".count))], options: nil).firstObject else { continue }
+                    let current = Self.item(asset)
+                    if seen.insert(current.id).inserted { count += 1; found(current) }
+                    continue
+                }
+                if item.id.hasPrefix("album:"), PHAssetCollection.fetchAssetCollections(withLocalIdentifiers:
+                    [String(item.id.dropFirst("album:".count))], options: nil).firstObject == nil { continue }
                 let assets = try Self.fetch(item.location)
                 for index in 0..<assets.count {
-                    try Task.checkCancellation()
+                    try CloudDriveFiles.checkCancellation()
                     let value = Self.item(assets.object(at: index))
-                    if seen.insert(value.id).inserted { result.append(value) }
-                    if index % 50 == 0 { progress(.init(message: "Finding photos and videos", completed: result.count)) }
+                    if seen.insert(value.id).inserted { count += 1; found(value) }
+                    if index % 50 == 0 { progress(.init(message: "Finding photos and videos", completed: count)) }
                 }
             }
-            return result
+            try self.checkAccess()
         }
     }
     func materialize(_ item: CloudDriveItem, directory: URL, progress: @escaping CloudDriveProgressHandler) async throws -> URL {
@@ -96,6 +137,7 @@ final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
             guard let resource = Self.resource(try Self.asset(item.id)) else { throw CloudDriveError.message("Photos did not provide an original resource for this item.") }
             return resource
         }
+        try Task.checkCancellation()
         let folder = directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try CloudDriveFiles.privateDirectory(folder)
         let output = folder.appendingPathComponent(FinderFileOpenStorage.safeFilename(resource.originalFilename))
@@ -106,8 +148,25 @@ final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
             }, onCancel: { request.cancel() })
         } catch { try? FileManager.default.removeItem(at: folder); throw error }
     }
-    private static func changes(_ block: @escaping () -> Void) async throws {
+    /// Similarity never exports a Photos original to a regular file. The
+    /// helper owns this private pipe and admits its buffer against the RAM limit.
+    func streamForSimilarity(_ item: CloudDriveItem, pipe: URL, capacity: UInt64,
+                             progress: @escaping CloudDriveProgressHandler) async throws -> URL {
+        try checkAccess()
+        let resource = try await CloudDriveFiles.detached { () -> PHAssetResource in
+            guard let resource = Self.resource(try Self.asset(item.id)) else {
+                throw CloudDriveError.message("Photos did not provide this original.")
+            }
+            return resource
+        }
         try Task.checkCancellation()
+        let request = PhotosResourceTransfer(output: pipe, progress: progress, pipeLimit: capacity)
+        return try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { request.begin(resource, continuation: $0) }
+        }, onCancel: { request.cancel() })
+    }
+    private static func changes(_ block: @escaping () -> Void) async throws {
+        try CloudDriveFiles.checkCancellation()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             PHPhotoLibrary.shared().performChanges(block) { success, error in
                 if success { continuation.resume() }
@@ -166,7 +225,7 @@ final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
         let files = try await CloudDriveFiles.detached { () -> [URL] in
             var result: [URL] = [], pending = urls
             while let url = pending.popLast() {
-                try Task.checkCancellation()
+                try CloudDriveFiles.checkCancellation()
                 let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
                 if values.isSymbolicLink == true { continue }
                 if values.isDirectory == true {
@@ -179,19 +238,28 @@ final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
         let album = location.id.hasPrefix("album:") ? try Self.album(location.id) : nil
         guard album?.canPerform(.addContent) != false else { throw CloudDriveError.message("Photos does not allow importing into this album.") }
         var createdCount = 0
-        try await Self.changes {
-            var placeholders: [PHObjectPlaceholder] = []
-            for url in files {
+        let control = NativeTransferControl.current
+        for url in files {
+            if control?.isCompleted(url.path) == true { createdCount += 1; continue }
+            try await control?.wait()
+            try CloudDriveFiles.checkCancellation()
+            var identifier: String?
+            try await Self.changes {
                 let request = UTType(filenameExtension: url.pathExtension)?.conforms(to: .movie) == true
                     ? PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
                     : PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: url)
-                if let placeholder = request?.placeholderForCreatedAsset { placeholders.append(placeholder) }
+                if let placeholder = request?.placeholderForCreatedAsset {
+                    identifier = placeholder.localIdentifier
+                    if let album { PHAssetCollectionChangeRequest(for: album)?.addAssets([placeholder] as NSArray) }
+                }
             }
-            createdCount = placeholders.count
-            if let album { PHAssetCollectionChangeRequest(for: album)?.addAssets(placeholders as NSArray) }
+            guard identifier != nil else { throw CloudDriveError.message("Photos did not accept \(url.lastPathComponent).") }
+            // An acknowledged Photos transaction must not be repeated when a
+            // later item fails or the task is cancelled just after commit.
+            control?.markCompleted(url.path)
+            createdCount += 1
+            progress(.init(message: "Imported into Photos", completed: createdCount, total: files.count))
         }
-        progress(.init(message: "Imported into Photos", completed: createdCount, total: files.count))
-        guard createdCount == files.count else { throw CloudDriveError.message("Imported \(createdCount) of \(files.count) items. Photos did not accept the remaining file formats.") }
         return nil
     }
     func delete(_ items: [CloudDriveItem], progress: @escaping CloudDriveProgressHandler) async throws -> CloudDriveUndo? {
@@ -230,7 +298,7 @@ final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
         return try await CloudDriveFiles.detached {
             var result: [CloudDriveItem] = []
             for (index, item) in albums.enumerated() {
-                try Task.checkCancellation()
+                try CloudDriveFiles.checkCancellation()
                 if PHAsset.fetchAssets(in: try Self.album(item.id), options: nil).count == 0 { result.append(item) }
                 progress(.init(message: "Checking albums", completed: index + 1, total: albums.count))
             }
@@ -255,10 +323,18 @@ final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
     }
 }
 
+/// A lower bound from the next PhotoKit chunk, not an exact original size.
+/// The scan discards this attempt before requesting a larger RAM allowance.
+struct PhotosMemoryCapacityExceeded: Error {
+    let requiredBytes: UInt64
+}
+
 private final class PhotosResourceTransfer: @unchecked Sendable {
     private let lock = NSLock()
     private let output: URL
+    private let transferControl = NativeTransferControl.current
     private let progress: CloudDriveProgressHandler
+    private let pipeLimit: UInt64?
     private var continuation: CheckedContinuation<URL, Error>?
     private var requestID: PHAssetResourceDataRequestID?
     private var file: FileHandle?
@@ -266,14 +342,20 @@ private final class PhotosResourceTransfer: @unchecked Sendable {
     private var finished = false
     private var bytes: UInt64 = 0
     private var lastProgress = Date.distantPast
-    init(output: URL, progress: @escaping CloudDriveProgressHandler) { self.output = output; self.progress = progress }
+    init(output: URL, progress: @escaping CloudDriveProgressHandler, pipeLimit: UInt64? = nil) {
+        self.output = output; self.progress = progress; self.pipeLimit = pipeLimit
+    }
     func begin(_ resource: PHAssetResource, continuation: CheckedContinuation<URL, Error>) {
         lock.lock()
         if cancelled { lock.unlock(); continuation.resume(throwing: CancellationError()); return }
         self.continuation = continuation
         do {
-            guard FileManager.default.createFile(atPath: output.path, contents: nil, attributes: [.posixPermissions: 0o600]) else { throw CocoaError(.fileWriteUnknown) }
-            file = try FileHandle(forWritingTo: output)
+            if pipeLimit != nil {
+                file = try SimilarityMemoryPipe.open(output)
+            } else {
+                guard FileManager.default.createFile(atPath: output.path, contents: nil, attributes: [.posixPermissions: 0o600]) else { throw CocoaError(.fileWriteUnknown) }
+                file = try FileHandle(forWritingTo: output)
+            }
         } catch { lock.unlock(); complete(error); return }
         lock.unlock()
         let options = PHAssetResourceRequestOptions(); options.isNetworkAccessAllowed = true
@@ -282,7 +364,38 @@ private final class PhotosResourceTransfer: @unchecked Sendable {
             self.progress(.init(message: "Fetching \(resource.originalFilename)", fraction: value, bytes: bytes))
         }
         let id = PHAssetResourceManager.default().requestData(for: resource, options: options) { [weak self] data in
-            guard let self else { return }; self.lock.lock()
+            guard let self else { return }
+            do { try self.transferControl?.check() } catch { self.cancel(); return }
+            if let limit = self.pipeLimit {
+                do {
+                    try data.withUnsafeBytes { buffer in
+                        var offset = 0
+                        while offset < buffer.count {
+                            self.lock.lock()
+                            guard !self.finished, !self.cancelled, let file = self.file else {
+                                self.lock.unlock(); throw CancellationError()
+                            }
+                            guard UInt64(buffer.count - offset) <= limit - min(limit, self.bytes) else {
+                                let required = self.bytes.addingReportingOverflow(UInt64(buffer.count - offset))
+                                self.lock.unlock()
+                                throw PhotosMemoryCapacityExceeded(requiredBytes: required.overflow ? UInt64.max : required.partialValue)
+                            }
+                            let written = Darwin.write(file.fileDescriptor, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+                            let code = errno
+                            if written > 0 { self.bytes += UInt64(written); offset += written }
+                            self.lock.unlock()
+                            if written < 0 && code != EAGAIN && code != EINTR {
+                                throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+                            }
+                            if written <= 0 { try SimilarityMemoryPipe.waitWritable(file.fileDescriptor) }
+                        }
+                    }
+                } catch { self.complete(error); self.cancel(); return }
+                self.lock.lock(); let bytes = self.bytes; self.lock.unlock()
+                self.progress(.init(message: "Reading \(resource.originalFilename) into memory", bytes: bytes))
+                return
+            }
+            self.lock.lock()
             guard !self.finished && !self.cancelled else { self.lock.unlock(); return }
             do {
                 try self.file?.write(contentsOf: data); self.bytes += UInt64(data.count)
@@ -307,5 +420,42 @@ private final class PhotosResourceTransfer: @unchecked Sendable {
         lock.lock(); cancelled = true; let id = requestID; lock.unlock()
         if let id { PHAssetResourceManager.default().cancelDataRequest(id) }
         complete(CancellationError())
+    }
+}
+
+enum SimilarityMemoryPipe {
+    static func waitWritable(_ descriptor: Int32) throws {
+        var pending = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+        let result = Darwin.poll(&pending, 1, 100)
+        if result < 0 && errno != EINTR { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+    }
+    /// O_NOFOLLOW and fstat prevent replacing the requested pipe with a file.
+    /// Nonblocking writes allow cancellation even when the helper stops reading.
+    /// The pipe is nonblocking so a stalled helper cannot wedge the writer.
+    /// Retry short writes until the chunk is delivered or the task is cancelled.
+    static func write(_ bytes: Data, to handle: FileHandle) throws {
+        try bytes.withUnsafeBytes { buffer in
+            var offset = 0
+            while offset < buffer.count {
+                try CloudDriveFiles.checkCancellation()
+                let written = Darwin.write(handle.fileDescriptor, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+                let code = errno
+                if written > 0 { offset += written; continue }
+                if written < 0 && code != EAGAIN && code != EINTR {
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+                }
+                try waitWritable(handle.fileDescriptor)
+            }
+        }
+    }
+    static func open(_ url: URL) throws -> FileHandle {
+        let fd = Darwin.open(url.path, O_WRONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFIFO,
+              fcntl(fd, F_SETNOSIGPIPE, 1) == 0 else {
+            Darwin.close(fd); throw CocoaError(.fileWriteNoPermission)
+        }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 }

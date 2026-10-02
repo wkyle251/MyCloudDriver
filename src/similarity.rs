@@ -4,25 +4,19 @@
 
 use crate::Client;
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use filetwin_core::{
-    api::{
-        Cache, CacheMode, EngineConfig, ExactDuplicates, Filters, JobEvent, JobRequest, JobSummary,
-        Limits, Matching, MatrixQuery, ResultsQuery, RuntimeConfig,
-    },
-    Catalog, Engine, HostServices,
-};
+use filetwin_core::api::RuntimeConfig;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(test)]
+use std::os::unix::ffi::OsStringExt;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
     io::Write,
-    os::unix::{
-        ffi::OsStringExt,
-        fs::{OpenOptionsExt, PermissionsExt},
-    },
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -30,13 +24,52 @@ use std::{
     },
     time::{Duration, Instant},
 };
+#[cfg(test)]
 use tokio::io::AsyncWriteExt;
 
-const MAX_CLOUD_FILES: usize = 100_000;
 const MAX_GROUPS: usize = 2_000;
 const MAX_MEMBERS: usize = 20_000;
 const MAX_ISSUES: usize = 500;
-const MAX_FILES: usize = 100_000;
+// Backpressure for prepared originals, not a limit on the scan inventory.
+const READY_QUEUE_CAPACITY: usize = 100_000;
+
+#[path = "similarity_groups.rs"]
+mod grouping;
+pub use grouping::{group_scores, GroupQuery};
+
+#[path = "similarity_encode.rs"]
+mod encoding;
+#[path = "similarity_format.rs"]
+#[cfg(test)]
+mod format_filter;
+#[path = "similarity_scope.rs"]
+mod scope;
+#[path = "similarity_store.rs"]
+mod store;
+#[path = "similarity_cache.rs"]
+mod vector_cache;
+#[path = "similarity_source_cache.rs"]
+mod source_cache;
+#[path = "similarity_password.rs"]
+mod password;
+#[path = "similarity_discovery.rs"]
+mod discovery;
+#[path = "similarity_inventory.rs"]
+mod inventory;
+#[path = "similarity_prefetch.rs"]
+mod prefetch;
+#[path = "similarity_fetch.rs"]
+mod fetch;
+#[path = "similarity_memory.rs"]
+mod memory;
+#[path = "similarity_control.rs"]
+mod control;
+#[path = "similarity_resources.rs"]
+mod resources;
+#[path = "similarity_checkpoint.rs"]
+mod checkpoint;
+#[path = "similarity_acceleration.rs"]
+mod acceleration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,29 +93,137 @@ pub struct CloudItem {
     pub size: u64,
     #[serde(default)]
     pub ancestors: Vec<CloudAncestor>,
+    #[serde(default)]
+    pub revision: Option<String>,
+}
+
+/// Provider inventory contains metadata only. The app resolves each ID when
+/// an encoder slot requests it; no Photos export or iCloud download is eager.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalSource {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub local_path: Option<PathBuf>,
+    #[serde(default)]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_kind: Option<ExternalContentKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalContentKind {
+    #[serde(rename = "photos_preview_1024_v1")]
+    PhotosPreview,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScanRequest {
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
+    #[serde(default)]
+    pub parent_pid: Option<u32>,
     pub source: ScanSource,
     #[serde(default)]
     pub local_paths: Vec<PathBuf>,
     #[serde(default)]
     pub cloud_items: Vec<CloudItem>,
+    #[serde(default)]
+    pub external_sources: Vec<ExternalSource>,
+    #[serde(default)]
+    pub external_source_stream: Option<PathBuf>,
+    /// The host can provide a fresh provider inventory before finalization.
+    #[serde(default)]
+    pub refresh_inventory: bool,
     pub families: Vec<String>,
     pub threshold: f64,
     pub exact_duplicates: bool,
+    /// Accepted for compatibility with older app requests. Dot-prefixed items
+    /// are now always outside the similarity scan scope.
+    #[serde(default)]
     pub include_hidden: bool,
     pub data_dir: PathBuf,
     pub model_dir: PathBuf,
     pub temp_dir: PathBuf,
     pub report_path: PathBuf,
     pub runtime: RuntimeConfig,
+    /// New apps send a hardware-derived snapshot. Older request files retain
+    /// their conservative defaults rather than unexpectedly increasing load.
+    #[serde(default)]
+    pub resources: ScanResources,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScanResources {
+    pub acceleration: acceleration::Mode,
+    /// Admit by per-file memory reservations; `workers` is legacy only.
+    pub memory_scheduling: bool,
+    pub workers: usize,
+    pub memory_bytes: u64,
+    /// Original buffers only. Native reader copies belong to analysis memory.
+    pub download_memory_bytes: Option<u64>,
+    /// Legacy request fields retained for compatibility; source acquisition
+    /// now follows worker capacity and does not create input batches.
+    pub batch_files: usize,
+    pub batch_bytes: u64,
+}
+
+impl Default for ScanResources {
+    fn default() -> Self {
+        Self {
+            acceleration: acceleration::Mode::Cpu,
+            memory_scheduling: false,
+            workers: 2,
+            memory_bytes: 1024 * 1024 * 1024,
+            download_memory_bytes: None,
+            batch_files: 128,
+            batch_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl ScanResources {
+    fn validate(&self) -> Result<()> {
+        if !self.memory_scheduling && !(1..=64).contains(&self.workers) {
+            bail!("Similarity workers must be a whole number from 1 to 64.");
+        }
+        if !((512 << 20)..=(1 << 40)).contains(&self.memory_bytes) {
+            bail!("Similarity memory allowance must be from 512 MiB to 1 TiB.");
+        }
+        if self.download_memory_bytes.is_some_and(|bytes| bytes < (1 << 20) || bytes >= self.memory_bytes) {
+            bail!("Download RAM must be positive and smaller than total scan memory.");
+        }
+        if !(1..=4096).contains(&self.batch_files) {
+            bail!("Similarity input batches must contain from 1 to 4,096 files.");
+        }
+        if !((1 << 20)..=(1 << 40)).contains(&self.batch_bytes) {
+            bail!("Similarity input batch size must be from 1 MiB to 1 TiB.");
+        }
+        Ok(())
+    }
+
+    /// Mirrors FileTwin's native admission rule; the allowance is not a hard
+    /// ceiling for the entire process or its inference runtime's allocations.
+    fn effective_workers(&self) -> usize {
+        if self.memory_scheduling {
+            return (self.analysis_budget() / (128 << 20)).clamp(1, 8192) as usize;
+        }
+        self.workers
+            .min((self.analysis_budget() / (512 << 20)).max(1) as usize)
+            .clamp(1, 64)
+    }
+    fn download_budget(&self) -> u64 { self.download_memory_bytes.unwrap_or((self.memory_bytes / 4).min(12 << 30)) }
+    fn analysis_budget(&self) -> u64 { self.memory_bytes.saturating_sub(self.download_budget()) }
 }
 
 impl ScanRequest {
     pub fn validate(&self) -> Result<()> {
+        if self.checkpoint_id.as_ref().is_some_and(|id| !checkpoint::valid_id(id)) { bail!("Invalid scan checkpoint identifier."); }
+        self.resources.validate()?;
         if !self.threshold.is_finite() || !(0.0..=1.0).contains(&self.threshold) {
             bail!("The similarity score must be between 0 and 1.");
         }
@@ -95,16 +236,48 @@ impl ScanRequest {
             bail!("Choose at least one supported content type.");
         }
         match self.source {
-            ScanSource::Local if self.local_paths.is_empty() || !self.cloud_items.is_empty() => {
+            ScanSource::Local
+                if (self.local_paths.is_empty() && self.external_sources.is_empty() && self.external_source_stream.is_none())
+                    || !self.cloud_items.is_empty()
+                    || (!self.local_paths.is_empty() && (!self.external_sources.is_empty() || self.external_source_stream.is_some()))
+                    || (!self.external_sources.is_empty() && self.external_source_stream.is_some()) =>
+            {
                 bail!("Choose local files or folders only for a local scan.")
             }
-            ScanSource::Cloud if self.cloud_items.is_empty() || !self.local_paths.is_empty() => {
+            ScanSource::Cloud
+                if self.cloud_items.is_empty()
+                    || !self.local_paths.is_empty()
+                    || !self.external_sources.is_empty() =>
+            {
                 bail!("Choose PikPak files or folders only for a cloud scan.")
             }
             _ => {}
         }
+        if self.source == ScanSource::Cloud && self.external_source_stream.is_some() {
+            bail!("A PikPak scan cannot use a native drive inventory stream.");
+        }
+        if let Some(stream) = &self.external_source_stream {
+            if !stream.is_absolute() || stream.parent().and_then(|p| p.canonicalize().ok()).is_none()
+                || stream.parent().and_then(|p| p.canonicalize().ok())
+                != self.temp_dir.parent().and_then(|p| p.canonicalize().ok()) {
+                bail!("The provider inventory must be inside this scan's private request directory.");
+            }
+        }
         if self.local_paths.len() + self.cloud_items.len() > 1000 {
             bail!("Choose at most 1,000 scan roots.");
+        }
+        let mut external_ids = HashSet::new();
+        if self.external_sources.iter().any(|file| {
+                file.id.is_empty()
+                    || file.id.len() > 8192
+                    || !external_ids.insert(&file.id)
+                    || file
+                        .local_path
+                        .as_ref()
+                        .is_some_and(|path| !path.is_absolute())
+            })
+        {
+            bail!("Choose files with unique provider identifiers and absolute local paths.");
         }
         for path in self.local_paths.iter().chain([
             &self.data_dir,
@@ -150,7 +323,14 @@ pub struct ScanIssue {
     pub reason: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueSummary {
+    pub category: String,
+    pub reason: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanReport {
     pub source: ScanSource,
     pub scope: Vec<String>,
@@ -159,6 +339,12 @@ pub struct ScanReport {
     pub scanned_files: u64,
     pub analysed_files: u64,
     pub skipped_files: u64,
+    #[serde(default)]
+    pub unsupported_files: u64,
+    #[serde(default)]
+    pub failed_files: u64,
+    #[serde(default)]
+    pub issue_summary: Vec<IssueSummary>,
     pub downloaded_bytes: u64,
     pub total_groups: u64,
     pub groups: Vec<MatchGroup>,
@@ -185,43 +371,18 @@ pub struct ScoreRowRequest {
 /// Query saved measurements only. Locators and temporary paths never leave this
 /// adapter; the app joins opaque file IDs to its provider-specific inventory.
 pub fn score_row(request: ScoreRowRequest, cancel: &AtomicBool) -> Result<Value> {
-    if !request.data_dir.is_absolute() { bail!("The score catalog path must be absolute."); }
-    let catalog = Catalog::open_read_only(&request.data_dir)?;
-    let mut offset = 0;
-    let mut entries = Vec::new();
-    let mut unavailable = std::collections::BTreeMap::<String, u64>::new();
-    let mut omitted = 0u64;
-    loop {
-        check_cancel(cancel)?;
-        let page = catalog.matrix_with_cancel(MatrixQuery {
-            row_offset: request.row_offset, column_offset: offset, row_limit: 1, column_limit: 256,
-            result_revision: Some(request.result_revision), ..MatrixQuery::new(&request.run_id)
-        }, &|| cancel.load(Ordering::Acquire))?;
-        if page.rows.first().map(|f| f.file_id.as_str()) != Some(request.file_id.as_str()) {
-            bail!("This file no longer belongs to the selected scan revision. Run a new scan.");
-        }
-        for (index, file) in page.columns.iter().enumerate() {
-            if file.file_id == request.file_id { continue; }
-            if let Some(score) = page.scores[0][index] {
-                if entries.len() < MAX_FILES {
-                    entries.push(json!({"file_id":file.file_id,"score":score}));
-                } else { omitted += 1; }
-            } else if let Some(reason) = page.unavailable_reasons[0][index] {
-                let reason = serde_json::to_value(reason)?.as_str().unwrap().to_owned();
-                *unavailable.entry(reason).or_default() += 1;
-            }
-        }
-        match page.next_column_offset { Some(next) => offset = next, None => break }
-    }
-    Ok(json!({"file_id":request.file_id,"entries":entries,"unavailable":unavailable,"omitted":omitted}))
+    check_cancel(cancel)?;
+    let matrix =
+        store::SavedMatrix::open(&request.data_dir, &request.run_id, request.result_revision)?;
+    matrix.row(&request, cancel)
 }
 
 struct StagedCloud {
     files: HashMap<PathBuf, CloudItem>,
     discovered: u64,
     skipped: u64,
-    bytes: u64,
     issues: Vec<ScanIssue>,
+    issue_summary: Vec<IssueSummary>,
 }
 impl StagedCloud {
     fn new() -> Self {
@@ -229,12 +390,14 @@ impl StagedCloud {
             files: HashMap::new(),
             discovered: 0,
             skipped: 0,
-            bytes: 0,
             issues: vec![],
+            issue_summary: vec![],
         }
     }
     fn skip(&mut self, path: &str, reason: &str) {
         self.skipped += 1;
+        if let Some(summary) = self.issue_summary.iter_mut().find(|s| s.reason == reason) { summary.count += 1; }
+        else { self.issue_summary.push(IssueSummary { category: "failed".into(), reason: reason.into(), count: 1 }); }
         if self.issues.len() < MAX_ISSUES {
             self.issues.push(ScanIssue {
                 path: path.into(),
@@ -289,6 +452,17 @@ pub async fn scan(
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     request.validate()?;
+    // A crashed/quitting GUI must not leave downloads or native children alive.
+    struct ParentMonitor(Option<tokio::task::JoinHandle<()>>);
+    impl Drop for ParentMonitor { fn drop(&mut self) { if let Some(task)=&self.0 { task.abort(); } } }
+    let _monitor = ParentMonitor(request.parent_pid.map(|parent| {
+        let stop=cancel.clone();
+        tokio::spawn(async move { loop {
+            if stop.load(Ordering::Acquire) { return; }
+            if rustix::process::getppid().map_or(0, |pid| pid.as_raw_nonzero().get() as u32) != parent { stop.store(true,Ordering::Release); return; }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        } })
+    }));
     private_dir(&request.data_dir)?;
     private_dir(&request.temp_dir)?;
     // A unique run directory makes cloud downloads, decoder staging and cleanup
@@ -296,22 +470,7 @@ pub async fn scan(
     let temporary = tempfile::Builder::new()
         .prefix("similarity-")
         .tempdir_in(&request.temp_dir)?;
-    let mut staged = StagedCloud::new();
     let started = Instant::now();
-    let preparation = match request.source {
-        ScanSource::Cloud => {
-            let client = client.context("Sign in to PikPak before scanning cloud files.")?;
-            stage_cloud(&request, client, temporary.path(), &cancel, &mut staged).await
-        }
-        ScanSource::Local => Ok(()),
-    };
-    if preparation.is_err() && !cancel.load(Ordering::Acquire) {
-        preparation?;
-    }
-    let roots: Vec<PathBuf> = match request.source {
-        ScanSource::Local => request.local_paths.clone(),
-        ScanSource::Cloud => vec![temporary.path().join("cloud")],
-    };
     let mut report = ScanReport {
         source: request.source,
         scope: match request.source {
@@ -328,59 +487,51 @@ pub async fn scan(
         },
         status: "completed".into(),
         threshold: request.threshold,
-        scanned_files: staged.discovered,
+        scanned_files: 0,
         analysed_files: 0,
-        skipped_files: staged.skipped,
-        downloaded_bytes: staged.bytes,
+        skipped_files: 0,
+        unsupported_files: 0,
+        failed_files: 0,
+        issue_summary: vec![],
+        downloaded_bytes: 0,
         total_groups: 0,
         groups: vec![],
-        issues: staged.issues.clone(),
+        issues: vec![],
         truncated: false,
         coverage: String::new(),
         elapsed_seconds: 0.0,
-        files: vec![], run_id: None, result_revision: None, scores_retained: 0,
+        files: vec![],
+        run_id: None,
+        result_revision: None,
+        scores_retained: 0,
     };
-    if !cancel.load(Ordering::Acquire)
-        && (request.source == ScanSource::Local || !staged.files.is_empty())
-    {
-        let mut config = EngineConfig::new(&request.data_dir);
-        config.temp_dir = temporary.path().join("workers");
-        config.model_dir = request.model_dir.clone();
-        config.runtime = request.runtime.clone();
-        let engine = Engine::open(config, HostServices::default())?;
-        let job = engine.submit(engine_request(&request, roots))?;
-        let events = job.events();
-        // No GUI thread is involved. The bounded event channel coalesces updates.
-        while !job.is_finished() || !events.is_empty() {
-            if cancel.load(Ordering::Acquire) {
-                job.cancel();
-            }
-            if let Ok(JobEvent::Progress { data, .. }) =
-                events.recv_timeout(Duration::from_millis(100))
-            {
-                if emit(&engine_progress(
-                    &request,
-                    &staged,
-                    &data,
-                    started.elapsed().as_secs_f64(),
-                ))
-                .is_err()
-                {
-                    job.cancel_for_output_failure();
-                }
-            }
-        }
-        let summary = job.wait()?;
-        emit(
-            &json!({"event":"progress", "stage":"finishing", "counts":summary.counts,
-            "skipped":staged.skipped, "downloaded_bytes":staged.bytes, "elapsed_seconds":started.elapsed().as_secs_f64()}),
-        )?;
-        collect_report(&request, &staged, &summary, &mut report)?;
+    if !cancel.load(Ordering::Acquire) {
+        let run_request = request.clone();
+        let run_path = temporary.path().to_owned();
+        let run_cancel = cancel.clone();
+        let run_client = client.cloned();
+        let runtime = tokio::runtime::Handle::current();
+        // Keep the async I/O driver alive while FileTwin's blocking worker pool
+        // pulls cloud files. This also works with a current-thread runtime.
+        report = tokio::task::spawn_blocking(move || -> Result<ScanReport> {
+            encoding::run(
+                &run_request,
+                &run_path,
+                &run_cancel,
+                &mut report,
+                started,
+                run_client.as_ref(),
+                &runtime,
+            )?;
+            Ok(report)
+        })
+        .await??;
     }
+
     if cancel.load(Ordering::Acquire) {
-        report.status = "cancelled".into();
+        report.status = if request.checkpoint_id.as_ref().is_some_and(|id| request.data_dir.join("checkpoints").join(id).join("pause").is_file()) { "paused" } else { "cancelled" }.into();
     } else if report.skipped_files > 0 && report.status == "completed" {
-        report.status = "partial".into();
+        report.status = if report.analysed_files == 0 && report.failed_files > 0 { "failed" } else { "partial" }.into();
     }
     if report.coverage.is_empty() {
         report.coverage = if report.status == "cancelled" {
@@ -402,137 +553,113 @@ pub async fn scan(
     Ok(())
 }
 
-fn engine_progress(
-    request: &ScanRequest,
-    staged: &StagedCloud,
-    data: &Value,
-    elapsed: f64,
-) -> Value {
-    let work = &data["work"];
-    let counts = &data["counts"];
-    let current = &work["current_file"];
-    let file = value_path(current).and_then(|path| {
-        let name = if request.source == ScanSource::Cloud {
-            staged.files.get(&path)?.name.clone()
-        } else {
-            path.file_name()?.to_string_lossy().into_owned()
+#[cfg(test)]
+async fn inventory_cloud(request: &ScanRequest, client: &Client, temp: &Path, cancel: &AtomicBool, staged: &mut StagedCloud) -> Result<()> {
+    let mut files = HashMap::new();
+    discover_cloud(request, client, temp, cancel, staged, &mut |item| {
+        files.insert(temp.join(format!("cloud/{:08}", files.len())), item);
+        Ok(())
+    }).await?;
+    staged.files = files;
+    Ok(())
+}
+
+fn cloud_listing_error(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<crate::Error>() {
+        Some(crate::Error::Auth(_) | crate::Error::SessionRejected(_) | crate::Error::TokenExpired | crate::Error::NotConfigured(_)) =>
+            "PikPak could not authenticate this scan. Check login status in Settings → Accounts and try again.".into(),
+        Some(crate::Error::Api { status: 401 | 403, .. }) =>
+            "PikPak denied access to this folder. Check the connected account and its login status.".into(),
+        Some(crate::Error::Api { status, .. }) => format!("PikPak could not list this folder (HTTP {status}). Try again shortly."),
+        Some(crate::Error::Http(_)) => "Could not reach PikPak after retrying. Check your connection and proxy settings.".into(),
+        Some(crate::Error::Parse(_)) => "PikPak returned an unreadable folder listing. Try again or update the app.".into(),
+        _ => "Could not read this PikPak folder. Check access and try again.".into(),
+    }
+}
+
+async fn list_scan_folder(client: &Client, id: &str, token: Option<&str>, cancel: &AtomicBool, retry_forever: bool) -> Result<crate::types::FilePage> {
+    retry_scan_read(cancel, retry_forever, || async { client.list_folder_page(id, token, 500).await.map_err(Into::into) }).await
+}
+
+async fn retry_scan_read<T, F, Fut>(cancel: &AtomicBool, retry_forever: bool, mut read: F) -> Result<T>
+where F: FnMut() -> Fut, Fut: std::future::Future<Output = Result<T>> {
+    let mut attempt=0u32;
+    loop {
+        let result = cancellable(cancel, read()).await;
+        let retry = match result.as_ref().err().and_then(|e| e.downcast_ref::<crate::Error>()) {
+            Some(crate::Error::Http(_)) => true,
+            Some(crate::Error::Api { status, .. } | crate::Error::RetryAfter { status, .. }) => crate::download_policy::transient_status(*status),
+            _ => false,
         };
-        Some(json!({"name":name, "bytes":current["bytes"]}))
-    });
-    // Cloud inventory has already completed before downloading. FileTwin's
-    // quick inventory of the staged copies belongs to its analysis stage.
-    let stage = if data["stage"] == "discovery" || (request.source == ScanSource::Cloud && data["stage"] == "inventory") {
-        "analysing"
-    } else if data["stage"] == "comparing" {
-        "comparison"
-    } else {
-        data["stage"].as_str().unwrap_or("analysing")
-    };
-    let (completed, total) = match stage {
-        "analysing" => (&counts["files_processed"], &counts["files_total"]),
-        "comparison" => (&counts["pairs_processed"], &counts["pairs_total"]),
-        "filtering" => (&counts["scores_reused"], &counts["scores_total"]),
-        _ => (&work["completed"], &work["total"]),
-    };
-    json!({"event":"progress", "stage":stage, "counts":counts,
-        "completed":completed, "total":total, "current_file":file,
-        "file_bytes_read":work["file_bytes_read"], "operation":work["operation"],
-        "skipped":staged.skipped, "downloaded_bytes":staged.bytes, "elapsed_seconds":elapsed})
+        if !retry || (!retry_forever && attempt == 2) {
+            if result.is_ok() && attempt > 0 { let _=emit(&json!({"event":"network_wait","waiting":false})); }
+            return result;
+        }
+        let delay=(300u64 * (1 << attempt.min(7))).min(30_000)
+            .max(result.as_ref().err().and_then(crate::download_policy::delay).map(|delay| delay.as_millis() as u64).unwrap_or(0));
+        let _=emit(&json!({"event":"network_wait","waiting":true,"retry_seconds":delay / 1000}));
+        cancellable(cancel, async { tokio::time::sleep(Duration::from_millis(delay)).await; Ok(()) }).await?;
+        attempt=attempt.saturating_add(1);
+    }
 }
 
-fn engine_request(request: &ScanRequest, roots: Vec<PathBuf>) -> JobRequest {
-    let mut job = JobRequest::experimental_scan(roots, request.threshold);
-    job.families = Some(request.families.clone());
-    let profiles = job.profiles.as_mut().expect("experimental profiles");
-    profiles.retain(|family, _| request.families.contains(family));
-    // Filtering belongs to the review UI. Preserve every compatible score and
-    // avoid rebuilding conservative groups whenever the user changes a cutoff.
-    job.matching = Some(Matching::all_scores());
-    job.recursive = Some(true);
-    job.filters = Some(Filters {
-        include_hidden: request.include_hidden,
-        ..Filters::default()
-    });
-    job.exact_duplicates = Some(if request.exact_duplicates {
-        ExactDuplicates::Compute
-    } else {
-        ExactDuplicates::Off
-    });
-    // Refresh forces a content read even for same-size edits with preserved
-    // timestamps. FileTwin's strict mode requires immutable revisions, which
-    // its local adapter intentionally does not claim to provide.
-    job.cache = Some(Cache {
-        mode: CacheMode::Refresh,
-        ..Cache::default()
-    });
-    job.limits = Some(Limits {
-        memory_bytes: Some(512 * 1024 * 1024),
-        // FileTwin requires a signed 64-bit staging allowance. Use its full
-        // addressable range, so it does not impose another per-file size cap.
-        // Original copies are streamed to disk; decoder memory stays bounded.
-        staging_bytes: Some(i64::MAX as u64),
-        result_bytes: Some(256 * 1024 * 1024),
-        io_workers: Some(2),
-        inference_workers: Some(1),
-        wall_time_seconds: Some(24 * 60 * 60),
-        ..Limits::default()
-    });
-    job
-}
-
-async fn stage_cloud(
+async fn discover_cloud(
     request: &ScanRequest,
     client: &Client,
     temp: &Path,
     cancel: &AtomicBool,
     staged: &mut StagedCloud,
+    next: &mut dyn FnMut(CloudItem) -> Result<()>,
 ) -> Result<()> {
-    let directory = temp.join("cloud");
-    private_dir(&directory)?;
+    let _ = temp;
     let mut pending: VecDeque<_> = request.cloud_items.clone().into();
+    let direct_items: HashSet<_> = request.cloud_items.iter().filter(|f| !f.id.is_empty()).map(|f| f.id.clone()).collect();
     let mut seen = HashSet::new();
-    let mut candidates = Vec::new();
-    emit(&json!({"event":"progress", "stage":"inventory", "completed":0}))?;
-    while let Some(item) = pending.pop_front() {
+    while let Some(mut item) = pending.pop_front() {
         check_cancel(cancel)?;
         if !seen.insert(item.id.clone()) {
             continue;
         }
-        if !request.include_hidden && item.name.starts_with('.') {
-            staged.skip(&item.path, "Hidden items are excluded from this scan.");
+        if item.name.starts_with('.') {
             continue;
+        }
+        if direct_items.contains(&item.id) {
+            // Direct roots must still exist outside Trash. Fresh cloud
+            // metadata also validates reuse for directly selected files.
+            let revision = retry_scan_read(cancel, request.checkpoint_id.is_some(), || async {
+                client.similarity_file_revision(&item.id, item.ancestors.last().map(|parent| parent.id.as_str()).unwrap_or("")).await.map_err(Into::into)
+            }).await;
+            let (size, revision) = match revision {
+                Ok(value) => value,
+                Err(error) if cloud_item_missing(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            item.size=size; item.revision=revision;
         }
         if !item.is_folder {
             staged.discovered += 1;
-            if candidates.len() >= MAX_CLOUD_FILES {
-                staged.skip(
-                    &item.path,
-                    "The scan reached its 100,000-file limit. Choose a smaller folder.",
-                );
-                break;
-            }
-            candidates.push(item);
+            next(item)?;
             continue;
         }
         let mut token: Option<String> = None;
         let mut tokens = HashSet::new();
         loop {
-            let page = cancellable(cancel, async {
-                client
-                    .list_folder_page(&item.id, token.as_deref(), 500)
-                    .await
-                    .map_err(Into::into)
-            })
-            .await;
+            let page = list_scan_folder(client, &item.id, token.as_deref(), cancel, request.checkpoint_id.is_some()).await;
             let page = match page {
-                Ok(page) => page,
-                Err(_) => {
+                Ok(page) => { let _=emit(&json!({"event":"network_wait","waiting":false})); page },
+                Err(error) => {
                     check_cancel(cancel)?;
-                    staged.skip(&item.path, "Could not read this cloud folder. Check your connection and login, then retry.");
+                    if cloud_item_missing(&error) { break; }
+                    if request.checkpoint_id.is_some() {
+                        return Err(error.context("The drive could not finish finding files. Reconnect it, then resume."));
+                    }
+                    staged.skip(&item.path, &cloud_listing_error(&error));
                     break;
                 }
             };
             for file in page.files {
+                check_cancel(cancel)?;
+                if file.name.starts_with('.') { continue; }
                 let mut ancestors = item.ancestors.clone();
                 if !item.id.is_empty() {
                     ancestors.push(CloudAncestor {
@@ -540,18 +667,25 @@ async fn stage_cloud(
                         name: item.name.clone(),
                     });
                 }
-                pending.push_back(CloudItem {
+                let child = CloudItem {
+                    revision: file.hash.clone().filter(|s| !s.trim().is_empty())
+                        .or_else(|| file.modified_time.clone().filter(|s| !s.trim().is_empty())),
                     id: file.id,
                     name: file.name.clone(),
                     path: format!("{}/{}", item.path.trim_end_matches('/'), file.name),
                     is_folder: file.kind.is_folder(),
                     size: file.size,
                     ancestors,
-                });
+                };
+                if child.is_folder {
+                    pending.push_back(child);
+                } else if seen.insert(child.id.clone()) {
+                    staged.discovered += 1;
+                    // Feed this page to workers before requesting the next
+                    // page or descending into another folder.
+                    next(child)?;
+                }
             }
-            emit(
-                &json!({"event":"progress", "stage":"inventory", "completed":staged.discovered, "pending":pending.len()}),
-            )?;
             token = page.next_page_token;
             match &token {
                 None => break,
@@ -564,117 +698,16 @@ async fn stage_cloud(
                 }
                 _ => {}
             }
-            if seen.len() + pending.len() >= MAX_CLOUD_FILES * 2 {
-                staged.skip(
-                    &item.path,
-                    "The cloud listing limit was reached. Choose a smaller scope.",
-                );
-                pending.clear();
-                break;
-            }
         }
-    }
-    let total = candidates.len();
-    for (index, item) in candidates.into_iter().enumerate() {
-        check_cancel(cancel)?;
-        // Names and IDs are untrusted. Neither can become a filesystem path.
-        let extension = Path::new(&item.name)
-            .extension()
-            .and_then(|v| v.to_str())
-            .unwrap_or("")
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .take(16)
-            .collect::<String>();
-        let path = directory.join(format!("{index:08}.{extension}"));
-        emit(&download_progress(
-            &item, staged, index, total, 0, item.size,
-        ))?;
-        match download_copy(client, &item, &path, cancel, staged, index, total).await {
-            Ok(()) => {
-                staged.files.insert(std::fs::canonicalize(&path)?, item);
-            }
-            Err(_) => {
-                let _ = std::fs::remove_file(&path);
-                check_cancel(cancel)?;
-                staged.skip(&item.path, "Could not fetch a complete copy. Check your connection, login and available disk space, then retry.");
-            }
-        }
-        emit(
-            &json!({"event":"progress", "stage":"downloading", "completed":index+1,
-            "total":total, "downloaded_bytes":staged.bytes, "skipped":staged.skipped}),
-        )?;
     }
     Ok(())
 }
 
-fn download_progress(
-    item: &CloudItem,
-    staged: &StagedCloud,
-    index: usize,
-    total: usize,
-    written: u64,
-    expected: u64,
-) -> Value {
-    json!({"event":"progress", "stage":"downloading", "current_file":{"name":item.name,"bytes":expected},
-        "completed":index, "total":total, "file_bytes_read":written, "operation":"downloading",
-        "downloaded_bytes":staged.bytes, "skipped":staged.skipped})
+fn cloud_item_missing(error: &anyhow::Error) -> bool {
+    matches!(error.downcast_ref::<crate::Error>(), Some(crate::Error::Api { status:404 | 410, .. }))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn download_copy(
-    client: &Client,
-    item: &CloudItem,
-    path: &Path,
-    cancel: &AtomicBool,
-    staged: &mut StagedCloud,
-    index: usize,
-    total: usize,
-) -> Result<()> {
-    let info = cancellable(cancel, async {
-        client.get_download_url(&item.id).await.map_err(Into::into)
-    })
-    .await?;
-    let expected = if info.size > 0 { info.size } else { item.size };
-    let response = cancellable(cancel, async {
-        client
-            .http_client()
-            .get(&info.web_content_link)
-            .send()
-            .await?
-            .error_for_status()
-            .map_err(Into::into)
-    })
-    .await?;
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    let mut file = tokio::fs::File::from_std(file);
-    let mut stream = response.bytes_stream();
-    let mut written = 0u64;
-    let mut last = Instant::now();
-    while let Some(chunk) = cancellable(cancel, async { Ok(stream.next().await) }).await? {
-        let chunk = chunk?;
-        // Count received bytes even when a failed/inconsistent response is discarded.
-        staged.bytes = staged.bytes.saturating_add(chunk.len() as u64);
-        written += chunk.len() as u64;
-        file.write_all(&chunk).await?;
-        if last.elapsed() >= Duration::from_millis(250) {
-            emit(&download_progress(
-                item, staged, index, total, written, expected,
-            ))?;
-            last = Instant::now();
-        }
-    }
-    file.flush().await?;
-    if expected > 0 && expected != written {
-        bail!("The cloud file changed or the download was incomplete.");
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn value_path(value: &Value) -> Option<PathBuf> {
     let locator = &value["locator"];
     if let Some(path) = locator["root"].as_str() {
@@ -684,6 +717,7 @@ fn value_path(value: &Value) -> Option<PathBuf> {
     Some(std::ffi::OsString::from_vec(STANDARD.decode(encoded).ok()?).into())
 }
 
+#[cfg(test)]
 fn matched_file(value: &Value, staged: &StagedCloud, source: ScanSource) -> Option<MatchedFile> {
     let path = value_path(value)?;
     let cloud = staged.files.get(&path);
@@ -717,160 +751,6 @@ fn matched_file(value: &Value, staged: &StagedCloud, source: ScanSource) -> Opti
     })
 }
 
-fn visit_results(
-    catalog: &Catalog,
-    summary: &JobSummary,
-    kind: &str,
-    group: Option<&str>,
-    mut visit: impl FnMut(Value) -> Result<bool>,
-) -> Result<bool> {
-    let mut cursor = None;
-    loop {
-        let page = catalog.results(ResultsQuery {
-            run_id: summary.run_id.clone(),
-            snapshot_id: None,
-            result_revision: summary.result_revision,
-            kind: kind.into(),
-            group_id: group.map(String::from),
-            page_size: Some(200),
-            cursor,
-            ..ResultsQuery::default()
-        })?;
-        for item in page.items {
-            if !visit(item)? {
-                return Ok(false);
-            }
-        }
-        cursor = page.next_cursor;
-        if cursor.is_none() {
-            return Ok(true);
-        }
-    }
-}
-
-fn collect_report(
-    request: &ScanRequest,
-    staged: &StagedCloud,
-    summary: &JobSummary,
-    report: &mut ScanReport,
-) -> Result<()> {
-    report.status = match summary.status.as_str() {
-        "cancelled" => "cancelled",
-        "failed" => "failed",
-        _ if summary.exit_code() == 3 => "partial",
-        _ => "completed",
-    }
-    .into();
-    report.scanned_files = if request.source == ScanSource::Cloud {
-        staged.discovered
-    } else {
-        summary.counts.files_discovered
-    };
-    report.analysed_files = summary.counts.files_ready;
-    report.skipped_files =
-        staged.skipped + summary.counts.files_failed + summary.counts.files_excluded;
-    report.run_id = summary.run_id.clone();
-    report.result_revision = summary.result_revision;
-    report.scores_retained = summary.counts.scores_retained;
-    report.coverage = format!(
-        "Source coverage: {}. Comparison coverage: {}.{}",
-        summary.completeness.source_coverage,
-        summary.completeness.comparison_coverage,
-        if staged.skipped > 0 {
-            " Some cloud files or folders were skipped before analysis."
-        } else {
-            ""
-        }
-    );
-    if let Some(error) = &summary.error {
-        report.issues.push(ScanIssue {
-            path: "Scan".into(),
-            reason: format!("{}: {}", error.stage, error.message),
-        });
-    }
-    if summary.result_revision.is_none() || summary.run_id.is_none() {
-        return Ok(());
-    }
-    let catalog = Catalog::open_read_only(&request.data_dir)?;
-    let mut errors = HashMap::new();
-    visit_results(&catalog, summary, "errors", None, |error| {
-        if errors.len() >= MAX_ISSUES {
-            return Ok(false);
-        }
-        if let (Some(id), Some(message)) = (error["file_id"].as_str(), error["message"].as_str()) {
-            let reason = match error["code"].as_str().unwrap_or("") {
-                "runtime_unavailable" if message.contains("FFmpeg") || message.contains("ffprobe") =>
-                    "Install FFmpeg 9 with ffprobe on this Mac to analyse this file type.".to_string(),
-                "runtime_unavailable" | "model_integrity" =>
-                    "A required analysis component is missing or damaged. Rebuild the app with the verified FileTwin assets.".to_string(),
-                "source_changed" => "This file changed during the scan. Run the scan again when changes have finished.".to_string(),
-                "worker_timeout" => "Analysis of this file exceeded its time limit.".to_string(),
-                _ => message.to_string(),
-            };
-            errors.insert(id.to_string(), reason);
-        }
-        Ok(true)
-    })?;
-    let mut hashes = std::collections::BTreeMap::<String, Vec<MatchedFile>>::new();
-    let mut ordinal = 0u64;
-    let mut inventory_bytes = 0usize;
-    visit_results(&catalog, summary, "files", None, |file| {
-        // File pages and matrix axes use the immutable snapshot file-ID order.
-        // Keep excluded non-file entries in the ordinal even though the tree
-        // only displays files. Never derive the row from the filtered tree.
-        let index = ordinal;
-        ordinal += 1;
-        if !file["bytes"].is_null() {
-            if let Some(mut mapped) = matched_file(&file, staged, request.source) {
-                mapped.engine_index = Some(index);
-                let bytes = serde_json::to_vec(&mapped)?.len();
-                if report.files.len() < MAX_FILES && inventory_bytes + bytes < 40 * 1024 * 1024 {
-                    inventory_bytes += bytes;
-                    if let Some(hash) = file["sha256"].as_str().filter(|_| request.exact_duplicates) {
-                        hashes.entry(hash.to_owned()).or_default().push(mapped.clone());
-                    }
-                    report.files.push(mapped);
-                } else { report.truncated = true; }
-            }
-        }
-        if file["state"].as_str() != Some("ready") && report.issues.len() < MAX_ISSUES {
-            if let Some(path) = value_path(&file) {
-                let path = staged
-                    .files
-                    .get(&path)
-                    .map(|f| f.path.clone())
-                    .unwrap_or_else(|| {
-                        if request.source == ScanSource::Local {
-                            path.to_string_lossy().into()
-                        } else {
-                            "Cloud file".into()
-                        }
-                    });
-                let reason = file["file_id"]
-                    .as_str()
-                    .and_then(|id| errors.get(id).map(String::as_str))
-                    .or(file["reason"].as_str())
-                    .or(file["state"].as_str())
-                    .unwrap_or("Could not analyse file")
-                    .replace('_', " ");
-                report.issues.push(ScanIssue { path, reason });
-            }
-        }
-        Ok(true)
-    })?;
-    let mut member_count = 0;
-    for (hash, members) in hashes.into_iter().filter(|(_, files)| files.len() > 1) {
-        report.total_groups += 1;
-        if report.groups.len() >= MAX_GROUPS || member_count + members.len() > MAX_MEMBERS {
-            report.truncated = true; continue;
-        }
-        member_count += members.len();
-        report.groups.push(MatchGroup { id: hash, match_kind: "byte_identical".into(), family: "other".into(),
-            minimum_score: None, member_count: members.len() as u64, members });
-    }
-    Ok(())
-}
-
 fn write_report(path: &Path, report: &ScanReport) -> Result<()> {
     let parent = path.parent().context("Missing report directory")?;
     private_dir(parent)?;
@@ -884,13 +764,29 @@ fn write_report(path: &Path, report: &ScanReport) -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "similarity_adapter_tests.rs"]
+mod adapter_tests;
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn session_rejection_keeps_cloud_listing_authentication_guidance() {
+        let error = anyhow::Error::new(crate::Error::SessionRejected("synthetic private detail"));
+        let message = super::cloud_listing_error(&error);
+        assert!(message.contains("Check login status"));
+        assert!(!message.contains("private detail"));
+    }
+
     use super::*;
-    fn request(root: &Path) -> ScanRequest {
+    pub(super) fn request(root: &Path) -> ScanRequest {
         ScanRequest {
+            checkpoint_id: None, parent_pid: None,
             source: ScanSource::Local,
             local_paths: vec![root.join("files")],
             cloud_items: vec![],
+            external_sources: vec![],
+            external_source_stream: None,
+            refresh_inventory: false,
             families: vec!["text".into()],
             threshold: 0.85,
             exact_duplicates: true,
@@ -900,7 +796,46 @@ mod tests {
             temp_dir: root.join("tmp"),
             report_path: root.join("output/report.json"),
             runtime: RuntimeConfig::default(),
+            resources: ScanResources::default(),
         }
+    }
+    #[test]
+    fn native_inventory_accepts_more_than_100000_files_and_still_rejects_duplicate_ids() {
+        let root=tempfile::tempdir().unwrap(); let mut request=request(root.path());
+        request.local_paths.clear();
+        request.external_sources=(0..100_137).map(|i|ExternalSource { content_kind: None,
+            id:format!("asset-{i}"),name:format!("{i}.txt"),path:format!("/Library/{i}.txt"),
+            size:1,local_path:None,revision:Some("revision".into()) }).collect();
+        request.validate().unwrap();
+        let mut report=serde_json::from_value(json!({"source":"local","scope":[],"status":"running","threshold":0.9,
+            "scanned_files":0,"analysed_files":0,"skipped_files":0,"downloaded_bytes":0,"total_groups":0,"groups":[],
+            "issues":[],"files":[],"scores_retained":0,"truncated":false,"coverage":"","elapsed_seconds":0.0})).unwrap();
+        let mut count=0;
+        scope::discover(&request,&StagedCloud::new(),&AtomicBool::new(false),&mut report,&mut |_|{count+=1;Ok(())}).unwrap();
+        assert_eq!(count,100_137); assert_eq!(report.scanned_files,100_137); assert!(!report.truncated);
+        request.external_sources.push(request.external_sources[0].clone());
+        assert!(request.validate().is_err());
+    }
+    #[test]
+    fn download_ram_is_an_independent_part_of_total_scan_memory() {
+        let legacy: ScanResources = serde_json::from_value(json!({"workers":52,"memory_bytes":48u64 << 30})).unwrap();
+        assert_eq!(legacy.download_budget(),12 << 30); assert_eq!(legacy.analysis_budget(),36 << 30);
+        let mut limits: ScanResources = serde_json::from_value(json!({"workers":52,"memory_bytes":64u64 << 30,"download_memory_bytes":12u64 << 30})).unwrap();
+        limits.validate().unwrap(); assert_eq!(limits.analysis_budget(),52 << 30); assert_eq!(limits.effective_workers(),52);
+        limits.download_memory_bytes = Some(0); assert!(limits.validate().is_err());
+        limits.download_memory_bytes = Some(64 << 30); assert!(limits.validate().is_err());
+        limits.download_memory_bytes = Some(63 << 30); assert_eq!(limits.effective_workers(),2);
+    }
+    #[test]
+    fn memory_scheduling_ignores_legacy_worker_preferences() {
+        let mut limits = ScanResources { memory_scheduling:true, workers:1,
+            memory_bytes:4 << 30, download_memory_bytes:Some(1 << 30), ..Default::default() };
+        limits.validate().unwrap();
+        let capacity = limits.effective_workers();
+        assert_eq!(capacity,24);
+        limits.workers = 0; limits.validate().unwrap(); assert_eq!(limits.effective_workers(),capacity);
+        limits.workers = 64; assert_eq!(limits.effective_workers(),capacity);
+        limits.memory_bytes = 2 << 30; assert_eq!(limits.effective_workers(),8);
     }
     #[test]
     fn rejects_mixed_sources_and_invalid_thresholds() {
@@ -914,9 +849,44 @@ mod tests {
         assert!(r.validate().is_err());
         r.threshold = 0.05;
         assert!(r.validate().is_ok());
-        let job = engine_request(&r, r.local_paths.clone());
-        assert!(job.filters.unwrap().max_bytes.is_none());
-        assert_eq!(job.limits.unwrap().staging_bytes, Some(i64::MAX as u64));
+    }
+
+    #[test]
+    fn resource_requests_validate_integer_ranges_and_native_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = request(dir.path());
+        r.resources.workers = 64;
+        r.resources.memory_bytes = 512 << 20;
+        assert!(r.validate().is_ok());
+        assert_eq!(r.resources.effective_workers(), 1);
+        r.resources.memory_bytes = 8 << 30;
+        assert_eq!(r.resources.effective_workers(), 12); // 6 GiB analysis after 2 GiB originals.
+        r.resources.workers = 4;
+        assert_eq!(r.resources.effective_workers(), 4);
+        for invalid in [0, 65] {
+            r.resources.workers = invalid;
+            assert!(r.validate().is_err());
+        }
+        r.resources = ScanResources::default();
+        for field in ["workers", "memory_bytes", "download_memory_bytes", "batch_files", "batch_bytes"] {
+            let mut json = serde_json::to_value(&r).unwrap();
+            json["resources"][field] = 1.5.into();
+            assert!(serde_json::from_value::<ScanRequest>(json).is_err());
+            let mut json = serde_json::to_value(&r).unwrap();
+            json["resources"][field] = 0.into();
+            assert!(serde_json::from_value::<ScanRequest>(json)
+                .unwrap()
+                .validate()
+                .is_err());
+        }
+        let mut legacy = serde_json::to_value(&r).unwrap();
+        legacy.as_object_mut().unwrap().remove("resources");
+        assert_eq!(
+            serde_json::from_value::<ScanRequest>(legacy)
+                .unwrap()
+                .resources,
+            ScanResources::default()
+        );
     }
     #[tokio::test]
     async fn local_scan_finds_content_without_cloud_credentials_and_cleans_up() {
@@ -948,17 +918,38 @@ mod tests {
             .groups
             .iter()
             .any(|g| g.match_kind == "byte_identical" && g.members.len() == 2));
-        assert_eq!(report.files.len(), 4, "Unmatched files remain in the tree inventory");
+        assert_eq!(
+            report.files.len(),
+            4,
+            "Unmatched files remain in the tree inventory"
+        );
         assert_eq!(report.scores_retained, 6);
-        let original = report.files.iter().find(|f| f.name == "original.txt").unwrap();
+        let original = report
+            .files
+            .iter()
+            .find(|f| f.name == "original.txt")
+            .unwrap();
         // Saved rows remain usable after originals have gone away. Changing a
         // display cutoff never re-reads source files or recomputes vectors.
         std::fs::remove_dir_all(&r.local_paths[0]).unwrap();
-        let row = score_row(ScoreRowRequest { data_dir: r.data_dir.clone(), run_id: report.run_id.clone().unwrap(),
-            result_revision: report.result_revision.unwrap(), file_id: original.id.clone(), row_offset: original.engine_index.unwrap() }, &AtomicBool::new(false)).unwrap();
+        let row = score_row(
+            ScoreRowRequest {
+                data_dir: r.data_dir.clone(),
+                run_id: report.run_id.clone().unwrap(),
+                result_revision: report.result_revision.unwrap(),
+                file_id: original.id.clone(),
+                row_offset: original.engine_index.unwrap(),
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(row["entries"].as_array().unwrap().len(), 3);
         for entry in row["entries"].as_array().unwrap() {
-            let other = report.files.iter().find(|f| f.id == entry["file_id"]).unwrap();
+            let other = report
+                .files
+                .iter()
+                .find(|f| f.id == entry["file_id"])
+                .unwrap();
             let score = entry["score"].as_f64().unwrap();
             match other.name.as_str() {
                 "copy.txt" => assert_eq!(score, 1.0),
@@ -967,8 +958,60 @@ mod tests {
                 _ => panic!("Unexpected reference or self score"),
             }
         }
-        assert!(score_row(ScoreRowRequest { data_dir: r.data_dir.clone(), run_id: report.run_id.clone().unwrap(),
-            result_revision: report.result_revision.unwrap(), file_id: "wrong-file".into(), row_offset: original.engine_index.unwrap() }, &AtomicBool::new(false)).is_err());
+        let before = std::fs::read(
+            r.data_dir
+                .join("runs")
+                .join(format!("{}.sqlite3", report.run_id.as_ref().unwrap())),
+        )
+        .unwrap();
+        for cutoff in [0.9, 0.05, 1.0] {
+            let grouped = group_scores(
+                GroupQuery {
+                    data_dir: r.data_dir.clone(),
+                    run_id: report.run_id.clone().unwrap(),
+                    result_revision: report.result_revision.unwrap(),
+                    minimum_score: cutoff,
+                    include_identical: true,
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert!(!grouped.groups.is_empty());
+            assert!(grouped
+                .groups
+                .iter()
+                .all(|g| g.identical || g.minimum_score.unwrap() >= cutoff));
+            if cutoff == 1.0 {
+                assert!(grouped
+                    .groups
+                    .iter()
+                    .any(|g| g.identical && g.file_ids.len() == 2));
+            }
+            if cutoff == 0.9 {
+                assert!(grouped.groups.iter().any(|g| g.file_ids.len() == 3));
+            }
+        }
+        assert_eq!(
+            before,
+            std::fs::read(
+                r.data_dir
+                    .join("runs")
+                    .join(format!("{}.sqlite3", report.run_id.as_ref().unwrap()))
+            )
+            .unwrap(),
+            "Regrouping only reads the saved matrix, after originals are removed"
+        );
+        assert!(score_row(
+            ScoreRowRequest {
+                data_dir: r.data_dir.clone(),
+                run_id: report.run_id.clone().unwrap(),
+                result_revision: report.result_revision.unwrap(),
+                file_id: "wrong-file".into(),
+                row_offset: original.engine_index.unwrap()
+            },
+            &AtomicBool::new(false)
+        )
+        .is_err());
         assert!(report
             .groups
             .iter()
@@ -996,12 +1039,13 @@ mod tests {
         assert_eq!(report.status, "cancelled");
         assert_eq!(std::fs::read_dir(&r.temp_dir).unwrap().count(), 0);
     }
+
     #[test]
     fn cloud_results_map_to_originals_not_temporary_paths() {
         let mut staged = StagedCloud::new();
         staged.files.insert(
             PathBuf::from("/private/scan/0001.jpg"),
-            CloudItem {
+            CloudItem { revision: None,
                 id: "cloud-1".into(),
                 name: "Photo.jpg".into(),
                 path: "/Albums/Photo.jpg".into(),
@@ -1062,6 +1106,10 @@ mod tests {
                     } else if route.starts_with("POST /v1/shield/captcha/init") {
                         json!({"captcha_token":"fixture-captcha","expires_in":3600}).to_string()
                     } else if route.starts_with("GET /drive/v1/files?") {
+                        assert!(
+                            !route.contains("hidden"),
+                            "Hidden folders must not be listed"
+                        );
                         assert!(header
                             .to_lowercase()
                             .contains("authorization: bearer fixture-access"));
@@ -1070,8 +1118,11 @@ mod tests {
                                 {"id":"big","name":"large.txt","kind":"drive#file","size":"2147483648"}],"next_page_token":null}).to_string()
                         } else {
                             json!({"files":[{"id":"a","name":"unsafe/../../escape.txt","kind":"drive#file","size":size.to_string()},
+                                {"id":"dot-file","name":".DS_Store","kind":"drive#file","size":"1024"},
                                 {"id":"hidden","name":".hidden","kind":"drive#folder"}],"next_page_token":"second"}).to_string()
                         }
+                    } else if route.starts_with("GET /drive/v1/files/root?") {
+                        json!({"id":"root","name":"Root","kind":"drive#folder","trashed":false}).to_string()
                     } else if route.starts_with("GET /drive/v1/files/a?")
                         || route.starts_with("GET /drive/v1/files/b?")
                         || route.starts_with("GET /drive/v1/files/big?")
@@ -1101,9 +1152,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut r = request(dir.path());
         r.source = ScanSource::Cloud;
+        r.include_hidden = true;
         r.local_paths.clear();
         r.cloud_items = vec![
-            CloudItem {
+            CloudItem { revision: None,
                 id: "".into(),
                 name: "PikPak".into(),
                 path: "/".into(),
@@ -1111,7 +1163,7 @@ mod tests {
                 size: 0,
                 ancestors: vec![],
             },
-            CloudItem {
+            CloudItem { revision: None,
                 id: "a".into(),
                 name: "unsafe/../../escape.txt".into(),
                 path: "/../../escape.txt".into(),
@@ -1119,16 +1171,40 @@ mod tests {
                 size,
                 ancestors: vec![],
             },
+            CloudItem { revision: None,
+                id: "explicit-dot-file".into(),
+                name: ".gitignore".into(),
+                path: "/.gitignore".into(),
+                is_folder: false,
+                size: 1024,
+                ancestors: vec![],
+            },
+            CloudItem { revision: None,
+                id: "hidden-root".into(),
+                name: ".git".into(),
+                path: "/.git".into(),
+                is_folder: true,
+                size: 0,
+                ancestors: vec![],
+            },
         ];
+        let inventory = tempfile::tempdir_in(dir.path()).unwrap();
+        let mut queued = StagedCloud::new();
+        inventory_cloud(&r, &client, inventory.path(), &AtomicBool::new(false), &mut queued).await.unwrap();
+        assert_eq!(queued.files.len(), 3);
+        assert_eq!(downloads.load(Ordering::SeqCst), 0, "Cloud inventory must not fetch queued originals");
+        assert!(queued.files.keys().all(|path| !path.exists()));
+        inventory.close().unwrap();
         scan(r.clone(), Some(&client), Arc::new(AtomicBool::new(false)))
             .await
             .unwrap();
         let bytes = std::fs::read(&r.report_path).unwrap();
         let report: ScanReport = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(report.status, "partial");
+        assert_eq!(report.status, "completed");
         assert_eq!(report.analysed_files, 3);
         assert_eq!(downloads.load(Ordering::SeqCst), 3);
-        assert_eq!(report.skipped_files, 1);
+        assert_eq!(report.skipped_files, 0);
+        assert!(report.issues.is_empty());
         assert_eq!(report.downloaded_bytes, size * 3);
         assert!(report
             .groups
@@ -1145,91 +1221,6 @@ mod tests {
         assert_eq!(std::fs::read_dir(&r.temp_dir).unwrap().count(), 0);
         assert!(!dir.path().join("escape.txt").exists());
         server.abort();
-    }
-
-    #[test]
-    fn progress_maps_cloud_names_and_never_exposes_staging_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut r = request(dir.path());
-        r.source = ScanSource::Cloud;
-        let path = dir.path().join("temporary-copy.txt");
-        let mut staged = StagedCloud::new();
-        staged.files.insert(
-            path.clone(),
-            CloudItem {
-                id: "cloud-file".into(),
-                name: "Original.txt".into(),
-                path: "/Projects/Original.txt".into(),
-                is_folder: false,
-                size: 1200,
-                ancestors: vec![],
-            },
-        );
-        let data = json!({"stage":"analysing", "counts":{"files_ready":4,"files_processed":4,"files_total":16},
-            "work":{"completed":4,"total":16,"operation":"reading","file_bytes_read":600,
-                "current_file":{"locator":{"root":path},"bytes":1200}}});
-        let progress = engine_progress(&r, &staged, &data, 12.0);
-        assert_eq!(progress["current_file"]["name"], "Original.txt");
-        assert_eq!(progress["total"], 16);
-        assert_eq!(progress["completed"], 4);
-        assert_eq!(progress["file_bytes_read"], 600);
-        assert!(!progress.to_string().contains("temporary-copy"));
-    }
-
-    #[test]
-    fn upstream_raw_counters_report_real_inventory_and_candidate_work() {
-        let dir = tempfile::tempdir().unwrap();
-        let r = request(dir.path());
-        let files = &r.local_paths[0];
-        std::fs::create_dir_all(files.join("nested")).unwrap();
-        std::fs::write(
-            files.join("a.txt"),
-            "a garden with flowers and trees".repeat(10),
-        )
-        .unwrap();
-        std::fs::write(
-            files.join("nested/b.txt"),
-            "a garden with flowers and trees".repeat(10),
-        )
-        .unwrap();
-        std::fs::write(files.join(".hidden.txt"), "hidden").unwrap();
-        // A sparse file over the old 1 GiB cap is still examined. Unsupported
-        // content may be skipped by the decoder, but never by a size filter.
-        let mut large = std::fs::File::create(files.join("large.gz")).unwrap();
-        large.write_all(&[0x1f, 0x8b]).unwrap();
-        large.set_len(1024 * 1024 * 1024 + 1).unwrap();
-        let mut job = engine_request(&r, r.local_paths.clone());
-        job.exact_duplicates = Some(ExactDuplicates::Off);
-        let engine = Engine::open(EngineConfig::new(&r.data_dir), HostServices::default()).unwrap();
-        let handle = engine.submit(job).unwrap();
-        let events = handle.events();
-        let mut updates = Vec::new();
-        while !handle.is_finished() || !events.is_empty() {
-            if let Ok(JobEvent::Progress { data, .. }) =
-                events.recv_timeout(Duration::from_millis(50))
-            {
-                updates.push(data);
-            }
-        }
-        let summary = handle.wait().unwrap();
-        assert_eq!(summary.counts.files_ready, 2);
-        assert_eq!(summary.counts.files_failed, 1); // unsupported archive
-        assert_eq!(summary.counts.files_excluded, 1); // hidden, not oversized
-        assert_eq!(summary.counts.files_processed, 4);
-        assert_eq!(summary.counts.files_total, Some(4));
-        assert_eq!(summary.counts.pairs_processed, 1);
-        assert_eq!(summary.counts.pairs_total, Some(1));
-        assert_eq!(summary.counts.scores_retained, 1);
-        for data in updates {
-            let progress = engine_progress(&r, &StagedCloud::new(), &data, 1.0);
-            if data["stage"] == "discovery" {
-                assert_eq!(progress["completed"], data["counts"]["files_processed"]);
-                assert_eq!(progress["total"], data["counts"]["files_total"]);
-            } else if data["stage"] == "comparing" {
-                assert_eq!(progress["completed"], data["counts"]["pairs_processed"]);
-                assert_eq!(progress["total"], data["counts"]["pairs_total"]);
-            }
-        }
     }
 
     #[tokio::test]

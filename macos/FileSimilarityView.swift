@@ -3,21 +3,23 @@ import SwiftUI
 
 private struct SimilarityProgressView: View {
     @ObservedObject var model: SimilarityScanModel
+    var scrollToDownloads: () -> Void
+    @State private var showDownloadList = true
     private var progress: SimilarityScanProgress { model.progress }
     private var steps: [SimilarityScanStage] {
-        model.source == .cloud || model.externalTitle != nil ? [.inventory, .downloading, .analysing, .comparison, .finishing]
+        model.externalDuplicatesOnly ? [.inventory, .downloading, .analysing, .comparison, .finishing]
             : [.analysing, .comparison, .finishing]
     }
-    private var stepIndex: Int { steps.firstIndex(of: progress.stage) ?? steps.count - 1 }
+    private var stepIndex: Int { progress.stage == .inventory && !model.externalDuplicatesOnly ? 0 : steps.firstIndex(of: progress.stage) ?? steps.count - 1 }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            VStack(alignment: .leading, spacing: 20) {
                 HStack(spacing: 0) {
                     ForEach(Array(steps.enumerated()), id: \.offset) { index, step in
                         HStack(spacing: 7) {
                             Image(systemName: index < stepIndex ? "checkmark.circle.fill" : index == stepIndex ? "circle.inset.filled" : "circle")
-                            Text(step.stepTitle).font(.callout.weight(index == stepIndex ? .semibold : .regular))
+                            Text(step == .analysing && !model.externalDuplicatesOnly ? "Find & Analyse" : step.stepTitle)
+                                .font(.callout.weight(index == stepIndex ? .semibold : .regular))
                         }.foregroundStyle(index <= stepIndex ? FinderAppearance.accent : Color.secondary)
                         if index < steps.count - 1 {
                             Rectangle().fill(index < stepIndex ? FinderAppearance.accent.opacity(0.4) : Color.primary.opacity(0.10))
@@ -32,46 +34,132 @@ private struct SimilarityProgressView: View {
                         .foregroundStyle(FinderAppearance.accent).frame(width: 48, height: 48)
                         .background(FinderAppearance.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
                     VStack(alignment: .leading, spacing: 5) {
-                        Text(model.isCancelling ? "Stopping scan…" : progress.stage.title).font(.title2.weight(.semibold))
+                        Text(model.isPaused ? "Scan paused · downloads retained" : model.isCancelling ? "Stopping scan…" : progress.displayTitle).font(.title2.weight(.semibold))
                         Text(progress.completedLabel).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                        if progress.downloadCount > 0 {
+                            Button("View Downloads (\(progress.downloadCount.formatted()))") {
+                                showDownloadList = true
+                                scrollToDownloads()
+                            }.buttonStyle(.borderless).font(.callout)
+                        }
                     }
                     Spacer(minLength: 8)
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         VStack(alignment: .trailing, spacing: 5) {
                             Text(elapsed(at: context.date)).font(.title3.monospacedDigit().weight(.medium))
-                            Text("Elapsed").font(.caption).foregroundStyle(.secondary)
+                            Text("Active scan time").font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 }
 
+                if !model.externalDuplicatesOnly && (progress.stage == .inventory || progress.stage == .analysing) {
+                    VStack(alignment: .leading, spacing: 15) {
+                      HStack(spacing: 22) {
+                        metric(progress.discoveryComplete ? "Discovery complete" : model.isPaused ? "Files found" : "Finding files…", value: progress.foundFiles.formatted())
+                        Divider().frame(height: 34)
+                        metric("Queued", value: progress.queuedFiles.formatted())
+                            .help("All waiting files, including ready originals and files waiting for downloads or memory.")
+                        Divider().frame(height: 34)
+                        metric("Analysing", value: progress.encodingFiles.formatted())
+                            .help("Files being analysed now. Ready files start when their estimated memory needs fit the analysis RAM budget.")
+                        Divider().frame(height: 34)
+                        metric("Processed", value: progress.completed.formatted())
+                      }
+                      if progress.hasWorkPhases {
+                        Divider()
+                        HStack(alignment: .top, spacing: 22) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                metric("Download RAM reserved", value: progress.originalMemoryLabel)
+                                    .help("Received original data and small receive windows for downloads and files waiting for analysis. When analysis starts, the original moves to Analysis RAM and frees this allowance for more downloads. Reservations are not measured process memory.")
+                                if progress.originalMemoryLimit > 0 {
+                                    ProgressView(value: progress.originalMemoryFraction).progressViewStyle(.linear)
+                                        .accessibilityLabel("Download RAM reserved")
+                                }
+                            }.frame(maxWidth: .infinity)
+                            VStack(alignment: .leading, spacing: 8) {
+                                metric("Analysis RAM reserved", value: progress.analysisMemoryLabel)
+                                    .help("Originals being analysed plus memory reserved for readers, decoders and any required copies. The original is handed over from Download RAM without copying it. This is an allowance, not measured process RAM.")
+                                if progress.memoryScheduling && progress.analysisMemoryLimit > 0 {
+                                    ProgressView(value: progress.analysisMemoryFraction).progressViewStyle(.linear)
+                                        .accessibilityLabel("Analysis RAM reserved")
+                                }
+                            }.frame(maxWidth: .infinity)
+                            metric("Ready for analysis", value: progress.readyFiles.formatted())
+                                .help("Completed originals waiting for reading or analysis. They are also included in Queued.")
+                            metric("Reading & hashing", value: progress.readingFiles.formatted())
+                        }
+                        if progress.originalMemoryLimit > 0 {
+                            HStack {
+                                Text("\(progress.fetchingFiles.formatted()) \(model.isPaused ? "downloads paused" : model.nativeScope?.drive == .photos ? "Photos requests" : "downloading") · \(progress.availableOriginalMemoryLabel) available")
+                                Spacer()
+                                Text("\(SimilarityScanProgress.memoryGB(progress.analysisMemoryLimit)) for analysis")
+                            }.font(.caption).foregroundStyle(.secondary)
+                        }
+                        if !progress.waitingSummary.isEmpty {
+                            Text(progress.waitingSummary)
+                                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        }
+                        if progress.analysisMemoryLimit > 0 && progress.analysisMemoryBytes > progress.analysisMemoryLimit {
+                            Text("Finishing work started before the RAM change. New analysis waits until enough memory is released.")
+                                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        }
+                        if model.source == .cloud && progress.originalMemoryLimit > 0 {
+                            Text("Downloads share RAM as data arrives. Starting analysis moves each original to Analysis RAM, freeing space for more downloads.")
+                                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        }
+                      }
+                    }.padding(13).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(FinderAppearance.accent.opacity(0.045), in: RoundedRectangle(cornerRadius: 9))
+                }
+
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text("\(progress.stage.stepTitle) progress").font(.caption).foregroundStyle(.secondary)
+                        Text(progress.progressTitle).font(.caption).foregroundStyle(.secondary)
                         Spacer()
                         if let label = progress.percentLabel {
                             Text(label).font(.callout.monospacedDigit().weight(.semibold))
                         } else {
-                            Text(progress.stage == .inventory ? "Counting files…" : "In progress…")
+                            Text(model.isPaused ? "Paused" : progress.stage == .inventory ? "Counting files…" : "In progress…")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
                     if let fraction = progress.fraction {
                         ProgressView(value: fraction).progressViewStyle(.linear)
-                            .accessibilityLabel("\(progress.stage.stepTitle) progress")
+                            .accessibilityLabel(progress.progressTitle)
+                    } else if model.isPaused {
+                        ProgressView(value: 0).progressViewStyle(.linear).accessibilityLabel("Scan paused")
                     } else {
                         ProgressView().progressViewStyle(.linear).accessibilityLabel(progress.stage.title)
                     }
+                    if progress.usesCloudByteProgress, let label = progress.cloudByteLabel {
+                        Text(label).font(.caption).foregroundStyle(.secondary)
+                        TimelineView(.periodic(from: .now, by: 1)) { context in
+                            if let estimate = progress.cloudDownloadTimeLabel(at: context.date,
+                                running: model.isRunning && !model.isPausing && !model.isCancelling,
+                                restoring: model.isRestoringProgress) {
+                                Label(estimate, systemImage: "clock")
+                                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .help("Estimated from the remaining cloud file size and recent total download speed. Cached and skipped files reduce the remaining size. Months use 30 days. Analysis and comparison may continue after downloads finish.")
+                            }
+                        }
+                    }
+                }
+
+                if progress.hasDownloadTelemetry {
+                    SimilarityDownloadsView(progress: progress, running: model.isRunning && !model.isPausing && !model.isCancelling, expanded: $showDownloadList)
+                        .id("similarity-downloads")
                 }
 
                 VStack(alignment: .leading, spacing: 7) {
                     HStack(spacing: 8) {
-                        Image(systemName: progress.currentName == nil ? "waveform.path" : "doc")
+                        Image(systemName: model.isPaused ? "pause.circle" : progress.currentName == nil ? "waveform.path" : "doc")
                             .foregroundStyle(FinderAppearance.accent)
-                        Text(progress.currentName ?? stageDetail).font(.callout.weight(.medium))
+                        Text(model.isPaused ? "Downloads and queued files are retained in RAM" : progress.currentName ?? stageDetail).font(.callout.weight(.medium))
                             .lineLimit(1).truncationMode(.middle)
                             .help(progress.currentName ?? stageDetail)
                         Spacer(minLength: 0)
-                        if progress.currentName != nil { ProgressView().controlSize(.small) }
+                        if progress.currentName != nil && !model.isPaused { ProgressView().controlSize(.small) }
                     }
                     if progress.currentName != nil {
                         HStack {
@@ -88,7 +176,9 @@ private struct SimilarityProgressView: View {
                 HStack(spacing: 0) {
                     metric("Analysed", value: progress.analysed.formatted())
                     Divider().frame(height: 34).padding(.horizontal, 20)
-                    metric("Skipped", value: progress.skipped.formatted())
+                    metric("Unsupported", value: progress.unsupportedFiles.formatted())
+                    Divider().frame(height: 34).padding(.horizontal, 20)
+                    metric("Failed", value: progress.failedFiles.formatted())
                     Divider().frame(height: 34).padding(.horizontal, 20)
                     metric(model.externalDuplicatesOnly ? "Identical pairs" : "Scores saved", value: (model.externalDuplicatesOnly ? progress.matches : progress.scoresRetained).formatted())
                     if model.source == .cloud {
@@ -99,19 +189,32 @@ private struct SimilarityProgressView: View {
                         metric("Read", value: SimilarityScanProgress.bytes(progress.bytesRead))
                     }
                 }
-                Text(model.isCancelling ? "Finishing the current operation and clearing temporary files."
-                     : "Keep browsing while this runs. You can close this window and follow progress in the status footer.")
+                if !model.externalDuplicatesOnly && (progress.vectorsEncoded > 0 || progress.cacheHits > 0) {
+                    Label("\(progress.vectorsEncoded.formatted()) newly analysed · \(progress.cacheHits.formatted()) reused", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .help("Unchanged file IDs and revisions reuse saved vectors before downloading. New or changed files are read and checked by content hash.")
+                }
+                if let limits = model.runResources, !model.externalDuplicatesOnly {
+                    Label("\(limits.analysisMemoryLabel) analysis RAM · \(limits.downloadMemoryLabel) download RAM", systemImage: "memorychip")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .help("Ready files start when their estimated RAM fits. Larger decoders reserve more memory; reservations are released when each file finishes.")
+                }
+                Text(model.isPaused ? "Keep this app open to retain downloads in RAM. Quitting or a helper crash releases RAM; saved analysis can still be resumed. Only Clear deletes saved progress."
+                     : model.isCancelling ? "Stopping tasks and releasing original buffers."
+                     : "Keep browsing while this runs. Closing this window pauses and saves the scan. Only Clear removes its progress and results.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }.padding(24)
-        }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }.padding(20)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
             .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 11))
             .overlay(RoundedRectangle(cornerRadius: 11).stroke(Color.primary.opacity(0.08)))
     }
     private var stageDetail: String {
+        if model.isRestoringProgress { return "Restoring saved progress and checking cached files…" }
         switch progress.stage {
+        case .checking: return "New files will be analysed and removed files excluded before results are finalized"
         case .inventory: return "Building the file list before reading content"
-        case .downloading: return "Preparing temporary cloud copies"
-        case .analysing: return progress.total == nil ? "Discovering and analysing files · total not known yet" : "Analysing the file inventory"
+        case .downloading: return "Fetching originals into memory"
+        case .analysing: return progress.hasWorkPhases ? progress.phaseSummary : progress.total == nil ? "Discovering and analysing files · total not known yet" : "Analysing the file inventory"
         case .comparison: return "\(progress.pairsCompared.formatted()) compatible comparisons · saving individual scores"
         case .grouping: return "Organising identical-copy evidence"
         case .finishing: return "Your results will appear here"
@@ -124,7 +227,7 @@ private struct SimilarityProgressView: View {
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
     private func elapsed(at date: Date) -> String {
-        let seconds = max(0, Int(date.timeIntervalSince(model.startedAt ?? date)))
+        let seconds = max(0, Int(model.elapsedSeconds(at: date)))
         return seconds >= 3600 ? String(format: "%dh %02dm %02ds", seconds / 3600, seconds / 60 % 60, seconds % 60)
             : seconds >= 60 ? String(format: "%dm %02ds", seconds / 60, seconds % 60) : "\(seconds)s"
     }
@@ -142,22 +245,23 @@ struct FileSimilarityView: View {
                     .frame(width: 50, height: 50)
                     .background(FinderAppearance.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(coordinator.duplicatesOnly ? "Check for Duplicates" : "Find Similar Files").font(.title2.weight(.semibold))
-                    Text(coordinator.duplicatesOnly ? "Review files with identical content." : "Compare content. Review related files together.").foregroundStyle(.secondary)
+                    Text(coordinator.activeCoordinator.duplicatesOnly ? "Check for Duplicates" : "Find Similar Files").font(.title2.weight(.semibold))
+                    Text(coordinator.activeCoordinator.duplicatesOnly ? "Review files with identical content." : "Scan once. Group, compare and review.").foregroundStyle(.secondary)
                 }
                 Spacer()
-                if let title = coordinator.externalTitle {
-                    Label(title, systemImage: coordinator.externalSymbol).foregroundStyle(FinderAppearance.accent)
-                } else { Picker("Scan source", selection: $coordinator.source) {
-                    ForEach(SimilaritySource.allCases) { source in Text(source.title).tag(source) }
-                }.pickerStyle(.segmented).labelsHidden().frame(width: 245).help("Cloud and local scans have separate scopes and results")
-                }
+                Picker("Scan drive", selection: Binding(get: { coordinator.selectedDriveID }, set: { coordinator.selectDrive($0) })) {
+                    ForEach(coordinator.driveOptions) { option in
+                        Label(option.title, systemImage: option.symbol).tag(option.id)
+                    }
+                }.pickerStyle(.menu).frame(width: 220)
+                    .help("Each drive has its own scan scope and results. Files are compared within the selected drive.")
+
             }.padding(22)
             Divider()
-            SimilarityScanView(model: coordinator.source == .cloud ? coordinator.cloud : coordinator.local,
-                coordinator: coordinator).id(coordinator.source)
+            SimilarityScanView(model: coordinator.activeModel, coordinator: coordinator.activeCoordinator)
+                .id(coordinator.selectedDriveID + coordinator.activeModel.sessionID.uuidString)
           }.frame(width: geometry.size.width, height: geometry.size.height)
-        }.frame(minWidth: 900, idealWidth: 1080, minHeight: 710, idealHeight: 800)
+        }.frame(minWidth: 940, idealWidth: 1320, minHeight: 740, idealHeight: 900)
         .background(Color(nsColor: .windowBackgroundColor))
         .tint(FinderAppearance.accent).accentColor(FinderAppearance.accent)
         .buttonStyle(FinderButtonStyle())
@@ -166,13 +270,81 @@ struct FileSimilarityView: View {
 
 private struct SimilarityScanView: View {
     @ObservedObject var model: SimilarityScanModel
-    let coordinator: FileSimilarityCoordinator
+    @ObservedObject var coordinator: FileSimilarityCoordinator
     @State private var showsScanSettings = true
     @State private var showsIssues = false
+    @State private var showsResources = false
+    @State private var resourceSettings = SimilarityResourceSettings.current
+    @State private var resourceSessionID: String?
+    @State private var pendingResourceEditID: String?
+    @State private var showsActiveDetails = false
+
+    private var hasActiveScan: Bool { model.isRunning || model.isPaused }
 
     var body: some View {
+        GeometryReader { geometry in
+            ScrollViewReader { scroll in
+                if model.report != nil && !hasActiveScan {
+                    pageContent(scroll: scroll)
+                } else {
+                    ScrollView {
+                        pageContent(scroll: scroll)
+                            .frame(minHeight: geometry.size.height, alignment: .top)
+                    }.accessibilityIdentifier("similarity-scan-page")
+                }
+            }
+        }
+        .onReceive(model.$report) { report in
+            showsScanSettings = report == nil
+            coordinator.preview.close()
+        }
+        .onReceive(model.$sessionID.dropFirst()) { _ in
+            showsScanSettings = true; showsActiveDetails = false; showsIssues = false; showsResources = false
+            resourceSessionID = nil; pendingResourceEditID = nil
+            resourceSettings = .current; coordinator.preview.close()
+        }
+        .onChange(of: model.isRunning) { running in
+            if running { showsActiveDetails = false }
+            finishResourcePause()
+        }
+        .onChange(of: model.isPaused) { _ in finishResourcePause() }
+        .sheet(isPresented: $showsIssues) { issuesSheet }
+        .sheet(item: $coordinator.scopePicker) { picker in
+            SimilarityScopePickerView(model: picker) { coordinator.scopePicker = nil }
+        }
+        .sheet(isPresented: $showsResources) {
+            SimilarityResourceSettingsView(settings: resourceSettings, resumesScan: resourceSessionID != nil) { value, resume in
+                do {
+                    if let id = resourceSessionID { try model.updatePausedResources(value, sessionID: id) }
+                    else { value.save() }
+                    resourceSettings = value; showsResources = false
+                    if resume { coordinator.resume(model) }
+                    return nil
+                } catch { return error.localizedDescription }
+            } cancel: { showsResources = false }
+        }
+    }
+
+    private func pageContent(scroll: ScrollViewProxy) -> some View {
         VStack(spacing: 14) {
-            if model.report != nil && !model.isRunning {
+            if !model.isRunning && !model.isPaused && !model.recoverableSessions.isEmpty {
+                VStack(alignment:.leading,spacing:10) {
+                    Label("Saved scans",systemImage:"clock.arrow.circlepath").font(.headline)
+                    ForEach(model.recoverableSessions) { session in
+                        HStack {
+                            VStack(alignment:.leading,spacing:3) {
+                                Text(session.scope).lineLimit(1).truncationMode(.middle)
+                                Text(session.updatedAt,style:.date).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button(["completed","partial","failed"].contains(session.state) ? "Open Results" : "Resume") { coordinator.resume(model,session:session) }
+                            Button("Clear") { coordinator.discardRecovery(model,session:session) }
+                                .help("Remove this saved scan and its results; original files are kept")
+                        }
+                    }
+                }.padding(14).background(FinderAppearance.accent.opacity(0.05),in:RoundedRectangle(cornerRadius:12))
+            }
+            if model.report != nil && !hasActiveScan {
                 HStack {
                     Label(model.report?.scope.joined(separator: ", ") ?? model.scopeLabel, systemImage: coordinator.externalTitle == nil ? model.source.symbol : coordinator.externalSymbol)
                         .font(.callout).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
@@ -181,9 +353,13 @@ private struct SimilarityScanView: View {
                         Label("Scan Settings", systemImage: showsScanSettings ? "chevron.up" : "slider.horizontal.3")
                     }
                     Button("Scan Again") { coordinator.start(model) }.disabled(!model.canStart)
+                    Button("Clear") { model.clearSession() }.help("Remove this scan and its saved results")
                 }
             }
-            if showsScanSettings || model.report == nil || model.isRunning {
+            if hasActiveScan {
+                activeScanControls
+                if showsActiveDetails { scopeCard }
+            } else if showsScanSettings || model.report == nil {
                 scopeCard
                 scanControls
             }
@@ -196,14 +372,74 @@ private struct SimilarityScanView: View {
                         .buttonStyle(.borderless).help("Dismiss message")
                 }.padding(10).background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
             }
-            resultArea.frame(maxWidth: .infinity, maxHeight: .infinity)
+            resultArea(scroll: scroll).frame(maxWidth: .infinity, maxHeight: .infinity)
             footer
         }.padding(18)
-        .onReceive(model.$report) { report in
-            showsScanSettings = report == nil
-            coordinator.preview.close()
-        }
-        .sheet(isPresented: $showsIssues) { issuesSheet }
+    }
+
+    private var activeScanControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Label(model.scopeLabel, systemImage: model.externalTitle == nil ? model.source.symbol : coordinator.externalSymbol)
+                    .font(.callout.weight(.semibold)).lineLimit(1).truncationMode(.middle).help(model.scopeLabel)
+                Spacer(minLength: 8)
+                scanActionButtons
+            }
+            HStack(spacing: 10) {
+                if let limits = model.runResources, !coordinator.duplicatesOnly {
+                    Label("\(limits.analysisMemoryLabel) analysis · \(limits.downloadMemoryLabel) downloads", systemImage: "memorychip")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if !coordinator.duplicatesOnly {
+                    Text("\(Int((model.threshold * 100).rounded()))% similarity")
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                Button { showsActiveDetails.toggle() } label: {
+                    Label("Scan Details", systemImage: showsActiveDetails ? "chevron.up" : "chevron.down")
+                }.buttonStyle(.borderless)
+                if !coordinator.duplicatesOnly {
+                    Button(model.isRunning ? "Pause & Adjust Resources…" : "Scan Resources…", action: editResources)
+                        .disabled(model.isRunning && !model.canPause)
+                }
+            }
+            if model.usesPhotosPreviews {
+                Text("Fast Previews · Photo previews and video thumbnails · Visual matches only")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if showsActiveDetails {
+                Text("All supported files\(model.exactDuplicates ? " · Includes identical copies" : "") · Dotfiles excluded")
+                    .font(.caption).foregroundStyle(.secondary)
+                if !model.processingLabel.isEmpty { Text(model.processingLabel).font(.caption).foregroundStyle(.secondary) }
+            }
+        }.padding(14).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 11))
+            .overlay(RoundedRectangle(cornerRadius: 11).stroke(Color.primary.opacity(0.08)))
+    }
+
+    private func editResources() {
+        if model.isRunning {
+            guard model.canPause else { return }
+            pendingResourceEditID = model.savedSession?.id
+            model.pause()
+            if !model.isPausing && !model.isPaused { pendingResourceEditID = nil }
+            finishResourcePause()
+        } else { openResourceSettings() }
+    }
+
+    private func finishResourcePause() {
+        guard let id = pendingResourceEditID else { return }
+        guard model.savedSession?.id == id else { pendingResourceEditID = nil; return }
+        guard !model.isRunning else { return }
+        pendingResourceEditID = nil
+        if model.isPaused { openResourceSettings() }
+    }
+
+    private func openResourceSettings() {
+        resourceSessionID = model.isPaused ? model.savedSession?.id : nil
+        if resourceSessionID != nil, let limits = model.savedSession?.resources {
+            resourceSettings = SimilarityResourceSettings(limits: limits)
+        } else { resourceSettings = .current }
+        showsResources = true
     }
 
     private var scopeCard: some View {
@@ -212,21 +448,18 @@ private struct SimilarityScanView: View {
                 Image(systemName: model.source.symbol).foregroundStyle(FinderAppearance.accent)
                 Text(model.externalTitle.map { "\($0) scan scope" } ?? (model.source == .cloud ? "Cloud scan scope" : "Files and folders on this Mac")).font(.headline)
                 Spacer()
-                if model.externalTitle != nil {
-                    Text("Choose a different scope in the drive browser").font(.caption).foregroundStyle(.secondary)
-                } else if model.source == .cloud {
-                    Button("Use Browser Folder") { coordinator.useBrowserSelection(false) }
-                        .help("Recursively scan the folder currently open in Browser")
-                    Button("Use Browser Selection") { coordinator.useBrowserSelection(true) }
-                        .help("Compare the selected cloud files and all contents of selected folders")
+                if let chooseFolder = coordinator.chooseFolderScope {
+                    Button(action: chooseFolder) { Label(coordinator.scopePickerButtonTitle, systemImage: "folder.badge.plus") }
+                        .help("Choose the scan location independently of Browser")
                 } else {
                     Button { model.chooseLocalFiles() } label: { Label("Choose Files or Folders…", systemImage: "plus") }
                 }
-            }.disabled(model.isRunning)
+            }.disabled(model.isRunning || model.isPaused)
             scopeLocations
-            Text(model.externalTitle != nil ? "Originals are prepared as needed. Analysis runs on this Mac while you keep browsing."
+            Text(coordinator.preferredDriveID == "local" ? "Includes all subfolders. Files are read directly from this Mac while you keep browsing."
+                 : model.externalTitle != nil ? "Files are found and analysed together. Scan copies stay in memory and are released after each file."
                  : model.source == .cloud
-                 ? "Cloud files are downloaded temporarily for analysis, then removed. Choose a scope in Browser; local files are compared in a separate scan."
+                 ? "Includes all subfolders. Downloads fill a RAM queue while analysis runs. Each original is released after processing."
                  : "Selected folders include their subfolders. Analysis runs on this Mac; local file content is not uploaded.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }.padding(14).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 11))
@@ -237,12 +470,12 @@ private struct SimilarityScanView: View {
         let isEmpty = model.source == .local ? model.localURLs.isEmpty : model.cloudRoots.isEmpty
         if model.externalTitle != nil {
             Text(model.externalScopeNames.joined(separator: ", ")).lineLimit(2).truncationMode(.middle)
+                .help(model.externalScopeNames.joined(separator: "\n"))
         } else if isEmpty {
-            Text(model.source == .cloud ? "Sign in from Settings → Accounts, then choose a folder in Browser."
+            Text(model.source == .cloud ? "Choose a PikPak folder to scan. Sign in from Settings → Accounts if needed."
                  : "Choose two or more files, or a folder containing files to compare.")
                 .foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 8)
         } else {
-            ScrollView {
                 VStack(alignment: .leading, spacing: 6) {
                     if model.source == .cloud {
                         ForEach(model.cloudRoots) { root in
@@ -256,7 +489,6 @@ private struct SimilarityScanView: View {
                         }
                     }
                 }
-            }.frame(height: min(60, CGFloat(max(1, model.source == .cloud ? model.cloudRoots.count : model.localURLs.count)) * 26))
         }
     }
 
@@ -266,7 +498,7 @@ private struct SimilarityScanView: View {
             Text(path).lineLimit(1).truncationMode(.middle).help(path)
             Spacer(minLength: 4)
             Button(action: remove) { Image(systemName: "minus.circle") }
-                .buttonStyle(.borderless).disabled(model.isRunning).help("Remove this location from the scan")
+                .buttonStyle(.borderless).disabled(model.isRunning || model.isPaused).help("Remove this location from the scan")
         }.padding(.horizontal, 3).frame(height: 22)
     }
 
@@ -279,19 +511,13 @@ private struct SimilarityScanView: View {
                         Text("Compare file sizes and SHA-256 content hashes. Review results before removing anything.").font(.callout).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    if model.isRunning { Button("Cancel Scan") { model.cancel() }.disabled(model.isCancelling) }
-                    else { Button("Start Scan") { coordinator.start(model) }.buttonStyle(.borderedProminent).disabled(!model.canStart) }
+                    scanActionButtons
                 }
             } else {
             HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("CONTENT TYPES").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
-                    HStack(spacing: 6) {
-                        familyToggle("text", "Documents", "doc.text")
-                        familyToggle("image", "Images", "photo")
-                        familyToggle("audio", "Audio", "waveform")
-                        familyToggle("video", "Video", "film")
-                    }
+                VStack(alignment: .leading, spacing: 5) {
+                    Label("All supported files", systemImage: "doc.on.doc").font(.headline)
+                    Text("Documents, images, audio and video").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 12)
                 VStack(alignment: .leading, spacing: 7) {
@@ -299,30 +525,35 @@ private struct SimilarityScanView: View {
                         Text("MINIMUM SCORE").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
                         Text(String(format: "%.0f%%", model.threshold * 100)).font(.caption.monospacedDigit().weight(.semibold))
                     }
-                    Slider(value: $model.threshold, in: 0.05...1, step: 0.01).frame(width: 185).disabled(model.isRunning)
+                    Slider(value: Binding(get: { model.threshold }, set: { model.threshold = ($0 * 100).rounded() / 100 }), in: 0.05...1).frame(width: 185).disabled(model.isRunning || model.isPaused)
                         .accessibilityLabel("Minimum similarity score")
                         .accessibilityValue(String(format: "%.0f percent", model.threshold * 100))
                         .help("Choose a score from 5% to 100%. Higher scores show closer matches. Scores are experimental cosine similarity, not probabilities.")
                 }
-                if model.isRunning {
-                    Button("Cancel Scan") { model.cancel() }.disabled(model.isCancelling).frame(width: 112)
-                } else {
-                    Button { coordinator.start(model) } label: { Label("Start Scan", systemImage: "magnifyingglass") }
-                        .buttonStyle(.borderedProminent).disabled(!model.canStart).frame(width: 112)
-                        .help("Start a background scan of the selected locations")
+                scanActionButtons
+            }
+            if model.nativeScope?.drive == .photos && model.photosPreviewsSupported {
+                HStack {
+                    Picker("Apple Photos scan", selection: Binding(get: { model.photosUsePreviews }, set: { model.choosePhotosPreviews($0) })) {
+                        Text("Fast Previews").tag(true)
+                        Text("Originals").tag(false)
+                    }.pickerStyle(.segmented).frame(maxWidth: 350).disabled(!model.canChoosePhotosMode)
+                    Text(model.usesPhotosPreviews
+                         ? "Photo previews and video thumbnails. Compares appearance; cannot verify identical originals."
+                         : "Fetches full originals. Supports byte-identical checks and sampled video frames.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
             HStack {
-                Toggle("Include byte-identical copies (all file types)", isOn: $model.exactDuplicates).disabled(model.isRunning || coordinator.duplicatesOnly)
+                Toggle("Include byte-identical copies (all file types)", isOn: $model.exactDuplicates).disabled(model.isRunning || model.isPaused || coordinator.duplicatesOnly || model.usesPhotosPreviews)
                     .font(.callout).help("Also compare SHA-256 content hashes, including formats without a similarity decoder")
                 Spacer()
-                if model.externalTitle == nil {
-                    Toggle("Include hidden files", isOn: $model.includeHidden)
-                        .font(.callout).disabled(model.isRunning)
-                }
+                Text("Files and folders starting with “.” are ignored.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .help("Dotfiles such as .gitignore and .DS_Store, and hidden folders such as .git, are excluded from analysis and skipped-file warnings.")
             }
             if SimilarityScanModel.mediaTool("ffmpeg") == nil || SimilarityScanModel.mediaTool("ffprobe") == nil {
-                Text("Audio, video and HEIF images require FFmpeg 9 and ffprobe on this Mac. Missing decoders are reported as skipped files.")
+                Text("Audio, video and HEIF images require FFmpeg 9 and ffprobe on this Mac. Missing decoders are reported in Scan Coverage.")
                     .font(.caption).foregroundStyle(.orange)
             }
             if !SimilarityScanModel.visualSimilarityAvailable {
@@ -330,21 +561,47 @@ private struct SimilarityScanView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             }
+            if !coordinator.duplicatesOnly {
+            HStack(spacing: 9) {
+                let hasScan = model.isRunning || model.isPaused
+                let limits = hasScan ? model.runResources ?? resourceSettings.limits : resourceSettings.limits
+                Image(systemName: "cpu").foregroundStyle(FinderAppearance.accent)
+                Text("\(hasScan ? "This scan" : resourceSettings.usesAutomatic ? "Automatic" : "Custom") · \(limits.analysisMemoryLabel) analysis RAM · \(limits.downloadMemoryLabel) download RAM")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button(model.isRunning ? "Pause & Adjust Resources…" : "Scan Resources…", action: editResources)
+                    .disabled(model.isRunning && !model.canPause)
+                    .help(model.isRunning ? "Pause new work and retain downloads while adjusting this scan’s RAM budgets" : "Set analysis and download RAM budgets for this scan")
+            }
+            if !model.processingLabel.isEmpty { Text(model.processingLabel).font(.caption).foregroundStyle(.secondary) }
+            }
         }
     }
 
-    private func familyToggle(_ family: String, _ label: String, _ symbol: String) -> some View {
-        Toggle(isOn: Binding(get: { model.families.contains(family) }, set: { selected in
-            if selected { model.families.insert(family) } else { model.families.remove(family) }
-        })) { Label(label, systemImage: symbol) }
-            .toggleStyle(.button).disabled(model.isRunning
-                || (["image", "video"].contains(family) && !SimilarityScanModel.visualSimilarityAvailable))
-            .help(family == "text" ? "UTF-8 text, DOCX and PDFs with a text layer" : "Compare \(label.lowercased()) by content")
-    }
-
-    @ViewBuilder private var resultArea: some View {
-        if model.isRunning {
-            SimilarityProgressView(model: model)
+    @ViewBuilder private func resultArea(scroll: ScrollViewProxy) -> some View {
+        if model.isRunning || model.retainsOriginalsInRAM {
+            VStack(spacing:10) {
+                if model.isPausing {
+                    Label("Pausing · keeping downloads in RAM…",systemImage:"pause.circle").foregroundStyle(FinderAppearance.accent)
+                } else if let deadline = model.autoResumeDeadline {
+                    autoResumeNotice(deadline)
+                } else if model.isPaused {
+                    Label("Downloads are retained in RAM. Work already analysing may finish; no new files start until Resume.", systemImage: "pause.circle")
+                        .font(.callout).foregroundStyle(.secondary)
+                } else if model.waitingForNetwork || model.progress.retryingDownloadFiles > 0 {
+                    Label("Waiting for the drive. Downloads retry automatically; ready files continue analysing.",systemImage:"wifi.exclamationmark")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                SimilarityProgressView(model: model) {
+                    withAnimation { scroll.scrollTo("similarity-downloads", anchor: .top) }
+                }
+            }
+        } else if model.isPaused {
+            VStack(spacing: 10) {
+                emptyState(symbol:model.interrupted ? "arrow.clockwise.circle" : "pause.circle",title:model.message,
+                    message:"Analysed files: \(model.progress.analysed.formatted()) · Saved comparisons: \(model.progress.pairsCompared.formatted()). The previous helper stopped. Resume reuses saved analysis and fetches unfinished originals again.")
+                if let deadline = model.autoResumeDeadline { autoResumeNotice(deadline).padding(.bottom, 20) }
+            }
         } else if let report = model.report {
             SimilarityResultsView(results: model.results, report: report, coordinator: coordinator)
         } else {
@@ -354,20 +611,47 @@ private struct SimilarityScanView: View {
         }
     }
 
+    @ViewBuilder private var scanActionButtons: some View {
+        HStack(spacing:8) {
+            if model.isRunning {
+                if !model.externalDuplicatesOnly {
+                    Button(model.isPausing ? "Pausing…" : "Pause") { model.pause() }.disabled(!model.canPause)
+                }
+                Button("Clear") { model.clearSession() }
+                Button("Cancel Scan") { model.cancel() }.disabled(model.isCancelling)
+            } else if model.isPaused {
+                Button { coordinator.resume(model) } label: {
+                    Label(model.isAutoResuming ? "Resume Now" : "Resume",systemImage:"play.fill")
+                }.buttonStyle(.borderedProminent)
+                if model.retainsOriginalsInRAM {
+                    Button("New Window") { WorkspaceSessionManager.current?.newWindow() }
+                        .help("Start another scan while keeping this scan’s downloads in RAM")
+                } else {
+                    Button("New Scan") { model.detachPausedForRecovery(); coordinator.refreshRecovery() }
+                }
+                Button("Clear") { model.clearSession() }
+                Button("Cancel Scan") { model.cancel() }
+            } else {
+                Button { coordinator.start(model) } label: { Label("Start Scan",systemImage:"magnifyingglass") }
+                    .buttonStyle(.borderedProminent).disabled(!model.canStart)
+            }
+        }
+    }
+
     private var footer: some View {
         VStack(alignment: .leading, spacing: 7) {
             if let report = model.report {
                 HStack(spacing: 12) {
                     Image(systemName: report.status == "completed" ? "checkmark.circle" : "exclamationmark.circle")
                         .foregroundStyle(report.status == "completed" ? Color.green : Color.orange)
-                    Text("\(report.analysedFiles.formatted()) analysed · \(report.skippedFiles.formatted()) skipped · \(Int(report.elapsedSeconds))s")
+                    Text("\(report.status == "cancelled" ? "Cancelled · " : report.status == "failed" ? "Incomplete · " : "")\(report.outcomeSummary) · \(Int(report.elapsedSeconds))s")
                         .font(.callout).foregroundStyle(.secondary)
                     Spacer()
-                    Button("Coverage & Skipped Files…") { showsIssues = true }
+                    Button("Scan Coverage…") { showsIssues = true }
                     Button("Export Scan Summary…") { model.exportReport() }
                 }
                 if report.truncated {
-                    Text("Some file or identical-copy results exceed the display limit. Narrow the scope to review the rest. The exported summary contains the displayed inventory and identical-copy evidence.")
+                    Text("Some results exceed the scan or display limits. Review coverage, or narrow the scope for complete results. The exported summary contains the displayed inventory and identical-copy evidence.")
                         .font(.caption).foregroundStyle(.orange)
                 }
             }
@@ -381,8 +665,24 @@ private struct SimilarityScanView: View {
             HStack { Text("Scan Coverage").font(.title2.weight(.semibold)); Spacer(); Button("Done") { showsIssues = false } }
             if let report = model.report {
                 Text(report.coverage).font(.callout).textSelection(.enabled)
-                Text("\(report.scannedFiles.formatted()) discovered · \(report.analysedFiles.formatted()) analysed · \(report.skippedFiles.formatted()) skipped")
+                Text("\(report.scannedFiles.formatted()) discovered · \(report.outcomeSummary)")
                     .foregroundStyle(.secondary)
+                if let summary = report.issueSummary, !summary.isEmpty {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 10) {
+                            ForEach(Array(summary.sorted { $0.count > $1.count }.enumerated()), id: \.offset) { _, item in
+                                HStack(alignment: .top, spacing: 12) {
+                                    Text(item.count.formatted()).font(.callout.monospacedDigit().weight(.semibold)).frame(minWidth: 35, alignment: .trailing)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(item.category == "unsupported" ? "Unsupported for similarity" : "Failed to analyse").font(.caption.weight(.semibold))
+                                        Text(item.reason).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                                    }
+                                    Spacer(minLength: 0)
+                                }
+                            }
+                        }.padding(12)
+                    }.frame(height: min(170, CGFloat(summary.count) * 62 + 24)).background(FinderAppearance.accent.opacity(0.045), in: RoundedRectangle(cornerRadius: 9))
+                }
                 if !report.issues.isEmpty {
                     List(Array(report.issues.enumerated()), id: \.offset) { _, issue in
                         VStack(alignment: .leading, spacing: 5) {
@@ -390,11 +690,24 @@ private struct SimilarityScanView: View {
                             Text(issue.reason).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                         }.padding(.vertical, 5)
                     }
-                } else { Text("No skipped items were reported.").foregroundStyle(.secondary); Spacer() }
-                Text("Up to 500 issues are listed. Unsupported formats can still appear in byte-identical groups. Audio uses sampled sound; video uses sampled frames, without audio or sequence order.")
+                } else { Text("No unsupported files or analysis failures were reported.").foregroundStyle(.secondary); Spacer() }
+                Text("Reason totals cover the full scan; up to 500 individual files are listed. Unsupported content can still appear in identical-copy groups. Audio uses sampled sound; video uses sampled frames.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-        }.padding(22).frame(width: 690, height: 490)
+        }.padding(22).frame(width: 740, height: 610)
+    }
+
+    /// An interrupted scan recovers on its own. Show the countdown so the wait
+    /// reads as deliberate, and how much of the budget is left before it stops.
+    private func autoResumeNotice(_ deadline: Date) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: "arrow.clockwise.circle")
+            Text("Resuming automatically in")
+            Text(timerInterval: Date()...deadline, countsDown: true).monospacedDigit()
+            Text("· attempt \(model.autoResumeAttempt) of \(model.autoResumeDelays.count)")
+        }
+        .font(.callout).foregroundStyle(.secondary)
+        .accessibilityElement(children: .combine)
     }
 
     private func emptyState(symbol: String, title: String, message: String) -> some View {
@@ -403,5 +716,119 @@ private struct SimilarityScanView: View {
             Text(title).font(.headline)
             Text(message).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 470)
         }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+
+private struct SimilarityResourceSettingsView: View {
+    @State var settings: SimilarityResourceSettings
+    let resumesScan: Bool
+    let save: (SimilarityResourceSettings, Bool) -> String?
+    let cancel: () -> Void
+    @State private var saveError: String?
+    private let hardware = SimilarityHardware.current
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 12) {
+                Image(systemName: "cpu").font(.title).foregroundStyle(FinderAppearance.accent)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Scan Resources").font(.title2.weight(.semibold))
+                    Text(hardware.summary).font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            Picker("Processing", selection: $settings.processingMode) {
+                ForEach(SimilarityAcceleration.allCases, id: \.self) { Text($0.title).tag($0) }
+            }.pickerStyle(.segmented).disabled(resumesScan)
+            Text(resumesScan ? "This scan keeps its original processing backend so its saved vectors remain compatible."
+                 : "Choose how new scans process image and video content.").font(.caption).foregroundStyle(.secondary)
+            Picker("Resource limits", selection: $settings.usesAutomatic) {
+                Text("Automatic").tag(true)
+                Text("Custom").tag(false)
+            }.pickerStyle(.segmented)
+            Text(resumesScan ? "Scan paused. Changes apply to this scan when you resume. Completed files and comparisons are kept."
+                 : settings.usesAutomatic ? "Recommended from this Mac’s CPU and memory, leaving room for browsing and other tasks."
+                 : "Default limits for new scans. Each scan keeps its own settings.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 13) {
+                gigabyteRow("Analysis RAM", value: $settings.analysisMemoryMiB, automatic: Int(hardware.recommendedLimits.analysisMemoryBytes >> 20), unit: "GB")
+                gigabyteRow("Download RAM", value: $settings.downloadBudgetMiB, automatic: hardware.recommendedLimits.downloadMemoryMiB, unit: "GB")
+            }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+            HStack {
+                Text("Total scan memory: \(SimilarityGigabytes.text(mib: settings.usesAutomatic ? hardware.recommendedLimits.memoryMiB : settings.memoryMiB)) GB of \(SimilarityGigabytes.text(mib: hardware.maximumMemoryMiB)) GB")
+                    .font(.callout).foregroundStyle(.secondary)
+                Spacer()
+                if !settings.usesAutomatic {
+                    Button("Use \(SimilarityGigabytes.text(mib: hardware.maximumMemoryMiB)) GB Total") {
+                        settings.memoryMiB = hardware.maximumMemoryMiB
+                    }.controlSize(.small)
+                }
+            }
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Ready files start when the original and its processing memory fit Analysis RAM. The original moves from Download RAM without being copied. Readers, models and any required decoder copies also use Analysis RAM; these reservations are released after processing.")
+                Text("Download RAM holds incoming and queued originals. Analysis frees that space for more downloads while keeping its originals in RAM. These two budgets add up to total scan memory. Decoder and system limits also apply.")
+                Text(hardware.backendDescription)
+            }.font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let error = settings.validationMessage ?? saveError {
+                Label(error, systemImage: "exclamationmark.circle").font(.callout).foregroundStyle(.orange)
+            }
+            Divider()
+            HStack {
+                Button("Restore Automatic") {
+                    let processing = settings.processingMode
+                    settings = SimilarityResourceSettings()
+                    if resumesScan { settings.processingMode = processing }
+                }
+                Spacer()
+                Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
+                if resumesScan {
+                    Button("Save") { saveError = save(settings, false) }
+                        .help("Save these limits and keep the scan paused")
+                        .disabled(settings.validationMessage != nil)
+                    Button("Save & Resume") { saveError = save(settings, true) }
+                        .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                        .disabled(settings.validationMessage != nil)
+                } else {
+                    Button("Save") { saveError = save(settings, false) }
+                        .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                        .disabled(settings.validationMessage != nil)
+                }
+            }
+        }.padding(24).frame(width: 570).tint(FinderAppearance.accent)
+    }
+    private func gigabyteRow(_ title: String, value: Binding<Int>, automatic: Int, unit: String) -> some View {
+        GridRow {
+            Text(title).font(.callout)
+            if settings.usesAutomatic {
+                Text(SimilarityGigabytes.text(mib: automatic)).font(.callout.monospacedDigit()).frame(width: 95, alignment: .trailing)
+            } else {
+                SimilarityGigabyteField(value: value, label: title).frame(width: 95)
+            }
+            Text(unit).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct SimilarityGigabyteField: View {
+    @Binding var value: Int
+    let label: String
+    @State private var text = ""
+    var body: some View {
+        TextField(label, text: $text).textFieldStyle(.roundedBorder)
+            .multilineTextAlignment(.trailing).font(.callout.monospacedDigit())
+            .accessibilityLabel("\(label) in GB")
+            .help("Enter a number in GB, including decimals such as 0.5 or 1.5.")
+            .onAppear { text = SimilarityGigabytes.text(mib: value) }
+            .onChange(of: text) { entered in
+                let numeric = SimilarityGigabytes.numericText(entered)
+                if numeric != entered { text = numeric }
+                value = SimilarityGigabytes.mebibytes(from: numeric) ?? 0
+            }
+            .onChange(of: value) { updated in
+                if (SimilarityGigabytes.mebibytes(from: text) ?? 0) != updated {
+                    text = SimilarityGigabytes.text(mib: updated)
+                }
+            }
     }
 }

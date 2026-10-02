@@ -45,6 +45,10 @@ struct FinderWindowActions {
     var emptyTitle = "Remove Empty Folders…"
     var mergeTitle = "Merge Selected Folders…"
     var supportsLinks = true
+    var supportsPikPakManagement = false
+    var canToggleFolder = false
+    var toggleFolderTitle = "Expand or Collapse Folder"
+    var toggleFolder: () -> Void = {}
     var isFileWorkspace: Bool { section == 0 || section == 3 }
 }
 
@@ -59,9 +63,41 @@ extension FocusedValues {
     }
 }
 
+/// Observe drive/login changes as well as window focus. Reading these through
+/// App's session manager alone leaves shortcuts disabled after Home → drive.
+struct FinderSearchCommands: Commands {
+    @ObservedObject private var sessions: WorkspaceSessionManager
+    @ObservedObject private var hub: CloudDriveHub
+    @ObservedObject private var model: DownloaderModel
+    @ObservedObject private var similarity: FileSimilarityCoordinator
+
+    init(sessions: WorkspaceSessionManager) {
+        self.sessions = sessions
+        hub = sessions.activeHub
+        model = sessions.activeHub.pikpak
+        similarity = sessions.activeHub.pikpak.fileSimilarity
+    }
+
+    var body: some Commands {
+        CommandGroup(after: .textEditing) {
+            Button(sessions.searchDrive == .pikpak ? "Find in Expanded Items…" : "Find in This Drive…") {
+                sessions.presentSearch(scope: .expanded)
+            }
+            .keyboardShortcut("f", modifiers: .command)
+            .disabled(sessions.searchDrive == nil || model.isLoginPresented)
+            Button("Find from PikPak Root…") { sessions.presentSearch(scope: .root) }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
+                .disabled(sessions.searchDrive != .pikpak || model.isLoginPresented)
+        }
+    }
+}
+
 struct FinderCommands: Commands {
-    @FocusedValue(\.finderWindowActions) private var actions
+    @FocusedValue(\.finderWindowActions) private var focusedActions
+    @ObservedObject private var router = FinderCommandRouter.shared
+    private var actions: FinderWindowActions? { WorkspaceSessionManager.current == nil ? focusedActions : router.actions }
     @ObservedObject var settings: FinderSettings
+    var sessions: WorkspaceSessionManager? = nil
     @StateObject private var undoFocus = FinderUndoCommandFocus()
 
     var body: some Commands {
@@ -82,6 +118,11 @@ struct FinderCommands: Commands {
                       : !undoFocus.allowsFileActions || actions?.canRedo != true)
         }
         CommandGroup(replacing: .newItem) {
+            if let sessions {
+                Button("New Window") { sessions.newWindow() }
+                    .keyboardShortcut("n", modifiers: .command)
+                Divider()
+            }
             Button(actions?.containerTitle ?? "New Folder…") { actions?.newFolder() }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
                 .disabled(actions?.canCreateFolder != true)
@@ -95,8 +136,11 @@ struct FinderCommands: Commands {
                 .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(actions?.canTrash != true)
             Divider()
-            Button("Find Similar Files…") { actions?.findSimilarFiles() }
-                .disabled(actions == nil)
+            Button("Find Similar Files…") {
+                if let actions { actions.findSimilarFiles() }
+                else { sessions?.presentSimilarity() }
+            }
+                .disabled(actions == nil && sessions?.canPresentSimilarity != true)
             Button("Check for Duplicates") { actions?.checkDuplicates() }
                 .keyboardShortcut("d", modifiers: [.command, .shift])
                 .disabled(actions?.canCheckDuplicates != true)
@@ -109,6 +153,8 @@ struct FinderCommands: Commands {
             Button(actions?.mergeTitle ?? "Merge Selected Folders…") { actions?.mergeFolders() }
                 .disabled(actions?.canMergeFolders != true)
             Divider()
+            Button("Show Transfers") { actions?.selectSection(1) }
+                .keyboardShortcut("t", modifiers: [.command, .shift]).disabled(actions == nil)
             Button("Show Status") { actions?.showStatus() }
                 .keyboardShortcut("i", modifiers: [.command, .shift])
                 .disabled(actions == nil)
@@ -125,6 +171,12 @@ struct FinderCommands: Commands {
             }
             .pickerStyle(.inline)
             .disabled(actions?.isFileWorkspace != true)
+            Divider()
+            Button(actions?.toggleFolderTitle ?? "Expand or Collapse Folder") {
+                if undoFocus.allowsFileActions { actions?.toggleFolder() }
+            }
+            .keyboardShortcut(.return, modifiers: [.command, .option])
+            .disabled(!undoFocus.allowsFileActions || actions?.canToggleFolder != true)
             Divider()
             Button("Make Items Larger") { actions?.adjustZoom(0.15) }
                 .keyboardShortcut("+", modifiers: .command)
@@ -147,14 +199,14 @@ struct FinderCommands: Commands {
             Divider()
         }
         CommandMenu("Go") {
-            Button("All Drives") { NotificationCenter.default.post(name: .init("MyCloudDriverAllDrives"), object: nil) }
+            Button("All Drives") { NotificationCenter.default.post(name: .init("MyCloudDriverAllDrives"), object: sessions?.activeHub) }
                 .keyboardShortcut("h", modifiers: [.command, .shift])
             Divider()
             Button("Back") { actions?.goBack() }
                 .keyboardShortcut("[", modifiers: .command)
                 .disabled(actions?.canGoBack != true)
             Divider()
-            ForEach(FinderWorkspaceSection.allCases) { section in
+            ForEach(actions?.supportsPikPakManagement == true ? FinderWorkspaceSection.allCases : FinderWorkspaceSection.standard) { section in
                 Button(section.title) { actions?.selectSection(section.rawValue) }
                     .keyboardShortcut(KeyEquivalent(Character(String(section.shortcut))), modifiers: [.command, .control])
                     .disabled(actions == nil || (section.rawValue == 3 && actions?.supportsLinks != true))

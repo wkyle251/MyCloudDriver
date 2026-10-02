@@ -1,5 +1,28 @@
 import Foundation
 
+enum PikPakCredentialKind: String, Codable, CaseIterable, Identifiable {
+    case desktopOAuth = "desktop-oauth"
+    case personalAccessToken = "personal-access-token"
+
+    var title: String { self == .personalAccessToken ? "Personal Access Token" : "PikPak sign-in" }
+    var id: String { rawValue }
+    var loginTitle: String { self == .personalAccessToken ? "Token login" : "Normal login" }
+    var symbol: String { self == .personalAccessToken ? "key.fill" : "person.crop.circle" }
+    var quotaTitle: String { self == .personalAccessToken ? "Connected Apps" : "Full account" }
+    var quotaExplanation: String {
+        self == .personalAccessToken ? "Shared by all Connected Apps · 25% of the account allowance" : "Account-wide usage and allowance"
+    }
+    func parse(_ token: String) throws -> String {
+        try self == .personalAccessToken ? CredentialParser.personalAccessToken(from: token) : CredentialParser.refreshToken(from: token)
+    }
+}
+
+struct PikPakAccountSession {
+    let token: String
+    let deviceID: String
+    var credentialKind: PikPakCredentialKind = .desktopOAuth
+}
+
 struct PikPakAccountProfile: Codable, Equatable {
     let sub: String
     let name: String?
@@ -15,15 +38,79 @@ struct SavedPikPakAccount: Codable, Equatable, Identifiable {
     var profile: PikPakAccountProfile?
     var needsSignIn: Bool
     var lastChecked: Date?
+    var credentialKind: PikPakCredentialKind?
 
     var displayName: String { profile?.displayName ?? "PikPak account" }
     var accountIdentifier: String? { profile?.sub }
+    var connectionKind: PikPakCredentialKind { credentialKind ?? .desktopOAuth }
+    var groupID: String { profile?.sub ?? id.uuidString }
+}
+
+/// One visible user can have both connection methods. Legacy indexes still
+/// decode; credentials remain in independent private session directories.
+struct PikPakAccountGroup: Identifiable {
+    let id: String
+    let connections: [SavedPikPakAccount]
+    var displayName: String { connections.first?.displayName ?? "PikPak account" }
+    func connection(_ kind: PikPakCredentialKind) -> SavedPikPakAccount? {
+        connections.first { $0.connectionKind == kind }
+    }
+    static func grouped(_ accounts: [SavedPikPakAccount]) -> [Self] {
+        var seen = Set<String>()
+        return accounts.compactMap { account in
+            guard seen.insert(account.groupID).inserted else { return nil }
+            return Self(id: account.groupID, connections: accounts.filter { $0.groupID == account.groupID })
+        }
+    }
 }
 
 struct PikPakAccountsDocument: Codable, Equatable {
     var version = 1
     var activeID: UUID?
     var accounts: [SavedPikPakAccount] = []
+    // Optional so existing account indexes decode without a migration pass.
+    var workspaceSelections: [String: PikPakWorkspaceAccountSelection]?
+
+    func activeID(for workspaceSessionID: String) -> UUID? {
+        if workspaceSessionID == "primary" { return activeID }
+        if let selection = workspaceSelections?[workspaceSessionID] { return selection.activeID }
+        // A new workspace initially offers the primary account.
+        return activeID
+    }
+
+    mutating func select(_ id: UUID?, for workspaceSessionID: String) {
+        if workspaceSessionID == "primary" { activeID = id }
+        else {
+            if workspaceSelections == nil { workspaceSelections = [:] }
+            workspaceSelections?[workspaceSessionID] = .init(activeID: id)
+        }
+    }
+}
+
+struct PikPakWorkspaceAccountSelection: Codable, Equatable { var activeID: UUID? }
+
+enum PikPakWorkspaceStorage {
+    static func sessionID(for slot: Int) -> String {
+        precondition(slot > 0)
+        switch slot {
+        case 1: return "primary"
+        case 2: return "secondary"
+        default: return "workspace-\(slot)"
+        }
+    }
+
+    static func isValidSessionID(_ id: String) -> Bool {
+        if id == "primary" || id == "secondary" { return true }
+        guard id.hasPrefix("workspace-"), let slot = Int(id.dropFirst("workspace-".count)), slot >= 3 else { return false }
+        return id == sessionID(for: slot)
+    }
+
+    static func directory(_ base: URL, workspaceSessionID: String) -> URL {
+        precondition(isValidSessionID(workspaceSessionID), "Invalid workspace storage identifier")
+        guard workspaceSessionID != "primary" else { return base }
+        return base.appendingPathComponent("Sessions", isDirectory: true)
+            .appendingPathComponent(workspaceSessionID, isDirectory: true)
+    }
 }
 
 enum PikPakAccountError: LocalizedError, Equatable {
@@ -45,26 +132,41 @@ enum PikPakAccountError: LocalizedError, Equatable {
 struct PikPakAccountSessionFiles {
     let id: UUID
     let directory: URL
-    var tokenURL: URL { directory.appendingPathComponent("refresh-token") }
+    var tokenURL: URL { credentialURL(for: (try? credentialKind()) ?? .desktopOAuth) }
     var lockURL: URL { directory.appendingPathComponent("refresh-token.lock") }
 
-    func load() throws -> (token: String, deviceID: String) {
+    func credentialURL(for kind: PikPakCredentialKind) -> URL {
+        directory.appendingPathComponent(kind == .personalAccessToken ? "personal-access-token" : "refresh-token")
+    }
+
+    func credentialKind() throws -> PikPakCredentialKind {
+        let marker = directory.appendingPathComponent("credential-kind")
+        guard FileManager.default.fileExists(atPath: marker.path) else { return .desktopOAuth }
+        guard let value = String(data: try PikPakAccountStore.readPrivateFile(marker), encoding: .utf8),
+              let kind = PikPakCredentialKind(rawValue: value) else { throw PikPakAccountError.invalidStorage }
+        return kind
+    }
+
+    func load() throws -> PikPakAccountSession {
         do { return try loadSavedSession() }
         catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
             throw PikPakAccountError.missingSession
         }
     }
 
-    private func loadSavedSession() throws -> (token: String, deviceID: String) {
+    private func loadSavedSession() throws -> PikPakAccountSession {
         try PikPakAccountStore.validateDirectory(directory)
-        let marker = try PikPakAccountStore.readPrivateFile(directory.appendingPathComponent("desktop-oauth-profile-v3"))
-        guard String(data: marker, encoding: .utf8) == "3" else { throw PikPakAccountError.missingSession }
-        guard let rawToken = String(data: try PikPakAccountStore.readPrivateFile(tokenURL), encoding: .utf8),
+        let kind = try credentialKind()
+        if kind == .desktopOAuth {
+            let marker = try PikPakAccountStore.readPrivateFile(directory.appendingPathComponent("desktop-oauth-profile-v3"))
+            guard String(data: marker, encoding: .utf8) == "3" else { throw PikPakAccountError.missingSession }
+        }
+        guard let rawToken = String(data: try PikPakAccountStore.readPrivateFile(credentialURL(for: kind)), encoding: .utf8),
               let deviceID = String(data: try PikPakAccountStore.readPrivateFile(directory.appendingPathComponent("device-id")), encoding: .utf8)
         else { throw PikPakAccountError.missingSession }
-        let token = try CredentialParser.refreshToken(from: rawToken)
+        let token = try kind.parse(rawToken)
         guard Self.validDeviceID(deviceID) else { throw PikPakAccountError.missingSession }
-        return (token, deviceID)
+        return PikPakAccountSession(token: token, deviceID: deviceID, credentialKind: kind)
     }
 
     static func validDeviceID(_ value: String) -> Bool {
@@ -77,6 +179,10 @@ struct PikPakAccountSessionFiles {
 /// private directory, verified, and then committed with one atomic index write.
 /// Failed or cancelled logins leave the previously active account untouched.
 final class PikPakAccountStore {
+    // Store mutations are synchronous and performed on the app's main actor.
+    // Protect unfinished logins from cleanup when a second workspace opens.
+    private static var stagedSessionPaths = Set<String>()
+    static let didChange = Notification.Name("MyCloudDriver.PikPakAccountsDidChange")
     let directory: URL
     private var indexURL: URL { directory.appendingPathComponent("accounts.json") }
 
@@ -87,7 +193,8 @@ final class PikPakAccountStore {
         let retained = Set(document.accounts.filter { !$0.needsSignIn }.map(\.id))
         // Recover interrupted staging/logout after a crash, before workers start.
         for child in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
-            if let id = UUID(uuidString: child.lastPathComponent), !retained.contains(id) {
+            if let id = UUID(uuidString: child.lastPathComponent), !retained.contains(id),
+               !Self.stagedSessionPaths.contains(child.standardizedFileURL.path) {
                 try? discard(files(for: id))
             }
         }
@@ -98,7 +205,9 @@ final class PikPakAccountStore {
         let document = try JSONDecoder().decode(PikPakAccountsDocument.self, from: Self.readPrivateFile(indexURL))
         let ids = Set(document.accounts.map(\.id))
         guard document.version == 1, ids.count == document.accounts.count,
-              document.activeID.map(ids.contains) ?? true else { throw PikPakAccountError.invalidStorage }
+              document.activeID.map(ids.contains) ?? true,
+              document.workspaceSelections?.values.allSatisfy({ $0.activeID.map(ids.contains) ?? true }) ?? true
+        else { throw PikPakAccountError.invalidStorage }
         return document
     }
 
@@ -106,15 +215,31 @@ final class PikPakAccountStore {
         PikPakAccountSessionFiles(id: id, directory: directory.appendingPathComponent(id.uuidString, isDirectory: true))
     }
 
-    func stage(token: String, deviceID: String) throws -> PikPakAccountSessionFiles {
-        let token = try CredentialParser.refreshToken(from: token)
+    /// Snapshot the starting account once. Later primary-window switches must
+    /// not change another existing workspace's selection implicitly.
+    @discardableResult
+    func registerWorkspace(_ workspaceSessionID: String) throws -> PikPakAccountsDocument {
+        var document = try load()
+        if workspaceSessionID != "primary", document.workspaceSelections?[workspaceSessionID] == nil {
+            document.select(document.activeID, for: workspaceSessionID)
+            try save(document)
+        }
+        return document
+    }
+
+    func stage(token: String, deviceID: String, credentialKind: PikPakCredentialKind = .desktopOAuth) throws -> PikPakAccountSessionFiles {
+        let token = try credentialKind.parse(token)
         guard PikPakAccountSessionFiles.validDeviceID(deviceID) else { throw PikPakAccountError.missingSession }
         let files = files(for: UUID())
+        Self.stagedSessionPaths.insert(files.directory.standardizedFileURL.path)
         do {
             try Self.prepareDirectory(files.directory)
-            try Self.writePrivateFile(Data(token.utf8), to: files.tokenURL)
+            try Self.writePrivateFile(Data(token.utf8), to: files.credentialURL(for: credentialKind))
             try Self.writePrivateFile(Data(deviceID.utf8), to: files.directory.appendingPathComponent("device-id"))
-            try Self.writePrivateFile(Data("3".utf8), to: files.directory.appendingPathComponent("desktop-oauth-profile-v3"))
+            if credentialKind == .desktopOAuth {
+                try Self.writePrivateFile(Data("3".utf8), to: files.directory.appendingPathComponent("desktop-oauth-profile-v3"))
+            }
+            try Self.writePrivateFile(Data(credentialKind.rawValue.utf8), to: files.directory.appendingPathComponent("credential-kind"))
             return files
         } catch {
             try? discard(files)
@@ -123,16 +248,30 @@ final class PikPakAccountStore {
     }
 
     @discardableResult
-    func commit(_ files: PikPakAccountSessionFiles, profile: PikPakAccountProfile?, checkedAt: Date? = nil) throws -> PikPakAccountsDocument {
+    func commit(_ files: PikPakAccountSessionFiles, profile: PikPakAccountProfile?, checkedAt: Date? = nil,
+                workspaceSessionID: String = "primary") throws -> PikPakAccountsDocument {
         guard files.directory == self.files(for: files.id).directory else { throw PikPakAccountError.invalidStorage }
-        _ = try files.load()
+        let session = try files.load()
         if let profile, profile.sub.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { throw PikPakAccountError.invalidProfile }
         var document = try load()
-        let replaced = document.accounts.filter { $0.id != files.id && profile != nil && $0.profile?.sub == profile?.sub }
+        let replaced = document.accounts.filter {
+            $0.id != files.id && profile != nil && $0.profile?.sub == profile?.sub
+                && $0.connectionKind == session.credentialKind
+        }
         document.accounts.removeAll { old in old.id == files.id || replaced.contains(where: { $0.id == old.id }) }
-        document.accounts.append(.init(id: files.id, profile: profile, needsSignIn: false, lastChecked: checkedAt))
-        document.activeID = files.id
+        document.accounts.append(.init(id: files.id, profile: profile, needsSignIn: false, lastChecked: checkedAt, credentialKind: session.credentialKind))
+        // Reauthentication follows the same connection in other workspaces;
+        // adding another method or user changes only the initiating workspace.
+        let replacedIDs = Set(replaced.map(\.id))
+        if let current = document.activeID, replacedIDs.contains(current) { document.activeID = files.id }
+        for key in Array(document.workspaceSelections?.keys ?? Dictionary<String, PikPakWorkspaceAccountSelection>().keys) {
+            if let selected = document.workspaceSelections?[key]?.activeID, replacedIDs.contains(selected) {
+                document.workspaceSelections?[key] = .init(activeID: files.id)
+            }
+        }
+        document.select(files.id, for: workspaceSessionID)
         try save(document)
+        Self.stagedSessionPaths.remove(files.directory.standardizedFileURL.path)
         // Only unreferenced directories are removed, after the new session is committed.
         for old in replaced { try? discard(self.files(for: old.id)) }
         return document
@@ -152,11 +291,11 @@ final class PikPakAccountStore {
     }
 
     @discardableResult
-    func activate(_ id: UUID) throws -> PikPakAccountsDocument {
+    func activate(_ id: UUID, workspaceSessionID: String = "primary") throws -> PikPakAccountsDocument {
         var document = try load()
         guard let account = document.accounts.first(where: { $0.id == id }), !account.needsSignIn else { throw PikPakAccountError.missingSession }
         _ = try files(for: id).load()
-        document.activeID = id
+        document.select(id, for: workspaceSessionID)
         try save(document)
         return document
     }
@@ -168,6 +307,12 @@ final class PikPakAccountStore {
         document.accounts[index].needsSignIn = true
         document.accounts[index].lastChecked = nil
         if deactivate && document.activeID == id { document.activeID = nil }
+        if deactivate {
+            for key in Array(document.workspaceSelections?.keys ?? Dictionary<String, PikPakWorkspaceAccountSelection>().keys)
+                where document.workspaceSelections?[key]?.activeID == id {
+                document.workspaceSelections?[key] = .init(activeID: nil)
+            }
+        }
         // Revoke local eligibility first. A partially failed removal is never loaded.
         try save(document)
         try discard(files(for: id))
@@ -176,6 +321,7 @@ final class PikPakAccountStore {
 
     func discard(_ files: PikPakAccountSessionFiles) throws {
         guard files.directory == self.files(for: files.id).directory else { throw PikPakAccountError.invalidStorage }
+        Self.stagedSessionPaths.remove(files.directory.standardizedFileURL.path)
         guard FileManager.default.fileExists(atPath: files.directory.path) else { return }
         try Self.validateDirectory(files.directory)
         try FileManager.default.removeItem(at: files.directory)
@@ -196,6 +342,7 @@ final class PikPakAccountStore {
 
     private func save(_ document: PikPakAccountsDocument) throws {
         try Self.writePrivateFile(JSONEncoder().encode(document), to: indexURL)
+        NotificationCenter.default.post(name: Self.didChange, object: self)
     }
 
     static func validateDirectory(_ url: URL) throws {

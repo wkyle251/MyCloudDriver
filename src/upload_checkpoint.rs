@@ -43,6 +43,8 @@ pub struct FileCheckpoint {
     pub gcid: Option<String>,
     pub remote_file_id: Option<String>,
     pub completed: bool,
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -126,7 +128,7 @@ impl UploadCheckpoint {
     }
 }
 
-fn private_options() -> OpenOptions {
+pub(crate) fn private_options() -> OpenOptions {
     let mut options = OpenOptions::new();
     #[cfg(unix)] {
         use std::os::unix::fs::OpenOptionsExt;
@@ -135,7 +137,7 @@ fn private_options() -> OpenOptions {
     options
 }
 
-fn private_directory(path: &Path) -> Result<()> {
+pub(crate) fn private_directory(path: &Path) -> Result<()> {
     if path.exists() {
         let metadata = std::fs::symlink_metadata(path)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() { bail!("invalid upload checkpoint directory"); }
@@ -158,14 +160,14 @@ fn validate_regular_if_present(path: &Path) -> Result<()> {
     }
 }
 
-fn read_optional<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+pub(crate) fn read_optional<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     validate_regular_if_present(path)?;
     if !path.exists() { return Ok(None); }
     if std::fs::metadata(path)?.len() > 64 * 1024 * 1024 { bail!("upload checkpoint exceeds its size limit"); }
     Ok(Some(serde_json::from_slice(&std::fs::read(path)?).context("could not read saved upload checkpoint; it was not overwritten")?))
 }
 
-fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     validate_regular_if_present(path)?;
     let temporary = path.with_extension(format!("tmp-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
@@ -193,7 +195,7 @@ mod tests {
         let run = directory.join("run");
         let mut first = UploadCheckpoint::open(run.clone(), "account-a".into(), "destination".into(), vec![source.clone()]).unwrap();
         first.initialize(&serde_json::json!({"files": ["source.txt"]}), [source.clone()].into_iter()).unwrap();
-        first.save_file(&source, &FileCheckpoint { gcid: Some("ABC".into()), remote_file_id: Some("uploaded-id".into()), completed: true }).unwrap();
+        first.save_file(&source, &FileCheckpoint { gcid: Some("ABC".into()), remote_file_id: Some("uploaded-id".into()), completed: true, cancelled: false }).unwrap();
         first.save_folder(0, &FolderCheckpoint { parent_id: "destination".into(), name: "Folder".into(), previous_ids: vec![], remote_id: Some("folder-id".into()) }).unwrap();
         assert!(UploadCheckpoint::open(run.clone(), "account-a".into(), "destination".into(), vec![source.clone()]).is_err());
         drop(first);

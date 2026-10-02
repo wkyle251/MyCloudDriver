@@ -87,27 +87,18 @@ struct FileSearchTests {
         DownloaderModel.testFileSearchReveal()
         #endif
 
-        struct Request { let destination: String; let roots: [Int] }
-        var requests = (0..<42).map { Request(destination: "A", roots: [$0]) }
-        requests.insert(Request(destination: "B", roots: [99]), at: 3)
-        let batch = DownloadQueueBatching.takeNext(from: &requests) { a, b in
-            guard a.destination == b.destination else { return nil }
-            return Request(destination: a.destination, roots: a.roots + b.roots)
-        }
-        require(batch?.roots == Array(0..<42), "42 compatible clicks must feed one concurrent batch")
-        require(requests.count == 1 && requests[0].destination == "B", "other destinations remain queued")
-        require(DownloadQueueBatching.relativeParents(for: ["/A/one.txt", "/B/two.txt"]) == [["A"], ["B"]], "multi-folder selection preserves its hierarchy")
-        require(DownloadQueueBatching.relativeParents(for: ["/A/one.txt"]) == [[]], "single click preserves its exact chosen destination")
-        require(DownloadQueueBatching.destinationsOverlap([["Folder"]], [["folder", "file.txt"]]), "overlapping trees cannot race their local writes")
-        require(DownloadQueueBatching.destinationsOverlap([["FILE.txt"]], [["file.txt"]]), "case-insensitive output collision")
-        require(!DownloadQueueBatching.destinationsOverlap([["Folder A", "file.txt"]], [["Folder B", "file.txt"]]), "independent output folders can share workers")
+        require(DownloadDestinationLayout.relativeParents(for: ["/A/one.txt", "/B/two.txt"]) == [["A"], ["B"]], "multi-folder selection preserves its hierarchy")
+        require(DownloadDestinationLayout.relativeParents(for: ["/A/one.txt"]) == [[]], "single click preserves its exact chosen destination")
+        require(DownloadDestinationLayout.destinationsOverlap([["Folder"]], [["folder", "file.txt"]]), "overlapping trees cannot race their local writes")
+        require(DownloadDestinationLayout.destinationsOverlap([["FILE.txt"]], [["file.txt"]]), "case-insensitive output collision")
+        require(!DownloadDestinationLayout.destinationsOverlap([["Folder A", "file.txt"]], [["Folder B", "file.txt"]]), "independent output folders can share workers")
         require(UploadAvailability.allowsStart(hasSession: true, uploadActive: false,
                     conflictingMutation: false, foregroundAllows: true), "downloads/read-only activity do not block upload policy")
         require(!UploadAvailability.allowsStart(hasSession: true, uploadActive: true,
                     conflictingMutation: false, foregroundAllows: true), "an active upload remains protected")
         require(!UploadAvailability.allowsStart(hasSession: false, uploadActive: false,
                     conflictingMutation: false, foregroundAllows: true), "authentication remains required")
-        print("PASS transfers: compatible batches share workers; destinations and upload state stay isolated")
+        print("PASS transfers: selection layouts, output collisions and upload availability")
 
         let urls = [URL(fileURLWithPath: "/private/tmp/Example Folder"),
                     URL(fileURLWithPath: "/private/tmp/Résumé 報告.txt")]

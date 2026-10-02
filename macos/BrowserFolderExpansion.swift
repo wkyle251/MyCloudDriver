@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct BrowserFolderExpansionProgress: Equatable {
@@ -13,10 +14,10 @@ struct BrowserFolderExpansionProgress: Equatable {
     }
 }
 
-/// A bounded, breadth-first expansion plan. Folder listings use the Browser's
-/// existing read-only helper lane; this state machine never performs network
-/// requests or changes selection. The selected folder is depth zero, so a
-/// depth of one opens it and all its immediate subfolders.
+/// A bounded, breadth-first expansion plan over one or more selected folders.
+/// Folder listings use the Browser's existing read-only helper lane; this state
+/// machine never performs network requests or changes selection. Every root is
+/// depth zero, so a depth of one opens each root and its immediate subfolders.
 final class BrowserFolderExpansionPlan {
     struct Folder {
         let id: String
@@ -26,7 +27,7 @@ final class BrowserFolderExpansionPlan {
     private enum Page: Hashable { case first, next(String) }
 
     let id = UUID()
-    let rootID: String
+    let rootIDs: [String]
     let rootName: String
     let levels: Int?
     private var work: [String: Folder] = [:]
@@ -38,11 +39,17 @@ final class BrowserFolderExpansionPlan {
     private(set) var loadedFolders = 0
     private(set) var failedFolders = 0
 
-    init(rootID: String, rootName: String, levels: Int?) {
-        self.rootID = rootID
-        self.rootName = rootName
+    convenience init(rootID: String, rootName: String, levels: Int?) {
+        self.init(roots: [(rootID, rootName)], levels: levels)
+    }
+
+    /// Roots are seeded in order and deduplicated by id, so a folder selected
+    /// alongside one of its own ancestors is still only expanded once.
+    init(roots: [(id: String, name: String)], levels: Int?) {
+        self.rootIDs = roots.map(\.id)
+        self.rootName = roots.count == 1 ? roots[0].name : "\(roots.count) folders"
         self.levels = levels.map { max(1, $0) }
-        discover(rootID, depth: 0)
+        for root in roots { discover(root.id, depth: 0) }
     }
 
     var isFinished: Bool { work.isEmpty }
@@ -99,25 +106,30 @@ final class BrowserFolderExpansionPlan {
     }
 }
 
-/// A primary action keeps a normal click at one level, while the native
-/// submenu offers deeper expansion without presenting a sheet or dialog.
-struct BrowserFolderExpansionMenu: View {
+/// The context menu expands the complete tree with one action. Row disclosure
+/// controls still open or close individual folders.
+struct BrowserFolderExpansionAction: View {
+    /// A menu opened on a row inside a multi-folder selection expands the whole
+    /// selection, so the title names how many folders the action will open.
+    static func title(folderCount: Int) -> String {
+        folderCount > 1 ? "Expand All Levels in \(folderCount) Folders" : "Expand All Levels"
+    }
+
+    var folderCount = 1
     let onExpand: (Int?) -> Void
 
+    @MainActor static func add(to menu: BrowserNativeMenu, enabled: Bool = true, folderCount: Int = 1,
+                               onExpand: @escaping (Int?) -> Void) {
+        menu.addAction(title(folderCount: folderCount), symbol: "chevron.right", enabled: enabled) { onExpand(nil) }
+    }
+
     var body: some View {
-        Menu {
-            Button("1 Level (Default)") { onExpand(1) }
-            ForEach(2...10, id: \.self) { level in
-                Button("\(level) Levels") { onExpand(level) }
-            }
-            Divider()
-            Button("All Levels") { onExpand(nil) }
-        } label: {
-            BrowserContextMenuStyle.label("Expand Folder", systemImage: "chevron.right")
-        } primaryAction: {
-            onExpand(1)
+        Button { onExpand(nil) } label: {
+            BrowserContextMenuStyle.label(Self.title(folderCount: folderCount), systemImage: "chevron.right")
         }
-        .help("Click to expand immediate subfolders, or use the submenu to choose a depth.")
+        .help(folderCount > 1
+              ? "Expand every selected folder and all of their nested subfolders."
+              : "Expand this folder and every nested subfolder.")
     }
 }
 

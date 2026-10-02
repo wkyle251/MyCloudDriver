@@ -1,10 +1,130 @@
 # Testing MyCloudDriver
 
+## Incremental app builds and installation
+
+```sh
+./scripts/build-app.sh
+python3 scripts/test-app-build.py
+```
+
+The build checks use the real Swift compiler with an isolated fixture. They cover
+unchanged builds, edits that preserve timestamps, dependent-file type errors,
+recovery after a failed build, compiler flags, damaged output and removed sources.
+Installation checks copy the signed build to a temporary location without launching
+it. They verify unchanged-install skipping, rejection of mismatched staging,
+verified rollback archives and restoration after a registration failure.
+
+For timing, compare `time ./scripts/build-app.sh --clean` with a second ordinary
+build. `--clean` clears only the app's Swift compilation cache; Rust dependencies,
+native torrent engines and model assets remain available.
+
+## Bookmarks and resized transfer workspaces
+
+```sh
+./scripts/build-native-test.sh scripts/BookmarkTests.swift /tmp/mycloud-bookmark-tests
+/tmp/mycloud-bookmark-tests
+swiftc -parse-as-library macos/FinderTransferLayout.swift scripts/TransferLayoutTests.swift -o /tmp/mycloud-transfer-layout-tests
+/tmp/mycloud-transfer-layout-tests
+./scripts/build-native-test.sh scripts/TransferLayoutUITestApp.swift /tmp/mycloud-transfer-layout-ui
+```
+
+Bookmark checks use isolated preferences, synthetic cloud IDs and generated
+local folders. They cover persistence, deduplication, account/drive isolation,
+updates across windows, and opening folders or selecting files without fetching
+their contents. Transfer geometry checks cover single, paired and three-column
+boards, bounded controls and use of available height.
+
+The transfer UI fixture uses production views and synthetic transfers. Its
+**Fixture** menu switches between Uploads and Downloads and provides 600, 720,
+1100 and 1400-point window presets. Check that setup/progress cards stack,
+buttons wrap, every board remains reachable vertically, and resizing wider
+restores columns.
+
+## Automatic recovery
+
+Run `zsh scripts/test-automatic-recovery.sh` after building the app resources.
+It compiles and runs the combined offline regression suites for retry backoff,
+helper exits, disk/provider interruptions, control-file write recovery, durable
+Pause/Cancel intent, account isolation, torrent receipts, scans and previews.
+All test payloads are generated. See [the recovery audit](AUTOMATIC_RECOVERY.md)
+for operation coverage and conditions requiring user intervention.
+
+## Video preview recovery and folder merging
+
+```sh
+./scripts/build-native-test.sh scripts/AVIPreviewTests.swift /tmp/MyCloudAVIPreviewTests
+/tmp/MyCloudAVIPreviewTests
+./scripts/build-native-test.sh scripts/NativeMediaPreviewTests.swift /tmp/MyCloudNativeMediaPreviewTests
+/tmp/MyCloudNativeMediaPreviewTests
+scripts/build-native-test.sh scripts/PreviewResourceLoaderTests.swift /tmp/MyCloudPreviewResourceLoaderTests
+/tmp/MyCloudPreviewResourceLoaderTests
+./scripts/build-native-test.sh scripts/MediaPreviewInteractionTests.swift /tmp/MyCloudMediaPreviewInteractionTests
+/tmp/MyCloudMediaPreviewInteractionTests
+/tmp/MyCloudMediaPreviewInteractionTests --ui
+```
+
+The AVI suite requires the installed FFmpeg and generates Xvid/PCM and silent
+MJPEG files. It decodes actual video frames through AVFoundation, exercises
+native preview play/pause/seek, checks cloud-source fallback and cancellation,
+and validates temporary-copy cleanup without modifying originals. A loopback
+HTTP fixture checks media headers, incomplete downloads, HTTP errors and
+download cancellation. It uses no cloud account or personal files.
+
+The same suite generates an MP4 and reproduces a real AVFoundation parse
+failure using deliberately damaged fixture cache bytes. It verifies one fresh
+cache retry, then a complete download and compatible H.264/AAC copy when range
+responses remain unparseable. It checks decoded frames, pause/autoplay intent,
+seeking, cleanup, bounded retries and unchanged originals. Network,
+authorization and protected-content failures must not trigger conversion,
+while an inconsistent sample table reported as `-11880` or `-11869` must. It
+also generates a Matroska file AVFoundation refuses to open, converts it with
+FFmpeg's own demuxer, and checks that every supported container maps to an
+explicit reader while playlists and archives map to none.
+The standalone resource-loader suite checks extensionless MP4 URLs with valid,
+generic, absent and incorrect MIME headers, plus the exact `-11829 / -12848`
+failure from a damaged synthetic cache. All HTTP requests use a loopback server.
+
+The media interaction suite generates H.264, VP9 and audio-only MP4s. VP9
+reproduces an AVKit item that reports ready without rendering a video frame.
+It checks first-frame detection, cloud-source fallback, local compatible-copy
+recovery, paused playback, stale callbacks, bounded retries and cleanup. Focus
+checks cover the header, video and controls, five-second Left/Right seeks,
+Up/Down file navigation while a volume slider has focus, text input and clicks
+outside the pane. The UI fixture uses the production pane, player and sliders
+with three synthetic clips for pointer and keyboard verification.
+
+The same suite checks PikPak merge eligibility for sibling folders, single
+folders, mixed selections and ancestors/descendants. In the offline
+`FinderWorkspaceUITestApp`, verify that **Merge Selected Folders…** remains in
+folder context menus while disabled, enables after selecting Projects and
+Notes, and opens the destination sheet. Verify the merge toolbar button and
+File menu action in both List and Thumbnails.
+
+## Browser file type filter
+
+```sh
+./scripts/build-native-test.sh scripts/BrowserFileFilterTests.swift /tmp/mycloud-file-filter-tests
+/tmp/mycloud-file-filter-tests
+/tmp/mycloud-file-filter-tests --ui
+```
+
+The offline suite covers categories, exact extensions, mixed case, provider MIME
+metadata, extensionless Photos assets, expanded List rows, Thumbnails, selection
+and keyboard ranges, cached listings, pagination, filename search and reset. It
+asserts that folders stay visible under every filter, in place and at their tree
+depth, while only files are matched, and that filtering does not fetch files or
+scan unopened folders. The UI fixture uses production Browser views with
+synthetic PikPak and Photos listings. Check the Filter menu, extension submenu,
+the matching-file count, Clear Filter, and Load More when a page contains no
+matches. Confirm that a filtered List still shows folders, indented, and that
+expanding one reveals only its matching files.
+
 ## RAM torrent uploads (2.2.46)
 
 The native suite covers the queue-decode compatibility guard, per-file progress
-parsing, piece-safety drain logic, `reselect`, streaming uploads, RAM reclaim
-and volume recycling. `queueCompatibility` must pass before any change to
+parsing, shared-piece drain logic, `reselect`, streaming uploads, RAM reclaim
+and sliding-window admission. It also checks download percentages/ETA and
+automatic resume of paused legacy queues under the matching account. `queueCompatibility` must pass before any change to
 `LocalTorrentJob` or `TorrentRelayState` ships: it decodes a queue written by
 the shipping build, and a new **non-optional** field breaks it — Swift's
 synthesised `Codable` ignores property defaults, so `load()` throws and the
@@ -17,31 +137,170 @@ cargo test --lib torrent_relay
 /tmp/mycloud-torrent-tests
 /tmp/mycloud-torrent-tests --ram-volume
 python3 scripts/test-local-torrents.py /tmp/mycloud-torrent-tests --ram
+python3 scripts/test-local-torrents.py /tmp/mycloud-torrent-tests --rolling
+python3 scripts/test-local-torrents.py /tmp/mycloud-torrent-tests --storage
+python3 scripts/test-local-torrents.py /tmp/mycloud-torrent-tests --upload-outage
+python3 scripts/test-local-torrents.py /tmp/mycloud-torrent-tests --reconnect
+python3 scripts/test-torrent-live-cleanup.py
+python3 scripts/test-torrent-handshake.py
 ```
 
-The native tests cover batch sizing, RAM-only destinations, both pause/resume
+Storage-capacity regressions verify that switching and restarting admit more
+than the former RAM limit, while RAM mode retains that limit. Synthetic low/free
+space changes exercise unfinished-byte reservations, the overhead margin and
+window expansion. The real `--storage` fixture selects all three generated files
+and requires admission beyond its original 256 MiB RAM window after migration.
+Storage tests also verify the default 100 GB free-space reserve, custom limits,
+200-to-100 GB reclamation, narrowing a running selection without deleting partial
+files, immediately increasing a limit, persistent settings, and retained pieces
+surviving app restart without another cloud upload. Immediate cleanup is tested
+with retention explicitly disabled.
+
+Peer-cache tests verify torrent identity binding, 24-hour expiry, public numeric
+endpoints, duplicate removal, bounded storage, private file permissions, and
+corrupt/symlink fallback. The independent encrypted-peer fixture returns an
+empty tracker response and restores its peer with `aria2.addPeers`, then checks
+the full payload checksum. It also verifies that invalid endpoint batches and
+oversized batches have no effect, and duplicate hints do not add connections.
+
+`test-torrent-live-cleanup.py` also checks the bundled engine's verified resume
+cache with private generated loopback data. Clean pause and process restart must
+reuse verified progress; same-size edits with restored mtime, missing files,
+legacy checkpoints, damaged trailers and altered piece bits must recheck. A
+restart after live cleanup must reuse the cache without trusting released pieces
+and must produce the expected SHA-256 for each remaining file.
+
+The `--upload-outage` fixture keeps its synthetic PikPak sink offline across
+RAM reuse, storage migration and app relaunch, then requires real loopback peers
+to finish downloading all generated files to storage. Only after confirming
+the pending payload is retained does it restore the sink; automatic retries
+must upload every SHA-256-verified file and clean storage after confirmation.
+Native tests also cover retry backoff, missing/wrong accounts, a lost commit
+reply, full buffers, continued peer telemetry, manual Pause and Stop.
+The storage migration case checks that disk usage can overlap confirmed cloud
+bytes while overall progress counts those bytes once, then requires cleanup
+after the final upload. Live token-to-normal login tests stop only the old
+upload helper and verify unchanged torrent GID, destination, selection, peer
+counts and engine pause/restart counts, including a switch during verification.
+
+The native tests cover RAM reservations, RAM-only destinations, both pause/resume
 stages, account and login-method binding, a lost cloud receipt followed by RAM
 loss, restart of unfinished work and final memory release. The volume test
 creates and detaches its own 256 MiB APFS RAM device; it checks case-sensitive
 names, sparse boundary writes, volume reuse and denial of disk writes after
-unmount. Never substitute an existing disk device.
+unmount. It also rejects a payload directory linked to disk. Never substitute
+an existing disk device. Destination checks cover stale engine paths, traversal,
+lookalike directory prefixes, symlinks and missing file lists.
 
 The loopback test downloads generated torrent files directly into a real RAM
 volume, pauses, recreates the app model, resumes partial pieces and compares
-SHA-256 at the synthetic upload sink. Rust HTTP fixtures exercise the actual
+SHA-256 at the synthetic upload sink. It first attempts to resume a deliberately
+disk-bound handle as a RAM relay and requires rejection before any payload is
+written; after completion it checks the fixture queue for escaped payload.
+Rust HTTP fixtures exercise the actual
 PikPak/OSS upload path, content validation, lost responses, completed receipts
 without source data, account mismatch and secret-free journals. No test sends
 user files to PikPak or uses a public torrent.
+The `--rolling` fixture transfers three generated 100 MiB files through a
+256 MiB RAM volume, interrupts and automatically resumes from an old model's saved
+progress, verifies every SHA-256, and requires multiple selections on one GID.
+Its cleanup checks the fixture's volume UUID and owner marker before releasing
+any RAM device, including after a failed test.
 
-## Local torrent downloads (2.2.45)
+Storage migration tests copy sparse partial files and aria2 checkpoints, switch
+during a blocked upload, reconcile a lost receipt, and verify the disk location
+is persisted before RAM is released. They cover paused/stopped transfers,
+relaunch, missing disks, failed copies, interrupted RAM release, unchanged cloud
+destinations, shared-piece retention and automatic disk cleanup. `--storage`
+uses a real 256 MiB RAM volume and loopback peers, moves a partial download to
+disk, relaunches, checks SHA-256 at the upload sink and requires an empty staging
+payload after completion. All files and cloud responses are synthetic.
+
+Connection regressions recreate an unselected shared-piece stub and require
+repeated censuses to preserve the running selection. A second fixture uploads
+small files while keeping peers intact, then admits more files after a useful
+amount of space is reclaimable, before the previous selection finishes. Pure
+policy checks cover low remaining work, RAM pressure and the final window.
+Storage migration also requires uploads and repeated censuses to retain the
+running selection while the drive has room, with cleanup at completion. The
+real storage fixture requires one selection throughout its download. Hash-check
+regressions cover queued checks, an active check at zero bytes, and checking
+starting between the lightweight poll and file census; none may restart the
+window, remove a payload file or launch a new upload until verification ends.
+
+Connection recovery fixtures inject repeated transport failures beyond the old
+five-reply cutoff in both RAM and storage modes, then restore replies. They
+require the same GID and selection, no pause/restart, refreshed peer counts,
+uninterrupted cloud-upload telemetry, and working explicit Pause/Stop. Repeated
+non-transport engine errors still pause through the normal error path.
+The `--reconnect` scenario terminates and restarts its only loopback seeder
+twice while a generated relay is incomplete. The client must keep its torrent
+and RAM buffer active through both empty-swarm periods, resume downloading
+without a user action, and deliver SHA-256 verified bytes to the synthetic
+upload sink. No real transfer or network connection is interrupted by this test.
+
+For isolated UI inspection, run the native test binary with `--ui-progress`.
+Expand Peers, set the synthetic peer count to zero, pause/resume and restore the
+peer. The disclosure must stay expanded. The fixture uses the production relay
+card with generated progress and no account or download reads.
+
+## Local torrent downloads (2.3.0)
 
 ```sh
 python3 scripts/prepare-torrent-engine.py
+python3 scripts/prepare-libtorrent-engine.py
 ./scripts/build-native-test.sh scripts/LocalTorrentTests.swift /tmp/mycloud-torrent-tests
 /tmp/mycloud-torrent-tests
 python3 scripts/test-local-torrents.py /tmp/mycloud-torrent-tests
 python3 scripts/test-local-torrents.py /tmp/mycloud-torrent-tests --dht
+python3 scripts/test-local-torrents.py /tmp/mycloud-torrent-tests --engine .build/libtorrent/runtime/bin/mycloud-torrent
+python3 scripts/test-local-torrents.py /tmp/mycloud-torrent-tests --storage --engine .build/libtorrent/runtime/bin/mycloud-torrent
+python3 -m venv .build/libtorrent-test-python
+.build/libtorrent-test-python/bin/pip install libtorrent==2.0.14
+.build/libtorrent-test-python/bin/python scripts/test-libtorrent-engine.py
 ```
+
+The native suite's re-dial test lets libtorrent write off an address after
+three refused dials, then starts a seeder there with no tracker. libtorrent must
+not dial it on its own; after one peer hint the transfer must complete
+byte-identical. It sets `lt-min-reconnect-time=1` so libtorrent gives up within
+seconds. The Swift suite's `peerRedialCadence` covers the app's five-minute
+repeat. The `--dht` fixture's DHT query assertion expects aria2's bootstrap
+pattern and fails with the libtorrent engine, before and after this change.
+
+The native engine suite also covers an older cache that claims verified pieces
+and partial blocks beyond EOF. Generated short files must stay out of the upload
+queue, recover only the missing pieces, preserve intact shared neighbors, and
+reuse the corrected checkpoint after restart. These tests never read live
+download payloads or account credentials.
+Explicit and legacy padding fixtures verify payload-only totals, virtual padding
+without physical files, and cleanup of legacy padding stubs without withdrawing
+real pieces. Model tests preserve padding offsets and old receipts while removing
+padding from selections and upload progress.
+
+For the energy regression, retain a copy of the helper before rebuilding, then run:
+
+```sh
+.build/libtorrent-test-python/bin/python scripts/benchmark-torrent-status.py \
+  --baseline /tmp/mycloud-torrent-before
+```
+
+This creates 8,192 small files in a private temporary folder and checks their
+verified progress through two isolated helpers, with discovery disabled. It
+compares the former 1/5-second status/file cadence with the new 10/30-second
+cadence, reporting detailed-response latency and process CPU time converted
+from Mach ticks. It verifies that summary and per-file totals agree. These are
+polling CPU measurements, not whole-app power or battery-life measurements;
+the 20-second trials exclude periodic checkpoint savings and Swift UI work.
+The model suite also verifies that returning credentials bypass a recent file
+census even when its interval is set to an hour, and drives missing status
+replies explicitly so recovery checks do not depend on the poll interval.
+
+Measured locally on 2026-10-02 with the default 8,192-file, 20-second trials:
+helper CPU fell from 36.66% to 4.24% of one core (88.4% lower). Median detailed
+status latency fell from 598.50 ms to 299.35 ms. The fixtures use completed local
+files without network payload traffic; these figures do not predict battery life
+or the exact cost of a live swarm.
 
 Native tests cover magnet validation, file selection before payload starts,
 private state, corrupt queues, destination checks, ambiguous RPC replies,
@@ -57,6 +316,13 @@ restarts the engine, resumes partial pieces and verifies SHA-256, unselected-fil
 cleanup and completion without continued seeding. It also checks live connected
 peers, seeds and nonzero download speed, plus cleared statistics after pause and
 completion. It contacts no public peers.
+
+The native helper suite additionally verifies µTP-only delivery against an
+independent libtorrent client, full-seed cleanup, retained TCP connections during
+shared-piece cleanup/selection changes, last-piece availability announcements,
+partfile reclamation and later file admission, fingerprint-validated resume,
+modified/corrupt-cache fallbacks, confined deletion, and aria2 verified-piece plus
+partial-block import. Its Python wheel is an isolated test dependency only.
 
 The `--dht` scenario starts with an empty routing table and a magnet containing
 no trackers. A loopback DHT node answers bootstrap, node lookup and peer lookup
@@ -94,6 +360,28 @@ See [PikPak management](PIKPAK_MANAGEMENT.md) for live verification limits.
 Use `--ui --task-limit` or `--ui --task-uncertain` to exercise the new-task error
 panels with synthetic replies; submitting in these fixtures never creates a live
 PikPak task.
+
+## PikPak session recovery
+
+```sh
+cargo test --lib auth::
+cargo test --lib account_profile_
+cargo test --lib personal_access_token
+./scripts/build-native-test.sh scripts/PikPakSessionRecoveryTests.swift /tmp/pikpak-session-tests
+/tmp/pikpak-session-tests
+```
+
+Loopback fixtures reproduce helpers rotating the same account unnecessarily,
+including six independent processes. Checks cover reuse until expiry, a rejected
+access token, late 401 responses after another helper refreshes, cache corruption,
+credential/client/device isolation, and private cache permissions. Only explicit
+refresh-credential rejection requests another sign-in; generic HTTP 400/401,
+timeouts, and unrelated error numbers do not establish that the saved session is
+invalid. Native tests verify a fresh account check before clearing credentials,
+preservation during an outage, deduplication, and late replies after switching
+accounts. No real account, transfer queue, downloaded content or file listing is
+read. `PikPakAccountVerifierTests.swift` with its compiled fixture also tests the
+real helper process error classification and cancellation.
 
 ## Personal Access Token connections
 
@@ -250,8 +538,8 @@ area. Compile **one entry point at a time**; each declares `@main`.
 | `SimilaritySessionTests.swift` | Separate four-drive scan scopes/results; Home → Scan drive discovers paused cloud/native scans with saved RAM/time settings, fresh ownership claims and account isolation; status dismissal/window close retain state; explicit Clear cancels and cleans up without late results. |
 | `SimilarityFileActionTests.swift` | Original-provider Trash routing for all four drives; Keep Smallest groups/batches, ties, overlap, retained-file checks, partial acknowledgements, duplicate clicks, stale sessions and one-step Undo/Redo. Real Trash tests restore only synthetic local files. Uses synthetic accounts/assets only. |
 | `SimilarityScopePickerTests.swift` | Direct folder selection, paging/deduplication, ancestor routes, loading and access errors, stale replies, close cancellation, and iCloud scan scope independent of Browser. |
-| `NativeDriveTests.swift` | iCloud path boundaries, copying/rollback, cleanup revalidation, Undo/Redo, folder merge, Photos membership planning, search cancellation, concurrent native scans and Photos staging cleanup. A delayed provider withholds its second file until the first is analysed, proving discovery and analysis overlap. Pass the built app's Resources path to include real engine scans. |
-| `NativeDriveTreeTests.swift` | Inline disclosure, nested keyboard/range selection, lazy loading and cache reuse, pagination/retry, sorting during I/O, bounded concurrency, refresh after rename/move/Undo, overlapping selections, Photos row identity and cancellation. |
+| `NativeDriveTests.swift` | iCloud path boundaries, copying/rollback, cleanup revalidation, Undo/Redo, folder merge, Photos membership planning, search cancellation, concurrent native scans and Photos staging cleanup. A delayed provider withholds its second file until the first is analysed, proving discovery and analysis overlap. The Local Disk and iCloud size walk must match a full item scan (hidden items, symbolic links and overlapping selections excluded) with throttled progress, and listed items must keep the identity a scan gives the same file. Pass the built app's Resources path to include real engine scans. |
+| `NativeDriveTreeTests.swift` | Inline disclosure, nested keyboard/range selection, remembered file focus on folder collapse/reopen, real temporary-file/folder Trash Undo/Redo, lazy loading and cache reuse, pagination/retry, sorting during I/O, bounded concurrency, refresh after rename/move/Undo, overlapping selections, Photos row identity and cancellation. |
 | `FinderWorkspaceTests.swift` | Settings, CPU/resource attribution, GPU counter validity and live device readings, navigation, and account management. CoreML job counts are attributed once per task. |
 | `WorkspaceSessionTests.swift` | Eight simultaneous views of one session; shared account/navigation/queues, unchanged frames, deduplicated resource activity, original/middle-window close without teardown, scan-only browser recovery, focused file commands, stale-registration protection and exactly one final teardown. Runs without presenting browser windows. |
 | `SimilarityLifecycleTests.swift` | Real helpers with isolated synthetic files: closing the browser keeps analysis running, scan windows retain account/storage ownership, result reveal reopens the same browser, Pause freezes active time, Quit saves it, and a fresh coordinator resumes without fetching completed originals. Also covers legacy descriptors and cumulative report time. Pass the app's `Contents/Resources` directory when running. |
@@ -266,7 +554,8 @@ area. Compile **one entry point at a time**; each declares `@main`.
 | `NativeMediaPreviewTests.swift` | Native original preparation progress, cancellation/late completion, reuse across layout changes, retryable errors and safe staging cleanup. |
 | `ExternalDiskTests.swift` | Creates its own 64 MB disk image: direct preview/export/upload sources, saved volume identity, ejection notifications, offline bookmark restoration without auto-mounting, read-only remount, incomplete-copy cleanup and replacement-disk rejection. Never uploads to a cloud account or ejects an existing user disk. Add `-D BROWSER_DROP_TESTS` to include uploader admission/resume checks. |
 | `FinderFileOpeningTests.swift` | File handoff, Open With, Quick Look loading, navigation, and cancellation. |
-| `FinderFileUndoTests.swift` | Undo/Redo history, partial completion, upload batches, and account isolation. |
+| `FinderFileUndoTests.swift` | Undo/Redo history, partial completion, upload batches, account isolation, and restored files/folders appearing under their expanded parents. Add `-D FOLDER_EXPANSION_TESTS` to verify automatic branch reload requests. |
+| `UndoTrashCacheTests.swift` | Trash updates after Undo/Redo, stale listing rejection, queued refresh after in-flight requests, account-switch cancellation and lazy loading. |
 | `WorkspaceSwitchingTests.swift` | Tab switching, cached presentation, cancellation, and performance. |
 | `SharedLinkSelectionTests.swift` | Selection across links, recursive roots, batch saving, and download routing. |
 | `SharedLinkRetryTests.swift` | Batch retries, concurrency limits, saved access codes, selection preservation, cancellation, and selection regressions. |
@@ -274,17 +563,20 @@ area. Compile **one entry point at a time**; each declares `@main`.
 | `SimilarityTests.swift` | 5% minimum score, upstream raw counters, real saved-score row queries, tree identity, score precision, unmatched/skipped files, source isolation, cancellation and cleanup. Also covers automatic recovery of an interrupted scan (bounded attempts, budget reset on progress, user actions ending it) and the engine `note:` filter that keeps a status line from masking a real failure. Pass the built app's `Contents/Resources` path as its first argument. |
 | `SimilarityTreeExpansionTests.swift` | Expand/collapse 250 groups, visible selection after collapse, search/regroup persistence, individual toggles, repeated commands, mode switches and whole-percent cutoff values. |
 | `BrowserDragDropTests.swift` | Drag targets across full rows, nested/file parents, blank space, thumbnails, clipping, scrolling, spring loading and rejection; Finder providers with native NSURL, async ordering, Unicode paths, atomic failure and root deduplication; release handoff geometry, provider capture and destination capture. Compile with `-D BROWSER_DROP_TESTS`. |
-| `BrowserFolderExpansionTests.swift` | Native folder menu for 1–10/all levels with correct callbacks and fresh menu instances, cached fixed-size template icons at 1x/2x, and expansion plans covering cycles, duplicate IDs, repeated page tokens and partial-failure totals. Compile with `-D FOLDER_EXPANSION_TESTS`. |
+| `BrowserFolderExpansionTests.swift` | Direct Expand All Levels action with no submenu, correct callbacks and fresh menu instances, cached fixed-size template icons at 1x/2x, and expansion plans covering cycles, duplicate IDs, repeated page tokens and partial-failure totals. Compile with `-D FOLDER_EXPANSION_TESTS`. |
 | `CloudExtractionTests.swift` | Blocked extraction requests that explain themselves and keep the task, parallel inspection/extraction with independent progress and selection, per-archive password prompts kept in memory only, cancellation and API failures isolated to their task, bounded batch inspection, and queued password popups with wrong-password retry. Compile with `-D ARCHIVE_TASK_TESTS` and pass a built `CloudExtractionFixtureEngine` as its first argument. |
 | `FileSearchTests.swift` | Search pagination, Unicode, ranking, limits, paths, navigation, cache replacement and redaction; offline local scope with duplicate link identities; transfer selection layouts and output collisions; Finder drop formats; and a live helper covering progressive root results, scope/cache isolation and cancel/reset races. Compile with `-D FILE_SEARCH_TESTS` and pass a built `FileSearchFixtureEngine` as its first argument to include the live-helper section. |
-| `FolderSizeCacheTests.swift` | Exact and recursive deletion with ancestor updates and sibling preservation, overlapping multiselection, new folder/file insertion, moves across common ancestors, dirty-branch repair with clean-subtree reuse, and complete-listing reconciliation that stays safe for unknown folders. Compile with `-D FOLDER_SIZE_TESTS`. |
+| `FolderSizeCacheTests.swift` | Exact and recursive deletion with ancestor updates and sibling preservation, overlapping multiselection, new folder/file insertion, moves across common ancestors, dirty-branch repair with clean-subtree reuse, size seeds limited to clean descendants, and complete-listing reconciliation that stays safe for unknown folders. With `-D FOLDER_SIZE_TESTS` it also checks that opening a folder for the first time during a scan keeps the scan while a changed listing still discards it, and that the saved-size store rereads a file replaced on disk. Compile with `-D FOLDER_SIZE_TESTS`; `cargo test --bin pikpak folder_measurement` covers the bounded concurrent walk. |
 | `GuestModeTests.swift` | Guest Mode behaviour alongside the live download queue and retry suites. Its results appear under the download-queue PASS lines rather than its own. |
 | `ICloudStorageTests.swift` | Quota parsing for personal, legacy, zero and enterprise responses plus invalid/ambiguous ones; a bounded read-only helper process covering missing commands, oversized output, timeout and cancellation; and refresh deduplication with truthful error state. Add `--live` to query the real macOS iCloud account. |
 | `ImagePreviewTests.swift` | Thumbnails retained during API/full-image loading without a second empty frame, late thumbnail/original suppression and signed-URL refresh races, rapid selection changes without previous-file leakage, and bitmap/alpha/oversized/corrupt handling restricted to HTTPS sources. |
 | `PikPakAccountStoreTests.swift` | Trusted-token migration into private directories without credentials in account metadata, independent device/token/lock files across sessions, duplicate sign-in replacing one account, symlink and untrusted legacy session rejection, and workspace isolation across 12 selections and 128 queue paths. |
 | `PikPakAccountVerifierTests.swift` | Real helper success, expired credentials, offline failure, cancellation, process cleanup and retry. Pass a built `PikPakAccountVerifierFixture` as its first argument. |
 | `PikPakTransferQuotaTests.swift` | Transfer-quota lifecycle across late replies, overlapping windows and cancellation; pass a built `PikPakAccountVerifierFixture` as its first argument to also cover the real helper's arguments, JSON delivery, failed refresh and process cleanup. |
-| `PreviewTransportTests.swift` | Preview transport configuration: inherited proxies disabled and an explicit override retained. |
+| `PreviewTransportTests.swift` | PikPak CDN HTTP links upgraded to HTTPS with signed path/query bytes preserved, unrelated HTTP and malformed links rejected; inherited proxies disabled and an explicit override retained. |
+| `PreviewProgressTests.swift` | Two million concurrent/burst cache events while the UI is occupied, latest-snapshot delivery, duplicate completed-cache reads, bounded update frequency, pending-event cancellation and release. No media or network access. |
+| `PreviewResourceLoaderTests.swift` | Generated MP4s served over loopback: MIME variants, completed/damaged caches, actual frame decoding, a 30-second player buffer before/after duration discovery, and duplicate/stale UI metrics. Requires macOS 14 or newer and ffmpeg. |
+| `PreviewResponseTests.swift` | Real preview JSON in User/Guest/Dynamic modes, HTTP/HTTPS source deduplication, legacy content-only replies, image/Quick Look/Open URL selection, and missing-link errors. Uses synthetic responses without network access. |
 | `SharedLinkInputTests.swift` | One- to four-row input layouts, fields and buttons that never overlap or leave 0–1600 pt viewports including fractional widths, and bounded handling of transient zero/invalid layout proposals. |
 | `SimilarityInventoryTests.swift` | Provider refresh restricted to an empty regular inventory in the owning request directory, indeterminate checking progress, skipped selected-file deletion, and a real helper catching additions/deletions/edits during and after analysis so a resumed sealed comparison never reuses scores for removed files. Pass the built app's `Contents/Resources` path as its first argument. |
 | `PhotosSimilarityConcurrencyTests.swift` | Actual Swift/Rust Photos FIFO protocol with generated RAM originals: eight unknown files overlap, pause retains all provider requests, larger originals retry with increasing capacities, final contents match a known-size original byte-for-byte, oversized/invalid/truncated inputs fail without blocking healthy peers, and attempt pipes are removed. Pass the app's `Contents/Resources` path and optionally a replacement `pikpak` engine path. |
@@ -358,8 +650,8 @@ Pause/resume verification (uses synthetic files and isolated account directories
 
 ```sh
 scripts/build-native-test.sh scripts/SimilarityResumeTests.swift /tmp/mycloud-resume-tests
-/tmp/mycloud-resume-tests dist/MyCloudDriver.app/Contents/Resources
-python3 scripts/test-similarity-resume.py dist/MyCloudDriver.app/Contents/Resources
+/tmp/mycloud-resume-tests dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources
+python3 scripts/test-similarity-resume.py dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources
 ```
 
 The Swift test exercises Pause → Resume, forced helper termination, recovery in
@@ -387,7 +679,7 @@ scans them without an account. FFmpeg 9 and ffprobe 9 must be installed:
 
 ```sh
 python3 scripts/test-similarity-native.py \
-  --resources 'dist/MyCloudDriver.app/Contents/Resources'
+  --resources 'dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources'
 ```
 
 Compile `scripts/SimilarityTests.swift` with the native model test command above,
@@ -420,7 +712,7 @@ retain the HTTP status, attempt count and fetch stage without raw URLs or bodies
 The Cloud Download Progress fixture shows actual fetches, waiting slots and
 retrying files separately.
 
-Run `python3 scripts/test-similarity-file-handles.py dist/MyCloudDriver.app/Contents/Resources`
+Run `python3 scripts/test-similarity-file-handles.py dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources`
 to test the GUI launch environment. It launches disposable 60-image scans with
 a 256-descriptor soft limit and then a fixed 256 hard limit. All files must
 succeed: the first run keeps 52 workers after raising the helper's soft limit;
@@ -483,7 +775,7 @@ it never authorizes PhotoKit or alters a live library:
 
 ```sh
 ./scripts/build-native-test.sh scripts/NativeDriveTests.swift /tmp/native-drive-tests
-/tmp/native-drive-tests "$PWD/dist/MyCloudDriver.app/Contents/Resources"
+/tmp/native-drive-tests "$PWD/dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources"
 python3 scripts/test-drive-archive.py
 ```
 
@@ -528,14 +820,14 @@ the timeline's currently playable ranges. All UI checks use synthetic media.
 Right-click a file and enter Open With. Leave the pointer on its trigger and
 move between the parent and application list; the submenu must remain stable,
 with application icons and Other… available. Other… must open the app chooser
-and Cancel must leave the selection untouched. For a PikPak folder, hover over
-Expand Folder and choose 1 Level, 2 Levels or All Levels. Test both list and
+and Cancel must leave the selection untouched. For a PikPak folder, choose
+Expand All Levels directly, with no depth submenu. Test both list and
 thumbnail views. Context menus explicitly use the standard button style: the
 app's pointing-hand hover state must not rebuild a menu during native tracking.
 PikPak folder menus use a native snapshot until dismissal. Enable **Simulate
-Background Updates** in the design fixture, then keep Expand Folder open while
+Background Updates** in the design fixture, then keep the folder menu open while
 the status counter advances. Check Browser and Links, list and thumbnails, hover
-between parent/submenu, Escape, and actual depth selection. Normal left-click
+over Expand All Levels, Escape, and actual recursive expansion. Normal left-click
 selection, disclosure and dragging must still work. The focused
 `BrowserFolderExpansionUITestApp.swift` fixture also has a background-update
 toggle and logs native menu changes to
@@ -589,7 +881,7 @@ After configuring local credentials as described in the
 
 ```sh
 ./scripts/build-app.sh
-codesign --verify --deep --strict "dist/MyCloudDriver.app"
+codesign --verify --deep --strict "dist/AppBuild.noindex/MyCloudDriver.app"
 ```
 
 Before publishing, check the staged files as well as the build:
@@ -654,7 +946,7 @@ python3 scripts/with-client-credentials.py cargo test --locked similarity::prefe
 python3 scripts/with-client-credentials.py cargo test --locked similarity::fetch::tests
 ```
 
-`python3 scripts/test-similarity-native.py --resources dist/MyCloudDriver.app/Contents/Resources`
+`python3 scripts/test-similarity-native.py --resources dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources`
 checks the real shipped image, PDF, DOCX, audio and video readers. Every native
 reader must report `input_storage: memory`. It also checks model/vector reuse,
 unchanged compatible-pair totals, result queries without originals, and cleanup.
@@ -755,8 +1047,8 @@ Banker safety guard. Targeted commands:
 python3 scripts/with-client-credentials.py cargo test --lib similarity::
 cargo test --manifest-path vendor/FileTwin/Cargo.toml -p filetwin-core memory_input::
 scripts/build-native-test.sh scripts/SimilarityTests.swift /private/tmp/SimilarityTests
-/private/tmp/SimilarityTests "$PWD/dist/MyCloudDriver.app/Contents/Resources"
-python3 scripts/test-similarity-memory-images.py dist/MyCloudDriver.app/Contents/Resources
+/private/tmp/SimilarityTests "$PWD/dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources"
+python3 scripts/test-similarity-memory-images.py dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources
 ```
 
 The Rust fixtures cover the 12 GB / mixed video-image scenario, unsafe partial
@@ -806,7 +1098,7 @@ well as the existing fixed upload allocation.
 ```sh
 python3 scripts/benchmark-download-speed.py
 python3 scripts/with-client-credentials.py cargo test --release --locked --bin pikpak download_speed_tests::inherited_proxies_cannot_reroute_downloads
-swiftc -swift-version 5 -target arm64-apple-macos13.0 -parse-as-library macos/PreviewTransport.swift scripts/PreviewTransportTests.swift -o /private/tmp/PreviewTransportTests
+scripts/build-native-test.sh scripts/PreviewTransportTests.swift /private/tmp/PreviewTransportTests
 /private/tmp/PreviewTransportTests
 ```
 
@@ -920,21 +1212,21 @@ disconnection handling, inventory refresh ownership and decreasing UI totals.
   connection, Clear while paused, completed originals retained through resource
   edits, safe RAM shrink and existing memory/fetch/encoding regressions.
 - `scripts/build-native-test.sh scripts/SimilarityResumeTests.swift /private/tmp/SimilarityResumeTests`
-  then `/private/tmp/SimilarityResumeTests "$PWD/dist/MyCloudDriver.app/Contents/Resources"`:
+  then `/private/tmp/SimilarityResumeTests "$PWD/dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources"`:
   same helper PID across pause/resume, live resource edits, account isolation,
   close/Cancel retention, crash recovery and Clear of a paused helper.
-- `python3 scripts/test-similarity-resume.py dist/MyCloudDriver.app/Contents/Resources`:
+- `python3 scripts/test-similarity-resume.py dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources`:
   comparison checkpoint and abrupt process recovery, parent disappearance.
 
 Cloud continuation follows [RFC 9110 ranges](https://www.rfc-editor.org/rfc/rfc9110.html#section-14)
 and [If-Range](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.5).
 
 - `scripts/build-native-test.sh scripts/SimilarityRAMPauseTests.swift /private/tmp/SimilarityRAMPauseTests`
-  then `/private/tmp/SimilarityRAMPauseTests "$PWD/dist/MyCloudDriver.app/Contents/Resources"`:
+  then `/private/tmp/SimilarityRAMPauseTests "$PWD/dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources"`:
   synthetic Photos partial stream pauses with a zero-size FIFO, retains bytes,
   changes resources and resumes the same provider exactly once.
 
-- `python3 scripts/test-similarity-live-pause.py dist/MyCloudDriver.app/Contents/Resources`:
+- `python3 scripts/test-similarity-live-pause.py dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources`:
   cooperative comparison pause freezes committed scores, keeps the same helper
   and resumes to the full matrix.
 # Similarity cache and scan layout (2.2.22)
@@ -974,7 +1266,7 @@ model before Resume while a partial Photos stream remains in RAM.
 
 ```sh
 cargo test --locked --manifest-path vendor/FileTwin/Cargo.toml -p filetwin-core
-python3 scripts/test-similarity-memory-video.py --resources dist/MyCloudDriver.app/Contents/Resources
+python3 scripts/test-similarity-memory-video.py --resources dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources
 ```
 
 The core regression leaves a full-file HTTP response unread while requesting
@@ -997,7 +1289,7 @@ cargo test --locked --lib similarity::
 ./scripts/build-native-test.sh scripts/SimilarityProgressTests.swift /tmp/MyCloudProgressTests
 /tmp/MyCloudProgressTests
 ./scripts/build-native-test.sh scripts/SimilarityRAMPauseTests.swift /tmp/MyCloudRAMPauseTests
-/tmp/MyCloudRAMPauseTests dist/MyCloudDriver.app/Contents/Resources
+/tmp/MyCloudRAMPauseTests dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources
 ```
 
 `SimilarityProgressTests` drives the production model with a local helper protocol
@@ -1035,7 +1327,7 @@ download time estimate. Build/run UI fixtures in a temporary
 python3 scripts/with-client-credentials.py cargo test --locked --lib similarity::
 cargo test --locked --manifest-path vendor/FileTwin/Cargo.toml -p filetwin-worker --lib documents::
 ./scripts/build-app.sh
-python3 scripts/test-similarity-password-skip.py --resources dist/MyCloudDriver.app/Contents/Resources
+python3 scripts/test-similarity-password-skip.py --resources dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources
 ```
 
 The integration fixture uses encrypted ZIPs, RAR4/RAR5 archives and a local HTTP service. Its
@@ -1108,7 +1400,7 @@ preview reuse. Its fake provider rejects every original-fetch method.
 
 ```sh
 scripts/build-native-test.sh scripts/PhotosSimilarityPreviewTests.swift /tmp/PhotosSimilarityPreviewTests
-/tmp/PhotosSimilarityPreviewTests "$PWD/dist/MyCloudDriver.app/Contents/Resources" "$PWD/dist/MyCloudDriver.app/Contents/Resources/pikpak"
+/tmp/PhotosSimilarityPreviewTests "$PWD/dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources" "$PWD/dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources/pikpak"
 ```
 
 `PhotosSimilarityConcurrencyTests.swift` additionally delivers a generated 4 MiB
@@ -1133,6 +1425,18 @@ automatically refetched. Cancel keeps unloaded branches stopped with Retry.
 
 Compile `BrowserFolderExpansionTests.swift` with both `FINDER_WORKSPACE_TESTS`
 and `FOLDER_EXPANSION_TESTS` to include the scheduler and workspace-cache checks.
+Those flags also run the folder-selection checks: ⌘A selects the folders in the
+current folder and no files, a refresh of that folder keeps the open outline,
+its cached branches and the selection, while opening another folder resets them.
+Expand All Levels over a selection runs as a single plan with deduplicated and
+nested roots. Up/Down step one file at a time through the outline, including
+rows inside expanded folders, and keep working after a step clears the previous
+preview or lands on a folder that has none. In the app, verify ⌘A in List and Thumbnails, that a rename or
+search field still selects its own text with ⌘A, and that right-clicking one of
+several selected folders offers **Expand All Levels in N Folders**. With the
+preview pane open, click the video surface or its transport controls and check
+that Up/Down still walk the files while the seek slider, once focused, keeps
+its own arrows.
 `BrowserTreeRecoveryUITestApp.swift`, built with the same flags, hosts the real
 Browser on a generated `9/P/V` hierarchy. After restoring the interrupted tree,
 `Recovered file.txt` must appear automatically without any disclosure click.

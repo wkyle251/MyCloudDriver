@@ -8,10 +8,10 @@
 	<string>MyCloudDriver</string>
 	<key>CFBundleExecutable</key>
 	<string>PikPakDownloader</string>
-	<key>CFBundleIdentifier</key>
-	<string>com.wky.PikPakDownloader</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.wky.PikPakDownloader</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -19,9 +19,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.1.0</string>
+	<string>2.3.0</string>
 	<key>CFBundleVersion</key>
-	<string>159</string>
+	<string>235</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
@@ -30,9 +30,9 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
-	<key>NSPrincipalClass</key>
-	<string>NSApplication</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>MyCloudDriver browses, previews and compares your photos and videos, and manages albums or imports and deletes media when you choose those actions.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
 </dict>
 </plist>

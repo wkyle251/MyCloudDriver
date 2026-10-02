@@ -110,6 +110,9 @@ final class FinderFileOpener: ObservableObject {
                     file = cached
                 } else {
                     self.onStatus("Downloading \(name) to open…", false)
+                    file = try await AutomaticRecovery.read(onRetry: { [weak self] _, delay in
+                        self?.onStatus("Retrying the download to open \(name) in \(Int(delay))s…", false)
+                    }) {
                     let info: PreviewInfo
                     if let resolve = self.resolve { info = try await resolve(configuration) }
                     else { info = try await self.fetchInfo(configuration, identity: identity) }
@@ -134,8 +137,9 @@ final class FinderFileOpener: ObservableObject {
                         throw NSError(domain: "PikPakOpen", code: 3,
                                       userInfo: [NSLocalizedDescriptionKey: "PikPak's file server could not return the complete file. Try Open again."])
                     }
-                    file = try FinderFileOpenStorage.preserveDownload(result.0, name: name, expectedSize: info.size,
-                                                                      directory: configuration.copiesDirectory)
+                    return try FinderFileOpenStorage.preserveDownload(result.0, name: name, expectedSize: info.size,
+                                                                       directory: configuration.copiesDirectory)
+                    }
                     unopenedCopy = file
                 }
                 try Task.checkCancellation()

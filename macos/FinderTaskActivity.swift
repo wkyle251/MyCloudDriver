@@ -26,12 +26,13 @@ enum FinderTaskKind: String, CaseIterable, Identifiable {
 
 struct FinderTaskActivity: Identifiable {
     enum State {
-        case running, stopping, completed, partial, cancelled, failed
+        case running, stopping, paused, completed, partial, cancelled, failed
         var isActive: Bool { self == .running || self == .stopping }
         var label: String {
             switch self {
             case .running: return "In progress"
             case .stopping: return "Stopping…"
+            case .paused: return "Paused"
             case .completed: return "Completed"
             case .partial: return "Partial results"
             case .cancelled: return "Cancelled"
@@ -55,6 +56,7 @@ struct FinderTaskActivity: Identifiable {
 /// footer, rather than publishing changes to every Browser row.
 @MainActor
 final class FinderTaskActivityStore: ObservableObject {
+    var onDismiss: (FinderTaskKind) -> Void = { _ in }
     @Published private(set) var tasks: [FinderTaskActivity] = []
     @Published var showsDetails = false
     @Published var showsDuplicateResults = false
@@ -101,7 +103,9 @@ final class FinderTaskActivityStore: ObservableObject {
     }
 
     func dismiss(_ kind: FinderTaskKind) {
+        guard tasks.contains(where: { $0.kind == kind && !$0.state.isActive }) else { return }
         tasks.removeAll { $0.kind == kind && !$0.state.isActive }
+        onDismiss(kind)
     }
 
     func reset(keeping kinds: Set<FinderTaskKind> = []) {
@@ -141,10 +145,14 @@ struct FinderTaskActivityRows: View {
                 }
                 HStack {
                     if task.kind == .similarityCloud || task.kind == .similarityLocal {
-                        Button(task.state.isActive ? "Show Scan…" : "Review Results…") {
+                        let scan = task.kind == .similarityCloud ? model.fileSimilarity.cloud : model.fileSimilarity.local
+                        Button(task.state.isActive || task.state == .paused ? "Show Scan…" : "Review Results…") {
                             activity.showsDetails = false
                             model.fileSimilarity.present(source: task.kind == .similarityCloud ? .cloud : .local)
                         }
+                        if scan.canPause { Button("Pause") { scan.pause() } }
+                        if scan.isRunning { Button("Clear") { scan.clearSession() }.disabled(scan.isCancelling) }
+                        if scan.isPaused { Button("Resume") { model.fileSimilarity.resume(scan) }; Button("Cancel") { scan.cancel() } }
                     }
                     if task.state.isActive {
                         Button("Cancel") { cancel(task.kind) }
@@ -162,15 +170,16 @@ struct FinderTaskActivityRows: View {
                                 .help("Retry only unfinished source folders")
                         }
                         Spacer()
-                        Button("Dismiss") { activity.dismiss(task.kind) }
-                            .help("Dismiss this status; duplicate results remain available in File")
+                        if task.kind == .similarityCloud || task.kind == .similarityLocal {
+                            Button("Clear") { (task.kind == .similarityCloud ? model.fileSimilarity.cloud : model.fileSimilarity.local).clearSession() }
+                        } else { Button("Dismiss") { activity.dismiss(task.kind) }.help("Dismiss this status") }
                     }
                 }
                 .font(.caption).buttonStyle(.borderless).pointingHandCursor()
             }
             .padding(12)
             .background(FinderAppearance.accent.opacity(0.045), in: RoundedRectangle(cornerRadius: 9))
-        }
+        }.onAppear { model.fileSimilarity.refreshRecovery() }
     }
 
     private func tint(for task: FinderTaskActivity) -> Color {
@@ -179,7 +188,7 @@ struct FinderTaskActivityRows: View {
         case .partial: return .orange
         case .completed: return .green
         case .running: return FinderAppearance.accent
-        case .stopping, .cancelled: return .secondary
+        case .stopping, .paused, .cancelled: return .secondary
         }
     }
 

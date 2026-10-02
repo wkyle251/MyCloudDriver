@@ -1,13 +1,50 @@
 import AppKit
+import CryptoKit
+import Darwin
 import Foundation
+import Photos
 import UniformTypeIdentifiers
 
-/// A click is a queue-edit operation, not a concurrency boundary. Gather all
-/// compatible waiting selections into the next worker pool; leave selections
-/// for other destinations/share sessions in their original relative order.
-enum DownloadQueueBatching {
-    /// Keep overlapping local trees in separate runs to avoid concurrent
-    /// writers targeting the same files on a case-insensitive macOS volume.
+/// Internal resource ceiling. The engine admits transfers according to
+/// measured throughput; saved user preferences do not constrain it.
+enum TransferConcurrency {
+    static let automaticLimit = 64
+}
+
+/// Sample one transfer's network counter, excluding any resumed local prefix.
+/// Each file has its own baseline, moving average and idle timeout.
+struct DownloadFileRate {
+    private var sampledAt: Date?
+    private var sampledBytes: UInt64 = 0
+    private var latestBytes: UInt64 = 0
+    private var progressedAt: Date?
+    private(set) var bytesPerSecond: Double = 0
+
+    mutating func sample(networkBytes: UInt64, at now: Date, transferring: Bool) -> Double {
+        if networkBytes > latestBytes { progressedAt = now }
+        latestBytes = networkBytes
+        guard transferring, let previous = sampledAt, networkBytes >= sampledBytes else {
+            sampledAt = now; sampledBytes = networkBytes; bytesPerSecond = 0
+            return 0
+        }
+        let interval = now.timeIntervalSince(previous)
+        guard interval >= 0.35 else { return bytesPerSecond }
+        let delta = networkBytes - sampledBytes
+        if delta > 0 {
+            let current = Double(delta) / interval
+            bytesPerSecond = bytesPerSecond > 0 ? bytesPerSecond * 0.55 + current * 0.45 : current
+        } else if progressedAt.map({ now.timeIntervalSince($0) >= 1.5 }) ?? true {
+            bytesPerSecond = 0
+        }
+        sampledAt = now; sampledBytes = networkBytes
+        return bytesPerSecond
+    }
+}
+
+/// Preserve each selection's local layout in the continuous download queue.
+enum DownloadDestinationLayout {
+    /// Detect overlapping trees when consolidating legacy selection fixtures.
+    /// The live engine serializes actual writes with destination leases.
     static func destinationsOverlap(_ first: [[String]], _ second: [[String]]) -> Bool {
         func key(_ components: [String]) -> [String] {
             components.map { ($0 as NSString).lastPathComponent.precomposedStringWithCanonicalMapping.lowercased() }
@@ -27,21 +64,7 @@ enum DownloadQueueBatching {
         return parents.map { Array($0.dropFirst(commonDepth)) }
     }
 
-    static func takeNext<Request>(from queue: inout [Request],
-                                  combining: (Request, Request) -> Request?) -> Request? {
-        guard !queue.isEmpty else { return nil }
-        var batch = queue.removeFirst()
-        var waiting: [Request] = []
-        for request in queue {
-            if let combined = combining(batch, request) {
-                batch = combined
-            } else {
-                waiting.append(request)
-            }
-        }
-        queue = waiting
-        return batch
-    }
+
 }
 
 enum UploadAvailability {
@@ -202,4 +225,155 @@ private final class FinderURLBatch: @unchecked Sendable {
             self.completion(.failure(FinderDropError("Finder took too long to supply the selected files. Nothing from this drop was uploaded; try again.")))
         }
     }
+}
+
+/// Deletes only regular partial data and its resume journals. The caller must first stop its writer;
+/// originals, directories, aliases and symbolic links are never eligible.
+enum TransferPartialCleanup {
+    static func remove(_ url: URL, owner: String, fileID: String, locksDirectory: URL? = nil, importedOwners: Set<String> = []) throws {
+        guard url.lastPathComponent.hasSuffix(".part") else { throw CocoaError(.fileWriteNoPermission) }
+        let locks = try locksDirectory ?? LocalCredentialStore.applicationSupportDirectoryURL().appendingPathComponent("TransferLocks", isDirectory: true)
+        try FileManager.default.createDirectory(at: locks, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let outputName = String(url.lastPathComponent.dropLast(5))
+        let output = url.deletingLastPathComponent().resolvingSymlinksInPath().appendingPathComponent(outputName).path.lowercased()
+        let key = SHA256.hash(data: Data(output.utf8)).map { String(format: "%02x", $0) }.joined()
+        let descriptor = Darwin.open(locks.appendingPathComponent(key).path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
+        guard descriptor >= 0 else { throw CocoaError(.fileWriteNoPermission) }
+        defer { Darwin.close(descriptor) }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            throw NSError(domain: "MyCloudDriver.Transfer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Another window is writing this destination. Its partial file was kept."])
+        }
+        defer { flock(descriptor, LOCK_UN) }
+        guard let data = try? Data(contentsOf: locks.appendingPathComponent(key)),
+              let claim = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+              let previousOwner = claim["owner"], previousOwner == owner || importedOwners.contains(previousOwner),
+              claim["file_id"] == fileID else { return }
+        for sibling in [url, URL(fileURLWithPath: url.path + ".resume.json"),
+                        URL(fileURLWithPath: url.path + ".ranges.data"), URL(fileURLWithPath: url.path + ".ranges.json")] {
+            guard FileManager.default.fileExists(atPath: sibling.path) else { continue }
+            let values = try sibling.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else { throw CocoaError(.fileWriteNoPermission) }
+            try FileManager.default.removeItem(at: sibling)
+        }
+    }
+
+    /// An interrupted folder can have owned partials before its resumed cloud
+    /// discovery reaches those children. The private ownership manifest supplies
+    /// exact output paths; every deletion still reacquires that output's lock.
+    static func removeOwned(in tree: URL, owner: String, ignoringActiveWriters: Bool = false, locksDirectory: URL? = nil, importedOwners: Set<String> = []) throws {
+        let locks = try locksDirectory ?? LocalCredentialStore.applicationSupportDirectoryURL().appendingPathComponent("TransferLocks", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: locks.path) else { return }
+        let root = tree.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+        for manifest in try FileManager.default.contentsOfDirectory(at: locks, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]) {
+            let attributes = try manifest.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            guard attributes.isRegularFile == true, attributes.isSymbolicLink != true, (attributes.fileSize ?? 0) < 64 * 1024,
+                  let data = try? Data(contentsOf: manifest),
+                  let record = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+                  let previousOwner = record["owner"], previousOwner == owner || importedOwners.contains(previousOwner),
+                  let fileID = record["file_id"], let path = record["output_path"] else { continue }
+            let output = URL(fileURLWithPath: path).standardizedFileURL
+            guard output.pathComponents.starts(with: root), output.pathComponents.count > root.count else { continue }
+            let partial = output.appendingPathExtension("part")
+            do { try remove(partial, owner: owner, fileID: fileID, locksDirectory: locks, importedOwners: importedOwners) }
+            catch let error as NSError where ignoringActiveWriters && error.domain == "MyCloudDriver.Transfer" && error.code == 1 {
+                // The helper sees the same cancellation and cleans its active
+                // writer after flushing. Never unlink while it holds the lock.
+            }
+        }
+    }
+}
+
+enum TransferFailure {
+    static func isRetryable(_ error: Error, depth: Int = 0) -> Bool {
+        // Callers check their own cancellation first. A provider cancelling a
+        // request without a user cancellation is an interruption to recover.
+        if error is CancellationError { return true }
+        if case .waiting = error as? CloudDriveError { return true }
+        if (error as? PikPakAccountError) == .unavailable { return true }
+        if case .api(let status, _, _) = error as? PikPakManagementError,
+           [408, 425, 429].contains(status) || (500...599).contains(status) { return true }
+        if SimilarityNetworkFailure.isTemporary(error) { return true }
+        let value = error as NSError
+        if value.domain == PHPhotosErrorDomain, [PHPhotosError.Code.libraryVolumeOffline.rawValue,
+            PHPhotosError.Code.relinquishingLibraryBundleToWriter.rawValue, PHPhotosError.Code.networkError.rawValue,
+            PHPhotosError.Code.operationInterrupted.rawValue, PHPhotosError.Code.notEnoughSpace.rawValue].contains(value.code) { return true }
+        if value.domain == "ImagePreview.HTTP", [408, 425, 429].contains(value.code) || (500...599).contains(value.code) { return true }
+        if value.domain == "PikPakOpen", value.code == 3 { return true }
+        if value.domain == NSURLErrorDomain && value.code == NSURLErrorCancelled { return true }
+        if value.domain == NSCocoaErrorDomain && [NSFileWriteOutOfSpaceError, NSFileReadNoSuchFileError,
+            NSFileNoSuchFileError, NSFileReadNoPermissionError, NSFileWriteNoPermissionError].contains(value.code) { return true }
+        if value.domain == NSPOSIXErrorDomain && [EAGAIN, EINTR, EMFILE, ENFILE, ENETDOWN, ENETUNREACH,
+            ECONNABORTED, ECONNRESET, ENOTCONN, ETIMEDOUT, ECONNREFUSED, EHOSTDOWN, EHOSTUNREACH,
+            ENOSPC, EDQUOT, ENODEV, ENXIO, EBUSY, EIO, ENOENT, EACCES, EPERM].contains(Int32(value.code)) { return true }
+        if depth < 3, let underlying = value.userInfo[NSUnderlyingErrorKey] as? Error { return isRetryable(underlying, depth: depth + 1) }
+        return false
+    }
+}
+
+/// Shared with detached filesystem workers. Waiting here never blocks AppKit;
+/// cancellation wakes paused workers so they close their file before cleanup.
+final class NativeTransferControl: @unchecked Sendable {
+    @TaskLocal static var current: NativeTransferControl?
+    private let condition = NSCondition()
+    private var paused = false
+    private var cancelled = false
+    private var completedItems = Set<String>()
+    func isCompleted(_ id: String) -> Bool { condition.lock(); defer { condition.unlock() }; return completedItems.contains(id) }
+    func markCompleted(_ id: String) { condition.lock(); completedItems.insert(id); condition.unlock() }
+    func pause() { condition.lock(); paused = true; condition.unlock() }
+    func resume() { condition.lock(); paused = false; condition.broadcast(); condition.unlock() }
+    func cancel() { condition.lock(); cancelled = true; condition.broadcast(); condition.unlock() }
+    func check() throws {
+        condition.lock()
+        while paused && !cancelled && !Task.isCancelled { _ = condition.wait(until: Date(timeIntervalSinceNow: 0.1)) }
+        let cancelled = cancelled
+        condition.unlock()
+        if cancelled { throw CancellationError() }
+        try Task.checkCancellation()
+    }
+    var isPaused: Bool { snapshot().paused }
+    var isCancelled: Bool { snapshot().cancelled }
+    func wait(ignoringPause: Bool = false) async throws {
+        while true {
+            let state = snapshot()
+            if state.cancelled { throw CancellationError() }
+            try Task.checkCancellation()
+            if ignoringPause || !state.paused { return }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+    private func snapshot() -> (paused: Bool, cancelled: Bool) {
+        condition.lock(); defer { condition.unlock() }; return (paused, cancelled)
+    }
+}
+
+
+actor NativeTransferAdmission {
+    static let shared = NativeTransferAdmission()
+    private var active = Set<UUID>()
+    private var waiting: [UUID] = []
+    private let limit: Int
+    init(limit: Int = min(8, max(2, ProcessInfo.processInfo.activeProcessorCount / 2))) { self.limit = max(1, limit) }
+    var activeCount: Int { active.count }
+    func acquire(control: NativeTransferControl, ignoringPause: Bool = false) async throws -> UUID {
+        let permit = UUID()
+        var admitted = false
+        defer {
+            waiting.removeAll { $0 == permit }
+            if !admitted { active.remove(permit) }
+        }
+        while true {
+            if !ignoringPause, control.isPaused { waiting.removeAll { $0 == permit } }
+            try await control.wait(ignoringPause: ignoringPause)
+            if !waiting.contains(permit) { waiting.append(permit) }
+            if waiting.first == permit, active.count < limit {
+                active.insert(permit); admitted = true
+                return permit
+            }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+    }
+    // Identity makes late or duplicate releases harmless during rapid
+    // pause/resume/cancel; an old release cannot free a new transfer's slot.
+    func release(_ permit: UUID) { active.remove(permit) }
 }

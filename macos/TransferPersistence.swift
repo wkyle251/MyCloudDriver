@@ -7,6 +7,57 @@ import Foundation
 struct TransferPersistenceStore {
     let directory: URL
 
+    /// Import old window queues once per account. The receipt and combined
+    /// queue are one atomic write, so completed work cannot reappear on the
+    /// next launch. Keep the old files intact for recovery or an older build.
+    func loadSharedTransfers(accountID: String) throws -> SavedTransfers? {
+        let saved = try load(SavedTransfers.self, accountID: accountID)
+        if let saved, saved.version != 1 || saved.accountID != accountID { throw CocoaError(.fileReadCorruptFile) }
+        let sessions = directory.appendingPathComponent("Sessions", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: sessions.path) else { return saved }
+        try Self.protectDirectory(sessions)
+        var imported = Set(saved?.importedWorkspaceSessions ?? [])
+        var downloads = saved?.downloads ?? []
+        var uploads = saved?.uploads ?? []
+        var cancelled = Set(saved?.cancelledDownloads ?? [])
+        var downloadKeys = Set(downloads.map(\.deduplicationKey))
+        var uploadIDs = Set(uploads.map(\.id))
+        var changed = false
+        for session in try FileManager.default.contentsOfDirectory(at: sessions, includingPropertiesForKeys: nil).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            let id = session.lastPathComponent
+            guard id != "primary", PikPakWorkspaceStorage.isValidSessionID(id), !imported.contains(id) else { continue }
+            let legacy = TransferPersistenceStore(directory: session)
+            guard let queue = try legacy.load(SavedTransfers.self, accountID: accountID) else { continue }
+            guard queue.version == 1, queue.accountID == accountID else { throw CocoaError(.fileReadCorruptFile) }
+            for upload in queue.uploads where uploadIDs.insert(upload.id).inserted {
+                let relative = "uploads/\(upload.id.uuidString)"
+                let source = try legacy.accountDirectory(accountID).appendingPathComponent(relative)
+                let target = try accountDirectory(accountID).appendingPathComponent(relative)
+                if FileManager.default.fileExists(atPath: source.path), !FileManager.default.fileExists(atPath: target.path) {
+                    try Self.protectDirectory(source)
+                    try Self.protectDirectory(target.deletingLastPathComponent())
+                    // Copy through a private sibling so an interrupted import
+                    // cannot leave a half-copied journal at its final path.
+                    let temporary = target.deletingLastPathComponent().appendingPathComponent(".import-\(UUID())")
+                    defer { try? FileManager.default.removeItem(at: temporary) }
+                    try FileManager.default.copyItem(at: source, to: temporary)
+                    try FileManager.default.moveItem(at: temporary, to: target)
+                }
+                uploads.append(upload)
+            }
+            downloads.append(contentsOf: queue.downloads.filter { downloadKeys.insert($0.deduplicationKey).inserted })
+            cancelled.formUnion(queue.cancelledDownloads ?? [])
+            imported.insert(id); changed = true
+        }
+        guard changed else { return saved }
+        let result = SavedTransfers(version: 1, accountID: accountID, downloads: downloads, uploads: uploads,
+                                    cancelledDownloads: Array(cancelled), importedWorkspaceSessions: imported.sorted(),
+                                    downloadsPaused: saved?.downloadsPaused, pausedDownloadIDs: saved?.pausedDownloadIDs,
+                                    pausedPendingDownloadIDs: saved?.pausedPendingDownloadIDs, pausedUploadIDs: saved?.pausedUploadIDs)
+        try save(result, accountID: accountID)
+        return result
+    }
+
     func accountDirectory(_ accountID: String) throws -> URL {
         guard !accountID.isEmpty else { throw CocoaError(.fileReadNoPermission) }
         try Self.protectDirectory(directory)

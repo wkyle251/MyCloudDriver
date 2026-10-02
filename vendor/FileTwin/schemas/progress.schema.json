@@ -1,0 +1,211 @@
+{
+  "$defs": {
+    "Counts": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes_hashed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "bytes_read": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_hits": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_discovered": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_failed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_processed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_ready": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_skipped": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "vectors_encoded": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "files_discovered",
+        "files_processed",
+        "files_ready",
+        "files_failed",
+        "files_skipped",
+        "vectors_encoded",
+        "cache_hits",
+        "bytes_read",
+        "bytes_hashed"
+      ],
+      "type": "object"
+    },
+    "Stage": {
+      "enum": [
+        "discovering",
+        "encoding",
+        "completed",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "WorkCounts": {
+      "description": "Live phases of admitted files. Reuse waiters do not occupy worker slots.",
+      "properties": {
+        "accelerator_active": {
+          "default": 0,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "accelerator_limit": {
+          "default": 0,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "encoding": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fetching": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_in_use": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_limit": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_scheduling": {
+          "default": false,
+          "type": "boolean"
+        },
+        "original_memory_bytes": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reading": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ready": {
+          "default": 0,
+          "description": "All read sources ready for decoding, including those waiting for memory\nor a processing slot. The wait counters describe the current constraint.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "waiting_accelerator": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "waiting_memory": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "waiting_reuse": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "waiting_worker": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "worker_limit": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fetching",
+        "reading",
+        "encoding",
+        "waiting_memory",
+        "waiting_reuse",
+        "worker_limit",
+        "memory_in_use",
+        "memory_limit"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "counts": {
+      "$ref": "#/$defs/Counts"
+    },
+    "elapsed_seconds": {
+      "format": "double",
+      "type": "number"
+    },
+    "stage": {
+      "$ref": "#/$defs/Stage"
+    },
+    "work": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WorkCounts"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "stage",
+    "counts",
+    "elapsed_seconds"
+  ],
+  "title": "Progress",
+  "type": "object"
+}

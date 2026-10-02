@@ -18,13 +18,54 @@ enum FinderAppVersion {
     }
 }
 
-/// One persistent preference for both transfer directions. Existing running
-/// processes retain their allocation; the next batch reads this shared value.
+enum FinderPreviewPlacement: String, CaseIterable, Identifiable {
+    case right, bottom
+    var id: Self { self }
+    var title: String { self == .right ? "Right" : "Bottom" }
+}
+
+enum PikPakContentMode: String, CaseIterable, Identifiable, Codable {
+    case user, guest, dynamic
+    var id: Self { self }
+    var title: String {
+        switch self {
+        case .user: return "User Mode"
+        case .guest: return "Guest Mode"
+        case .dynamic: return "Dynamic Mode"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .user: return "person.crop.circle"
+        case .guest: return "link"
+        case .dynamic: return "arrow.triangle.branch"
+        }
+    }
+    var summary: String {
+        switch self {
+        case .user: return "Signed-in account only"
+        case .guest: return "Public links only"
+        case .dynamic: return "Guest first, then account"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .user: return "Always use your signed-in account."
+        case .guest: return "Use public links. Stop if guest access is unavailable."
+        case .dynamic: return "Try guest access first. Use your account when a guest link is unavailable."
+        }
+    }
+}
+
+/// Presentation and archive preferences shared by every app window.
 @MainActor
 final class FinderSettings: ObservableObject {
-    static let defaultWorkers = 32
-    nonisolated static let workerRange = 1...64
     private let defaults: UserDefaults
+    let playback: MediaPlaybackSettings
+
+    @Published var contentMode: PikPakContentMode {
+        didSet { defaults.set(contentMode.rawValue, forKey: "pikpakContentMode") }
+    }
 
     @Published var autoHideSidebar: Bool {
         didSet { defaults.set(autoHideSidebar, forKey: "finderAutoHideSidebar") }
@@ -32,35 +73,47 @@ final class FinderSettings: ObservableObject {
     @Published var showsPreviewPane: Bool {
         didSet { defaults.set(showsPreviewPane, forKey: "finderShowsPreviewPane") }
     }
-    @Published private(set) var transferWorkers: Int
+    @Published var previewPlacement: FinderPreviewPlacement {
+        didSet { defaults.set(previewPlacement.rawValue, forKey: "finderPreviewPlacement") }
+    }
     @Published private(set) var concurrentExtractions: Int
     @Published var selectedPane = 0
+    @Published private(set) var layoutResetRevision = 0
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        playback = MediaPlaybackSettings(defaults: defaults)
+        contentMode = PikPakContentMode(rawValue: defaults.string(forKey: "pikpakContentMode") ?? "")
+            ?? (defaults.bool(forKey: "pikpakGuestMode") ? .guest : .user)
         autoHideSidebar = defaults.bool(forKey: "finderAutoHideSidebar")
         showsPreviewPane = defaults.object(forKey: "finderShowsPreviewPane") as? Bool ?? true
-        transferWorkers = Self.clampWorkers(
-            (defaults.object(forKey: "finderTransferWorkers") as? NSNumber)?.intValue ?? Self.defaultWorkers
-        )
+        previewPlacement = FinderPreviewPlacement(rawValue: defaults.string(forKey: "finderPreviewPlacement") ?? "") ?? .right
         concurrentExtractions = min(8, max(1,
             (defaults.object(forKey: "finderConcurrentExtractions") as? NSNumber)?.intValue ?? 4))
-    }
-
-    nonisolated static func clampWorkers(_ value: Int) -> Int {
-        min(max(value, workerRange.lowerBound), workerRange.upperBound)
-    }
-
-    func setTransferWorkers(_ value: Int) {
-        let bounded = Self.clampWorkers(value)
-        guard transferWorkers != bounded else { return }
-        transferWorkers = bounded
-        defaults.set(transferWorkers, forKey: "finderTransferWorkers")
+        defaults.set(contentMode.rawValue, forKey: "pikpakContentMode")
     }
 
     func setConcurrentExtractions(_ value: Int) {
         concurrentExtractions = min(8, max(1, value))
         defaults.set(concurrentExtractions, forKey: "finderConcurrentExtractions")
+    }
+
+    func resetLayout() {
+        // Reset only presentation keys. Keep the selected drive/location,
+        // accounts, transfers, download destination and background work intact.
+        let values: [String: Any] = [
+            "browserSplitFraction": 0.64, "browserBottomSplitFraction": 0.45,
+            "previewCanvasHeight": 440.0,
+            "browserViewMode": 0, "linksViewMode": 0,
+            "browserListItemZoom": 1.0, "browserThumbnailItemZoom": 1.0, "browserItemZoom": 0.0,
+            "browserNameColumnWidth": 250.0, "browserSizeColumnWidth": 76.0,
+            "browserKindColumnWidth": 104.0, "browserModifiedColumnWidth": 156.0,
+            "browserShowsSizeColumn": true, "browserShowsKindColumn": true, "browserShowsModifiedColumn": true,
+        ]
+        values.forEach { defaults.set($0.value, forKey: $0.key) }
+        defaults.removeObject(forKey: "previewCanvasWidth") // Width now always follows the pane.
+        autoHideSidebar = false; showsPreviewPane = true; previewPlacement = .right
+        layoutResetRevision &+= 1
     }
 }
 
@@ -93,14 +146,15 @@ struct FinderSettingsButton: View {
 /// Route the sidebar shortcut to the same native Settings window.
 struct FinderAccountSettingsLink<LabelView: View>: View {
     @ObservedObject var settings: FinderSettings
+    var pane = 2
     @ViewBuilder let label: () -> LabelView
 
     var body: some View {
         if #available(macOS 14.0, *) {
-            ModernAccountSettingsLink(settings: settings, label: label)
+            ModernAccountSettingsLink(settings: settings, pane: pane, label: label)
         } else {
             Button {
-                settings.selectedPane = 2
+                settings.selectedPane = pane
                 NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
             } label: { label() }
         }
@@ -111,11 +165,12 @@ struct FinderAccountSettingsLink<LabelView: View>: View {
 private struct ModernAccountSettingsLink<LabelView: View>: View {
     @Environment(\.openSettings) private var openSettings
     @ObservedObject var settings: FinderSettings
+    let pane: Int
     @ViewBuilder let label: () -> LabelView
 
     var body: some View {
         Button {
-            settings.selectedPane = 2
+            settings.selectedPane = pane
             openSettings()
         } label: { label() }
     }
@@ -123,9 +178,9 @@ private struct ModernAccountSettingsLink<LabelView: View>: View {
 
 /// Reject non-digits while typing or pasting, including signs and decimal
 /// separators. Clamp a completed integer without overflowing on long input.
-private final class WorkerCountFormatter: Formatter {
+private final class BoundedCountFormatter: Formatter {
     var fallbackValue = 1
-    var range = FinderSettings.workerRange
+    var range = 1...8
 
     override func string(for obj: Any?) -> String? {
         (obj as? NSNumber)?.stringValue
@@ -171,15 +226,15 @@ private final class WorkerCountFormatter: Formatter {
 
 /// SwiftUI's value/formatter field permits invalid drafts. Use AppKit's native
 /// partial validation so disallowed characters never enter the editor.
-private struct WorkerCountField: NSViewRepresentable {
+private struct BoundedCountField: NSViewRepresentable {
     @Binding var value: Int
-    var range = FinderSettings.workerRange
-    var label = "Workers per direction"
+    var range = 1...8
+    var label = "Extractions at once"
 
     final class Coordinator: NSObject, NSTextFieldDelegate {
         var value: Binding<Int>
         var lastValue: Int
-        var range = FinderSettings.workerRange
+        var range = 1...8
 
         init(value: Binding<Int>) {
             self.value = value
@@ -194,7 +249,7 @@ private struct WorkerCountField: NSViewRepresentable {
         }
 
         @objc func commit(_ field: NSTextField) {
-            let formatter = field.formatter as? WorkerCountFormatter
+            let formatter = field.formatter as? BoundedCountFormatter
             formatter?.fallbackValue = value.wrappedValue
             var number: AnyObject?
             if formatter?.getObjectValue(&number, for: field.stringValue, errorDescription: nil) == true,
@@ -221,7 +276,7 @@ private struct WorkerCountField: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSTextField {
         let field = NSTextField(string: String(value))
-        let formatter = WorkerCountFormatter()
+        let formatter = BoundedCountFormatter()
         formatter.range = range
         context.coordinator.range = range
         formatter.fallbackValue = value
@@ -242,8 +297,8 @@ private struct WorkerCountField: NSViewRepresentable {
         let coordinator = context.coordinator
         coordinator.value = $value
         coordinator.range = range
-        (field.formatter as? WorkerCountFormatter)?.range = range
-        (field.formatter as? WorkerCountFormatter)?.fallbackValue = value
+        (field.formatter as? BoundedCountFormatter)?.range = range
+        (field.formatter as? BoundedCountFormatter)?.fallbackValue = value
         if coordinator.lastValue != value || field.currentEditor() == nil {
             coordinator.lastValue = value
             field.stringValue = String(value)
@@ -252,110 +307,164 @@ private struct WorkerCountField: NSViewRepresentable {
     }
 }
 
+/// Keep frequently changing operation state inside its content panes. The
+/// native tab toolbar only observes settings/navigation, not transfer ticks.
 struct FinderSettingsView: View {
     @ObservedObject var settings: FinderSettings
-    @ObservedObject var model: DownloaderModel
-    @StateObject private var monitor = TaskResourceMonitor()
+    private let model: DownloaderModel
     private let initialPane: Int?
-    private let connections: AnyView?
+    private let hub: CloudDriveHub?
 
-    init(settings: FinderSettings, model: DownloaderModel, initialPane: Int? = nil, connections: AnyView? = nil) {
+    init(settings: FinderSettings, model: DownloaderModel, initialPane: Int? = nil, hub: CloudDriveHub? = nil) {
         self.settings = settings
         self.model = model
         self.initialPane = initialPane
-        self.connections = connections
+        self.hub = hub
     }
 
     var body: some View {
+        #if SETTINGS_ICON_TESTS
+        let _ = SettingsIconRenderProbe.navigationRendered()
+        #endif
         TabView(selection: $settings.selectedPane) {
-            Form {
-                Section("About") {
-                    LabeledContent("App version") {
-                        Text(FinderAppVersion.displayText())
-                            .textSelection(.enabled)
-                    }
-                }
-                Section("Sidebar") {
-                    Toggle("Automatically hide the sidebar", isOn: $settings.autoHideSidebar)
-                    Text("Move to the narrow left edge to reveal it. The reveal strip is outside the file list and does not activate while dragging files.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Section("Browser and Links") {
-                    Toggle("Show the preview pane", isOn: $settings.showsPreviewPane)
-                    Text("You can also change this in View. Hide the preview to give the file list more space.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Section("Transfers") {
-                    LabeledContent("Workers per direction") {
-                        HStack(spacing: 6) {
-                            WorkerCountField(value: Binding(get: { settings.transferWorkers }, set: settings.setTransferWorkers))
-                                .frame(width: 60, height: 22)
-                            Stepper("Workers per direction",
-                                    value: Binding(get: { settings.transferWorkers }, set: settings.setTransferWorkers),
-                                    in: FinderSettings.workerRange)
-                                .labelsHidden()
-                                .pointingHandCursor()
-                        }
-                    }
-                    Text("Default: 32 · Range: 1–64. Applies to both upload and download. Changes take effect on the next batch, not a transfer already running. Each batch is capped to its file count.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    LabeledContent("This Mac", value: "\(ProcessInfo.processInfo.activeProcessorCount) cores · \(ProcessInfo.processInfo.physicalMemory / 1_073_741_824) GB memory")
-                    LabeledContent("Download folder") {
-                        Text(model.outputURL.path).lineLimit(2).truncationMode(.middle)
-                            .textSelection(.enabled)
-                        Button("Choose…") { model.chooseOutputFolder() }
-                            .disabled(model.isDownloading)
-                    }
-                }
-                Section("Archives") {
-                    LabeledContent("Extractions at once") {
-                        HStack(spacing: 6) {
-                            WorkerCountField(value: $model.archiveConcurrencyLimit, range: 1...8,
-                                label: "Extractions at once")
-                                .frame(width: 60, height: 22)
-                            Stepper("Extractions at once", value: $model.archiveConcurrencyLimit, in: 1...8)
-                                .labelsHidden().pointingHandCursor()
-                        }
-                    }
-                    Text("Extract ZIP, RAR and 7z files from Browser. Password-protected archives ask for a password. Progress stays in the footer while you keep working. Range: 1–8; running extractions keep their slot.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            .formStyle(.grouped)
-            .tabItem { Label("General", systemImage: "gearshape") }
-            .tag(0)
-
-            TaskResourceMonitorView(monitor: monitor)
-                .tabItem { Label("Resources", systemImage: "gauge") }
+            FinderGeneralSettingsView(settings: settings, model: model)
+                .tabItem { FinderSymbolImage.settingsLabel("General", systemImage: "gearshape") }
+                .tag(0)
+            FinderResourceSettingsView(model: model, isActive: settings.selectedPane == 1)
+                .tabItem { FinderSymbolImage.settingsLabel("Resources", systemImage: "gauge") }
                 .tag(1)
-
-            FinderAccountsSettingsView(model: model)
-                .tabItem { Label("Accounts", systemImage: "person.crop.circle") }
+            FinderAccountsSettingsView(model: model, hub: hub)
+                .buttonStyle(FinderButtonStyle())
+                .tabItem { FinderSymbolImage.settingsLabel("Accounts", systemImage: "person.crop.circle") }
                 .tag(2)
-            if let connections {
-                connections.tabItem { Label("Drives", systemImage: "externaldrive") }.tag(3)
+            if let hub {
+                CloudDriveConnectionsView(hub: hub)
+                    .buttonStyle(FinderButtonStyle())
+                    .tabItem { FinderSymbolImage.settingsLabel("Drives", systemImage: "externaldrive") }
+                    .tag(3)
             }
         }
         .tint(FinderAppearance.accent)
-        .buttonStyle(FinderButtonStyle())
+        // Native tab buttons own hover/selection; pane buttons keep our style.
+        .buttonStyle(.automatic)
         .padding(12)
         .frame(width: 580, height: 580)
         .onAppear { if let initialPane { settings.selectedPane = initialPane } }
         .task(id: settings.selectedPane) {
-            if settings.selectedPane == 1 { await monitor.watch { model.resourceActivities } }
             if settings.selectedPane == 2 { model.checkAccountStatus(automatically: true) }
         }
-        .sheet(isPresented: Binding(get: { model.isLoginPresented && model.loginFromSettings }, set: {
-            if !$0 && model.isLoginPresented && model.loginFromSettings { model.cancelLogin() }
-        })) {
-            PikPakLoginView(reason: model.loginReason, currentDeviceID: model.loginDeviceID,
-                onSession: { model.completeWebLogin(with: $0) }, onCancel: model.cancelLogin)
+        .background { FinderSettingsLoginPresentation(model: model) }
+    }
+}
+
+private struct FinderGeneralSettingsView: View {
+    @ObservedObject var settings: FinderSettings
+    @ObservedObject var model: DownloaderModel
+    @State private var didResetLayout = false
+
+    var body: some View {
+        Form {
+            Section("About") {
+                LabeledContent("App version") {
+                    Text(FinderAppVersion.displayText())
+                        .textSelection(.enabled)
+                }
+            }
+            Section("Sidebar") {
+                Toggle("Automatically hide the sidebar", isOn: $settings.autoHideSidebar)
+                Text("Move to the narrow left edge to reveal it. The reveal strip is outside the file list and does not activate while dragging files.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Browser and Links") {
+                Toggle("Show the preview pane", isOn: $settings.showsPreviewPane)
+                Picker("Preview placement", selection: $settings.previewPlacement) {
+                    ForEach(FinderPreviewPlacement.allCases) { Text($0.title).tag($0) }
+                }.pickerStyle(.segmented)
+                Text("Applies to every drive and all workspace windows.").font(.caption).foregroundStyle(.secondary)
+                Text("You can also change this in View. Hide the preview to give the file list more space.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Layout") {
+                HStack {
+                    Text("Default workspace layout")
+                    Spacer()
+                    Button("Reset Layout") {
+                        settings.resetLayout(); didResetLayout = true
+                    }.pointingHandCursor()
+                }
+                Text("Restore the sidebar, split view, preview height, file columns, list view and item sizes across all drives.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if didResetLayout {
+                    Label("Layout reset", systemImage: "checkmark.circle.fill")
+                        .font(.caption).foregroundStyle(.green)
+                }
+            }
+            Section("Transfers") {
+                Text("Uploads and downloads adjust automatically to your connection. You can pause or resume them in Transfers. iCloud Drive and Photos transfers are managed by macOS.")
+                    .font(.caption).foregroundStyle(.secondary)
+                LabeledContent("This Mac", value: "\(ProcessInfo.processInfo.activeProcessorCount) cores · \(ProcessInfo.processInfo.physicalMemory / 1_073_741_824) GB memory")
+                LabeledContent("Download folder") {
+                    Text(model.outputURL.path).lineLimit(2).truncationMode(.middle)
+                        .textSelection(.enabled)
+                    Button("Choose…") { model.chooseOutputFolder() }
+                        .disabled(model.isDownloading)
+                }
+            }
+            Section("Archives") {
+                LabeledContent("Extractions at once") {
+                    HStack(spacing: 6) {
+                        BoundedCountField(value: $model.archiveConcurrencyLimit, range: 1...8,
+                            label: "Extractions at once")
+                            .frame(width: 60, height: 22)
+                        Stepper("Extractions at once", value: $model.archiveConcurrencyLimit, in: 1...8)
+                            .labelsHidden().pointingHandCursor()
+                    }
+                }
+                Text("Extract ZIP, RAR and 7z files from Browser. Password-protected archives ask for a password. Progress stays in the footer while you keep working. Range: 1–8; running extractions keep their slot.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
+        .formStyle(.grouped)
+        .buttonStyle(FinderButtonStyle())
+    }
+}
+
+private struct FinderResourceSettingsView: View {
+    let model: DownloaderModel
+    let isActive: Bool
+    @StateObject private var monitor = TaskResourceMonitor()
+
+    var body: some View {
+        TaskResourceMonitorView(monitor: monitor)
+            .buttonStyle(FinderButtonStyle())
+            .task(id: isActive) {
+                if isActive {
+                    await monitor.watch { WorkspaceSessionManager.current?.resourceActivities ?? model.resourceActivities }
+                }
+            }
+    }
+}
+
+/// Account/login changes must still present their sheet without invalidating
+/// the tab toolbar for every unrelated model update.
+private struct FinderSettingsLoginPresentation: View {
+    @ObservedObject var model: DownloaderModel
+
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0)
+            .sheet(isPresented: Binding(get: { model.isLoginPresented && model.loginFromSettings }, set: {
+                if !$0 && model.isLoginPresented && model.loginFromSettings { model.cancelLogin() }
+            })) {
+                PikPakLoginView(reason: model.loginReason, currentDeviceID: model.loginDeviceID,
+                    initialCredentialKind: model.loginCredentialKind,
+                    onSession: { model.completeWebLogin(with: $0) }, onCancel: model.cancelLogin)
+            }
     }
 }
 
 private struct FinderAccountsSettingsView: View {
     @ObservedObject var model: DownloaderModel
+    let hub: CloudDriveHub?
 
     private var statusColor: Color {
         switch model.accountLoginStatus {
@@ -367,11 +476,13 @@ private struct FinderAccountsSettingsView: View {
 
     var body: some View {
         Form {
-            Section("Current account") {
+            Section("Current PikPak account") {
                 HStack(spacing: 14) {
                     Image(systemName: "person.crop.circle.fill")
                         .font(.system(size: 44)).foregroundStyle(FinderAppearance.accent)
                     VStack(alignment: .leading, spacing: 5) {
+                        Label("PikPak", systemImage: CloudDriveKind.pikpak.symbol)
+                            .font(.caption.weight(.semibold)).foregroundStyle(FinderAppearance.accent)
                         Text(model.activeSavedAccount?.displayName ?? "Connect to PikPak")
                             .font(.title3.weight(.semibold))
                             .textSelection(.enabled)
@@ -387,7 +498,7 @@ private struct FinderAccountsSettingsView: View {
                 .padding(.vertical, 6)
 
                 if !model.hasAccountSession {
-                    Text("Sign in to browse your files, save shared files and manage transfers.")
+                    Text("Sign in to PikPak to browse your files, save shared files and manage transfers.")
                         .font(.callout).foregroundStyle(.secondary)
                     HStack {
                         Button("Sign In…") { model.beginAccountLogin(accountID: model.activeAccountID) }
@@ -422,41 +533,71 @@ private struct FinderAccountsSettingsView: View {
                 }
             }
 
-            Section("Saved accounts") {
-                if model.savedAccounts.isEmpty {
-                    Text("Accounts you add will appear here.")
-                        .foregroundStyle(.secondary)
-                }
-                ForEach(model.savedAccounts) { account in
-                    HStack(spacing: 10) {
-                        Image(systemName: "person.crop.circle")
-                            .font(.title2).foregroundStyle(FinderAppearance.accent)
+            Section("Login method") {
+                ForEach(PikPakCredentialKind.allCases) { kind in
+                    HStack {
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(account.displayName).fontWeight(.medium)
-                            if let identifier = account.accountIdentifier {
-                                Text("Account \(identifier)").font(.caption)
-                                    .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                            }
-                            if account.needsSignIn {
-                                Text("Signed out · sign in to reconnect").font(.caption).foregroundStyle(.secondary)
-                            }
+                            Text(kind.loginTitle).fontWeight(.medium)
+                            Text(kind.quotaExplanation).font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer()
-                        if account.id == model.activeAccountID && !account.needsSignIn {
-                            Label("Current", systemImage: "checkmark.circle.fill")
-                                .font(.caption).foregroundStyle(FinderAppearance.accent)
+                        let current = model.hasAccountSession && model.activeCredentialKind == kind
+                        let saved = model.activeAccountGroup?.connection(kind)
+                        if current {
+                            Label("Active", systemImage: "checkmark.circle.fill").font(.caption).foregroundStyle(FinderAppearance.accent)
+                            Button(kind == .personalAccessToken ? "Replace Token…" : "Reconnect…") {
+                                model.beginAccountLogin(accountID: model.activeAccountID, credentialKind: kind)
+                            }.disabled(!model.canChangeAccount)
                         } else {
-                            Button(account.needsSignIn ? "Sign In…" : "Switch") {
-                                if account.needsSignIn { model.beginAccountLogin(accountID: account.id) }
-                                else { model.switchAccount(to: account.id) }
-                            }
-                            .disabled(!model.canChangeAccount)
+                            Button(saved == nil || saved?.needsSignIn == true ? "Connect…" : "Switch") {
+                                model.selectPikPakConnection(kind, fromSettings: true)
+                            }.disabled(!model.canChangeAccount)
                         }
                     }
-                    .padding(.vertical, 4)
+                }
+                Text("Both login methods stay saved. You can switch accounts and login methods in the left sidebar. The selected connection applies to account requests in downloads, previews and scans.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            if model.hasAccountSession {
+                PikPakAccountDetailsSection(model: model, management: model.pikpakManagement, quotas: model.transferQuotaMonitor)
+            }
+
+            Section("Saved PikPak accounts") {
+                if model.savedAccounts.isEmpty {
+                    Text("PikPak accounts you add will appear here.")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(model.savedAccountGroups) { group in
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 10) {
+                            Image(systemName: "person.crop.circle").font(.title2).foregroundStyle(FinderAppearance.accent)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(group.displayName).fontWeight(.medium)
+                                if let identifier = group.connections.first?.accountIdentifier {
+                                    Text("Account ID: \(identifier)").font(.caption).foregroundStyle(.secondary)
+                                        .lineLimit(1).truncationMode(.middle)
+                                }
+                            }
+                            Spacer()
+                        }
+                        ForEach(group.connections) { account in
+                            HStack {
+                                Text(account.connectionKind.loginTitle).font(.callout)
+                                Spacer()
+                                if account.id == model.activeAccountID && model.hasAccountSession {
+                                    Label("Current", systemImage: "checkmark.circle.fill").font(.caption).foregroundStyle(FinderAppearance.accent)
+                                } else {
+                                    Button(account.needsSignIn ? "Sign In…" : "Switch") {
+                                        model.selectPikPakConnection(account.connectionKind, accountID: account.id, fromSettings: true)
+                                    }.disabled(!model.canChangeAccount)
+                                }
+                            }.padding(.leading, 30)
+                        }
+                    }.padding(.vertical, 4)
                 }
                 Button { model.beginAccountLogin() } label: {
-                    Label("Add Account…", systemImage: "plus")
+                    Label("Add PikPak Account…", systemImage: "plus")
                 }
                 .disabled(!model.canChangeAccount)
             }
@@ -466,10 +607,16 @@ private struct FinderAccountsSettingsView: View {
                     Label(reason, systemImage: "clock")
                         .foregroundStyle(.secondary)
                 }
-                Text("Unfinished transfers stay with their account. Logging out removes that account’s saved sign-in from this Mac.")
+                Text("Unfinished PikPak transfers stay with their account. Log Out removes only the selected login method from this Mac; other saved connections are kept.")
                     .foregroundStyle(.secondary)
             }
             .font(.caption)
+
+            if let hub {
+                Section("Apple services") {
+                    CloudDriveAccountsSummary(hub: hub)
+                }
+            }
         }
         .formStyle(.grouped)
     }

@@ -1,5 +1,15 @@
 import AppKit
 import SwiftUI
+import Photos
+
+@MainActor private final class DemoPhotosAccessState {
+    var status = PHAuthorizationStatus.authorized
+}
+
+@MainActor private final class DemoICloudStorageState {
+    var unavailable = false
+    var delay: UInt64 = 200_000_000
+}
 
 private final class DemoPhotosDrive: NativeCloudDrive, @unchecked Sendable {
     let kind = CloudDriveKind.photos
@@ -12,8 +22,8 @@ private final class DemoPhotosDrive: NativeCloudDrive, @unchecked Sendable {
                 .init(id: "demo:album:\($0.offset)", name: $0.element, isFolder: true, canRename: $0.offset > 0, canDelete: $0.offset > 0)
             }, total: 4)
         }
-        let items = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).filter { $0.pathExtension == "png" }.map { url in
-            CloudDriveItem(id: "demo:" + url.lastPathComponent, name: url.lastPathComponent, isFolder: false, bytes: 1_245_082, modified: Date(), url: url, mediaType: "image", canRename: false)
+        let items = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).filter { ["png", "mp4"].contains($0.pathExtension) }.map { url in
+            CloudDriveItem(id: "demo:" + url.lastPathComponent, name: url.lastPathComponent, isFolder: false, bytes: 1_245_082, modified: Date(), url: url, mediaType: url.pathExtension == "mp4" ? "video" : "image", canRename: false)
         }.filter { search.isEmpty || $0.name.localizedStandardContains(search) }
         return .init(items: items, total: items.count)
     }
@@ -33,15 +43,41 @@ private final class DemoPhotosDrive: NativeCloudDrive, @unchecked Sendable {
 }
 
 @main @MainActor struct NativeDriveUITestApp: App {
-    @StateObject private var hub: CloudDriveHub
+    @StateObject private var sessions: WorkspaceSessionManager
+    private var hub: CloudDriveHub { sessions.activeHub }
     @State private var dark = false
+    @State private var stressMenuUpdates = false
+    @State private var menuUpdateTicks = 0
+    private let menuUpdateTimer = Timer.publish(every: 0.15, on: .main, in: .common).autoconnect()
+    private let photosAccessState = DemoPhotosAccessState()
+    private let storageState = DemoICloudStorageState()
+    private let preferences: UserDefaults
     init() {
         let defaults = UserDefaults(suiteName: "com.wky.MyCloudDriver.DesignFixture.preferences")!
+        preferences = defaults
         defaults.removePersistentDomain(forName: "com.wky.MyCloudDriver.DesignFixture.preferences")
-        let hub = CloudDriveHub(pikpak: DownloaderModel.finderWorkspaceFixture(defaults: defaults), defaults: defaults, restoreConnections: false)
+        defaults.set(0, forKey: "browserViewMode")
+        defaults.set(0, forKey: "selectedTransferMode")
+        defaults.set(1.0, forKey: "browserListItemZoom")
+        defaults.set(1.0, forKey: "browserThumbnailItemZoom")
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("MyCloudDriverDesignFixture", isDirectory: true)
         try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        for folder in ["Documents", "Projects", "Travel"] { try? FileManager.default.createDirectory(at: directory.appendingPathComponent(folder), withIntermediateDirectories: true) }
+        let access = photosAccessState
+        let storage = storageState
+        let hub = CloudDriveHub(pikpak: DownloaderModel.finderWorkspaceFixture(defaults: defaults), defaults: defaults,
+            restoreConnections: false, photosAccess: .init(status: { access.status }, request: {
+                try? await Task.sleep(nanoseconds: 700_000_000)
+                access.status = .authorized; return access.status
+            }, provider: { DemoPhotosDrive(directory: directory) }), icloudStorage: ICloudStorageModel(fetch: {
+                try await Task.sleep(nanoseconds: storage.delay)
+                if storage.unavailable { throw ICloudStorageError.unavailable }
+                return 37_500_000_000
+            }), localRootURL: directory)
+        try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for folder in ["Documents/Drafts", "Projects", "Travel"] { try? FileManager.default.createDirectory(at: directory.appendingPathComponent(folder), withIntermediateDirectories: true) }
+        for name in ["Documents/Drafts/Outline.txt", "Documents/Meeting notes.txt", "Documents/Project plan.txt"] {
+            try! Data("Synthetic content for \(name).\n".utf8).write(to: directory.appendingPathComponent(name))
+        }
         try! Data("A synthetic document for MyCloudDriver UI verification.\nPress Space for Quick Look.\n".utf8).write(to: directory.appendingPathComponent("Welcome.txt"))
         for (index, name) in ["Coast", "Desert", "Forest", "Mountains", "City", "Garden"].enumerated() {
             let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 480, pixelsHigh: 320, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
@@ -55,20 +91,88 @@ private final class DemoPhotosDrive: NativeCloudDrive, @unchecked Sendable {
             try! bitmap.representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent("\(name).png"))
         }
         hub.icloud.connect(ICloudDriveProvider(rootURL: directory)); hub.photos.connect(DemoPhotosDrive(directory: directory))
-        let activity = hub.icloud.activity.begin("Exporting project files")
+        let activity = hub.icloud.activity.begin("Exporting project files", transferDirection: 0)
         hub.icloud.activity.update(activity, .init(message: "Copying Project overview.pdf", completed: 12, total: 28, fraction: 0.43))
-        _hub = StateObject(wrappedValue: hub)
+        let imported = hub.icloud.activity.begin("Importing images", transferDirection: 1)
+        hub.icloud.activity.update(imported, .init(message: "Uploaded 6 images", completed: 6, total: 6))
+        hub.icloud.activity.finish(imported)
+        let exportPhotos = hub.photos.activity.begin("Exporting Summer", transferDirection: 0)
+        hub.photos.activity.update(exportPhotos, .init(message: "Fetching Coast.png", completed: 3, total: 12, fraction: 0.25))
+        hub.selected = nil
+        _sessions = StateObject(wrappedValue: WorkspaceSessionManager(initialHub: hub, makeHub: { id, settings in
+            let workspace = CloudDriveHub(pikpak: DownloaderModel.finderWorkspaceFixture(defaults: defaults, workspaceSessionID: id, settings: settings), defaults: defaults,
+                restoreConnections: false, photosAccess: .init(status: { access.status }, request: { access.status },
+                    provider: { DemoPhotosDrive(directory: directory) }), localRootURL: directory)
+            workspace.icloud.connect(ICloudDriveProvider(rootURL: directory)); workspace.photos.connect(DemoPhotosDrive(directory: directory))
+            return workspace
+        }))
     }
     var body: some Scene {
-        WindowGroup("MyCloudDriver · Design Fixture") {
-            MyCloudDriverRootView(hub: hub, settings: hub.pikpak.finderSettings).preferredColorScheme(dark ? .dark : .light)
+        Window("MyCloudDriver · Design Fixture", id: "fixture") {
+            WorkspaceSessionRoot(hub: sessions.initialHub, manager: sessions).preferredColorScheme(dark ? .dark : .light)
+                .defaultAppStorage(preferences)
+                .onReceive(menuUpdateTimer) { _ in
+                    if stressMenuUpdates {
+                        menuUpdateTicks += 1
+                        hub.pikpak.status = "Synthetic background update \(menuUpdateTicks)"
+                    }
+                }
         }.defaultSize(width: 1240, height: 820)
         .commands {
-            FinderCommands(settings: hub.pikpak.finderSettings)
+            FinderCommands(settings: sessions.settings, sessions: sessions)
             CommandMenu("Fixture") {
+                Button("All Drives") { hub.selected = nil }
+                Button("Find Similar Files") { hub.local.findSimilar([]) }
                 Button("Toggle Appearance") { dark.toggle() }.keyboardShortcut("d", modifiers: [.command, .shift])
-                Button("Minimum Window Size") { NSApp.keyWindow?.setContentSize(.init(width: 1000, height: 720)) }
-                Button("Show Photos Grid") { hub.selected = .photos; hub.photos.viewMode = 1; hub.photos.enter(.init(id: "demo:all", name: "All Photos & Videos", isFolder: true)) }
+                Toggle("Simulate Background Updates", isOn: $stressMenuUpdates)
+                Button("Minimum Window Size") { NSApp.keyWindow?.setContentSize(.init(width: 560, height: 360)) }
+                Button("Compact Width") { NSApp.keyWindow?.setContentSize(.init(width: 750, height: 820)) }
+                Button("Compact Height") { NSApp.keyWindow?.setContentSize(.init(width: 1240, height: 460)) }
+                Button("Show Photos Grid") {
+                    hub.open(.photos); hub.pikpakNavigation.showImmediately(0)
+                    preferences.set(1, forKey: "browserViewMode")
+                    hub.photos.enter(.init(id: "demo:all", name: "All Photos & Videos", isFolder: true))
+                }
+                Button("Next Drive") {
+                    let kinds = CloudDriveKind.allCases
+                    hub.open(kinds[((kinds.firstIndex(of: hub.selected ?? .pikpak) ?? 0) + 1) % kinds.count])
+                }.keyboardShortcut("]", modifiers: [.command, .shift])
+                Button("Standard Window Size") { NSApp.keyWindow?.setContentSize(.init(width: 1240, height: 820)) }
+                Button("Show PikPak Media Preview") {
+                    let video = FileManager.default.temporaryDirectory.appendingPathComponent("MyCloudDriverDesignFixture/Resize sample.mp4")
+                    guard FileManager.default.fileExists(atPath: video.path) else { return }
+                    hub.pikpak.configureMediaPreviewFixture(videoURL: video)
+                    hub.pikpakNavigation.showImmediately(0); hub.open(.pikpak)
+                }
+                Button("Use Oversized Preview") {
+                    preferences.set(1_500.0, forKey: "previewCanvasWidth")
+                    preferences.set(2_000.0, forKey: "previewCanvasHeight")
+                }
+                Button("Show Second PikPak Video") {
+                    let video = FileManager.default.temporaryDirectory.appendingPathComponent("MyCloudDriverDesignFixture/Second sample.mp4")
+                    guard FileManager.default.fileExists(atPath: video.path) else { return }
+                    hub.pikpak.configureMediaPreviewFixture(videoURL: video)
+                    hub.pikpakNavigation.showImmediately(0); hub.open(.pikpak)
+                }
+                Button("Play Fixture Video") { hub.pikpak.previewPlayer?.play() }
+                Button("Show Fixture Playback Position") {
+                    let seconds = hub.pikpak.previewPlayer?.currentTime().seconds ?? 0
+                    hub.pikpak.status = "Synthetic playback: \(Int(seconds.isFinite ? seconds : 0)) seconds"
+                }
+                Button("Hold PikPak Request and Return to Browser") {
+                    _ = hub.pikpak.activateSharedLinkBrowser()
+                    hub.pikpak.isRunning = true
+                    hub.pikpakNavigation.showImmediately(0); hub.open(.pikpak)
+                }
+                Button("Finish Held PikPak Request") { hub.pikpak.isRunning = false }
+                Button("Photos Permission Denied") { photosAccessState.status = .denied; hub.refreshPhotosAuthorization() }
+                Button("Photos Permission Allowed") { photosAccessState.status = .authorized; hub.refreshPhotosAuthorization() }
+                Button("Photos Permission Not Requested") {
+                    hub.disconnectPhotos(); photosAccessState.status = .notDetermined; hub.refreshPhotosAuthorization()
+                }
+                Button("iCloud Storage Available") { storageState.unavailable = false; storageState.delay = 200_000_000; hub.icloudStorage.refresh(force: true) }
+                Button("iCloud Storage Unavailable") { storageState.unavailable = true; hub.icloudStorage.refresh(force: true) }
+                Button("iCloud Storage Loading") { storageState.unavailable = false; storageState.delay = 12_000_000_000; hub.icloudStorage.refresh(force: true) }
                 Button("Show Scan Progress") {
                     let scan = hub.photos.similarity.local
                     scan.externalScopeNames = ["Summer"]
@@ -78,6 +182,9 @@ private final class DemoPhotosDrive: NativeCloudDrive, @unchecked Sendable {
                 }
             }
         }
-        Settings { FinderSettingsView(settings: hub.pikpak.finderSettings, model: hub.pikpak, connections: AnyView(CloudDriveConnectionsView(hub: hub))) }
+        Settings {
+            FinderSettingsView(settings: hub.pikpak.finderSettings, model: hub.pikpak, hub: hub)
+                .preferredColorScheme(dark ? .dark : .light).defaultAppStorage(preferences)
+        }
     }
 }

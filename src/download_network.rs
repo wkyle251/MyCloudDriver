@@ -1,0 +1,420 @@
+//! One bounded socket allowance for original downloads. App helpers share
+//! advisory locks; process exit releases every slot, including after a crash.
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{self, Read, Seek, Write},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+pub const CONNECTION_BUDGET: usize = 64;
+pub const RECEIVE_WINDOW: u64 = 256 * 1024;
+
+pub struct Network {
+    trials: Arc<crate::download_trials::Coordinator>,
+    limit: usize,
+    slots: Arc<Semaphore>,
+    directory: Option<PathBuf>,
+    cursor: AtomicUsize,
+    bytes: Arc<AtomicU64>,
+    endpoint_active: Arc<AtomicUsize>,
+    participants: Arc<AtomicUsize>,
+    endpoint_participants: Arc<AtomicUsize>,
+    cooldown_name: String,
+    soft_limit: AtomicUsize,
+    soft_until: Mutex<Instant>,
+    cooldown: Mutex<(Instant, Instant)>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_slots_release_after_a_helper_is_killed() {
+        let directory = tempfile::tempdir().unwrap();
+        let network = Network::new(2, Some(directory.path().to_path_buf()));
+        let first = network.try_acquire().unwrap().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "download_network::tests::connection_lock_child"])
+            .env("MYCLOUD_CONNECTION_TEST_DIRECTORY", directory.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        while !directory.path().join("ready").exists() && started.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ready = directory.path().join("ready").exists();
+        let bounded = network.try_acquire().unwrap().is_none();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            ready && bounded,
+            "Different helpers exceeded their shared allowance"
+        );
+        let second = network.try_acquire().unwrap().unwrap();
+        assert!(network.try_acquire().unwrap().is_none());
+        drop((first, second));
+        assert!(network.try_acquire().unwrap().is_some());
+    }
+
+    #[test]
+    fn connection_lock_child() {
+        let Some(directory) = std::env::var_os("MYCLOUD_CONNECTION_TEST_DIRECTORY") else {
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        let network = Network::new(2, Some(directory.clone()));
+        let _permit = network.try_acquire().unwrap().unwrap();
+        std::fs::write(directory.join("ready"), b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(10));
+    }
+
+    #[test]
+    fn cooldown_and_reduced_capacity_are_shared_between_helpers() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = Network::new(4, Some(directory.path().to_path_buf()));
+        let second = Network::new(4, Some(directory.path().to_path_buf()));
+        let a = first.try_acquire().unwrap().unwrap();
+        let b = first.try_acquire().unwrap().unwrap();
+        first.defer(Duration::from_millis(120)).unwrap();
+        assert!(second.try_acquire().unwrap().is_none());
+        drop((a, b));
+        std::thread::sleep(Duration::from_millis(160));
+        let _one = second.try_acquire().unwrap().unwrap();
+        assert!(
+            second.try_acquire().unwrap().is_none(),
+            "Retry immediately restored the rejected concurrency"
+        );
+    }
+}
+
+struct EndpointPermit(Arc<AtomicUsize>);
+impl Drop for EndpointPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+pub struct Participant(Arc<AtomicUsize>, Arc<AtomicUsize>);
+impl Drop for Participant {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.1.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub struct Permit {
+    _local: OwnedSemaphorePermit,
+    _shared: Option<File>,
+    _endpoint: EndpointPermit,
+}
+
+impl Network {
+    pub fn shared() -> Arc<Self> {
+        static NETWORK: OnceLock<Arc<Network>> = OnceLock::new();
+        NETWORK
+            .get_or_init(|| {
+                Self::new(
+                    CONNECTION_BUDGET,
+                    std::env::var_os("MYCLOUDDRIVER_DOWNLOAD_CONNECTIONS").map(PathBuf::from),
+                )
+            })
+            .clone()
+    }
+
+    pub fn new(limit: usize, directory: Option<PathBuf>) -> Arc<Self> {
+        let limit = limit.clamp(1, CONNECTION_BUDGET);
+        Arc::new(Self {
+            trials: crate::download_trials::Coordinator::new(directory.clone()),
+            limit,
+            slots: Arc::new(Semaphore::new(limit)),
+            directory,
+            cursor: AtomicUsize::new(0),
+            bytes: Arc::new(AtomicU64::new(0)),
+            endpoint_active: Arc::new(AtomicUsize::new(0)),
+            cooldown_name: "cooldown".into(),
+            participants: Arc::new(AtomicUsize::new(0)),
+            endpoint_participants: Arc::new(AtomicUsize::new(0)),
+            soft_limit: AtomicUsize::new(limit),
+            soft_until: Mutex::new(Instant::now()),
+            cooldown: Mutex::new((Instant::now(), Instant::now())),
+        })
+    }
+
+    /// Cooldowns apply to the serving origin. Socket and byte counters still
+    /// belong to the same pool, including across independent app helpers.
+    pub fn for_url(link: &str) -> Arc<Self> {
+        static ROUTES: OnceLock<Mutex<HashMap<String, Arc<Network>>>> = OnceLock::new();
+        let Ok(url) = reqwest::Url::parse(link) else {
+            return Self::shared();
+        };
+        let origin = url.origin().ascii_serialization();
+        let mut routes = ROUTES.get_or_init(Default::default).lock().unwrap();
+        if let Some(network) = routes.get(&origin) {
+            return network.clone();
+        }
+        if routes.len() >= 1024 {
+            routes.retain(|_, network| {
+                Arc::strong_count(network) > 1
+                    || network.cooldown.lock().unwrap().0 > Instant::now()
+                    || *network.soft_until.lock().unwrap() > Instant::now()
+            });
+        }
+        let shared = Self::shared();
+        let network = Arc::new(Self {
+            trials: shared.trials.clone(),
+            limit: shared.limit,
+            slots: shared.slots.clone(),
+            directory: shared.directory.clone(),
+            cursor: AtomicUsize::new(0),
+            bytes: shared.bytes.clone(),
+            endpoint_active: Arc::new(AtomicUsize::new(0)),
+            participants: shared.participants.clone(),
+            endpoint_participants: Arc::new(AtomicUsize::new(0)),
+            cooldown_name: format!(
+                "origin-{}",
+                hex::encode(
+                    ring::digest::digest(&ring::digest::SHA256, origin.as_bytes()).as_ref()
+                )
+            ),
+            soft_limit: AtomicUsize::new(shared.limit),
+            soft_until: Mutex::new(Instant::now()),
+            cooldown: Mutex::new((Instant::now(), Instant::now())),
+        });
+        routes.insert(origin, network.clone());
+        network
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+    pub fn active(&self) -> usize { self.endpoint_active.load(Ordering::Acquire) }
+    pub fn register(&self) -> Participant {
+        self.participants.fetch_add(1, Ordering::AcqRel);
+        self.endpoint_participants.fetch_add(1, Ordering::AcqRel);
+        Participant(
+            self.participants.clone(),
+            self.endpoint_participants.clone(),
+        )
+    }
+    pub fn fair_share(&self) -> usize {
+        (self.limit / self.participants.load(Ordering::Acquire).max(1))
+            .min(
+                self.soft_limit.load(Ordering::Acquire)
+                    / self.endpoint_participants.load(Ordering::Acquire).max(1),
+            )
+            .max(1)
+    }
+    pub fn received(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+    pub fn trials(&self) -> Arc<crate::download_trials::Coordinator> { self.trials.clone() }
+    pub fn received_counter(&self) -> Arc<AtomicU64> { self.bytes.clone() }
+    pub fn record(&self, bytes: u64) {
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn directory(&self) -> io::Result<Option<&Path>> {
+        let Some(path) = self.directory.as_deref() else {
+            return Ok(None);
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(path)?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(io::Error::other(
+                "Download connection directory is not a regular directory",
+            ));
+        }
+        Ok(Some(path))
+    }
+
+    pub(crate) fn locked_file(path: &Path, operation: rustix::fs::FlockOperation) -> io::Result<File> {
+        let descriptor = rustix::fs::openat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )?;
+        let file = File::from(descriptor);
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("Invalid download connection lock"));
+        }
+        rustix::fs::flock(&file, operation)?;
+        Ok(file)
+    }
+
+    fn read_control(file: &mut File) -> io::Result<[u64; 3]> {
+        let mut bytes = [0; 24];
+        file.rewind()?;
+        match file.read_exact(&mut bytes) {
+            Ok(()) => Ok(std::array::from_fn(|index| {
+                u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap())
+            })),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok([0; 3]),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn now_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    fn cooling_down(&self) -> io::Result<bool> {
+        let mut state = self.cooldown.lock().unwrap();
+        let now = Instant::now();
+        if now >= *self.soft_until.lock().unwrap() {
+            self.soft_limit.store(self.limit, Ordering::Release);
+        }
+        if now >= state.1 {
+            if let Some(directory) = self.directory()? {
+                let mut file = Self::locked_file(
+                    &directory.join(&self.cooldown_name),
+                    rustix::fs::FlockOperation::LockShared,
+                )?;
+                let [until, limited_until, limit] = Self::read_control(&mut file)?;
+                let millis = until.saturating_sub(Self::now_millis()).min(86_400_000);
+                state.0 = state.0.max(now + Duration::from_millis(millis));
+                if limited_until > Self::now_millis() && (1..=self.limit as u64).contains(&limit) {
+                    self.soft_limit.fetch_min(limit as usize, Ordering::AcqRel);
+                    let mut expires = self.soft_until.lock().unwrap();
+                    *expires = (*expires).max(
+                        now + Duration::from_millis(
+                            limited_until
+                                .saturating_sub(Self::now_millis())
+                                .min(86_430_000),
+                        ),
+                    );
+                }
+            }
+            state.1 = now + Duration::from_millis(100);
+        }
+        Ok(now < state.0)
+    }
+
+    pub fn defer(&self, delay: Duration) -> io::Result<()> {
+        let delay = delay.min(Duration::from_secs(86_400));
+        let limited_until = Instant::now() + delay + Duration::from_secs(30);
+        let limit = (self.endpoint_active.load(Ordering::Acquire) / 2).max(1);
+        self.soft_limit.fetch_min(limit, Ordering::AcqRel);
+        *self.soft_until.lock().unwrap() = limited_until;
+        {
+            let mut state = self.cooldown.lock().unwrap();
+            state.0 = state.0.max(Instant::now() + delay);
+        }
+        if let Some(directory) = self.directory()? {
+            let mut file = Self::locked_file(
+                &directory.join(&self.cooldown_name),
+                rustix::fs::FlockOperation::LockExclusive,
+            )?;
+            let previous = Self::read_control(&mut file)?;
+            let now = Self::now_millis();
+            let until = previous[0].max(now.saturating_add(delay.as_millis() as u64));
+            let limited_until = previous[1].max(until.saturating_add(30_000));
+            let limit = if previous[1] > now && previous[2] > 0 {
+                previous[2].min(limit as u64)
+            } else {
+                limit as u64
+            };
+            file.rewind()?;
+            for value in [until, limited_until, limit] {
+                file.write_all(&value.to_le_bytes())?;
+            }
+            file.set_len(24)?;
+            file.sync_data()?;
+        }
+        Ok(())
+    }
+
+    pub fn try_acquire(&self) -> io::Result<Option<Permit>> {
+        let Ok(local) = self.slots.clone().try_acquire_owned() else {
+            return Ok(None);
+        };
+        self.finish_acquire(local)
+    }
+
+    fn finish_acquire(&self, local: OwnedSemaphorePermit) -> io::Result<Option<Permit>> {
+        if self.cooling_down()? {
+            return Ok(None);
+        }
+        if self
+            .endpoint_active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.soft_limit.load(Ordering::Acquire)).then_some(active + 1)
+            })
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let endpoint = EndpointPermit(self.endpoint_active.clone());
+        let shared = if let Some(directory) = self.directory()? {
+            let start = self.cursor.fetch_add(1, Ordering::Relaxed);
+            let mut found = None;
+            for offset in 0..self.limit {
+                let path =
+                    directory.join(format!("slot-{}", start.wrapping_add(offset) % self.limit));
+                match Self::locked_file(&path, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                {
+                    Ok(file) => {
+                        found = Some(file);
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let Some(file) = found else {
+                return Ok(None);
+            };
+            Some(file)
+        } else {
+            None
+        };
+        Ok(Some(Permit {
+            _local: local,
+            _shared: shared,
+            _endpoint: endpoint,
+        }))
+    }
+
+    pub async fn acquire(&self) -> io::Result<Permit> {
+        loop {
+            if !self.cooling_down()? {
+                // Queued starts receive local slots before a busy range loop
+                // can reacquire them for its next piece.
+                let local = self
+                    .slots
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("Download pool remains open");
+                if let Some(permit) = self.finish_acquire(local)? {
+                    return Ok(permit);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}

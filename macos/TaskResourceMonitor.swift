@@ -26,6 +26,7 @@ struct TaskResourceActivity: Sendable, Equatable {
     let name: String
     var detail: String = ""
     var symbol: String = "gearshape.2"
+    var processing: TaskResourceProcessing? = nil
 }
 
 struct TaskResourceGroup: Identifiable, Sendable {
@@ -160,6 +161,7 @@ final class TaskResourceMonitor: ObservableObject {
     @Published private(set) var rows: [TaskResourceRow] = []
     @Published private(set) var tasks: [TaskResourceGroup] = []
     @Published private(set) var sampledAt: Date?
+    @Published private(set) var gpus: [TaskGPUUsage] = []
     private var generation = UUID()
 
     func watch(activities: @MainActor () -> [Int32: TaskResourceActivity] = { [:] }) async {
@@ -169,13 +171,15 @@ final class TaskResourceMonitor: ObservableObject {
         rows = []
         tasks = []
         sampledAt = nil
-        defer { if generation == ticket { rows = []; tasks = []; sampledAt = nil } }
+        gpus = []
+        defer { if generation == ticket { rows = []; tasks = []; gpus = []; sampledAt = nil } }
         while !Task.isCancelled {
             let descriptions = activities()
-            let samples = await Task.detached(priority: .utility) { TaskResourceSampler.sample() }.value
+            let snapshot = await Task.detached(priority: .utility) { (TaskResourceSampler.sample(), TaskGPUSampler.sample()) }.value
             guard !Task.isCancelled, generation == ticket else { return }
-            rows = accumulator.update(samples, at: ProcessInfo.processInfo.systemUptime)
+            rows = accumulator.update(snapshot.0, at: ProcessInfo.processInfo.systemUptime)
             tasks = TaskResourceAttribution.group(rows, activities: descriptions)
+            gpus = snapshot.1
             sampledAt = Date()
             do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return }
         }
@@ -207,6 +211,7 @@ struct TaskResourceMonitorView: View {
                 metric("Resident memory", value: monitor.rows.isEmpty ? "—" : bytes(monitor.rows.reduce(0) { $0 + $1.residentBytes }))
                 metric("Background tasks", value: monitor.rows.isEmpty ? "—" : monitor.tasks.filter { $0.id != getpid() }.count.formatted())
             }
+            gpuUsage
             Text(activitySummary)
                 .font(.caption).foregroundStyle(.secondary)
             Table(monitor.tasks) {
@@ -220,6 +225,13 @@ struct TaskResourceMonitorView: View {
                                 Text(row.activity.detail).font(.caption).foregroundStyle(.secondary)
                                     .lineLimit(2).truncationMode(.middle)
                             }
+                            if let processing = row.activity.processing {
+                                HStack(spacing: 6) {
+                                    Text(processing.title).foregroundStyle(processing.backend == .coreml ? FinderAppearance.accent : .secondary)
+                                    if !processing.detail.isEmpty { Text(processing.detail).foregroundStyle(.secondary) }
+                                }
+                                .font(.caption2).lineLimit(1).help(processing.help)
+                            }
                         }
                     }
                     .padding(.vertical, 4)
@@ -230,7 +242,7 @@ struct TaskResourceMonitorView: View {
                 }.width(70)
                 TableColumn("Memory") { row in Text(bytes(row.residentBytes)).monospacedDigit() }.width(90)
             }
-            Text("Updates every 2 seconds. Each task includes its helper processes; previews and other work inside the app share the app row. 100% CPU is one core. Memory may include shared pages. PikPak’s cloud resource usage is not measured here.")
+            Text("Updates every 2 seconds. CPU and memory include task helpers; 100% CPU is one core. Memory may include shared pages. CoreML jobs show the scan’s current model activity. Drive servers’ resource usage is not included.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let date = monitor.sampledAt {
                 Text("Updated \(date.formatted(date: .omitted, time: .standard))")
@@ -238,6 +250,41 @@ struct TaskResourceMonitorView: View {
             }
         }
         .padding(16)
+    }
+
+    private var gpuUsage: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("GPU · This Mac", systemImage: "cpu").font(.callout.weight(.medium))
+                Spacer()
+                if monitor.gpus.count == 1, let gpu = monitor.gpus.first {
+                    Text(gpu.utilization.map { String(format: "%.0f%%", $0) } ?? "Unavailable")
+                        .font(.callout.weight(.semibold)).monospacedDigit()
+                }
+            }
+            if monitor.gpus.isEmpty {
+                Text(monitor.sampledAt == nil ? "Measuring GPU usage…" : "GPU usage is unavailable on this Mac.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(monitor.gpus) { gpu in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(gpu.name)
+                        Spacer()
+                        if monitor.gpus.count > 1 {
+                            Text(gpu.utilization.map { String(format: "%.0f%%", $0) } ?? "Unavailable").monospacedDigit()
+                        }
+                    }.font(.caption).foregroundStyle(.secondary)
+                    if let utilization = gpu.utilization {
+                        ProgressView(value: utilization, total: 100).progressViewStyle(.linear)
+                            .accessibilityLabel("\(gpu.name) GPU usage across this Mac")
+                    }
+                }
+            }
+            Text("Includes all apps on this Mac. CoreML may also use the Neural Engine.")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .padding(12).background(FinderAppearance.accent.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
     }
 
     private func metric(_ title: String, value: String) -> some View {
