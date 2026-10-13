@@ -94,22 +94,23 @@ import Foundation
         try await until { scan.progress.analysed == 2 }
         precondition(scan.processIdentifier == pid && !scan.isPaused, "Analysis must continue after the browser closes")
         // The closed view reserves its slot so the scan's browser can come back
-        // in place; a further window is another view of the same session, never
-        // a second account, so focus keeps resolving to the one hub.
+        // in place. Additional browsers own independent workspace state; focus
+        // on the scan must still return to its original hub and running helper.
         manager.activateBrowser(in: primaryHub)
         let reopened = manager.windowForTesting("primary")!
         precondition(reopened !== browser && manager.workspaceCount == 1 && manager.activeHub === primaryHub)
         manager.newWindow()
         let secondary = manager.windowForTesting("secondary")!
-        precondition(manager.workspaceCount == 2 && secondary !== reopened)
+        let secondaryHub = manager.hubForTesting("secondary")!
+        precondition(manager.workspaceCount == 2 && secondary !== reopened && secondaryHub !== primaryHub)
         NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: secondary)
-        precondition(manager.activeHub === primaryHub && manager.canPresentSimilarity)
+        precondition(manager.activeHub === secondaryHub && manager.canPresentSimilarity)
         NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: scanWindow)
         precondition(manager.activeHub === primaryHub && manager.canPresentSimilarity)
         precondition(scan.processIdentifier == pid && !scan.isPaused, "Reopening views must not disturb the running scan")
         reopened.close(); secondary.close()
         precondition(manager.workspaceCount == 0 && lastCloses == 0 && scan.isRunning)
-        print("PASS browser close keeps the same scan helper processing; restored and additional views share one session, account and focus")
+        print("PASS browser close keeps the same scan helper processing; restoring its browser and focusing independent windows preserve scan ownership")
 
         scan.pause()
         let pausedElapsed = scan.elapsedSeconds(at: Date())

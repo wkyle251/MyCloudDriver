@@ -1,10 +1,23 @@
 # Resumable similarity scans
 
-Scans expose Pause, Resume, Cancel and Clear in the scan window and Status.
-Closing the scan window pauses active work and keeps the scan. Cancel stops
-work but retains a resumable checkpoint. **Only Clear deletes a saved scan and
-its result matrix**; it never deletes the original files or shared vector cache.
-Completed results remain in Saved Scans across window closes and app restarts.
+Scans expose **Pause**, **Resume** and **Finish Scan** in the scan window and
+Status. Pause retains the helper, downloads and queued originals in RAM. Closing
+the scan window also pauses and keeps the scan.
+
+**Finish Scan** stops new acquisition and analysis, lets files already analysing
+complete, then compares completed files and opens a saved report marked
+**Finished early**. It also works while paused. Unfinished disk reads and provider
+requests do not delay the report. The report supports the existing selection,
+comparison and Move to Trash actions. **Resume Scan** continues its checkpoint,
+reusing unchanged completed analysis and fetching unfinished originals again.
+Opening a saved report does not start the scanner or require its disk to be online;
+resuming or changing source files requires the original drive/account.
+
+**Delete Report** removes the saved scan record and its result matrix. While a
+scan is active or paused, **Delete Scan** discards its progress and results.
+Neither action deletes original files or the shared vector cache. Completed and
+user-finished reports remain in Saved Scans across window closes and app restarts.
+Older cancelled scans remain readable and resumable.
 Closing a browser window leaves its open Find Similar Files window and helpers
 running. The account and drive providers remain owned by that scan window;
 revealing a result reopens its original browser. Closing the last scan window
@@ -80,10 +93,12 @@ files finish. In-app Resume continues the existing helper and inventory, retaini
 partial and ready originals in RAM. After a helper/app restart, Resume inventories
 the scope again, reuses unchanged completed files, and retries unfinished files. Changes in source revision invalidate reuse.
 Once analysis finishes, comparisons use that saved inventory and resume from
-the last committed range of pairs. A process lock prevents two windows from
+the last committed range of pairs. A user-finished, unsealed inventory receives
+a fresh comparison matrix on Resume, so scores cannot be assigned to new file
+ordinals; completed per-file analysis is still reused. A process lock prevents two windows from
 resuming the same checkpoint simultaneously.
 
-Downloads remain RAM-only. Pause and Cancel now stop admission cooperatively;
+Downloads remain RAM-only. Pause stops admission cooperatively;
 the helper, partially received originals, completed RAM queue and provider pipes
 remain alive. Work already analysing may finish and save its vector, releasing
 that original normally. Resume uses the same helper; it does not repeat discovery
@@ -99,8 +114,12 @@ cannot strand a download behind connections that need its memory. Photos retains
 the same FIFO, buffer and provider task; paused time does not count toward its
 provider timeout. No original is checkpointed to disk.
 
-Clear stops the helper, cancels providers and releases all buffers. Actual app
-shutdown or a helper crash necessarily releases volatile RAM; completed vectors
+Finish releases unfinished originals after draining active analysis, and keeps
+the derived checkpoint for explicit Resume, without automatic recovery. Provider
+cleanup runs after its writers stop, independently of publishing the report.
+Deleting an active scan cancels the helper, with a force-stop deadline if it is
+blocked in filesystem I/O. Actual app shutdown or a helper crash necessarily
+releases volatile RAM; completed vectors
 and comparisons survive in the checkpoint. The UI distinguishes live RAM retention
 from this restart recovery.
 Temporary network/server errors retry with capped backoff and Retry-After,

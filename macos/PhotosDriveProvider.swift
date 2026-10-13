@@ -18,6 +18,13 @@ import UniformTypeIdentifiers
     }
 }
 
+private final class PhotosChangeFailure: @unchecked Sendable {
+    private let lock = NSLock()
+    private var error: Error?
+    func set(_ error: Error) { lock.lock(); defer { lock.unlock() }; self.error = error }
+    var value: Error? { lock.lock(); defer { lock.unlock() }; return error }
+}
+
 final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
     let kind = CloudDriveKind.photos
     let supportsSimilarityPreviews = true
@@ -55,7 +62,13 @@ final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
         let resource = resource(asset)
         return .init(id: "asset:" + asset.localIdentifier, name: resource?.originalFilename ?? "Untitled media",
             isFolder: false, modified: asset.modificationDate ?? asset.creationDate, mediaType: asset.mediaType == .video ? "video" : "image",
-            canRename: false, canDelete: asset.canPerform(.delete))
+            canRename: false, canDelete: asset.canPerform(.delete), revision: assetRevision(asset))
+    }
+    private static func assetRevision(_ asset: PHAsset) -> String {
+        let resources = PHAssetResource.assetResources(for: asset).map {
+            "\($0.type.rawValue):\($0.originalFilename):\($0.uniformTypeIdentifier)"
+        }.sorted().joined(separator: "|")
+        return "\(asset.localIdentifier):\(asset.modificationDate?.timeIntervalSinceReferenceDate ?? -1):\(asset.creationDate?.timeIntervalSinceReferenceDate ?? -1):\(asset.pixelWidth):\(asset.pixelHeight):\(asset.duration):\(resources)"
     }
     private static func fetch(_ location: CloudDriveLocation) throws -> PHFetchResult<PHAsset> {
         let options = PHFetchOptions()
@@ -165,11 +178,13 @@ final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
             try await withCheckedThrowingContinuation { request.begin(resource, continuation: $0) }
         }, onCancel: { request.cancel() })
     }
-    private static func changes(_ block: @escaping () -> Void) async throws {
+    private static func changes(_ block: @escaping () throws -> Void) async throws {
         try CloudDriveFiles.checkCancellation()
+        let failure = PhotosChangeFailure()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            PHPhotoLibrary.shared().performChanges(block) { success, error in
-                if success { continuation.resume() }
+            PHPhotoLibrary.shared().performChanges({ do { try block() } catch { failure.set(error) } }) { success, error in
+                if let validationError = failure.value { continuation.resume(throwing: validationError) }
+                else if success { continuation.resume() }
                 else { continuation.resume(throwing: error ?? CloudDriveError.message("Photos could not complete the change.")) }
             }
         }
@@ -278,6 +293,24 @@ final class PhotosDriveProvider: NativeCloudDrive, @unchecked Sendable {
         progress(.init(message: "Deleted. Recover media in Photos → Recently Deleted.", completed: items.count, total: items.count))
         guard assets.isEmpty else { return nil } // PhotoKit cannot restore deleted assets.
         return .init(title: "Delete Albums") { try await self.restoreAlbums(snapshots) }
+    }
+    func deleteVerified(_ items: [CloudDriveItem], progress: @escaping CloudDriveProgressHandler) async throws -> CloudDriveUndo? {
+        try checkAccess()
+        guard items.allSatisfy({ !$0.isFolder && $0.canDelete && $0.revision != nil }) else {
+            throw CloudDriveError.message("Scan the group again before changing these Photos assets.")
+        }
+        try await Self.changes {
+            let assets = try items.map { item -> PHAsset in
+                let asset = try Self.asset(item.id)
+                guard Self.assetRevision(asset) == item.revision else {
+                    throw CloudDriveError.message("A Photos asset changed after comparison. No assets were deleted. Scan the group again.")
+                }
+                return asset
+            }
+            PHAssetChangeRequest.deleteAssets(assets as NSArray)
+        }
+        progress(.init(message: "Deleted. Recover media in Photos → Recently Deleted.", completed: items.count, total: items.count))
+        return nil
     }
     private static var unavailableUndo: CloudDriveUndo { .init(title: "Album Change") { throw CloudDriveError.message("Photos could not restore this album change.") } }
     private func restoreAlbums(_ snapshots: [(String, [String])]) async throws -> CloudDriveUndo {

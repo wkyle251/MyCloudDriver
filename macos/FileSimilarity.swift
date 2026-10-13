@@ -33,6 +33,7 @@ struct SimilarityFile: Codable, Identifiable {
     var engineIndex: UInt64? = nil
     var engineId: String? = nil
     var state: String? = nil
+    var nativeRevision: String? = nil
     var scoreID: String { engineId ?? id }
     var symbol: String {
         switch family { case "image": return "photo"; case "audio": return "waveform"; case "video": return "film"; default: return "doc.text" }
@@ -58,7 +59,7 @@ struct SimilarityIssueSummary: Codable {
 struct SimilarityReport: Codable {
     let source: SimilaritySource
     let scope: [String]
-    let status: String
+    var status: String
     let threshold: Double
     let scannedFiles: UInt64
     let analysedFiles: UInt64
@@ -68,7 +69,7 @@ struct SimilarityReport: Codable {
     let groups: [SimilarityGroup]
     let issues: [SimilarityIssue]
     let truncated: Bool
-    let coverage: String
+    var coverage: String
     var elapsedSeconds: Double
     var files: [SimilarityFile]? = nil
     var runId: String? = nil
@@ -212,6 +213,10 @@ struct SimilarityScanProgress: Codable {
     var operation = ""
     var bytesRead: UInt64 = 0
     var bytesHashed: UInt64 = 0
+    // Optional additions keep snapshots from older installed versions readable.
+    var originalBytesRead: UInt64? = nil
+    var hashingFiles: UInt64? = nil
+    var waitingReadFiles: UInt64? = nil
     var pairsCompared: UInt64 = 0
     var scoresRetained: UInt64 = 0
     var vectorsEncoded: UInt64 = 0
@@ -312,7 +317,7 @@ struct SimilarityScanProgress: Codable {
     var queuedFiles: UInt64 { foundFiles > completed + activeFiles + waitingReuseFiles ? foundFiles - completed - activeFiles - waitingReuseFiles : 0 }
     var phaseSummary: String {
         if encodingFiles > 0 { return "\(encodingFiles.formatted()) files analysing · \(readingFiles.formatted()) reading · \(fetchingFiles.formatted()) fetching" }
-        if readingFiles > 0 { return "Reading and hashing \(readingFiles.formatted()) files" }
+        if readingFiles > 0 { return "Reading \(readingFiles.formatted()) files into RAM" }
         if fetchingFiles > 0 { return "Fetching \(fetchingFiles.formatted()) originals from the drive" }
         if readyFiles > 0 { return "\(readyFiles.formatted()) files ready for analysis" }
         if resolvingFiles > 0 { return "Connecting to \(resolvingFiles.formatted()) originals" }
@@ -325,6 +330,7 @@ struct SimilarityScanProgress: Codable {
     var waitingSummary: String {
         var parts: [String] = []
         if resolvingFiles > 0 { parts.append("\(resolvingFiles.formatted()) connecting") }
+        if let count = waitingReadFiles, count > 0 { parts.append("\(count.formatted()) waiting to read") }
         if waitingDownloadFiles > 0 { parts.append("\(waitingDownloadFiles.formatted()) waiting to download") }
         if retryingDownloadFiles > 0 { parts.append("\(retryingDownloadFiles.formatted()) retrying download") }
         if waitingMemoryFiles > 0 { parts.append("\(waitingMemoryFiles.formatted()) waiting for memory") }
@@ -334,7 +340,12 @@ struct SimilarityScanProgress: Codable {
         return parts.joined(separator: " · ")
     }
     var displayTitle: String {
-        stage == .analysing && !discoveryComplete ? "Finding and analysing files" : stage.title
+        if stage == .analysing {
+            if !discoveryComplete { return "Finding and analysing files" }
+            if encodingFiles == 0 && readingFiles > 0 { return "Reading files into RAM" }
+            if let hashingFiles, hashingFiles > 0 && hashingFiles == encodingFiles { return "Hashing file content" }
+        }
+        return stage.title
     }
 
     init() {}
@@ -394,7 +405,10 @@ struct SimilarityScanProgress: Codable {
             hasWorkPhases = true
             fetchingFiles = (work["fetching"] as? NSNumber)?.uint64Value ?? 0
             readingFiles = (work["reading"] as? NSNumber)?.uint64Value ?? 0
-            encodingFiles = (work["encoding"] as? NSNumber)?.uint64Value ?? 0
+            hashingFiles = (work["hashing"] as? NSNumber)?.uint64Value
+            encodingFiles = Self.cumulative((work["encoding"] as? NSNumber)?.uint64Value ?? 0, hashingFiles ?? 0)
+            originalBytesRead = (work["original_bytes_read"] as? NSNumber)?.uint64Value
+            waitingReadFiles = (work["waiting_read"] as? NSNumber)?.uint64Value
             acceleratorActive = (work["accelerator_active"] as? NSNumber)?.uint64Value ?? 0
             acceleratorLimit = (work["accelerator_limit"] as? NSNumber)?.uint64Value ?? 0
             waitingAcceleratorFiles = (work["waiting_accelerator"] as? NSNumber)?.uint64Value ?? 0
@@ -488,8 +502,9 @@ final class SimilarityScanModel: ObservableObject {
     func configurePhotosPreviews(supported: Bool, enabled: Bool) {
         photosPreviewsSupported = supported; photosUsePreviews = enabled
     }
-    @Published private(set) var isRunning = false { didSet { if oldValue != isRunning { onRunningChanged() } } }
+    @Published private(set) var isRunning = false { didSet { if oldValue != isRunning { recordProcessingSpeed(); onRunningChanged() } } }
     @Published private(set) var isCancelling = false
+    @Published private(set) var isFinishing = false
     @Published private(set) var isPaused = false
     @Published private(set) var isPausing = false
     @Published private(set) var interrupted = false
@@ -509,6 +524,11 @@ final class SimilarityScanModel: ObservableObject {
     @Published private(set) var detail = ""
     @Published private(set) var fraction: Double?
     @Published private(set) var progress = SimilarityScanProgress()
+    @Published private(set) var processingSpeed = DownloadSpeedSnapshot()
+    private var processingHistory = SimilarityProcessingHistory()
+    @Published private(set) var readSpeed: Double = 0
+    private var readHistory = SimilarityReadHistory()
+    private var processingSpeedTask: Task<Void, Never>?
     @Published private(set) var startedAt: Date?
     @Published private var scanClock = SimilarityScanClock()
     private var lastClockSave = Date.distantPast
@@ -529,6 +549,9 @@ final class SimilarityScanModel: ObservableObject {
     var resolveExternalSource: ((String, URL, @escaping CloudDriveProgressHandler) async throws -> URL)?
     var resolveExternalMemorySource: ((String, URL, UInt64, @escaping CloudDriveProgressHandler) async throws -> URL)?
     var cleanupExternalScope: () -> Void = {}
+    // Detach a specific run's directory now; remove it only after its provider
+    // writers stop. A later Resume must never have its directory removed.
+    var takeExternalScopeCleanup: (() -> (() -> Void)?)?
     var transformExternalReport: ((SimilarityReport) -> SimilarityReport)?
     private var preparationTask: Task<Void, Never>?
     private var externalSources: [SimilarityExternalSource] = []
@@ -567,6 +590,26 @@ final class SimilarityScanModel: ObservableObject {
 
     init(source: SimilaritySource, activity: FinderTaskActivityStore) { self.source = source; self.activity = activity }
     func elapsedSeconds(at date: Date) -> TimeInterval { scanClock.elapsed(at: date) }
+
+    private func recordProcessingSpeed() {
+        let active = isRunning && !isPausing && !isCancelling
+        let now = Date()
+        if readHistory.observe(progress, running: active, restoring: isRestoringProgress, at: now) {
+            readSpeed = readHistory.bytesPerSecond
+        }
+        if processingHistory.observe(progress, running: active, restoring: isRestoringProgress, at: now) {
+            processingSpeed = processingHistory.snapshot(for: progress)
+        }
+        if active, processingSpeedTask == nil {
+            processingSpeedTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
+                    guard let self else { return }
+                    self.recordProcessingSpeed()
+                }
+            }
+        } else if !active { processingSpeedTask?.cancel(); processingSpeedTask = nil }
+    }
 
     /// An interruption the user did not ask for recovers on its own. Deliberate
     /// pauses, cancellation and shutdown leave `interrupted` false and never
@@ -658,6 +701,7 @@ final class SimilarityScanModel: ObservableObject {
 
     func start(_ configuration: SimilarityConfiguration, resuming session: SimilaritySavedSession? = nil) {
         guard !isRunning, session != nil || canStart else { return }
+        let resumesCurrentSession = session != nil && session?.id == savedSession?.id
         if var session, session.id == savedSession?.id, let child = process, child.isRunning {
             guard let previous = resultConfiguration, SimilaritySessionStore.sameAccount(previous, configuration) else {
                 error = "Switch back to the account that started this scan, then resume."; return
@@ -699,6 +743,10 @@ final class SimilarityScanModel: ObservableObject {
         helperRestoresReport = false; liveFoundFiles = 0; liveDiscoveryComplete = false
         isRestoringProgress = runProgressBaseline != nil
         progress = runProgressBaseline?.afterHelperRestart() ?? SimilarityScanProgress()
+        if !resumesCurrentSession { processingHistory = SimilarityProcessingHistory() }
+        processingHistory.restart(progress, at: Date())
+        processingSpeed = processingHistory.snapshot(for: progress)
+        readHistory = SimilarityReadHistory(); readSpeed = 0
         resultConfiguration = configuration; results.reset()
         runResources = session?.resources ?? SimilarityResourceSettings.current.limits
         // Older checkpoints retain their RAM amounts, but no longer impose a
@@ -707,7 +755,8 @@ final class SimilarityScanModel: ObservableObject {
         // Resource amounts may change on Resume; the encoding backend is
         // pinned by the original checkpoint to keep cached vectors compatible.
         if let session { runResources?.acceleration = session.resources.acceleration ?? .cpu }
-        cancelRequested=false; processingLabel=""; processingBackend=nil
+        generation = UUID()
+        cancelRequested=false; isFinishing=false; processingLabel=""; processingBackend=nil
         isPaused=false; isPausing=false; interrupted=false; waitingForNetwork=false; pauseReason=nil; preserveOnClose=false
         // The countdown is over; the attempt count stays until this run proves
         // itself by finishing work, so a crash loop still reaches its limit.
@@ -722,6 +771,7 @@ final class SimilarityScanModel: ObservableObject {
             saved.progress = progress
             do {
                 try SimilaritySessionStore.save(saved,configuration:configuration)
+                try SimilaritySessionStore.removeFinish(configuration,id:saved.id)
                 try SimilaritySessionStore.removePause(configuration,id:saved.id)
                 SimilaritySessionStore.claim(configuration,id:saved.id); savedSession=saved
                 recoverableSessions.removeAll { $0.id == saved.id }
@@ -736,10 +786,12 @@ final class SimilarityScanModel: ObservableObject {
             message = "Finding \(externalTitle ?? "drive") files…"; detail = scopeLabel
             if runProgressBaseline == nil { progress = SimilarityScanProgress() }
             activity.begin(source.taskKind, scope: scopeLabel, message: message)
+            let preparationID = generation
             preparationTask = Task { [weak self] in
                 guard let self else { return }
                 do {
                     let sources = try await inventoryExternalSources()
+                    guard self.generation == preparationID else { return }
                     try Task.checkCancellation()
                     guard !sources.isEmpty else {
                         self.preparationTask = nil
@@ -754,6 +806,7 @@ final class SimilarityScanModel: ObservableObject {
                     self.externalSourceIDs = Set(sources.map(\.id))
                     self.preparationTask = nil; self.launch(configuration)
                 } catch {
+                    guard self.generation == preparationID else { return }
                     self.isCancelling = self.isCancelling || (error is CancellationError && !self.isPausing)
                     self.preparationTask = nil; self.finish(nil, diagnostic: error.localizedDescription, exitCode: 1)
                 }
@@ -765,22 +818,27 @@ final class SimilarityScanModel: ObservableObject {
         message = "Preparing \(externalTitle ?? "drive") files…"; detail = scopeLabel
         progress = SimilarityScanProgress(event: ["stage":"downloading"])
         activity.begin(source.taskKind, scope: scopeLabel, message: message)
+        let preparationID = generation
         preparationTask = Task { [weak self] in
             guard let self else { return }
             do {
                 let urls = try await prepareExternalScope()
+                guard self.generation == preparationID else { return }
                 try Task.checkCancellation()
                 guard !urls.isEmpty else { throw CloudDriveError.message("No readable files were found in this scope.") }
                 self.localURLs = urls
                 if self.externalDuplicatesOnly {
+                    // Apple Photos hashes temporary exports, whose paths mean nothing the next time.
                     let report = try await NativeDriveDuplicates.scan(urls) { [weak self] event in
                         Task { @MainActor in
                             guard let self, self.isRunning, !self.isCancelling else { return }; self.receive(event)
                         }
                     }
+                    guard self.generation == preparationID else { return }
                     self.preparationTask = nil; self.finish(report, diagnostic: "", exitCode: 0)
                 } else { self.preparationTask = nil; self.launch(configuration) }
             } catch {
+                guard self.generation == preparationID else { return }
                 self.isCancelling = self.isCancelling || (error is CancellationError && !self.isPausing)
                 self.preparationTask = nil
                 self.finish(nil, diagnostic: error.localizedDescription, exitCode: 1)
@@ -852,16 +910,7 @@ final class SimilarityScanModel: ObservableObject {
                 reader.finish(reportURL: reportURL) { report, diagnostic in
                     Task { @MainActor in
                         guard let self, self.generation == runID else { return }
-                        let inventory = self.inventoryTask
-                        inventory?.cancel()
-                        let pending = Array(self.sourceTasks.values)
-                        pending.forEach { $0.cancel() }
-                        // Let provider writers stop before final directory
-                        // cleanup, including when the helper exits unexpectedly.
-                        for task in pending { await task.value }
-                        await inventory?.value
-                        await Task.detached(priority: .utility) { try? FileManager.default.removeItem(at: directory) }.value
-                        self.finish(report, diagnostic: diagnostic, exitCode: child.terminationStatus)
+                        self.finish(report, diagnostic: diagnostic, exitCode: child.terminationStatus, temporaryDirectory: directory)
                     }
                 }
             }
@@ -945,8 +994,8 @@ final class SimilarityScanModel: ObservableObject {
     }
 
     private func receive(_ event: [String: Any], preparing: Bool = false) {
-        defer { checkpointProgress(force: event["event"] as? String == "pause_state") }
-        if event["event"] as? String == "refresh_inventory" { refreshInventory(event); return }
+        defer { checkpointProgress(force: event["event"] as? String == "pause_state"); recordProcessingSpeed() }
+        if event["event"] as? String == "refresh_inventory" { if !isFinishing { refreshInventory(event) }; return }
         if event["event"] as? String == "inventory_check" {
             isRestoringProgress = false
             progress = progress.afterHelperRestart(); progress.stage = .checking
@@ -1050,12 +1099,13 @@ final class SimilarityScanModel: ObservableObject {
         updateProgressStatus()
     }
     func recordDiscovery(found: Int, complete: Bool = false) {
-        guard isRunning, !isCancelling else { return }
+        guard isRunning, !isCancelling, !isFinishing else { return }
         receive(["event":"discovery", "found":found, "complete":complete])
     }
     private func updateProgressStatus() {
         guard !isPaused, !isPausing else { return }
-        message = isRestoringProgress ? "Restoring saved progress…" : progress.displayTitle + "…"
+        message = isFinishing ? (progress.stage == .comparison || progress.stage == .finishing ? "Preparing report…" : "Finishing current analysis…")
+            : isRestoringProgress ? "Restoring saved progress…" : progress.displayTitle + "…"
         fraction = progress.fraction
         detail = progress.completedLabel
         if let name = progress.currentName { detail += " · \(name)" }
@@ -1064,6 +1114,7 @@ final class SimilarityScanModel: ObservableObject {
     }
 
     private func resolveSource(_ event: [String: Any]) {
+        guard !isFinishing else { return }
         guard let resolver = resolveExternalSource, let root = sourceRequestRoot,
               let request = SimilaritySourceRequest(event: event, root: root, allowedIDs: externalSourceIDs) else {
             error = "The drive received an invalid file request. Please restart the scan."
@@ -1133,7 +1184,29 @@ final class SimilarityScanModel: ObservableObject {
         }
     }
 
-    private func finish(_ result: SimilarityReport?, diagnostic: String, exitCode: Int32) {
+    private func retireProviders(temporaryDirectory: URL?) {
+        let pending = Array(sourceTasks.values)
+        let inventory = inventoryTask, preparation = preparationTask
+        pending.forEach { $0.cancel() }; inventory?.cancel(); preparation?.cancel()
+        sourceTasks = [:]; inventoryTask = nil; preparationTask = nil
+        let cleanup = takeExternalScopeCleanup?()
+        let heldScopes = scopes; scopes = []
+        generation = UUID(); inventoryGeneration = UUID()
+        Task {
+            for task in pending { await task.value }
+            await inventory?.value; await preparation?.value
+            await Task.detached(priority: .utility) {
+                if let temporaryDirectory { try? FileManager.default.removeItem(at: temporaryDirectory) }
+                cleanup?()
+                heldScopes.forEach { $0.stopAccessingSecurityScopedResource() }
+            }.value
+        }
+    }
+
+    private func finish(_ result: SimilarityReport?, diagnostic: String, exitCode: Int32, temporaryDirectory: URL? = nil) {
+        retireProviders(temporaryDirectory: temporaryDirectory)
+        let finishedEarly = isFinishing || result?.status == "finished"
+        isFinishing = false
         scanClock.pause(at: Date())
         if let result {
             let base = runProgressBaseline?.downloadedBytes ?? 0
@@ -1143,25 +1216,34 @@ final class SimilarityScanModel: ObservableObject {
         inventoryTask?.cancel(); inventoryTask = nil
         sourceTasks.values.forEach { $0.cancel() }; sourceTasks = [:]; sourceRequestRoot = nil; providerProgress = SimilarityProviderProgress()
         externalSources = []; externalSourceIDs = []
-        let cancelled = isCancelling || result?.status == "cancelled"
-        if savedSession != nil && !resetWhenFinished && (isCancelling || isPausing || exitCode != 0 || result == nil || result?.status == "paused" || result?.status == "cancelled") {
+        let cancelled = cancelRequested || isCancelling || result?.status == "cancelled"
+        if savedSession != nil && !resetWhenFinished && !cancelRequested && !finishedEarly && (isCancelling || isPausing || exitCode != 0 || result == nil || result?.status == "paused" || result?.status == "cancelled") {
             scopes.forEach { $0.stopAccessingSecurityScopedResource() }; scopes=[]
             process=nil; isRunning=false; isPaused=true; interrupted = !isPausing || pauseReason != nil
             isPausing=false; isCancelling=false; waitingForNetwork=false; fraction=nil; cleanupExternalScope()
-            message=cancelRequested ? "Scan cancelled · progress saved" : pauseReason ?? (interrupted ? "Scan interrupted — ready to resume" : "Scan paused")
+            message=pauseReason ?? (interrupted ? "Scan interrupted — ready to resume" : "Scan paused")
             let reported = FileSearchIndex.withoutStatusNotes(diagnostic)
             if interrupted && !reported.isEmpty { error=String(FileSearchIndex.redacted(reported).prefix(2_000)) }
             detail="Completed files and comparisons are saved. Unfinished originals will be fetched again."
-            savedSession?.state = cancelRequested ? "cancelled" : interrupted ? "interrupted" : "paused"; savedSession?.updatedAt=Date()
+            savedSession?.state = interrupted ? "interrupted" : "paused"; savedSession?.updatedAt=Date()
             savedSession?.activeElapsedSeconds = scanClock.elapsed(at: Date())
             savedSession?.progress = progress
-            if let savedSession, let configuration=resultConfiguration { try? SimilaritySessionStore.save(savedSession,configuration:configuration) }
+            if let savedSession, let configuration=resultConfiguration {
+                // Shutdown can produce a partial report while preserving the
+                // pause. Keep it for review if the user later cancels recovery.
+                if var result {
+                    result.elapsedSeconds = scanClock.elapsed(at: Date())
+                    result.downloadedBytes = progress.downloadedBytes
+                    try? SimilaritySessionStore.saveReport(result,configuration:configuration,id:savedSession.id)
+                }
+                try? SimilaritySessionStore.save(savedSession,configuration:configuration)
+            }
             progress = progress.afterHelperRestart()
-            activity.finish(source.taskKind,state:cancelRequested ? .cancelled : .paused,message:message,detail:detail)
+            activity.finish(source.taskKind,state:.paused,message:message,detail:detail)
             if interrupted { scheduleAutoResume() } else { cancelAutoResume() }
             return
         }
-        isPaused=false; isPausing=false; waitingForNetwork=false
+        isPaused=false; isPausing=false; interrupted=false; waitingForNetwork=false; pauseReason=nil
         // The scan reached a real ending: results, a hard failure or a clear.
         cancelAutoResume(resettingAttempts: true)
         if resetWhenFinished {
@@ -1179,7 +1261,21 @@ final class SimilarityScanModel: ObservableObject {
         }
         scopes.forEach { $0.stopAccessingSecurityScopedResource() }; scopes = []
         process = nil; isRunning = false; isCancelling = false; fraction = nil
-        report = result.map { transformExternalReport?($0) ?? $0 }
+        var finalReport = result ?? ((cancelled || finishedEarly) ? cancelledReport() : nil)
+        if finishedEarly {
+            finalReport?.status = "finished"
+            if !(finalReport?.coverage.contains("Finished early") ?? false) {
+                finalReport?.coverage = "Finished early at your request. Resume Scan continues the remaining files. " + (result?.coverage ?? "No files were analysed before finishing.")
+            }
+        } else if cancelled {
+            finalReport?.status = "cancelled"
+            let notice = "The scan was cancelled; these results are incomplete."
+            let coverage = finalReport?.coverage ?? ""
+            if !coverage.contains(notice) {
+                finalReport?.coverage = notice + " " + coverage
+            }
+        }
+        report = finalReport.map { transformExternalReport?($0) ?? $0 }
         report?.elapsedSeconds = scanClock.elapsed(at: Date())
         report?.downloadedBytes = progress.downloadedBytes
         if let report {
@@ -1199,9 +1295,9 @@ final class SimilarityScanModel: ObservableObject {
         }
         if let report { results.load(report, configuration: resultConfiguration, allowsSizeBasedCleanup: !usesPhotosPreviews) }
         cleanupExternalScope()
-        if let result = report, exitCode == 0 {
-            let state: FinderTaskActivity.State = cancelled ? .cancelled : result.status == "failed" ? .failed : result.status == "partial" ? .partial : .completed
-            message = cancelled ? "Scan cancelled" : state == .failed ? "Scan could not finish" : "\(result.analysedFiles.formatted()) files ready to review"
+        if let result = report, exitCode == 0 || cancelled || finishedEarly {
+            let state: FinderTaskActivity.State = cancelled ? .cancelled : result.status == "failed" ? .failed : ["partial", "finished"].contains(result.status) ? .partial : .completed
+            message = finishedEarly ? "Scan finished early · \(result.analysedFiles.formatted()) files ready to review" : cancelled ? "Scan cancelled · \(result.analysedFiles.formatted()) files ready to review" : state == .failed ? "Scan could not finish" : "\(result.analysedFiles.formatted()) files ready to review"
             if state == .failed { error = result.issues.first?.reason ?? "The selected scope could not be scanned. Check access and try again." }
             detail = "\(result.analysedFiles.formatted()) analysed · \(result.skippedFiles.formatted()) skipped"
             activity.finish(source.taskKind, state: state, message: "\(source.title): \(message)", detail: detail)
@@ -1213,36 +1309,67 @@ final class SimilarityScanModel: ObservableObject {
         }
     }
 
+    /// Cancellation before the helper starts still opens a report. If a
+    /// stopped helper could not publish its inventory, report the known counts
+    /// and say explicitly that file details are unavailable.
+    private func cancelledReport() -> SimilarityReport {
+        if let savedSession, let configuration=resultConfiguration,
+           let archived=SimilaritySessionStore.loadReport(configuration,id:savedSession.id) { return archived }
+        return .init(source:source,scope:[savedSession?.scope ?? scopeLabel],status:"cancelled",threshold:threshold,
+            scannedFiles:max(progress.foundFiles,SimilarityScanProgress.cumulative(progress.analysed,progress.skipped)),
+            analysedFiles:progress.analysed,skippedFiles:progress.skipped,downloadedBytes:progress.downloadedBytes,
+            totalGroups:0,groups:[],issues:[],truncated:false,
+            coverage:progress.analysed == 0 ? "No files were analysed before cancellation."
+                : "The scan engine stopped before it could publish file details. Resume to recover the saved analysis.",
+            elapsedSeconds:scanClock.elapsed(at:Date()),files:[],
+            unsupportedFiles:progress.unsupportedFiles,failedFiles:progress.failedFiles)
+    }
+
+    var canFinish: Bool { !externalDuplicatesOnly && !isFinishing && !isCancelling && (isRunning || isPaused) }
+    var canResumeReport: Bool { savedSession != nil && ["finished", "cancelled"].contains(report?.status ?? "") }
+
+    func finishScan() {
+        guard canFinish else { return }
+        cancelAutoResume(resettingAttempts: true)
+        guard var saved = savedSession, let configuration = resultConfiguration else { return }
+        saved.state = "finished"; saved.updatedAt = Date(); saved.progress = progress
+        saved.activeElapsedSeconds = scanClock.elapsed(at: saved.updatedAt)
+        do { try SimilaritySessionStore.finish(saved, configuration: configuration) }
+        catch { self.error = "Could not save the finish request. Check available storage and try again."; return }
+        savedSession = saved; isFinishing = true; isPaused = false; isPausing = false; isRunning = true
+        interrupted = false; waitingForNetwork = false; pauseReason = nil; error = nil
+        scanClock.resume(at: Date())
+        message = "Finishing current analysis and preparing report…"
+        detail = "No more files will start analysis. You can resume from the report."
+        activity.stopping(source.taskKind, message: message)
+        inventoryTask?.cancel(); sourceTasks.values.forEach { $0.cancel() }
+        if process == nil { finish(nil, diagnostic: "", exitCode: 0) }
+    }
+
     func cancel() {
         cancelAutoResume(resettingAttempts: true)
-        if savedSession != nil && !resetWhenFinished {
-            cancelRequested=true
-            if isRunning { pause(); return }
-            if isPaused {
-                savedSession?.state="cancelled"; savedSession?.updatedAt=Date()
-                if let savedSession, let configuration=resultConfiguration { try? SimilaritySessionStore.save(savedSession,configuration:configuration) }
-                message="Scan cancelled · progress saved"; detail="Resume when ready, or use Clear to remove this scan."
-                activity.finish(source.taskKind,state:.cancelled,message:message,detail:detail)
-            }
-            return
-        }
-        if isPaused && process?.isRunning != true {
-            isPaused=false; interrupted=false; message="Scan cancelled"; detail=""; error=nil
-            activity.finish(source.taskKind,state:.cancelled,message:message); return
-        }
+        guard !isCancelling, isRunning || isPaused || process != nil else { return }
+        cancelRequested = !resetWhenFinished
+        isCancelling=true; isPausing=false; isPaused=false; isRunning=true
+        interrupted=false; waitingForNetwork=false; pauseReason=nil; error=nil
+        recordProcessingSpeed()
+        // A pause marker would make the helper return a paused report. Cancel
+        // ends the helper and publishes its partial inventory and comparisons.
+        if let savedSession, let configuration=resultConfiguration { try? SimilaritySessionStore.removePause(configuration,id:savedSession.id) }
+        message = resetWhenFinished ? "Stopping and removing temporary copies…" : "Stopping scan and preparing report…"
+        activity.stopping(source.taskKind, message: message)
         inventoryTask?.cancel()
         sourceTasks.values.forEach { $0.cancel() }
-        if let preparationTask {
-            isCancelling = true; message = "Stopping scan…"
-            activity.stopping(source.taskKind, message: message)
-            preparationTask.cancel(); return
+        if preparationTask != nil {
+            finish(nil, diagnostic: "", exitCode: 0); return
         }
-        guard let child = process, child.isRunning, !isCancelling else { return }
-        isCancelling = true; message = "Stopping and removing temporary copies…"
-        activity.stopping(source.taskKind, message: message)
+        guard let child=process else { finish(nil,diagnostic:"",exitCode:0); return }
+        // An exited child may still be draining its report; let its existing
+        // termination handler finish instead of replacing it with an empty one.
+        guard child.isRunning else { return }
         child.terminate()
         // A crashed decoder must not keep the operation active indefinitely.
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 15) {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) {
             if child.isRunning { kill(child.processIdentifier, SIGKILL) }
         }
     }
@@ -1258,18 +1385,21 @@ final class SimilarityScanModel: ObservableObject {
             localURLs = []; cloudRoots = []; externalScopeNames = []
         } else {
             if let savedSession, let configuration=resultConfiguration { SimilaritySessionStore.discard(configuration,id:savedSession.id) }
-            savedSession=nil; isPaused=false; resetIdleState()
+            savedSession=nil; isPaused=false; isFinishing=false; resetIdleState()
             activity.dismiss(source.taskKind)
         }
     }
 
     private func resetIdleState() {
         cancelAutoResume(resettingAttempts: true)
-        processingLabel=""; processingBackend=nil; cancelRequested=false
+        processingLabel=""; processingBackend=nil; cancelRequested=false; isFinishing=false
         nativeScope = nil; waitingForNetwork = false; isPausing = false; pauseReason = nil
         results.reset(); resultConfiguration = nil
         report = nil; error = nil; message = "Ready to scan"; detail = ""
         fraction = nil; progress = SimilarityScanProgress(); startedAt = nil; runResources = nil
+        processingSpeedTask?.cancel(); processingSpeedTask = nil
+        processingHistory = SimilarityProcessingHistory(); processingSpeed = DownloadSpeedSnapshot()
+        readHistory = SimilarityReadHistory(); readSpeed = 0
         scanClock = SimilarityScanClock()
         runProgressBaseline = nil; helperRestoresReport = false; isRestoringProgress = false
         liveFoundFiles = 0; liveDiscoveryComplete = false
@@ -1279,12 +1409,12 @@ final class SimilarityScanModel: ObservableObject {
         inventoryExternalSources = nil; streamExternalSources = nil; resolveExternalSource = nil; resolveExternalMemorySource = nil; externalSources = []
         externalSourceIDs = []
         sourceTasks.values.forEach { $0.cancel() }; sourceTasks = [:]; sourceRequestRoot = nil; providerProgress = SimilarityProviderProgress()
-        transformExternalReport = nil; cleanupExternalScope = {}
+        transformExternalReport = nil; cleanupExternalScope = {}; takeExternalScopeCleanup = nil
         onSessionReset()
         sessionID = UUID()
     }
 
-    var canPause: Bool { isRunning && !isCancelling && !isPausing && savedSession != nil }
+    var canPause: Bool { isRunning && !isFinishing && !isCancelling && !isPausing && savedSession != nil }
     func updatePausedResources(_ settings: SimilarityResourceSettings, sessionID: String) throws {
         guard !isRunning, isPaused, var saved = savedSession, saved.id == sessionID,
               let configuration = resultConfiguration else {
@@ -1317,6 +1447,7 @@ final class SimilarityScanModel: ObservableObject {
         catch { self.error="Could not save the pause point. Check available storage and try again."; return }
         scanClock = pausedClock
         savedSession=saved; isPausing=true; pauseReason=reason; message="Pausing · keeping downloads in RAM…"
+        recordProcessingSpeed()
         activity.stopping(source.taskKind,message:message)
         // The marker pauses the helper cooperatively. Keep provider tasks,
         // security scopes, FIFO writers and all original buffers alive.
@@ -1340,7 +1471,7 @@ final class SimilarityScanModel: ObservableObject {
     func detachPausedForRecovery() {
         guard !isRunning else { return }
         guard process?.isRunning != true else {
-            error = "This scan is retaining downloads in RAM. Use File → New Window to start another scan, or Clear to discard this one."; return
+            error = "This scan is retaining downloads in RAM. Use File → New Window to start another scan, or Delete Scan to discard this one."; return
         }
         if let savedSession, let configuration=resultConfiguration { SimilaritySessionStore.release(configuration,id:savedSession.id) }
         self.savedSession=nil; isPaused=false; preserveOnClose=false; resetIdleState()
@@ -1361,7 +1492,7 @@ final class SimilarityScanModel: ObservableObject {
         savedSession=saved; resultConfiguration=configuration; localURLs=saved.localURLs; cloudRoots=saved.cloudRoots
         nativeScope=saved.nativeScope; threshold=saved.threshold; exactDuplicates=saved.exactDuplicates; families=saved.families
         photosUsePreviews = saved.nativeScope?.photosUsePreviews ?? false
-        isPaused=false; isPausing=false; interrupted=false; cancelRequested=false; error=nil
+        isPaused=false; isPausing=false; isFinishing=false; isCancelling=false; interrupted=false; cancelRequested=false; error=nil
         cancelAutoResume(resettingAttempts: true)
         self.report=report; runResources=saved.resources; startedAt=saved.startedAt
         progress = saved.progress?.afterHelperRestart() ?? SimilarityScanProgress()
@@ -1369,7 +1500,7 @@ final class SimilarityScanModel: ObservableObject {
         results.load(report,configuration:configuration,allowsSizeBasedCleanup:!usesPhotosPreviews); message="\(report.analysedFiles.formatted()) files ready to review"
         SimilaritySessionStore.claim(configuration,id:saved.id); recoverableSessions.removeAll { $0.id == saved.id }
         activity.begin(source.taskKind,scope:saved.scope,message:message)
-        let state: FinderTaskActivity.State = report.status == "failed" ? .failed : report.status == "partial" ? .partial : .completed
+        let state: FinderTaskActivity.State = report.status == "failed" ? .failed : ["partial", "finished"].contains(report.status) ? .partial : .completed
         activity.finish(source.taskKind,state:state,message:message)
     }
 
@@ -1434,6 +1565,8 @@ final class SimilarityScanModel: ObservableObject {
         if paused { scanClock.pause(at: Date()) } else { scanClock.resume(at: Date()) }
         if let work = event["work"] as? [String: Any], let workers = work["worker_limit"] as? NSNumber, let memory = work["memory_limit"] as? NSNumber {
             runResources = SimilarityResourceLimits(workers: workers.intValue, memoryBytes: memory.uint64Value, batchFiles: 128, batchBytes: 4 * 1_024 * 1_024 * 1_024)
+            runResources?.downloadMemoryBytes = (work["original_memory_limit"] as? NSNumber)?.uint64Value
+            runResources?.memoryScheduling = work["memory_scheduling"] as? Bool ?? false
         }
         activity.begin(source.taskKind, scope: scopeLabel, message: "Starting scan")
         receive(event)
@@ -1627,12 +1760,12 @@ final class FileSimilarityCoordinator: NSObject, ObservableObject, NSWindowDeleg
             if model.savedSession != nil, let previous=model.resultConfiguration, !SimilaritySessionStore.sameAccount(previous,config) {
                 throw CloudDriveError.message("Switch back to the account that started this scan, then resume.")
             }
+            if (["completed","partial","failed"].contains(saved.state) || (session != nil && saved.state == "finished")), SimilaritySessionStore.loadReport(config,id:saved.id) != nil {
+                model.openSaved(saved,configuration:config); return
+            }
             if !model.retainsOriginalsInRAM, let scope=saved.nativeScope {
                 guard let restoreNativeScope else { throw CloudDriveError.message("Reconnect this drive before resuming.") }
                 try restoreNativeScope(scope)
-            }
-            if ["completed","partial","failed"].contains(saved.state), SimilaritySessionStore.loadReport(config,id:saved.id) != nil {
-                model.openSaved(saved,configuration:config); return
             }
             model.start(config,resuming:saved)
         } catch {

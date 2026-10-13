@@ -8,10 +8,14 @@ enum TorrentPortMapState: Equatable {
     /// No default gateway, or the gateway never answered on the NAT-PMP port.
     case unsupported
     case failed(String)
-    case mapped(tcp: UInt16, address: String?)
+    case mapped(tcp: UInt16?, udp: UInt16? = nil, address: String?, lease: UInt32? = nil)
 
-    var externalAddress: String? { if case .mapped(_, let address) = self { return address }; return nil }
-    var isMapped: Bool { if case .mapped = self { return true }; return false }
+    var externalAddress: String? { if case .mapped(_, _, let address, _) = self { return address }; return nil }
+    var tcpPort: UInt16? { if case .mapped(let port, _, _, _) = self { return port }; return nil }
+    var udpPort: UInt16? { if case .mapped(_, let port, _, _) = self { return port }; return nil }
+    var leaseSeconds: UInt32? { if case .mapped(_, _, _, let lease) = self { return lease }; return nil }
+    /// A UDP-only mapping does not establish the TCP listening port.
+    var isMapped: Bool { tcpPort != nil }
 }
 
 /// The IPv4 default gateway, read from the kernel routing table.
@@ -81,93 +85,138 @@ actor TorrentPortMapper {
     private var upnp: TorrentUPnP.Gateway?
     private var upnpPorts: [(port: UInt16, proto: String)] = []
 
-    init(gateway: String? = nil) { gatewayOverride = gateway }
+    struct UPnPOperations: Sendable {
+        var discover: @Sendable () async -> TorrentUPnP.Gateway?
+        var localAddress: @Sendable (String) -> String?
+        var add: @Sendable (TorrentUPnP.Gateway, UInt16, String, String, UInt32) async -> UInt32?
+        var remove: @Sendable (TorrentUPnP.Gateway, UInt16, String) async -> Void
+        var address: @Sendable (TorrentUPnP.Gateway) async -> String?
+        static let live = Self(discover: { await TorrentUPnP.gateway() },
+            localAddress: { TorrentUPnP.localAddress(towards: $0) },
+            add: { await TorrentUPnP.mappingLease($0, port: $1, proto: $2, client: $3, lease: $4) },
+            remove: { await TorrentUPnP.deleteMapping($0, port: $1, proto: $2) },
+            address: { await TorrentUPnP.externalAddress(of: $0) })
+    }
+    private let operations: UPnPOperations
+    private let upnpOnly: Bool
+    private var generation = UUID()
 
-    /// Map the BitTorrent TCP listen port and the DHT UDP port, then keep them alive.
+    init(gateway: String? = nil, upnpOperations: UPnPOperations? = nil) {
+        gatewayOverride = gateway; operations = upnpOperations ?? .live
+        upnpOnly = upnpOperations != nil
+    }
+
+    /// New work waits for prior requests and cleanup before touching the router.
+    /// In particular, an old permanent mapping cannot outlive Stop or delete a
+    /// mapping that a newer Start has just installed on the same port.
     func start(tcp: UInt16, udp: UInt16) {
-        renewal?.cancel()
+        let token = UUID(); generation = token; state = .idle
+        let previous = renewal; previous?.cancel()
         renewal = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self else { return }
-                let seconds = await self.renew(tcp: tcp, udp: udp)
+            await previous?.value
+            guard let self, await self.isCurrent(token) else { return }
+            await self.clearMappings()
+            while await self.isCurrent(token) {
+                let seconds = await self.renew(tcp: tcp, udp: udp, token: token)
+                guard await self.isCurrent(token) else { return }
                 do { try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)) } catch { return }
             }
         }
     }
 
-    /// Release the mappings. Best effort: the router expires them regardless.
     func stop() async {
-        renewal?.cancel(); renewal = nil
-        if let found = upnp {
-            for mapping in upnpPorts { await TorrentUPnP.deleteMapping(found, port: mapping.port, proto: mapping.proto) }
+        let token = UUID(); generation = token; state = .idle
+        let previous = renewal; previous?.cancel()
+        let cleanup = Task { [weak self] in
+            await previous?.value
+            await self?.clearMappings()
         }
-        upnp = nil; upnpPorts = []
+        renewal = cleanup
+        await cleanup.value
+        if generation == token { renewal = nil; state = .idle }
+    }
+
+    private func isCurrent(_ token: UUID) -> Bool { generation == token && !Task.isCancelled }
+
+    private func clearMappings() async {
+        let found = upnp, ports = upnpPorts, mappings = granted
+        upnp = nil; upnpPorts = []; granted = []
+        if let found {
+            for mapping in ports {
+                let operation = operations.remove
+                // Complete bounded cleanup even if this lifecycle is cancelled.
+                await Task { await operation(found, mapping.port, mapping.proto) }.value
+            }
+        }
         if let gateway = gateway() {
-            for mapping in granted {
+            for mapping in mappings {
                 _ = try? exchange(map: mapping.proto, internalPort: mapping.internalPort,
                                   externalPort: 0, lifetime: 0, gateway: gateway)
             }
         }
-        granted = []; state = .idle
     }
 
     private func gateway() -> String? { gatewayOverride ?? TorrentGateway.defaultIPv4() }
 
-    /// Returns how long to wait before renewing.
-    private func renew(tcp: UInt16, udp: UInt16) async -> Double {
+    private func renew(tcp: UInt16, udp: UInt16, token: UUID) async -> Double {
+        guard isCurrent(token) else { return 60 }
+        if upnpOnly { return await renewViaUPnP(tcp: tcp, udp: udp, token: token) }
         guard let gateway = gateway() else { state = .unsupported; return 600 }
         var results: [(Proto, UInt16, UInt16)] = []
         var lifetimes: [UInt32] = []
+        var failure: String?
         for (proto, port) in [(Proto.tcp, tcp), (Proto.udp, udp)] {
+            guard isCurrent(token) else { return 60 }
             do {
                 let reply = try exchange(map: proto, internalPort: port, externalPort: port,
                                          lifetime: Self.lifetime, gateway: gateway)
-                results.append((proto, port, reply.externalPort))
-                lifetimes.append(reply.lifetime)
+                results.append((proto, port, reply.externalPort)); lifetimes.append(reply.lifetime)
+                granted.removeAll { $0.proto == proto && $0.internalPort == port }
+                granted.append((proto, port, reply.externalPort))
             } catch let error as MapError {
-                granted = []
-                // Silence is not a verdict: most consumer routers ship UPnP and no
-                // NAT-PMP, so ask again in the other protocol before giving up.
-                if error == .silent { return await renewViaUPnP(tcp: tcp, udp: udp) }
-                state = .failed(error.message)
-                return 120
-            } catch {
-                granted = []; state = .failed(error.localizedDescription); return 120
-            }
+                if error == .silent && results.isEmpty {
+                    return await renewViaUPnP(tcp: tcp, udp: udp, token: token)
+                }
+                failure = error.message
+            } catch { failure = error.localizedDescription }
         }
-        granted = results
-        let external = results.first { $0.0 == .tcp }?.2 ?? tcp
-        state = .mapped(tcp: external, address: try? externalAddress(gateway: gateway))
-        let shortest = Double(lifetimes.min() ?? Self.lifetime)
-        return max(60, shortest * Self.renewalFraction)
+        guard isCurrent(token) else { return 60 }
+        guard !results.isEmpty else { state = .failed(failure ?? "The router refused port mapping."); return 120 }
+        let shortest = lifetimes.min() ?? Self.lifetime
+        state = .mapped(tcp: results.first { $0.0 == .tcp }?.2,
+                        udp: results.first { $0.0 == .udp }?.2,
+                        address: try? externalAddress(gateway: gateway), lease: shortest)
+        return max(60, Double(shortest) * Self.renewalFraction)
     }
 
-    /// Maps the same ports over UPnP IGD, for gateways that never answer NAT-PMP.
-    private func renewViaUPnP(tcp: UInt16, udp: UInt16) async -> Double {
+    private func renewViaUPnP(tcp: UInt16, udp: UInt16, token: UUID) async -> Double {
         var discovered = upnp
-        if discovered == nil { discovered = await TorrentUPnP.gateway() }
-        guard let found = discovered else {
-            upnp = nil; upnpPorts = []; state = .unsupported; return 600
-        }
+        if discovered == nil { discovered = await operations.discover() }
+        guard isCurrent(token) else { return 60 }
+        guard let found = discovered else { state = .unsupported; return 600 }
         upnp = found
-        guard let host = found.control.host, let client = TorrentUPnP.localAddress(towards: host) else {
-            state = .unsupported; return 600
-        }
-        var held: [(port: UInt16, proto: String)] = []
+        guard let host = found.control.host, let client = operations.localAddress(host) else { state = .unsupported; return 600 }
+        var held: [(port: UInt16, proto: String, lease: UInt32)] = []
         for (port, proto) in [(tcp, "TCP"), (udp, "UDP")] {
-            if await TorrentUPnP.addMapping(found, port: port, proto: proto, client: client, lease: Self.lifetime) {
-                held.append((port, proto))
+            guard isCurrent(token) else { return 60 }
+            let operation = operations.add
+            // Await the bounded reply even if Stop arrives after the router has
+            // accepted it. Keep its receipt so Stop can remove the actual lease.
+            let lease = await Task { await operation(found, port, proto, client, Self.lifetime) }.value
+            if let lease {
+                held.append((port, proto, lease))
+                if !upnpPorts.contains(where: { $0.port == port && $0.proto == proto }) { upnpPorts.append((port, proto)) }
             }
+            guard isCurrent(token) else { return 60 }
         }
-        upnpPorts = held
-        guard !held.isEmpty else {
-            // The gateway is there and talking, so this is a refusal, not absence.
-            upnp = nil
-            state = .failed("The router refused a UPnP port mapping.")
-            return 120
-        }
-        state = .mapped(tcp: tcp, address: await TorrentUPnP.externalAddress(of: found))
-        return max(60, Double(Self.lifetime) * Self.renewalFraction)
+        guard !held.isEmpty else { state = .failed("The router refused a UPnP port mapping."); return 120 }
+        let address = await operations.address(found)
+        guard isCurrent(token) else { return 60 }
+        let shortest = held.map(\.lease).min() ?? Self.lifetime
+        state = .mapped(tcp: held.first { $0.proto == "TCP" }?.port,
+                        udp: held.first { $0.proto == "UDP" }?.port,
+                        address: address, lease: shortest)
+        return max(60, Double(shortest == 0 ? Self.lifetime : shortest) * Self.renewalFraction)
     }
 
     private func externalAddress(gateway: String) throws -> String? {

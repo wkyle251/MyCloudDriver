@@ -52,16 +52,19 @@ private final class DemoPhotosDrive: NativeCloudDrive, @unchecked Sendable {
     private let photosAccessState = DemoPhotosAccessState()
     private let storageState = DemoICloudStorageState()
     private let preferences: UserDefaults
+    private let fixtureDirectory: URL
     init() {
-        let defaults = UserDefaults(suiteName: "com.wky.MyCloudDriver.DesignFixture.preferences")!
+        let suite = "com.wky.MyCloudDriver.DesignFixture.preferences.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
         preferences = defaults
-        defaults.removePersistentDomain(forName: "com.wky.MyCloudDriver.DesignFixture.preferences")
+        defaults.removePersistentDomain(forName: suite)
         defaults.set(0, forKey: "browserViewMode")
         defaults.set(0, forKey: "selectedTransferMode")
         defaults.set(1.0, forKey: "browserListItemZoom")
         defaults.set(1.0, forKey: "browserThumbnailItemZoom")
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("MyCloudDriverDesignFixture", isDirectory: true)
-        try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let directory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("MyCloudDriverDesignFixture-\(UUID().uuidString)", isDirectory: true)
+        fixtureDirectory = directory
+        try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         let access = photosAccessState
         let storage = storageState
         let hub = CloudDriveHub(pikpak: DownloaderModel.finderWorkspaceFixture(defaults: defaults), defaults: defaults,
@@ -111,6 +114,9 @@ private final class DemoPhotosDrive: NativeCloudDrive, @unchecked Sendable {
         Window("MyCloudDriver · Design Fixture", id: "fixture") {
             WorkspaceSessionRoot(hub: sessions.initialHub, manager: sessions).preferredColorScheme(dark ? .dark : .light)
                 .defaultAppStorage(preferences)
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+                    sessions.closeAll(); try? FileManager.default.removeItem(at: fixtureDirectory)
+                }
                 .onReceive(menuUpdateTimer) { _ in
                     if stressMenuUpdates {
                         menuUpdateTicks += 1
@@ -121,6 +127,7 @@ private final class DemoPhotosDrive: NativeCloudDrive, @unchecked Sendable {
         .commands {
             FinderCommands(settings: sessions.settings, sessions: sessions)
             CommandMenu("Fixture") {
+                Button("Show Fixture Folder") { NSWorkspace.shared.open(fixtureDirectory) }
                 Button("All Drives") { hub.selected = nil }
                 Button("Find Similar Files") { hub.local.findSimilar([]) }
                 Button("Toggle Appearance") { dark.toggle() }.keyboardShortcut("d", modifiers: [.command, .shift])
@@ -139,7 +146,7 @@ private final class DemoPhotosDrive: NativeCloudDrive, @unchecked Sendable {
                 }.keyboardShortcut("]", modifiers: [.command, .shift])
                 Button("Standard Window Size") { NSApp.keyWindow?.setContentSize(.init(width: 1240, height: 820)) }
                 Button("Show PikPak Media Preview") {
-                    let video = FileManager.default.temporaryDirectory.appendingPathComponent("MyCloudDriverDesignFixture/Resize sample.mp4")
+                    let video = fixtureDirectory.appendingPathComponent("Resize sample.mp4")
                     guard FileManager.default.fileExists(atPath: video.path) else { return }
                     hub.pikpak.configureMediaPreviewFixture(videoURL: video)
                     hub.pikpakNavigation.showImmediately(0); hub.open(.pikpak)
@@ -149,7 +156,7 @@ private final class DemoPhotosDrive: NativeCloudDrive, @unchecked Sendable {
                     preferences.set(2_000.0, forKey: "previewCanvasHeight")
                 }
                 Button("Show Second PikPak Video") {
-                    let video = FileManager.default.temporaryDirectory.appendingPathComponent("MyCloudDriverDesignFixture/Second sample.mp4")
+                    let video = fixtureDirectory.appendingPathComponent("Second sample.mp4")
                     guard FileManager.default.fileExists(atPath: video.path) else { return }
                     hub.pikpak.configureMediaPreviewFixture(videoURL: video)
                     hub.pikpakNavigation.showImmediately(0); hub.open(.pikpak)

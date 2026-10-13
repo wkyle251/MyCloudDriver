@@ -18,6 +18,9 @@ with tempfile.TemporaryDirectory(prefix="myclouddriver-archive-tests-") as tempo
     reader.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p,
                        callback_type, ctypes.c_char_p, ctypes.c_size_t]
     reader.restype = ctypes.c_int
+    limited = ctypes.CDLL(str(library)).mcd_archive_extract_limited
+    limited.argtypes = reader.argtypes[:3] + [ctypes.c_uint64, ctypes.c_uint64] + reader.argtypes[3:]
+    limited.restype = ctypes.c_int
 
     def extract(source, destination, password=b"", cancel=False):
         destination.mkdir()
@@ -41,6 +44,14 @@ with tempfile.TemporaryDirectory(prefix="myclouddriver-archive-tests-") as tempo
     assert (work / "normal/Unicode/Garden 🌿.txt").read_bytes() == b"Garden notes"
     assert stat.S_IMODE((work / "normal/Documents/Readme.txt").stat().st_mode) == 0o600
     print("PASS streamed ZIP extraction, progress, Unicode paths and private permissions")
+    for name, budget, entries in [("bytes", 65536, 100), ("entries", len(content) * 2, 1)]:
+        destination = work / ("limit-" + name); destination.mkdir()
+        error = ctypes.create_string_buffer(1024)
+        callback = callback_type(lambda *_: 0)
+        assert limited(bytes(source), bytes(destination), b"", budget, entries, None, callback, error, len(error)) == 4
+        assert b"archive" in error.value.lower()
+        assert not (destination / "Documents/Readme.txt").exists()
+    print("PASS expanded-byte and entry-count limits reject compressed archive amplification before writing the large file")
 
     for index, name in enumerate(["../escape.txt", "/tmp/myclouddriver-escape.txt", "nested/../../escape.txt"]):
         unsafe = work / f"unsafe-{index}.zip"

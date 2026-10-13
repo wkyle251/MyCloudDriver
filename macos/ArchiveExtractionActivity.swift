@@ -138,6 +138,8 @@ private struct ArchiveActivityRow: View {
                         .disabled(model.isRunning)
                 } else if task.isInspecting || task.queuedAction != nil {
                     Button("Cancel") { model.cancelArchiveInspection(task.id) }
+                } else if task.needsNormalLogin, model.canRetryArchiveWithNormalLogin(task) {
+                    Button("Retry with Normal login") { model.retryArchiveWithNormalLogin(task.id) }
                 } else if task.error != nil || !task.isBusy {
                     Button("Retry") { model.retryArchiveTask(task.id) }
                 }
@@ -147,6 +149,12 @@ private struct ArchiveActivityRow: View {
                 Spacer(minLength: 0)
             }
             .font(.caption).buttonStyle(ArchiveActionButtonStyle())
+            if task.needsNormalLogin {
+                Text(model.canRetryArchiveWithNormalLogin(task)
+                    ? "PikPak denied cloud extraction with Token login. Retry this archive using Normal login for the same account."
+                    : "PikPak denied cloud extraction with Token login. Connect Normal login for this account, then retry the archive.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if showsError, let error = task.error {
                 Text(error.displayText).font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary).textSelection(.enabled)

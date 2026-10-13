@@ -48,6 +48,10 @@ final class MediaPreviewKeyView: NSView {
             $0.window === window && $0.hasPreviewFocus && !$0.isHiddenOrHasHiddenAncestor
         }) else { return false }
         switch event.keyCode {
+        case 49:
+            // Keep Space in the preview while its player is preparing, too.
+            // A held key must not alternate between pause and resume.
+            if !event.isARepeat { scope.playback?.togglePlayback() }
         case 123, 124:
             guard let playback = scope.playback else { return false }
             playback.skip(event.keyCode == 123 ? -5 : 5)
@@ -234,7 +238,8 @@ private struct MediaTransportBar: View {
                     playback.seek(to: value)
                 })
                 .frame(height: 18)
-                .help("Drag to seek. The solid section is played; lighter sections are buffered.")
+                .help(playback.bufferHelp.map { "Drag to seek. The solid section is played; lighter sections are held in memory. \($0)" }
+                    ?? "Drag to seek. The solid section is played; lighter sections are buffered.")
 
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 16) {
@@ -255,10 +260,10 @@ private struct MediaTransportBar: View {
     }
     private var transportButtons: some View {
         HStack(spacing: 7) {
-            control("Back 10 seconds", symbol: "gobackward.10", enabled: playback.canSeek) { playback.skip(-10) }
+            control("Back 5 seconds", symbol: "gobackward.5", enabled: playback.canSeek) { playback.skip(-5) }
             control(playback.wantsPlayback ? "Pause" : playback.phase == .finished ? "Replay" : "Play",
                     symbol: playback.wantsPlayback ? "pause.fill" : "play.fill", enabled: playback.canPlay, prominent: true) { playback.togglePlayback() }
-            control("Forward 10 seconds", symbol: "goforward.10", enabled: playback.canSeek) { playback.skip(10) }
+            control("Forward 5 seconds", symbol: "goforward.5", enabled: playback.canSeek) { playback.skip(5) }
         }.fixedSize()
     }
     private var speedMenu: some View {
@@ -318,6 +323,19 @@ private struct MediaSeekSlider: NSViewRepresentable {
         slider.onScrub = onScrub; slider.onCommit = onCommit; slider.source = source
         if !slider.tracking { slider.value = min(max(0, position), slider.maximum) }
         slider.needsDisplay = true
+    }
+}
+
+/// Which keys belong to a focused slider, and which pages have files to walk through. Up and Down always move
+/// to the previous or next file, so a slider that happens to have focus can never turn them into a seek.
+enum PreviewKeyRouting {
+    /// Left, Right, Home and End.
+    static func sliderOwns(keyCode: UInt16) -> Bool { [123, 124, 115, 119].contains(keyCode) }
+
+    /// The Browser, the Links tab and an open bookmark folder list files beside a preview.
+    static func isFilePreviewTab(_ tab: Int, bookmarkBrowserIsOpen: Bool) -> Bool {
+        tab == FinderWorkspaceSection.browser.rawValue || tab == FinderWorkspaceSection.links.rawValue
+            || (tab == FinderWorkspaceSection.bookmarks.rawValue && bookmarkBrowserIsOpen)
     }
 }
 
@@ -387,12 +405,12 @@ final class MediaSliderControl: NSControl {
         NSAccessibility.post(element: self, notification: .valueChanged)
     }
     override func keyDown(with event: NSEvent) {
+        guard PreviewKeyRouting.sliderOwns(keyCode: event.keyCode) else { super.keyDown(with: event); return }
         switch event.keyCode {
-        case 123, 125: adjust(-1)
-        case 124, 126: adjust(1)
+        case 123: adjust(-1)
+        case 124: adjust(1)
         case 115: commit(0)
-        case 119: commit(maximum)
-        default: super.keyDown(with: event)
+        default: commit(maximum)
         }
     }
     private func adjust(_ direction: Double) { commit(value + direction * (isVolume ? 0.05 : 5)) }

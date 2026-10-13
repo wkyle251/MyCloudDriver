@@ -13,8 +13,35 @@ use std::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-pub const CONNECTION_BUDGET: usize = 64;
 pub const RECEIVE_WINDOW: u64 = 256 * 1024;
+static KNOWN_COOLDOWN_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+pub fn known_cooldown_remaining_ms() -> u64 {
+    KNOWN_COOLDOWN_UNTIL_MS.load(Ordering::Relaxed).saturating_sub(Network::now_millis())
+}
+
+fn descriptor_budget(descriptors: u64) -> usize {
+    // Leave room for metadata, SQLite, journals and app-control pipes. An
+    // active original needs a socket, staging/checkpoint files and lock files.
+    usize::try_from(descriptors.saturating_sub(128) / 8).unwrap_or(usize::MAX)
+        .clamp(1, Semaphore::MAX_PERMITS)
+}
+
+fn connection_budget() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+        let limits = getrlimit(Resource::Nofile);
+        // macOS GUI helpers can inherit a small soft limit. Raising this
+        // process's soft allowance never changes the system or hard limit.
+        let current = limits.current.unwrap_or(10_240);
+        let desired = current.max(10_240).min(limits.maximum.unwrap_or(10_240));
+        if desired > current {
+            let _ = setrlimit(Resource::Nofile, Rlimit { current: Some(desired), maximum: limits.maximum });
+        }
+        descriptor_budget(getrlimit(Resource::Nofile).current.unwrap_or(desired))
+    })
+}
 
 pub struct Network {
     trials: Arc<crate::download_trials::Coordinator>,
@@ -35,6 +62,29 @@ pub struct Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_budget_reserves_resources_without_a_sixty_four_cap() {
+        assert_eq!(descriptor_budget(0), 1);
+        assert_eq!(descriptor_budget(128), 1);
+        assert_eq!(descriptor_budget(10_240), 1_264);
+        assert!(descriptor_budget(u64::MAX) <= Semaphore::MAX_PERMITS);
+    }
+
+    #[test]
+    fn more_than_sixty_four_connections_share_and_release_the_same_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = Network::new(80, Some(directory.path().to_path_buf()));
+        let second = Network::new(80, Some(directory.path().to_path_buf()));
+        assert_eq!(first.limit, 80);
+        let mut permits = Vec::new();
+        for _ in 0..65 { permits.push(first.try_acquire().unwrap().unwrap()); }
+        for _ in 65..80 { permits.push(second.try_acquire().unwrap().unwrap()); }
+        assert!(first.try_acquire().unwrap().is_none());
+        assert!(second.try_acquire().unwrap().is_none());
+        drop(permits.pop());
+        assert!(second.try_acquire().unwrap().is_some());
+    }
 
     #[test]
     fn shared_slots_release_after_a_helper_is_killed() {
@@ -123,7 +173,7 @@ impl Network {
         NETWORK
             .get_or_init(|| {
                 Self::new(
-                    CONNECTION_BUDGET,
+                    connection_budget(),
                     std::env::var_os("MYCLOUDDRIVER_DOWNLOAD_CONNECTIONS").map(PathBuf::from),
                 )
             })
@@ -131,7 +181,7 @@ impl Network {
     }
 
     pub fn new(limit: usize, directory: Option<PathBuf>) -> Arc<Self> {
-        let limit = limit.clamp(1, CONNECTION_BUDGET);
+        let limit = limit.max(1).min(connection_budget());
         Arc::new(Self {
             trials: crate::download_trials::Coordinator::new(directory.clone()),
             limit,
@@ -196,7 +246,9 @@ impl Network {
     pub fn limit(&self) -> usize {
         self.limit
     }
-    pub fn active(&self) -> usize { self.endpoint_active.load(Ordering::Acquire) }
+    pub fn active(&self) -> usize {
+        self.endpoint_active.load(Ordering::Acquire)
+    }
     pub fn register(&self) -> Participant {
         self.participants.fetch_add(1, Ordering::AcqRel);
         self.endpoint_participants.fetch_add(1, Ordering::AcqRel);
@@ -216,8 +268,12 @@ impl Network {
     pub fn received(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
     }
-    pub fn trials(&self) -> Arc<crate::download_trials::Coordinator> { self.trials.clone() }
-    pub fn received_counter(&self) -> Arc<AtomicU64> { self.bytes.clone() }
+    pub fn trials(&self) -> Arc<crate::download_trials::Coordinator> {
+        self.trials.clone()
+    }
+    pub fn received_counter(&self) -> Arc<AtomicU64> {
+        self.bytes.clone()
+    }
     pub fn record(&self, bytes: u64) {
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
@@ -245,7 +301,10 @@ impl Network {
         Ok(Some(path))
     }
 
-    pub(crate) fn locked_file(path: &Path, operation: rustix::fs::FlockOperation) -> io::Result<File> {
+    pub(crate) fn locked_file(
+        path: &Path,
+        operation: rustix::fs::FlockOperation,
+    ) -> io::Result<File> {
         let descriptor = rustix::fs::openat(
             rustix::fs::CWD,
             path,
@@ -296,6 +355,7 @@ impl Network {
                 )?;
                 let [until, limited_until, limit] = Self::read_control(&mut file)?;
                 let millis = until.saturating_sub(Self::now_millis()).min(86_400_000);
+                KNOWN_COOLDOWN_UNTIL_MS.fetch_max(Self::now_millis().saturating_add(millis), Ordering::Relaxed);
                 state.0 = state.0.max(now + Duration::from_millis(millis));
                 if limited_until > Self::now_millis() && (1..=self.limit as u64).contains(&limit) {
                     self.soft_limit.fetch_min(limit as usize, Ordering::AcqRel);
@@ -316,6 +376,8 @@ impl Network {
 
     pub fn defer(&self, delay: Duration) -> io::Result<()> {
         let delay = delay.min(Duration::from_secs(86_400));
+        crate::download_waits::cooldown_requested();
+        KNOWN_COOLDOWN_UNTIL_MS.fetch_max(Self::now_millis().saturating_add(delay.as_millis() as u64), Ordering::Relaxed);
         let limited_until = Instant::now() + delay + Duration::from_secs(30);
         let limit = (self.endpoint_active.load(Ordering::Acquire) / 2).max(1);
         self.soft_limit.fetch_min(limit, Ordering::AcqRel);
@@ -350,14 +412,21 @@ impl Network {
 
     pub fn try_acquire(&self) -> io::Result<Option<Permit>> {
         let Ok(local) = self.slots.clone().try_acquire_owned() else {
+            crate::download_waits::connection_blocked(crate::download_waits::Kind::ContentBudget);
             return Ok(None);
         };
         self.finish_acquire(local)
     }
 
     fn finish_acquire(&self, local: OwnedSemaphorePermit) -> io::Result<Option<Permit>> {
+        Ok(self.finish_acquire_reason(local)?.ok())
+    }
+
+    fn finish_acquire_reason(&self, local: OwnedSemaphorePermit) -> io::Result<Result<Permit, crate::download_waits::Kind>> {
+        use crate::download_waits::{connection_blocked, Kind};
         if self.cooling_down()? {
-            return Ok(None);
+            connection_blocked(Kind::EndpointCooldown);
+            return Ok(Err(Kind::EndpointCooldown));
         }
         if self
             .endpoint_active
@@ -366,7 +435,8 @@ impl Network {
             })
             .is_err()
         {
-            return Ok(None);
+            connection_blocked(Kind::EndpointCapacity);
+            return Ok(Err(Kind::EndpointCapacity));
         }
         let endpoint = EndpointPermit(self.endpoint_active.clone());
         let shared = if let Some(directory) = self.directory()? {
@@ -386,13 +456,14 @@ impl Network {
                 }
             }
             let Some(file) = found else {
-                return Ok(None);
+                connection_blocked(Kind::SharedContentSlots);
+                return Ok(Err(Kind::SharedContentSlots));
             };
             Some(file)
         } else {
             None
         };
-        Ok(Some(Permit {
+        Ok(Ok(Permit {
             _local: local,
             _shared: shared,
             _endpoint: endpoint,
@@ -400,18 +471,31 @@ impl Network {
     }
 
     pub async fn acquire(&self) -> io::Result<Permit> {
+        use crate::download_waits::{Kind, Stage};
+        let _stage = crate::download_waits::Stage::enter(crate::download_waits::Kind::ContentPermit);
+        let mut waiting: Option<(Kind, Stage)> = None;
+        let set_wait = |waiting: &mut Option<(Kind, Stage)>, kind| {
+            if waiting.as_ref().is_none_or(|(previous, _)| *previous != kind) {
+                *waiting = Some((kind, Stage::enter(kind)));
+            }
+        };
         loop {
-            if !self.cooling_down()? {
+            if self.cooling_down()? {
+                crate::download_waits::connection_blocked(crate::download_waits::Kind::EndpointCooldown);
+                set_wait(&mut waiting, Kind::EndpointCooldown);
+            } else {
                 // Queued starts receive local slots before a busy range loop
                 // can reacquire them for its next piece.
+                if self.slots.available_permits() == 0 { set_wait(&mut waiting, Kind::ContentBudget); }
                 let local = self
                     .slots
                     .clone()
                     .acquire_owned()
                     .await
                     .expect("Download pool remains open");
-                if let Some(permit) = self.finish_acquire(local)? {
-                    return Ok(permit);
+                match self.finish_acquire_reason(local)? {
+                    Ok(permit) => return Ok(permit),
+                    Err(kind) => set_wait(&mut waiting, kind),
                 }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

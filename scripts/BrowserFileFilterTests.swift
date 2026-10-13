@@ -79,6 +79,7 @@ private actor FilterTestDrive: NativeCloudDrive {
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         DownloaderModel.testBrowserFileFiltering(defaults: defaults)
+        DownloaderModel.testBrowserFilterSelectionRetention(defaults: defaults)
         for kind in [CloudDriveKind.local, .icloud, .photos] { try await testNative(kind) }
     }
 
@@ -91,7 +92,9 @@ private actor FilterTestDrive: NativeCloudDrive {
     }
 
     @MainActor static func testNative(_ kind: CloudDriveKind) async throws {
-        let drive = FilterTestDrive(kind: kind), model = NativeDriveModel(kind: kind)
+        let drive = FilterTestDrive(kind: kind), model = NativeDriveModel(kind: kind, preferences: UserDefaults(suiteName: "com.wky.MyCloudDriver.FileFilterNative.\(UUID().uuidString)")!)
+        // These checks are about the type filter itself, where every folder stays; hiding empty folders has its own suite.
+        model.hidesEmptyFolders = false
         defer { model.close() }
         model.connect(drive); try await idle(model)
         let folder = model.items.first { $0.isFolder }!

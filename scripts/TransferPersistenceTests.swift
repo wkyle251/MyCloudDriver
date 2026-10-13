@@ -31,7 +31,11 @@ struct TransferPersistenceTests {
         let store = TransferPersistenceStore(directory: root.appendingPathComponent("shared"))
         let secondary = TransferPersistenceStore(directory: store.directory.appendingPathComponent("Sessions/secondary"))
         let third = TransferPersistenceStore(directory: store.directory.appendingPathComponent("Sessions/workspace-3"))
-        let original = fixture(root)
+        var original = fixture(root)
+        let retryRoot = original.downloads[1].pendingItems[0].id
+        let originalRoot = original.downloads[0].pendingItems[0].id
+        original.downloadRetryOrigins = [retryRoot: originalRoot]
+        original.pausedPendingDownloadIDs = [retryRoot]
         try store.save(SavedTransfers(version: 1, accountID: account, downloads: [original.downloads[0]], uploads: []), accountID: account)
         try secondary.save(original, accountID: account)
         try third.save(original, accountID: account)
@@ -40,6 +44,9 @@ struct TransferPersistenceTests {
         try sentinel.write(to: journal.appendingPathComponent("batch.json"))
         let combined = try store.loadSharedTransfers(accountID: account)!
         precondition(combined.downloads.count == 2 && combined.uploads == original.uploads)
+        precondition(combined.downloadRetryOrigins?[retryRoot] == originalRoot
+            && combined.pausedPendingDownloadIDs?.contains(retryRoot) == true,
+            "Imported retry roots must preserve their parent linkage and durable Pause")
         precondition(Set(combined.importedWorkspaceSessions ?? []) == ["secondary", "workspace-3"])
         let copied = try store.uploadDirectory(accountID: account, batchID: uploadID).appendingPathComponent("batch.json")
         let copiedData = try Data(contentsOf: copied)

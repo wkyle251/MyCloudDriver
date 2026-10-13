@@ -190,6 +190,7 @@ pub struct LiveResources {
 #[derive(Debug, Default)]
 struct LiveControl {
     paused: AtomicBool,
+    finishing: AtomicBool,
     resources: Mutex<Option<LiveResources>>,
 }
 #[derive(Debug, Default, Clone)]
@@ -197,6 +198,13 @@ pub struct CancellationToken(Arc<AtomicBool>, Arc<LiveControl>);
 impl CancellationToken {
     pub fn set_paused(&self, paused: bool) { self.1.paused.store(paused, Ordering::Release); }
     pub fn is_paused(&self) -> bool { self.1.paused.load(Ordering::Acquire) }
+    /// Stop admission, finish already analysing inputs and return a partial vector file.
+    /// Unlike cancellation, completed vectors remain eligible for comparison.
+    pub fn request_finish(&self) {
+        self.1.finishing.store(true, Ordering::Release);
+        self.set_paused(false);
+    }
+    pub fn is_finishing(&self) -> bool { self.1.finishing.load(Ordering::Acquire) }
     pub fn update_resources(&self, resources: LiveResources) { *self.1.resources.lock().unwrap() = Some(resources); }
     pub(crate) fn take_resources(&self) -> Option<LiveResources> { self.1.resources.lock().unwrap().take() }
     pub fn cancel(&self) {
@@ -326,6 +334,9 @@ pub struct WorkCounts {
     pub accelerator_limit: usize,
     pub fetching: u64,
     pub reading: u64,
+    /// Hashing has already handed its original over to Analysis RAM.
+    #[serde(default)]
+    pub hashing: u64,
     pub encoding: u64,
     /// All read sources ready for decoding, including those waiting for memory
     /// or a processing slot. The wait counters describe the current constraint.
@@ -342,6 +353,9 @@ pub struct WorkCounts {
     pub memory_limit: u64,
     #[serde(default)]
     pub original_memory_bytes: u64,
+    /// Bytes acquired from source files, excluding hashing and decoder reads.
+    #[serde(default)]
+    pub original_bytes_read: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

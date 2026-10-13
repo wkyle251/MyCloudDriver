@@ -9,6 +9,8 @@ private final class SimilarityActionDrive: NativeCloudDrive, @unchecked Sendable
     var item: CloudDriveItem { items[0] }
     var keeperMissing = false
     var keeperSizeChanged = false
+    var changedRemoval = false
+    var changedKeeperRevision = false
     private(set) var deleteCalls = 0
     private let lock = NSLock()
     private var removed = false
@@ -19,7 +21,7 @@ private final class SimilarityActionDrive: NativeCloudDrive, @unchecked Sendable
         let folder = root.url!
         items = (batch ? ["original-asset", "copy-b", "copy-c"] : ["original-asset"]).enumerated().map { index, id in
             .init(id: id, name: id + ".jpg", isFolder: false, bytes: UInt64(100 + index * 100),
-                  url: kind == .photos ? nil : folder.appendingPathComponent(id + ".jpg"))
+                  url: kind == .photos ? nil : folder.appendingPathComponent(id + ".jpg"), revision: "scanned-" + id)
         }
     }
     private func setTrashed(_ value: Bool) { lock.lock(); removed = value; lock.unlock() }
@@ -40,7 +42,14 @@ private final class SimilarityActionDrive: NativeCloudDrive, @unchecked Sendable
     }
     func refreshedItems(_ items: [CloudDriveItem]) async throws -> [CloudDriveItem] {
         if keeperMissing { throw CloudDriveError.message("Synthetic keeper is missing") }
-        return items.map { item in var copy = item; if keeperSizeChanged { copy.bytes = 999 }; return copy }
+        return items.map { item in
+            var copy = item
+            if keeperSizeChanged { copy.bytes = 999 }
+            if (changedRemoval && item.id == "copy-b") || (changedKeeperRevision && item.id == "original-asset") {
+                copy.revision = "edited-with-the-same-size"
+            }
+            return copy
+        }
     }
     func materialize(_ item: CloudDriveItem, directory: URL, progress: @escaping CloudDriveProgressHandler) async throws -> URL { throw CocoaError(.featureUnsupported) }
     func createContainer(_ name: String, in location: CloudDriveLocation) async throws -> CloudDriveUndo? { throw CocoaError(.featureUnsupported) }
@@ -230,6 +239,14 @@ private final class SimilarityActionDrive: NativeCloudDrive, @unchecked Sendable
                 precondition(drive.deleteCalls == 0 && results.trashedIDs.isEmpty && results.fileActionError != nil)
             }
             drive.keeperSizeChanged = false
+            for changesKeeper in [false, true] {
+                drive.changedRemoval = !changesKeeper; drive.changedKeeperRevision = changesKeeper
+                results.keepSmallest(plan, using: model.similarity.keepSmallest!)
+                try await wait { results.trashingIDs.isEmpty }
+                precondition(drive.deleteCalls == 0 && results.trashedIDs.isEmpty && results.fileActionError != nil,
+                             "Same-size edits to either removals or keepers must require a rescan, including Photos")
+            }
+            drive.changedRemoval = false; drive.changedKeeperRevision = false
             results.keepSmallest(plan, using: model.similarity.keepSmallest!)
             try await wait { results.trashingIDs.isEmpty && !model.isMutating }
             precondition(drive.deleteCalls == 1 && results.visibleFileCount == 1 && results.fileActionError == nil)

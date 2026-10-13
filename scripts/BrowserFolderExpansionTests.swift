@@ -122,6 +122,9 @@ struct BrowserFolderExpansionTests {
         let suite = "com.wky.MyCloudDriver.FolderSelectionTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
+        // These navigation checks include empty folders deliberately; their
+        // visibility setting has its own All Types/category regression suite.
+        BrowserEmptyFolders.setPreference(false, in: defaults)
         DownloaderModel.testBrowserFolderSelection(defaults: defaults)
         DownloaderModel.testPreviewKeyboardNavigation(defaults: defaults)
         DownloaderModel.testBrowserFolderToggle(defaults: defaults)

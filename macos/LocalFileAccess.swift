@@ -1,11 +1,12 @@
 import Foundation
 
 /// Check the actual mounted volume, rather than treating a remembered path as
-/// proof that a disk is present. Reads also work on read-only external disks.
+/// proof that a disk is present. Reads also work on read-only disks and shares.
 enum LocalFileAccess {
     static func volumeID(_ url: URL) -> String? {
         var fresh = url; fresh.removeAllCachedResourceValues()
-        return try? fresh.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString
+        guard let values = try? fresh.resourceValues(forKeys: MountedVolumeIdentity.resourceKeys) else { return nil }
+        return MountedVolumeIdentity.identifier(values)
     }
 
     @discardableResult
@@ -13,10 +14,18 @@ enum LocalFileAccess {
                          directory: Bool = false, writing: Bool = false) throws -> URL {
         guard url.isFileURL else { throw CloudDriveError.message("Choose a file or folder on this Mac or a mounted disk.") }
         var fresh = url.standardizedFileURL; fresh.removeAllCachedResourceValues()
+        let components = fresh.pathComponents
+        if components.count >= 3, components[1] == "Volumes" {
+            var mount = URL(fileURLWithPath: "/Volumes").appendingPathComponent(components[2], isDirectory: true)
+            mount.removeAllCachedResourceValues()
+            guard (try? mount.resourceValues(forKeys: [.isVolumeKey]).isVolume) == true else {
+                throw CloudDriveError.waiting("The disk for “\(url.lastPathComponent)” is unavailable. Reconnect it in Finder.")
+            }
+        }
         let values: URLResourceValues
-        do { values = try fresh.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .volumeUUIDStringKey, .volumeIsReadOnlyKey]) }
+        do { values = try fresh.resourceValues(forKeys: MountedVolumeIdentity.resourceKeys.union([.isDirectoryKey, .isRegularFileKey, .volumeIsReadOnlyKey])) }
         catch { throw CloudDriveError.waiting("“\(url.lastPathComponent)” is unavailable. Waiting for its disk to reconnect.") }
-        if let expected, values.volumeUUIDString != expected {
+        if let expected, MountedVolumeIdentity.identifier(values) != expected {
             throw CloudDriveError.waiting("The original disk for “\(url.lastPathComponent)” is unavailable. Waiting for that disk to reconnect.")
         }
         guard values.isDirectory == true || (!directory && values.isRegularFile == true) else {

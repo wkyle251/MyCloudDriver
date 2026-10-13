@@ -21,7 +21,16 @@
 	<key>CFBundleShortVersionString</key>
 	<string>2.3.0</string>
 	<key>CFBundleVersion</key>
-	<string>235</string>
+	<string>284</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.wky.PikPakDownloader.verification</string>
+			<key>CFBundleURLSchemes</key>
+			<array><string>myclouddriver-verification</string></array>
+		</dict>
+	</array>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>

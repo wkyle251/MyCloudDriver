@@ -24,3 +24,9 @@ extern const char *archive_entry_pathname(struct archive_entry *entry);
 extern const char *archive_entry_symlink(struct archive_entry *entry);
 extern const char *archive_entry_hardlink(struct archive_entry *entry);
 extern mode_t archive_entry_filetype(struct archive_entry *entry);
+extern int64_t archive_entry_size(struct archive_entry *entry);
+
+typedef int (*mcd_archive_progress)(void *, long long, const char *);
+extern int mcd_archive_extract(const char *, const char *, const char *, void *, mcd_archive_progress, char *, size_t);
+extern int mcd_archive_extract_limited(const char *, const char *, const char *, uint64_t, uint64_t,
+                                      void *, mcd_archive_progress, char *, size_t);

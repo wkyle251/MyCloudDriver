@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import UniformTypeIdentifiers
 
 final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
@@ -6,7 +7,8 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
     let root: CloudDriveLocation
     private let securityScopedURL: URL?
     let volumeID: String?
-    init(rootURL: URL, kind: CloudDriveKind = .icloud, volumeID: String? = nil) {
+    let diskTrash: DiskTrash?
+    init(rootURL: URL, kind: CloudDriveKind = .icloud, volumeID: String? = nil, diskTrashRootURL: URL? = nil) {
         precondition(kind == .icloud || kind == .local)
         self.kind = kind
         // A scan can own a folder independently of the Browser's connection.
@@ -15,6 +17,10 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
         self.volumeID = volumeID ?? LocalFileAccess.volumeID(rootURL)
         let rootURL = rootURL.standardizedFileURL.resolvingSymlinksInPath()
         root = .init(id: rootURL.absoluteString, title: kind == .local ? (rootURL.lastPathComponent.isEmpty ? "Local Disk" : rootURL.lastPathComponent) : kind.title, url: rootURL)
+        let values = kind == .local ? (try? rootURL.resourceValues(forKeys: [.volumeURLKey, .volumeIsLocalKey, .volumeIsInternalKey])) : nil
+        let trashRoot = diskTrashRootURL ?? (values?.volumeIsLocal == false || values?.volumeIsInternal == false ? values?.volume : nil)
+        let identity = self.volumeID
+        diskTrash = kind == .local ? trashRoot.map { DiskTrash(volumeRoot: $0, volumeID: identity) } : nil
     }
     deinit { securityScopedURL?.stopAccessingSecurityScopedResource() }
     func validateAccess() throws {
@@ -31,10 +37,40 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
         guard resolved == base || resolved.path.hasPrefix(base.path == "/" ? "/" : base.path + "/") else {
             throw CloudDriveError.message("This item is outside the connected drive.")
         }
+        guard diskTrash?.contains(resolved) != true else { throw CloudDriveError.message("Use the Trash tab to put back or empty deleted items.") }
         return resolved
     }
-    static let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey,
-        .fileSizeKey, .contentModificationDateKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey, .isHiddenKey]
+    /// What every listing needs. The system hands these back with the folder's own listing.
+    static let baseKeys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey,
+        .fileSizeKey, .contentModificationDateKey, .isHiddenKey]
+    /// Adds the iCloud download state. The system looks these up one file at a time, which on 50,000 files
+    /// takes about 1.2 s instead of 0.07 s, so only a listing that can contain iCloud files asks for them.
+    static let keys: Set<URLResourceKey> = baseKeys.union([.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
+
+    /// Every key for the iCloud Drive browser and for a folder that is itself in iCloud; the base keys for
+    /// anything else, where no file can be an iCloud placeholder and every file counts as downloaded.
+    static func listingKeys(for folder: URL, kind: CloudDriveKind,
+                            isUbiquitous: (URL) -> Bool = { FileManager.default.isUbiquitousItem(at: $0) }) -> Set<URLResourceKey> {
+        kind == .icloud || isUbiquitous(folder) ? keys : baseKeys
+    }
+
+    private static let mediaTypeLock = NSLock()
+    private static var mediaTypes: [String: String] = [:]
+    /// "image", "video", "audio" or "file" for a filename extension. Looking a type up and testing its
+    /// conformance costs far more than a dictionary read, and a folder has a handful of distinct extensions.
+    static func mediaType(forExtension ext: String) -> String {
+        mediaTypeLock.lock()
+        let known = mediaTypes[ext]
+        mediaTypeLock.unlock()
+        if let known { return known }
+        let type = UTType(filenameExtension: ext)
+        let value = type?.conforms(to: .image) == true ? "image" : type?.conforms(to: .movie) == true ? "video"
+            : type?.conforms(to: .audio) == true ? "audio" : "file"
+        mediaTypeLock.lock(); defer { mediaTypeLock.unlock() }
+        if mediaTypes.count >= 1_000 { mediaTypes.removeAll(keepingCapacity: true) }
+        mediaTypes[ext] = value
+        return value
+    }
 
     static func item(_ url: URL) throws -> CloudDriveItem {
         // File coordination can return /private/var for an input under /var.
@@ -46,17 +82,23 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
     /// is already resolved. Its resolved identity is that folder plus its name,
     /// so neither the path nor the prefetched values are read from disk again.
     static func item(listed url: URL, in folder: URL) throws -> CloudDriveItem {
-        let values = try url.resourceValues(forKeys: keys)
-        return item(folder.appendingPathComponent(url.lastPathComponent, isDirectory: values.isDirectory == true), values: values)
+        item(listed: url, in: folder, values: try url.resourceValues(forKeys: keys))
+    }
+    static func item(listed url: URL, in folder: URL, values: URLResourceValues) -> CloudDriveItem {
+        item(folder.appendingPathComponent(url.lastPathComponent, isDirectory: values.isDirectory == true), values: values)
     }
     private static func item(_ url: URL, values: URLResourceValues) -> CloudDriveItem {
-        let type = UTType(filenameExtension: url.pathExtension)
-        return .init(id: url.absoluteString, name: url.lastPathComponent, isFolder: values.isDirectory == true,
+        .init(id: url.absoluteString, name: url.lastPathComponent, isFolder: values.isDirectory == true,
             bytes: values.isDirectory == true ? nil : values.fileSize.map { UInt64(max(0, $0)) },
             modified: values.contentModificationDate, url: url,
-            mediaType: type?.conforms(to: .image) == true ? "image" : type?.conforms(to: .movie) == true ? "video"
-                : type?.conforms(to: .audio) == true ? "audio" : "file",
-            isDownloaded: values.isUbiquitousItem != true || values.ubiquitousItemDownloadingStatus == .current || values.ubiquitousItemDownloadingStatus == .downloaded)
+            mediaType: mediaType(forExtension: url.pathExtension),
+            isDownloaded: values.isUbiquitousItem != true || values.ubiquitousItemDownloadingStatus == .current || values.ubiquitousItemDownloadingStatus == .downloaded,
+            revision: fileRevision(url))
+    }
+    static func fileRevision(_ url: URL) -> String? {
+        var info = stat()
+        guard lstat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return nil }
+        return "\(info.st_dev):\(info.st_ino):\(info.st_size):\(info.st_mtimespec.tv_sec):\(info.st_mtimespec.tv_nsec):\(info.st_ctimespec.tv_sec):\(info.st_ctimespec.tv_nsec)"
     }
     func refreshedItems(_ items: [CloudDriveItem]) async throws -> [CloudDriveItem] {
         let urls = try items.map { try checked($0.url) }
@@ -69,15 +111,18 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
     }
     func list(_ location: CloudDriveLocation, offset: Int, search: String) async throws -> CloudDrivePage {
         let folder = try checked(location.url)
+        let resourceKeys = Self.listingKeys(for: folder, kind: kind)
         return try await CloudDriveFiles.detached {
             let children: [URL] = try CloudDriveFiles.coordinated(folder) { url in
-                try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: Array(Self.keys), options: [.skipsHiddenFiles])
+                try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: Array(resourceKeys), options: [.skipsHiddenFiles])
             }
             var items: [CloudDriveItem] = []
             for url in children {
                 try CloudDriveFiles.checkCancellation()
-                guard (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true else { continue }
-                let item = try Self.item(listed: url, in: folder)
+                if self.diskTrash?.contains(url) == true { continue }
+                let values = try url.resourceValues(forKeys: resourceKeys)
+                guard values.isSymbolicLink != true else { continue }
+                let item = Self.item(listed: url, in: folder, values: values)
                 if search.isEmpty || item.name.localizedStandardContains(search) { items.append(item) }
             }
             items.sort { $0.isFolder == $1.isFolder ? $0.name.localizedStandardCompare($1.name) == .orderedAscending : $0.isFolder }
@@ -120,6 +165,7 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
             var pending = roots, count = 0, seen = Set<URL>()
             while let url = pending.popLast() {
                 try CloudDriveFiles.checkCancellation()
+                if self.diskTrash?.contains(url) == true { continue }
                 guard seen.insert(url.standardizedFileURL).inserted else { continue }
                 do {
                     let v = try url.resourceValues(forKeys: Self.keys)
@@ -152,21 +198,45 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
                       progress: @escaping CloudDriveProgressHandler) async throws -> CloudDriveMeasurement {
         let roots = try items.isEmpty ? [checked(location.url)] : items.map { try checked($0.url) }
         return try await CloudDriveFiles.detached {
-            var pending = roots, seen = Set<URL>(), total = CloudDriveMeasurement()
+            // Each entry remembers the folder it was listed from, so a file's size lands in its
+            // folder without rebuilding its path. `direct` holds the bytes in each folder's own
+            // files; `visited` the folders walked, which are the only ones that get a total.
+            var pending: [(url: URL, folder: String?)] = roots.map { ($0, nil) }
+            var seen = Set<URL>(), total = CloudDriveMeasurement()
+            var direct: [String: UInt64] = [:], visited = Set<String>()
             var reported = Date.distantPast
+            // The walk finishes each selected folder before it starts the next: the unstarted ones wait at the
+            // bottom of the stack, and the one in progress is exhausted when nothing but those is left.
+            let rootCount = roots.count
+            var started = 0, announced = -1
+            let finished = { started - (pending.count > rootCount - started ? 1 : 0) }
+            let report = { (done: Int) in
+                // One folder has no total to measure against, so only several folders get a bar.
+                let several = rootCount > 1
+                progress(.init(message: Self.tally(total, kind: self.kind), completed: several ? done : total.files,
+                               total: several ? rootCount : 0, fraction: several ? Double(done) / Double(rootCount) : nil, bytes: total.bytes))
+            }
             let list = { (folder: URL) in
                 try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: Array(Self.sizeKeys),
                                                             options: [.skipsHiddenFiles])
             }
-            while let url = pending.popLast() {
+            while true {
+                // Each folder finished moves the bar at once, whatever the time since the last update.
+                if finished() > announced { announced = finished(); report(announced) }
+                guard let (url, listedFrom) = pending.popLast() else { break }
+                if listedFrom == nil { started += 1 }
                 try CloudDriveFiles.checkCancellation()
+                if self.diskTrash?.contains(url) == true { continue }
                 guard seen.insert(url.standardizedFileURL).inserted else { continue }
                 do {
                     let v = try url.resourceValues(forKeys: Self.sizeKeys)
                     if v.isSymbolicLink == true || v.isHidden == true { continue }
                     if v.isDirectory == true {
+                        let path = url.standardizedFileURL.path
+                        visited.insert(path)
                         // An iCloud folder can be a placeholder its File Provider fills in first.
-                        pending.append(contentsOf: try self.kind == .icloud ? CloudDriveFiles.coordinated(url, list) : list(url))
+                        let children = try self.kind == .icloud ? CloudDriveFiles.coordinated(url, list) : list(url)
+                        pending.append(contentsOf: children.map { ($0, path) })
                     } else if v.isRegularFile == true {
                         var size = v.fileSize
                         if size == nil {
@@ -176,13 +246,16 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
                             fetched.removeAllCachedResourceValues()
                             size = try fetched.resourceValues(forKeys: [.fileSizeKey]).fileSize
                         }
+                        let bytes = UInt64(max(0, size ?? 0))
                         total.files += 1
-                        total.bytes += UInt64(max(0, size ?? 0))
+                        total.bytes += bytes
+                        // A file chosen on its own has no listing; its folder is only counted if that folder is walked too.
+                        direct[listedFrom ?? url.deletingLastPathComponent().standardizedFileURL.path, default: 0] += bytes
                     }
                     // Progress is for people: a few updates a second, not one per file.
                     if Date().timeIntervalSince(reported) >= 0.25 {
                         reported = Date()
-                        progress(.init(message: "Calculating \(self.kind.title) size", completed: total.files))
+                        report(finished())
                     }
                 } catch {
                     guard Self.missingDuringScan(error) else { throw error }
@@ -191,8 +264,33 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
                 }
             }
             try self.validateAccess()
+            total.folders = Self.folderTotals(direct: direct, visited: visited)
             return total
         }
+    }
+
+    /// What the walk has counted so far; nothing to say until it has found a file.
+    private static func tally(_ total: CloudDriveMeasurement, kind: CloudDriveKind) -> String {
+        guard total.files > 0 else { return "Calculating \(kind.title) size" }
+        let size = ByteCountFormatter.string(fromByteCount: Int64(clamping: total.bytes), countStyle: .file)
+        return "Calculating \(kind.title) size · \(total.files.formatted()) \(total.files == 1 ? "file" : "files") · \(size) so far"
+    }
+
+    /// The identity a folder row has in a listing; `item(listed:in:)` builds the same string.
+    static func folderID(_ url: URL) -> String { URL(fileURLWithPath: url.path, isDirectory: true).absoluteString }
+
+    /// Each walked folder's total: its own files plus every walked folder below it. A folder's
+    /// bytes pass only to a walked parent, so hidden folders and symbolic links stay excluded,
+    /// and a subfolder measured before its parent (overlapping selections) is still included.
+    private static func folderTotals(direct: [String: UInt64], visited: Set<String>) -> [String: UInt64] {
+        var totals = Dictionary(uniqueKeysWithValues: visited.map { ($0, direct[$0] ?? 0) })
+        let deepestFirst = visited.map { path in (path: path, depth: path.utf8.reduce(0) { $1 == 0x2F ? $0 + 1 : $0 }) }
+            .sorted { $0.depth > $1.depth }
+        for (path, _) in deepestFirst {
+            let parent = (path as NSString).deletingLastPathComponent
+            if parent != path, let inherited = totals[path], totals[parent] != nil { totals[parent]! += inherited }
+        }
+        return Dictionary(uniqueKeysWithValues: totals.map { (folderID(URL(fileURLWithPath: $0.key)), $0.value) })
     }
 
     static func missingDuringScan(_ error: Error) -> Bool {
@@ -229,31 +327,48 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
             }
         }
     }
-    private static func trashUndo(_ urls: [URL], title: String) -> CloudDriveUndo {
-        .init(title: title) { try await Self.trash(urls, title: title, progress: { _ in }) }
+    private static func trashUndo(_ urls: [URL], title: String, diskTrash: DiskTrash? = nil) -> CloudDriveUndo {
+        .init(title: title) { try await Self.trash(urls, title: title, progress: { _ in }, diskTrash: diskTrash) }
     }
-    private static func trash(_ urls: [URL], title: String, progress: @escaping CloudDriveProgressHandler) async throws -> CloudDriveUndo {
-        try await CloudDriveFiles.detached {
+    private static func trash(_ urls: [URL], title: String, progress: @escaping CloudDriveProgressHandler, diskTrash: DiskTrash? = nil,
+                              validate: (@Sendable (URL) throws -> Void)? = nil) async throws -> CloudDriveUndo {
+        if let diskTrash { return try await diskTrash.trash(urls, title: title, progress: progress, validate: validate) }
+        return try await CloudDriveFiles.detached {
             var restore: [(URL, URL)] = []
             do {
                 for (index, url) in urls.enumerated() {
                     try CloudDriveFiles.checkCancellation()
                     var trashed: NSURL?
-                    try CloudDriveFiles.coordinated(url, writing: true) { try FileManager.default.trashItem(at: $0, resultingItemURL: &trashed) }
+                    try CloudDriveFiles.coordinated(url, writing: true) {
+                        try validate?($0)
+                        try FileManager.default.trashItem(at: $0, resultingItemURL: &trashed)
+                    }
                     guard let trashed else { throw CloudDriveError.message("Finder did not return the Trash location.") }
                     restore.append((trashed as URL, url))
                     progress(.init(message: "Moving to Trash", completed: index + 1, total: urls.count))
                 }
             } catch { for (from, to) in restore.reversed() { try? Self.move(from, to) }; throw error }
             // Redo uses Trash again instead of relying on an expired Trash name.
-            let pairs = restore
-            return .init(title: title) {
-                try await CloudDriveFiles.detached {
-                    var restored: [URL] = []
-                    do { for (from, to) in pairs { try Self.move(from, to); restored.append(to) } }
-                    catch { throw CloudDriveError.message("Some items could not be restored. Their original names may already be in use. \(error.localizedDescription)") }
-                    return Self.trashUndo(restored, title: title)
+            return Self.restoreTrashUndo(restore, title: title)
+        }
+    }
+    static func restoreTrashUndo(_ pairs: [(URL, URL)], title: String) -> CloudDriveUndo {
+        .init(title: title) {
+            try await CloudDriveFiles.detached {
+                // Reject a known conflict before restoring any member of the batch.
+                for (from, to) in pairs {
+                    guard FileManager.default.fileExists(atPath: from.path), !FileManager.default.fileExists(atPath: to.path) else {
+                        throw CloudDriveError.message("Some items could not be restored. Their original names may already be in use.")
+                    }
                 }
+                var restored: [(URL, URL)] = []
+                do {
+                    for (from, to) in pairs { try CloudDriveFiles.checkCancellation(); try Self.move(from, to); restored.append((to, from)) }
+                } catch {
+                    for (from, to) in restored.reversed() { try? Self.move(from, to) }
+                    throw CloudDriveError.message("Some items could not be restored. Their original names may already be in use. \(error.localizedDescription)")
+                }
+                return Self.trashUndo(restored.map { $0.0 }, title: title)
             }
         }
     }
@@ -261,7 +376,7 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
         let folder = try checked(location.url).appendingPathComponent(CloudDriveFiles.validName(name), isDirectory: true)
         return try await CloudDriveFiles.detached {
             try CloudDriveFiles.coordinated(folder, writing: true) { try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: false) }
-            return Self.trashUndo([folder], title: "New Folder")
+            return Self.trashUndo([folder], title: "New Folder", diskTrash: self.diskTrash)
         }
     }
     func rename(_ item: CloudDriveItem, to name: String) async throws -> CloudDriveUndo? {
@@ -289,8 +404,13 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
     static func copy(_ source: URL, to destination: URL, progress: CloudDriveProgressHandler, destinationVolumeID: String? = nil) throws {
         try NativeTransferControl.current?.check(); try CloudDriveFiles.checkCancellation()
         let destinationVolumeID = destinationVolumeID ?? LocalFileAccess.volumeID(destination.deletingLastPathComponent())
-        try LocalFileAccess.validate(source)
-        try LocalFileAccess.validate(destination.deletingLastPathComponent(), volumeID: destinationVolumeID, directory: true, writing: true)
+        let validatedSource = try LocalFileAccess.validate(source)
+        guard (try validatedSource.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink != true else {
+            throw CloudDriveError.message("Symbolic links are excluded from transfers.")
+        }
+        let source = validatedSource.resolvingSymlinksInPath()
+        let parent = try LocalFileAccess.validate(destination.deletingLastPathComponent(), volumeID: destinationVolumeID, directory: true, writing: true).resolvingSymlinksInPath()
+        let destination = parent.appendingPathComponent(destination.lastPathComponent)
         guard source != destination, !destination.path.hasPrefix(source.path + "/") else { throw CloudDriveError.message("Choose a destination outside the source folder.") }
         guard !FileManager.default.fileExists(atPath: destination.path) else { throw CloudDriveError.message("An item named “\(destination.lastPathComponent)” already exists.") }
         try CloudDriveFiles.coordinated(source) { source in
@@ -301,9 +421,10 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
                 var created = false
                 do {
                     if v.isDirectory == true {
+                        let children = try FileManager.default.contentsOfDirectory(at: source, includingPropertiesForKeys: nil)
                         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
                         created = true
-                        for file in try FileManager.default.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
+                        for file in children {
                             try Self.copy(file, to: destination.appendingPathComponent(file.lastPathComponent), progress: progress, destinationVolumeID: destinationVolumeID)
                         }
                     } else {
@@ -349,13 +470,27 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
                     progress(.init(message: "Copying files", completed: index + 1, total: urls.count))
                 }
             } catch { for file in copied { try? FileManager.default.removeItem(at: file) }; throw error }
-            return Self.trashUndo(copied, title: "Import")
+            return Self.trashUndo(copied, title: "Import", diskTrash: self.diskTrash)
         }
     }
     func delete(_ items: [CloudDriveItem], progress: @escaping CloudDriveProgressHandler) async throws -> CloudDriveUndo? {
         let urls = try items.map { try checked($0.url) }
         guard !urls.contains(root.url!) else { throw CloudDriveError.message("The connected drive root cannot be moved to Trash.") }
-        return try await Self.trash(urls, title: "Move to Trash", progress: progress)
+        return try await Self.trash(urls, title: "Move to Trash", progress: progress, diskTrash: diskTrash)
+    }
+    func deleteVerified(_ items: [CloudDriveItem], progress: @escaping CloudDriveProgressHandler) async throws -> CloudDriveUndo? {
+        let urls = try items.map { try checked($0.url) }
+        guard !urls.contains(root.url!), Set(urls.map(\.path)).count == urls.count,
+              items.allSatisfy({ !$0.isFolder && $0.revision != nil }) else {
+            throw CloudDriveError.message("Scan the group again before changing these files.")
+        }
+        let revisions = Dictionary(uniqueKeysWithValues: zip(urls.map(\.path), items.compactMap(\.revision)))
+        return try await Self.trash(urls, title: "Keep Smallest", progress: progress, diskTrash: diskTrash) { url in
+            guard let expected = revisions[url.standardizedFileURL.resolvingSymlinksInPath().path],
+                  Self.fileRevision(url) == expected else {
+                throw CloudDriveError.message("A file changed after comparison. No more files were moved to Trash. Scan the group again.")
+            }
+        }
     }
 
     func cleanupCandidates(in location: CloudDriveLocation, empty: Bool, progress: @escaping CloudDriveProgressHandler) async throws -> [CloudDriveItem] {
@@ -368,6 +503,7 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
                 var allEmpty = true
                 for child in children {
                     try CloudDriveFiles.checkCancellation(); visited += 1
+                    if self.diskTrash?.contains(child) == true { allEmpty = false; continue }
                     let values = try child.resourceValues(forKeys: Self.keys)
                     if values.isSymbolicLink == true { allEmpty = false; continue }
                     if values.isDirectory == true {
@@ -415,7 +551,14 @@ final class ICloudDriveProvider: NativeCloudDrive, @unchecked Sendable {
                 guard safe else { throw CloudDriveError.message("The cleanup scope changed. Review it again before removing items.") }
             }
         }
-        return try await Self.trash(urls, title: empty ? "Remove Empty Folders" : "Remove .DS_Store Files", progress: progress)
+        return try await Self.trash(urls, title: empty ? "Remove Empty Folders" : "Remove .DS_Store Files", progress: progress, diskTrash: diskTrash) { url in
+            let values = try url.resourceValues(forKeys: Self.keys)
+            let safe: Bool
+            if values.isSymbolicLink == true { safe = false }
+            else if empty, values.isDirectory == true { safe = try Self.isEmptyTree(url) }
+            else { safe = !empty && values.isRegularFile == true && url.lastPathComponent == ".DS_Store" }
+            guard safe else { throw CloudDriveError.message("The cleanup scope changed. Review it again before removing items.") }
+        }
     }
     func merge(_ items: [CloudDriveItem], progress: @escaping CloudDriveProgressHandler) async throws -> CloudDriveUndo? {
         guard items.count > 1, items.allSatisfy(\.isFolder), let first = items.first else { throw CloudDriveError.message("Select at least two folders to merge.") }

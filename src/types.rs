@@ -117,7 +117,9 @@ pub struct AccountProfile {
     pub name: String,
 }
 
-fn deserialize_profile_name<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+fn deserialize_profile_name<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<String, D::Error> {
     Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 

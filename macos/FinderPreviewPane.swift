@@ -1,27 +1,21 @@
 import AppKit
 import SwiftUI
 
-/// Fill the pane's width and reserve room below the adjustable preview height
-/// for its resize handle and scrollable details. The header is already laid out.
+/// Fill the pane's width, with the adjustable preview height and its resize handle below the header. Metadata
+/// and actions are in the header's information popover, so they take none of the pane's height.
 struct FinderPreviewGeometry {
     static let defaultHeight: CGFloat = 440
     static let minimumHeight: CGFloat = 180
     static let handle: CGFloat = 14
-    static let detailsMinimum: CGFloat = 106
     let maximum: CGSize
     let size: CGSize
     let verticalHandle: CGFloat
-    let spacing: CGFloat
 
-    init(available: CGSize, requestedHeight: CGFloat, reservedDetailsHeight: CGFloat = Self.detailsMinimum) {
+    init(available: CGSize, requestedHeight: CGFloat) {
         let width = available.width.isFinite ? max(0, available.width) : 0
         let height = available.height.isFinite ? max(0, available.height) : 0
-        let reservation = reservedDetailsHeight.isFinite ? max(0, reservedDetailsHeight) : Self.detailsMinimum
-        spacing = reservation > 0 ? min(12, height) : 0
-        let details = min(reservation, height - spacing)
-        verticalHandle = min(Self.handle, height - spacing - details)
-        maximum = .init(width: width,
-                        height: max(0, height - spacing - details - verticalHandle))
+        verticalHandle = min(Self.handle, height)
+        maximum = .init(width: width, height: max(0, height - verticalHandle))
         size = .init(width: width, height: Self.clampHeight(requestedHeight, maximum: maximum.height))
     }
 
@@ -35,8 +29,9 @@ struct FinderPreviewGeometry {
     }
 }
 
-/// Shared preview geometry for all drives. The height handle sits below the
-/// native media view, so the player's controls cannot consume its mouse events.
+/// Shared preview for all drives, with one layout for both placements: the file's details and actions are behind
+/// the header's information button. The height handle sits below the native media view, so the player's
+/// controls cannot consume its mouse events.
 struct FinderPreviewPane<Header: View, Media: View, Details: View>: View {
     var resetRevision = 0
     var mediaPlayback: MediaPlaybackController? = nil
@@ -54,35 +49,25 @@ struct FinderPreviewPane<Header: View, Media: View, Details: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: bottom ? 6 : 12) {
-            if bottom {
-                HStack(spacing: 8) {
-                    header().frame(maxWidth: .infinity).fixedSize(horizontal: false, vertical: true)
-                    Button { showsDetails.toggle() } label: {
-                        Image(systemName: "info.circle").font(.system(size: 17)).frame(width: 30, height: 30)
-                    }.buttonStyle(.borderless).help("Show file details and actions")
-                        .accessibilityLabel("File details")
-                        .popover(isPresented: $showsDetails, arrowEdge: .top) {
-                            ScrollView { details().frame(maxWidth: .infinity, alignment: .leading).padding(18) }
-                                .frame(width: 360, height: 270)
-                        }
-                }
-            } else { header().fixedSize(horizontal: false, vertical: true) }
-            GeometryReader { viewport in
-                let layout = FinderPreviewGeometry(available: viewport.size,
-                    requestedHeight: liveHeight ?? CGFloat(savedHeight), reservedDetailsHeight: bottom ? 0 : FinderPreviewGeometry.detailsMinimum)
-                VStack(alignment: .leading, spacing: layout.spacing) {
-                    VStack(spacing: 0) {
-                        media().frame(width: layout.size.width, height: layout.size.height)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                            .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.1)).allowsHitTesting(false) }
-                        heightHandle(layout: layout)
-                            .frame(width: layout.size.width, height: layout.verticalHandle)
-                    }.frame(maxWidth: .infinity, alignment: .leading)
-                    if !bottom {
-                        ScrollView {
-                            details().frame(maxWidth: .infinity, alignment: .leading).padding(2)
-                        }.scrollIndicators(.automatic)
+            HStack(spacing: 8) {
+                header().frame(maxWidth: .infinity).fixedSize(horizontal: false, vertical: true)
+                Button { showsDetails.toggle() } label: {
+                    Image(systemName: "info.circle").font(.system(size: 17)).frame(width: 30, height: 30)
+                }.buttonStyle(.borderless).help("Show file details and actions")
+                    .accessibilityLabel("File details")
+                    .popover(isPresented: $showsDetails, arrowEdge: .top) {
+                        ScrollView { details().frame(maxWidth: .infinity, alignment: .leading).padding(18) }
+                            .frame(width: 360, height: 270)
                     }
+            }
+            GeometryReader { viewport in
+                let layout = FinderPreviewGeometry(available: viewport.size, requestedHeight: liveHeight ?? CGFloat(savedHeight))
+                VStack(spacing: 0) {
+                    media().frame(width: layout.size.width, height: layout.size.height)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.1)).allowsHitTesting(false) }
+                    heightHandle(layout: layout)
+                        .frame(width: layout.size.width, height: layout.verticalHandle)
                 }.frame(width: viewport.size.width, height: viewport.size.height, alignment: .topLeading)
             }
         }.padding(bottom ? 10 : 16)

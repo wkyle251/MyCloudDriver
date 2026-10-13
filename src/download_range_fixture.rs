@@ -30,15 +30,19 @@ pub struct Fixture {
     pub base: String,
     pub size: u64,
     pub requests: Arc<Mutex<Vec<Request>>>,
+    pub metadata_requests: Arc<AtomicUsize>,
     pub peak: Arc<AtomicUsize>,
     pub revision: Arc<AtomicUsize>,
     /// 0: normal, 1: ignore ranges, 2: malformed range, 3: changed body ETag,
-    /// 4: service error on non-probe range.
+    /// 4: service error on non-probe range, 5: bounded bodies ignore ranges
+    /// after a valid probe, while open-ended sequential suffixes are honored.
+    /// 6: complete the first bounded piece before falling back on later pieces.
     pub mode: Arc<AtomicUsize>,
     pub hold_first: Arc<AtomicBool>,
     pub drop_first: Arc<AtomicBool>,
     pub finished_other: Arc<AtomicUsize>,
     pub chunk_delay_millis: Arc<AtomicUsize>,
+    pub wire_chunk_bytes: Arc<AtomicUsize>,
     pub hold_after_bytes: Arc<AtomicUsize>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -53,6 +57,7 @@ impl Fixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let metadata_requests = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let active = Arc::new(AtomicUsize::new(0));
         let revision = Arc::new(AtomicUsize::new(1));
@@ -61,9 +66,11 @@ impl Fixture {
         let drop_first = Arc::new(AtomicBool::new(false));
         let finished_other = Arc::new(AtomicUsize::new(0));
         let chunk_delay_millis = Arc::new(AtomicUsize::new(0));
+        let wire_chunk_bytes = Arc::new(AtomicUsize::new(64 * 1024));
         let hold_after_bytes = Arc::new(AtomicUsize::new(256 * 1024));
         let shared = (
             base.clone(),
+            metadata_requests.clone(),
             requests.clone(),
             peak.clone(),
             revision.clone(),
@@ -73,6 +80,7 @@ impl Fixture {
             finished_other.clone(),
             chunk_delay_millis.clone(),
             hold_after_bytes.clone(),
+            wire_chunk_bytes.clone(),
         );
         let server = tokio::spawn(async move {
             let mut jobs = tokio::task::JoinSet::new();
@@ -80,7 +88,10 @@ impl Fixture {
                 tokio::select! {
                     connection = listener.accept() => {
                         let (mut socket, _) = connection.unwrap();
-                        let (base, requests, peak, revision, mode, hold_first, drop_first, finished_other, chunk_delay_millis, hold_after_bytes) = shared.clone();
+                        // Small-fragment receive-budget tests must measure RAM
+                        // admission rather than Nagle/delayed-ACK pacing.
+                        socket.set_nodelay(true).unwrap();
+                        let (base, metadata_requests, requests, peak, revision, mode, hold_first, drop_first, finished_other, chunk_delay_millis, hold_after_bytes, wire_chunk_bytes) = shared.clone();
                         let active = active.clone();
                         jobs.spawn(async move {
                             let mut request = Vec::new();
@@ -98,6 +109,7 @@ impl Fixture {
                             } else if route.starts_with("POST /v1/shield/captcha/init") {
                                 Some(serde_json::json!({"captcha_token":"fixture","expires_in":3600}))
                             } else if route.starts_with("GET /drive/v1/files/") {
+                                metadata_requests.fetch_add(1, Ordering::Relaxed);
                                 Some(serde_json::json!({"name":"generated.bin","size":size.to_string(),"hash":format!("fixture-{generation}"),"web_content_link":format!("{base}/original")}))
                             } else { None };
                             if let Some(body) = body {
@@ -109,6 +121,7 @@ impl Fixture {
                             let header = |name: &str| headers.lines().find_map(|line| line.strip_prefix(name).map(str::trim)).map(str::to_owned);
                             let range = header("range:").and_then(|value| value.strip_prefix("bytes=").map(str::to_owned))
                                 .and_then(|value| value.split_once('-').map(|(start, end)| (start.parse::<u64>().unwrap(), end.parse::<u64>().unwrap_or(size - 1))));
+                            let open_ended = header("range:").is_some_and(|value| value.ends_with('-'));
                             let if_range = header("if-range:");
                             let requested = range.unwrap_or((0, size - 1));
                             requests.lock().unwrap().push(Request { start: requested.0, end: requested.1, ranged: range.is_some(),
@@ -120,7 +133,10 @@ impl Fixture {
                                 return;
                             }
                             let etag = format!("\"fixture-{generation}\"");
-                            let ranged = range.is_some() && mode != 1 && if_range.as_ref().is_none_or(|tag| *tag == etag);
+                            let ranged = range.is_some() && mode != 1
+                                && (mode != 5 || probe || open_ended)
+                                && (mode != 6 || probe || open_ended || requested.0 < 16 << 20)
+                                && if_range.as_ref().is_none_or(|tag| *tag == etag);
                             let (start, end) = if ranged { requested } else { (0, size - 1) };
                             if start >= size || end >= size || end < start {
                                 let reply = format!("HTTP/1.1 416 Range\r\nETag: {etag}\r\nContent-Range: bytes */{size}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -144,7 +160,8 @@ impl Fixture {
                                     }
                                     tokio::time::sleep(Duration::from_millis(10)).await; continue;
                                 }
-                                let data = bytes(position, ((end - position + 1) as usize).min(64 * 1024), generation);
+                                let chunk_size = wire_chunk_bytes.load(Ordering::Acquire).clamp(1, 64 * 1024);
+                                let data = bytes(position, ((end - position + 1) as usize).min(chunk_size), generation);
                                 if socket.write_all(&data).await.is_err() { break; }
                                 position += data.len() as u64;
                                 let delay = chunk_delay_millis.load(Ordering::Acquire);
@@ -164,6 +181,7 @@ impl Fixture {
             base,
             size,
             requests,
+            metadata_requests,
             peak,
             revision,
             mode,
@@ -171,6 +189,7 @@ impl Fixture {
             drop_first,
             finished_other,
             chunk_delay_millis,
+            wire_chunk_bytes,
             hold_after_bytes,
             server,
         }

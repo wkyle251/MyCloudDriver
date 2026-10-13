@@ -102,12 +102,12 @@ struct LocalTorrentPeerList: View {
             DisclosureGroup(isExpanded: $expanded) {
                 VStack(alignment: .leading, spacing: 4) {
                     if peers.isEmpty {
-                        Text("No connected peers right now.")
+                        Text(connected > 0 ? "Peer speeds unavailable. Refreshing…" : "No connected peers right now.")
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     ScrollView { VStack(spacing: 4) { ForEach(peers, id: \.address, content: row) } }
                         .frame(maxHeight: peers.count > 6 ? 150 : nil)
-                    if peers.count < connected {
+                    if !peers.isEmpty && peers.count < connected {
                         Text("Busiest \(peers.count) of \(connected) shown.")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
@@ -115,11 +115,15 @@ struct LocalTorrentPeerList: View {
             } label: {
                 HStack(spacing: 14) {
                     Text("Peers")
-                    Label("\(downloading) downloading", systemImage: "arrow.down")
-                        .accessibilityLabel("Downloading from \(downloading) peers")
-                    Label("\(uploading) uploading", systemImage: "arrow.up")
-                        .accessibilityLabel("Uploading to \(uploading) peers")
-                }.help("Connected peers and their current rates, refreshed every few seconds. Downloading transfers data from peers to this Mac; uploading transfers data from this Mac to peers.")
+                    if peers.isEmpty && connected > 0 {
+                        Text("Speeds unavailable")
+                    } else {
+                        Label("\(downloading) downloading", systemImage: "arrow.down")
+                            .accessibilityLabel("Downloading from \(downloading) peers")
+                        Label("\(uploading) uploading", systemImage: "arrow.up")
+                            .accessibilityLabel("Uploading to \(uploading) peers")
+                    }
+                }.help("Connected peers and their latest reported speeds. Downloading transfers data from peers to this Mac; uploading transfers data from this Mac to peers.")
             }.font(.caption).foregroundStyle(.secondary).monospacedDigit()
     }
 

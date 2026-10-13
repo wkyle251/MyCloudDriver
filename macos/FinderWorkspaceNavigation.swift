@@ -5,7 +5,9 @@ import SwiftUI
 enum FinderWorkspaceSection: Int, CaseIterable, Identifiable {
     case browser = 0, bookmarks = 7, transfers = 1, links = 3
     case cloudDownloads = 4, shares = 5, trash = 6
-    static let standard: [Self] = [.browser, .bookmarks, .transfers, .links]
+    /// What every drive has. Shared Links and the account-management pages belong to PikPak alone, which
+    /// lists `allCases`; no other drive shows a Links entry, in its sidebar or in the Go menu.
+    static let standard: [Self] = [.browser, .bookmarks, .transfers]
     var isPikPakManagement: Bool { (4...6).contains(rawValue) }
     var id: Int { rawValue }
     var title: String {

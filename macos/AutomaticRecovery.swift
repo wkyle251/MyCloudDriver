@@ -16,8 +16,11 @@ enum AutomaticRecovery {
 
     /// For reads/materialization with cancellation owned by the calling task.
     /// Mutations must use their operation's receipt/checkpoint reconciliation.
+    /// Status callbacks update observable UI state. Hop to the main actor
+    /// before publishing; a synchronous callback on this generic executor can
+    /// deadlock Combine against a simultaneous main-thread preview update.
     static func read<T>(backoff: [TimeInterval] = delays,
-                        onRetry: (Error, TimeInterval) -> Void = { _, _ in },
+                        onRetry: @MainActor (Error, TimeInterval) -> Void = { _, _ in },
                         _ operation: () async throws -> T) async throws -> T {
         var attempt = 0
         while true {
@@ -28,7 +31,7 @@ enum AutomaticRecovery {
                 guard TransferFailure.isRetryable(error) else { throw error }
                 let seconds = delay(attempt: attempt, schedule: backoff)
                 attempt = nextAttempt(attempt)
-                onRetry(error, seconds)
+                await onRetry(error, seconds)
                 try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             }
         }

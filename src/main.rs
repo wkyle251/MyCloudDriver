@@ -1,11 +1,29 @@
-mod transfer_control;
-mod live_downloads;
-mod download_transport;
-mod trash_selection;
 #[cfg(test)]
 mod disk_download_tests;
 #[cfg(test)]
+mod download_name_tests;
+mod download_fs;
+mod download_checkpoint;
+mod download_cleanup;
+mod download_names;
+mod download_preparation;
+#[cfg(test)]
+mod download_preparation_tests;
+mod download_receipt;
+#[cfg(test)]
 mod download_speed_tests;
+mod download_transport;
+mod download_buffer;
+mod download_telemetry;
+mod download_verification;
+mod duplicate_cross_drive;
+#[cfg(test)]
+mod duplicate_scan_tests;
+mod live_downloads;
+mod transfer_control;
+mod trash_selection;
+#[cfg(test)]
+mod upload_recovery_tests;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::future::Future;
@@ -13,25 +31,26 @@ use std::io::Write as _;
 use std::path::{Path as StdPath, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use futures_util::{stream::FuturesUnordered, StreamExt};
 use clap::{Parser, Subcommand};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use humansize::{format_size, BINARY};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+#[cfg(test)]
 use tokio::io::AsyncWriteExt;
 #[cfg(test)]
-mod guest_fixture;
-#[cfg(test)]
 mod guest_disk_tests;
+#[cfg(test)]
+mod guest_fixture;
 use tracing_subscriber::EnvFilter;
 
 use pikpak::auth::OAuthCredentials;
-use pikpak::{Client, Error as PikPakError, FileInfo, FileKind, ShareClient};
 use pikpak::upload_checkpoint::{FolderCheckpoint, UploadCheckpoint};
+use pikpak::{Client, Error as PikPakError, FileInfo, FileKind, ShareClient};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -112,6 +131,8 @@ enum Command {
     Quota(QuotaArgs),
     /// Check the signed-in account and print its profile as JSON.
     Account,
+    /// Check account identity and the browser's verification gate, without listing files.
+    CheckConnection,
     /// Manage cloud tasks, owned shares, Trash and account details.
     Manage(ManagementArgs),
 }
@@ -360,6 +381,12 @@ struct DuplicatesArgs {
     /// Emit prefixed JSON scan progress events for the native macOS UI.
     #[arg(long, hide = true)]
     progress_json: bool,
+    /// Compare with a folder on this Mac or an external disk. Repeat as needed.
+    #[arg(long = "local-path")]
+    local_paths: Vec<PathBuf>,
+    /// Private native-app scope containing multiple PikPak and disk folders.
+    #[arg(long, hide = true)]
+    scope_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -668,6 +695,9 @@ struct DuplicateCandidate {
     modified_time: Option<String>,
     content_hash: Option<String>,
     md5_checksum: Option<String>,
+    source: duplicate_cross_drive::DuplicateSource,
+    folder_created_time: Option<String>,
+    local_identity: Option<duplicate_cross_drive::LocalIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -684,6 +714,9 @@ struct DuplicateFile {
     path: String,
     size: u64,
     modified_time: Option<String>,
+    source: duplicate_cross_drive::DuplicateSource,
+    folder_created_time: Option<String>,
+    local_identity: Option<duplicate_cross_drive::LocalIdentity>,
 }
 
 #[derive(Debug, Serialize)]
@@ -760,7 +793,10 @@ fn duplicate_folder_backoff(failed_attempt: u32) -> Duration {
 fn duplicate_error_requires_abort(error: &PikPakError) -> bool {
     matches!(
         error,
-        PikPakError::Auth(_) | PikPakError::SessionRejected(_) | PikPakError::TokenExpired | PikPakError::NotConfigured(_)
+        PikPakError::Auth(_)
+            | PikPakError::SessionRejected(_)
+            | PikPakError::TokenExpired
+            | PikPakError::NotConfigured(_)
     ) || matches!(error, PikPakError::Api { status: 401, .. })
 }
 
@@ -990,13 +1026,12 @@ struct UploadArgs {
 
 const DOWNLOAD_PROGRESS_PREFIX: &str = "@pikpak-progress:";
 const DOWNLOAD_QUEUE_BATCH_SIZE: usize = 200;
-const MAX_DOWNLOAD_WORKERS: usize = 64;
 
 fn bounded_download_workers(requested: usize, file_count: usize) -> usize {
     if file_count == 0 {
         return 0;
     }
-    requested.clamp(1, MAX_DOWNLOAD_WORKERS).min(file_count)
+    requested.max(1).min(file_count)
 }
 
 const UPLOAD_PROGRESS_PREFIX: &str = "@pikpak-upload-progress:";
@@ -1149,12 +1184,20 @@ struct DownloadTask {
     file: FileInfo,
     output_directory: PathBuf,
     remote_path: String,
+    retry_state: Arc<download_transport::RetryState>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum DownloadProgressEvent<'a> {
-    BatchFailed { retryable: bool, retry_in_millis: Option<u64> },
+    BatchFailed {
+        retryable: bool,
+        retry_in_millis: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination_unavailable: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<&'a str>,
+    },
     Plan {
         total_files: usize,
         total_bytes: u64,
@@ -1174,6 +1217,14 @@ enum DownloadProgressEvent<'a> {
         transferred_bytes: u64,
         total_bytes: u64,
     },
+    /// A finished file is being read to prove it is the original, for example after a backup was restored.
+    /// No bytes are transferred, so the app shows verification instead of an idle download.
+    FileVerifying {
+        file_id: &'a str,
+        name: &'a str,
+        verified_bytes: u64,
+        total_bytes: u64,
+    },
     FileProgress {
         file_id: &'a str,
         name: &'a str,
@@ -1186,10 +1237,16 @@ enum DownloadProgressEvent<'a> {
         name: &'a str,
         attempt: u32,
         retry_in_millis: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination_unavailable: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<&'a str>,
     },
     FileCompleted {
         file_id: &'a str,
         name: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_path: Option<&'a str>,
         downloaded_bytes: u64,
         transferred_bytes: u64,
         total_bytes: u64,
@@ -1197,9 +1254,21 @@ enum DownloadProgressEvent<'a> {
     FileSkipped {
         file_id: &'a str,
         name: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_path: Option<&'a str>,
         downloaded_bytes: u64,
         transferred_bytes: u64,
         total_bytes: u64,
+    },
+    FileSourceTrashed {
+        file_id: &'a str,
+        name: &'a str,
+        source_file_id: &'a str,
+    },
+    FileSourceCleanupFailed {
+        file_id: &'a str,
+        name: &'a str,
+        error: &'a str,
     },
     FileFailed {
         error: &'a str,
@@ -1208,6 +1277,9 @@ enum DownloadProgressEvent<'a> {
         downloaded_bytes: u64,
         transferred_bytes: u64,
         total_bytes: u64,
+        /// Why this file can never be fetched, when the failure proves it. Absent for anything that may clear.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        permanent: Option<&'static str>,
     },
 }
 
@@ -1217,8 +1289,12 @@ struct DownloadProgressContext<'a> {
     file_id: &'a str,
     file_name: &'a str,
     source_file_id: &'a str,
+    source_revision: Option<String>,
+    require_content_hash: bool,
+    guest_range_fallback: bool,
     transferred_bytes: Arc<AtomicU64>,
     batch_received_bytes: Option<Arc<AtomicU64>>,
+    retry_state: Arc<download_transport::RetryState>,
 }
 
 impl<'a> DownloadProgressContext<'a> {
@@ -1228,15 +1304,12 @@ impl<'a> DownloadProgressContext<'a> {
             file_id,
             file_name,
             source_file_id: file_id,
+            source_revision: None,
+            require_content_hash: false,
+            guest_range_fallback: false,
             transferred_bytes: Arc::new(AtomicU64::new(0)),
             batch_received_bytes: None,
-        }
-    }
-
-    fn add_transferred(&self, bytes: u64) {
-        self.transferred_bytes.fetch_add(bytes, Ordering::Relaxed);
-        if let Some(counter) = &self.batch_received_bytes {
-            counter.fetch_add(bytes, Ordering::Relaxed);
+            retry_state: Arc::new(download_transport::RetryState::default()),
         }
     }
 
@@ -1281,10 +1354,17 @@ fn emit_upload_progress(enabled: bool, event: UploadProgressEvent<'_>) {
 }
 
 fn emit_transfer_cancelled(enabled: bool, upload: bool, id: &str, name: &str, size: u64) {
-    if !enabled { return; }
-    let mut event = serde_json::json!({"event": "file_cancelled", "name": name, "total_bytes": size});
+    if !enabled {
+        return;
+    }
+    let mut event =
+        serde_json::json!({"event": "file_cancelled", "name": name, "total_bytes": size});
     event[if upload { "upload_id" } else { "file_id" }] = id.into();
-    let prefix = if upload { UPLOAD_PROGRESS_PREFIX } else { DOWNLOAD_PROGRESS_PREFIX };
+    let prefix = if upload {
+        UPLOAD_PROGRESS_PREFIX
+    } else {
+        DOWNLOAD_PROGRESS_PREFIX
+    };
     let mut output = std::io::stdout().lock();
     let _ = writeln!(output, "{prefix}{event}");
     let _ = output.flush();
@@ -1311,17 +1391,33 @@ async fn main() -> ExitCode {
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
+    let telemetry_enabled = matches!(&cli.command, Command::DownloadQueue(_))
+        || matches!(&cli.command, Command::Download(args) if args.progress_json)
+        || matches!(&cli.command, Command::ShareDownload(args) if args.progress_json);
+    let _telemetry = download_telemetry::Telemetry::start(telemetry_enabled);
 
     let filter = if cli.verbose {
         EnvFilter::new("pikpak=debug")
     } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("warn,pikpak::guest=info,pikpak::download_share=info")
+        })
     };
-    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            if let Some(challenge) = e.chain().find_map(|cause| match cause.downcast_ref::<pikpak::Error>() {
+                Some(pikpak::Error::VerificationRequired(challenge)) => Some(challenge), _ => None,
+            }) {
+                if let Ok(json) = serde_json::to_string(challenge) {
+                    eprintln!("PikPak verification required: {json}");
+                }
+            }
             if let Some(reason) = rejected_session_reason(&e) {
                 // A stable standalone diagnostic survives anyhow context
                 // (e.g. "browse folder failed") without text heuristics in UI.
@@ -1334,10 +1430,12 @@ async fn main() -> ExitCode {
 }
 
 fn rejected_session_reason(error: &anyhow::Error) -> Option<&'static str> {
-    error.chain().find_map(|cause| match cause.downcast_ref::<pikpak::Error>() {
-        Some(pikpak::Error::SessionRejected(reason)) => Some(*reason),
-        _ => None,
-    })
+    error
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<pikpak::Error>() {
+            Some(pikpak::Error::SessionRejected(reason)) => Some(*reason),
+            _ => None,
+        })
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -1347,7 +1445,9 @@ async fn run(cli: Cli) -> Result<()> {
             let request = read_json_request(&args.request_file)?;
             let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
             signal_hook::flag::register(signal_hook::consts::SIGTERM, cancelled.clone())?;
-            return pikpak::similarity::emit(&serde_json::to_value(pikpak::similarity::group_scores(request, &cancelled)?)?);
+            return pikpak::similarity::emit(&serde_json::to_value(
+                pikpak::similarity::group_scores(request, &cancelled)?,
+            )?);
         }
         Command::SimilarityScores(args) => {
             let request = read_json_request(&args.request_file)?;
@@ -1358,7 +1458,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::SimilarityScan(args) => {
             // Large native inventories use the metadata stream. Retain a byte
             // bound for request parsing, independently of the scan's file count.
-            let request: pikpak::similarity::ScanRequest = read_json_request_bounded(&args.request_file, 64 * 1024 * 1024)?;
+            let request: pikpak::similarity::ScanRequest =
+                read_json_request_bounded(&args.request_file, 64 * 1024 * 1024)?;
             request.validate()?;
             let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
             signal_hook::flag::register(signal_hook::consts::SIGTERM, cancelled.clone())?;
@@ -1436,7 +1537,11 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }.await,
         Command::Quota(args) => cmd_quota(&client, args).await,
-        Command::Account => cmd_account(&client).await,
+        Command::Account => cmd_account(&client, true).await,
+        Command::CheckConnection => {
+            client.check_drive_access().await.context("drive access check failed")?;
+            cmd_account(&client, false).await
+        },
         Command::Manage(args) => async {
             let request = read_json_request_bounded(&args.request_file, 1024 * 1024)?;
             let result = client.manage(request).await?;
@@ -1464,7 +1569,8 @@ fn read_json_request_bounded<T: DeserializeOwned>(path: &StdPath, max_bytes: u64
 }
 
 fn build_share_client(access: &ShareAccessInput, account: &Client) -> Result<ShareClient> {
-    account.share_client(&access.url, &access.pass_code, &access.pass_code_token)
+    account
+        .share_client(&access.url, &access.pass_code, &access.pass_code_token)
         .context("failed to prepare share client")
 }
 
@@ -1479,16 +1585,26 @@ fn build_client_with_proxy(proxy: Option<&str>) -> Result<(Client, String)> {
         Err(_) => bail!("PIKPAK_PERSONAL_ACCESS_TOKEN_FILE is invalid"),
     };
     let is_personal = personal_token.is_some();
-    let refresh_token = if is_personal { String::new() } else { load_refresh_token()? };
+    let refresh_token = if is_personal {
+        String::new()
+    } else {
+        load_refresh_token()?
+    };
     let mut builder = if let Some(token) = personal_token {
         Client::builder().personal_access_token(token)
-    } else { Client::builder().refresh_token(refresh_token.clone()) };
+    } else {
+        Client::builder().refresh_token(refresh_token.clone())
+    };
 
     if let Ok(device_id) = std::env::var("PIKPAK_DEVICE_ID") {
         let device_id = device_id.trim();
         if !device_id.is_empty() {
             builder = builder.device_id(device_id);
         }
+    }
+
+    if let Some(path) = std::env::var_os("PIKPAK_VERIFICATION_CACHE_FILE").filter(|path| !path.is_empty()) {
+        builder = builder.verification_cache(path);
     }
 
     if let (Ok(token_path), Ok(lock_path)) = (
@@ -1500,7 +1616,10 @@ fn build_client_with_proxy(proxy: Option<&str>) -> Result<(Client, String)> {
         }
     }
 
-    if let Some(proxy) = proxy.map(str::to_owned).or_else(|| std::env::var("PIKPAK_PROXY").ok()) {
+    if let Some(proxy) = proxy
+        .map(str::to_owned)
+        .or_else(|| std::env::var("PIKPAK_PROXY").ok())
+    {
         if !proxy.is_empty() {
             builder = builder.proxy(proxy);
         }
@@ -1515,25 +1634,56 @@ fn build_client_with_proxy(proxy: Option<&str>) -> Result<(Client, String)> {
         }
     }
 
-    let mode = pikpak::ContentMode::from_settings(std::env::var("PIKPAK_CONTENT_MODE").ok().as_deref(),
-        std::env::var("PIKPAK_GUEST_MODE").is_ok_and(|value| value == "1"))?;
-    let client = builder.build().context("failed to build API client")?.with_content_mode(mode);
+    let mode = pikpak::ContentMode::from_settings(
+        std::env::var("PIKPAK_CONTENT_MODE").ok().as_deref(),
+        std::env::var("PIKPAK_GUEST_MODE").is_ok_and(|value| value == "1"),
+    )?;
+    let mut client = builder
+        .build()
+        .context("failed to build API client")?
+        .with_content_mode(mode);
+    let cache_directory = std::env::var_os("PIKPAK_DUPLICATE_CACHE_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                let home = PathBuf::from(home);
+                if cfg!(target_os = "macos") {
+                    home.join("Library/Application Support/My PikPak for Mac/Duplicate Cache")
+                } else {
+                    std::env::var_os("XDG_CACHE_HOME")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| home.join(".cache"))
+                        .join("pikpak/duplicates")
+                }
+            })
+        });
+    if let Some(directory) = cache_directory {
+        client = client.with_duplicate_cache_directory(directory);
+    }
     Ok((client, refresh_token))
 }
 
 /// Explicit PAT configuration never falls back to an inherited OAuth session.
 /// Keep secrets out of command arguments and process environment listings.
 fn load_personal_access_token(path: &str) -> Result<String> {
-    if path.trim().is_empty() { bail!("PIKPAK_PERSONAL_ACCESS_TOKEN_FILE is empty"); }
-    let metadata = std::fs::symlink_metadata(path).context("could not read the Personal Access Token file")?;
+    if path.trim().is_empty() {
+        bail!("PIKPAK_PERSONAL_ACCESS_TOKEN_FILE is empty");
+    }
+    let metadata =
+        std::fs::symlink_metadata(path).context("could not read the Personal Access Token file")?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         bail!("Personal Access Token must be stored in a regular private file");
     }
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 { bail!("Personal Access Token file must have private permissions (0600)"); }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("Personal Access Token file must have private permissions (0600)");
+        }
     }
-    let token = std::fs::read_to_string(path).context("could not read the Personal Access Token file")?;
+    let token =
+        std::fs::read_to_string(path).context("could not read the Personal Access Token file")?;
     let token = token.trim();
     if token.is_empty() || token.chars().any(char::is_whitespace) {
         bail!("Personal Access Token file is empty or contains whitespace");
@@ -1565,7 +1715,9 @@ fn load_refresh_token() -> Result<String> {
 /// new value to `./.env` if present so the stored credential stays valid;
 /// otherwise print it so the user can update their environment.
 async fn persist_rotated_token(client: &Client, original: &str) {
-    if client.tokens().is_personal_access_token() { return; }
+    if client.tokens().is_personal_access_token() {
+        return;
+    }
     let current = client.tokens().current_refresh_token().await;
     if current == original {
         return;
@@ -1768,24 +1920,14 @@ async fn cmd_share_save(account: &Client, args: ShareSaveArgs) -> Result<()> {
     } else {
         request.access.pass_code_token
     };
-    let result = account
-        .restore_shared_files(
-            &share_client.parsed_link().share_id,
-            &pass_code_token,
-            &request.file_ids,
-        )
-        .await
-        .context("save shared selection failed")?;
-    let mut result = serde_json::to_value(&result)?;
-    // A restore does not return the destination's ID. Resolve only its root
-    // entry so the GUI can refresh that branch without invalidating the drive.
-    // A failed cache hint must never turn an accepted restore into a failure.
-    if let Ok(entries) = account.list_folder("").await {
-        let parents: Vec<_> = entries.into_iter()
-            .filter(|entry| entry.kind.is_folder() && entry.name == "Pack From Shared")
-            .map(|entry| entry.id).collect();
-        if !parents.is_empty() { result["cache_parent_ids"] = serde_json::to_value(parents)?; }
-    }
+    let result = pikpak::share_save_duplicates::save_unique_shared_files(
+        account,
+        &share_client,
+        &pass_code_token,
+        &request.file_ids,
+    )
+    .await
+    .context("save shared selection failed")?;
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
@@ -2047,9 +2189,13 @@ async fn calculate_shared_folder_size(
     client: &ShareClient,
     root_id: &str,
 ) -> Result<FolderMeasurementReport> {
-    let mut report = measure_folder_tree(root_id, FolderMeasurementSeed::default(), FOLDER_MEASUREMENT_CONCURRENCY, |id| async move {
-        Ok(client.list_folder(&id).await?)
-    }).await?;
+    let mut report = measure_folder_tree(
+        root_id,
+        FolderMeasurementSeed::default(),
+        FOLDER_MEASUREMENT_CONCURRENCY,
+        |id| async move { Ok(client.list_folder(&id).await?) },
+    )
+    .await?;
     // The app keeps only aggregate sizes for shared links, never their
     // listings, so don't send every entry of the shared tree back to it.
     report.listings.clear();
@@ -2057,12 +2203,20 @@ async fn calculate_shared_folder_size(
 }
 
 async fn cmd_measure(client: &Client, args: MeasureArgs) -> Result<()> {
-    let seed = args.cache_file.as_ref().map(|path| read_json_request(path)).transpose()?.unwrap_or_default();
-    let measurement = measure_folder_tree(&args.id, seed, FOLDER_MEASUREMENT_CONCURRENCY, |id| async move {
-        Ok(client.list_folder(&id).await?)
-    })
-        .await
-        .context("calculate folder size failed")?;
+    let seed = args
+        .cache_file
+        .as_ref()
+        .map(|path| read_json_request(path))
+        .transpose()?
+        .unwrap_or_default();
+    let measurement = measure_folder_tree(
+        &args.id,
+        seed,
+        FOLDER_MEASUREMENT_CONCURRENCY,
+        |id| async move { Ok(client.list_folder(&id).await?) },
+    )
+    .await
+    .context("calculate folder size failed")?;
     println!("{}", serde_json::to_string(&measurement)?);
     Ok(())
 }
@@ -2081,8 +2235,9 @@ async fn measure_folder_tree<F, Fut>(
     concurrency: usize,
     mut list: F,
 ) -> Result<FolderMeasurementReport>
-where F: FnMut(String) -> Fut,
-      Fut: Future<Output = Result<Vec<FileInfo>>>,
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<Vec<FileInfo>>>,
 {
     let mut pending = vec![root_id.to_string()];
     let mut visited = HashSet::from([root_id.to_string()]);
@@ -2095,7 +2250,9 @@ where F: FnMut(String) -> Fut,
 
     loop {
         while running.len() < concurrency.max(1) {
-            let Some(folder_id) = pending.pop() else { break };
+            let Some(folder_id) = pending.pop() else {
+                break;
+            };
             // A folder is only discovered once its parent's listing finished,
             // so recording here still places every parent before its children.
             traversal_order.push(folder_id.clone());
@@ -2111,7 +2268,9 @@ where F: FnMut(String) -> Fut,
             let listing = list(folder_id.clone());
             running.push(async move { (folder_id, listing.await) });
         }
-        let Some((folder_id, entries)) = running.next().await else { break };
+        let Some((folder_id, entries)) = running.next().await else {
+            break;
+        };
         let entries = entries.with_context(|| format!("failed to inspect folder {folder_id}"))?;
         let mut direct_measurement = FolderMeasurement::default();
         let mut children = Vec::new();
@@ -2119,10 +2278,16 @@ where F: FnMut(String) -> Fut,
         let mut seen_entries = HashSet::new();
 
         for entry in entries {
-            if entry.id.is_empty() || !seen_entries.insert(entry.id.clone()) { continue; }
-            if entry.kind.is_folder() && visited.contains(&entry.id) { continue; }
+            if entry.id.is_empty() || !seen_entries.insert(entry.id.clone()) {
+                continue;
+            }
+            if entry.kind.is_folder() && visited.contains(&entry.id) {
+                continue;
+            }
             direct_entries.push(FolderSizeEntry {
-                id: entry.id.clone(), size: entry.size, is_folder: entry.kind.is_folder(),
+                id: entry.id.clone(),
+                size: entry.size,
+                is_folder: entry.kind.is_folder(),
             });
             if entry.kind.is_folder() {
                 if visited.insert(entry.id.clone()) {
@@ -2179,13 +2344,25 @@ fn build_folder_measurement_report(
     }
 
     let root = folders.get(root_id).cloned().unwrap_or_default();
-    FolderMeasurementReport { root, folders, ..Default::default() }
+    FolderMeasurementReport {
+        root,
+        folders,
+        ..Default::default()
+    }
 }
 
 async fn cmd_duplicates(client: &Client, args: DuplicatesArgs) -> Result<()> {
-    let scan = scan_duplicates(client, &args.parent_id, &args.root_path, args.progress_json)
-        .await
-        .context("scan for duplicate files failed")?;
+    let scope = if let Some(path) = args.scope_file {
+        read_json_request_bounded(&path, 1024 * 1024).context("decode duplicate scan scope")?
+    } else {
+        duplicate_cross_drive::Scope {
+            cloud_folders: vec![duplicate_cross_drive::CloudFolder { id: args.parent_id, path: args.root_path }],
+            local_paths: args.local_paths,
+        }
+    };
+    let scan = duplicate_cross_drive::scan(client, scope, args.progress_json)
+    .await
+    .context("scan for duplicate files failed")?;
     println!("{}", serde_json::to_string(&scan)?);
     Ok(())
 }
@@ -2196,8 +2373,25 @@ async fn scan_duplicates(
     root_path: &str,
     progress_json: bool,
 ) -> Result<DuplicateScan> {
+    let (folders, failed, candidates) = collect_duplicate_candidates(client, root_id, root_path, progress_json).await?;
+    let mut scan = build_duplicate_scan(normalize_remote_path(root_path), folders, candidates);
+    scan.failed_folders = failed;
+    Ok(scan)
+}
+
+async fn collect_duplicate_candidates(
+    client: &Client,
+    root_id: &str,
+    root_path: &str,
+    progress_json: bool,
+) -> Result<(usize, usize, Vec<DuplicateCandidate>)> {
+    // Scanning never reads or writes the persistent inventory used by other operations.
+    let client = client.clone().without_duplicate_cache();
     let root_path = normalize_remote_path(root_path);
-    let mut pending = vec![(root_id.to_string(), root_path.clone())];
+    let root_created = if root_id.is_empty() { None } else {
+        client.file_metadata(root_id).await.ok().and_then(|value| value["created_time"].as_str().map(str::to_owned))
+    };
+    let mut pending = vec![(root_id.to_string(), root_path.clone(), root_created)];
     let mut visited = HashSet::from([root_id.to_string()]);
     let mut candidates = Vec::new();
     let mut scanned_folders = 0usize;
@@ -2211,10 +2405,13 @@ async fn scan_duplicates(
         },
     );
 
-    while let Some((folder_id, folder_path)) = pending.pop() {
+    while let Some((folder_id, folder_path, folder_created_time)) = pending.pop() {
         let mut attempt = 1u32;
         let entries = loop {
-            match client.list_folder(&folder_id).await {
+            match client
+                .list_folder(&folder_id)
+                .await
+            {
                 Ok(entries) => break Some(entries),
                 Err(error) => {
                     match duplicate_folder_failure_action(&error, attempt, folder_id == root_id) {
@@ -2282,7 +2479,7 @@ async fn scan_duplicates(
             let path = join_remote_display_path(&folder_path, &entry.name);
             if entry.kind.is_folder() {
                 if visited.insert(entry.id.clone()) {
-                    pending.push((entry.id, path));
+                    pending.push((entry.id, path, entry.created_time));
                 }
             } else {
                 candidates.push(DuplicateCandidate {
@@ -2293,6 +2490,9 @@ async fn scan_duplicates(
                     modified_time: entry.modified_time,
                     content_hash: entry.hash,
                     md5_checksum: entry.md5_checksum,
+                    source: duplicate_cross_drive::DuplicateSource::Pikpak,
+                    folder_created_time: folder_created_time.clone(),
+                    local_identity: None,
                 });
             }
         }
@@ -2310,9 +2510,7 @@ async fn scan_duplicates(
         );
     }
 
-    let mut scan = build_duplicate_scan(root_path, scanned_folders, candidates);
-    scan.failed_folders = failed_folders;
-    Ok(scan)
+    Ok((scanned_folders, failed_folders, candidates))
 }
 
 fn build_duplicate_scan(
@@ -2321,48 +2519,18 @@ fn build_duplicate_scan(
     candidates: Vec<DuplicateCandidate>,
 ) -> DuplicateScan {
     let scanned_files = candidates.len();
-    let mut grouped: HashMap<DuplicateKey, Vec<DuplicateCandidate>> = HashMap::new();
-
-    for candidate in candidates {
-        let key = if let Some(digest) = normalized_digest(candidate.content_hash.as_deref()) {
-            DuplicateKey::Exact {
-                algorithm: "pikpak_gcid",
-                digest,
-                size: candidate.size,
-            }
-        } else if let Some(digest) = normalized_digest(candidate.md5_checksum.as_deref()) {
-            DuplicateKey::Exact {
-                algorithm: "md5",
-                digest,
-                size: candidate.size,
-            }
-        } else {
-            DuplicateKey::Metadata {
-                normalized_name: candidate.name.trim().to_lowercase(),
-                size: candidate.size,
-            }
-        };
-        grouped.entry(key).or_default().push(candidate);
-    }
+    let grouped = duplicate_cross_drive::group_candidates(candidates);
 
     let mut groups = Vec::new();
     for (key, mut members) in grouped {
         if members.len() < 2 {
             continue;
         }
-        members.sort_by(|a, b| {
-            a.path
-                .to_lowercase()
-                .cmp(&b.path.to_lowercase())
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        let match_kind = match key {
-            DuplicateKey::Exact { .. } => DuplicateMatchKind::ExactContent,
-            DuplicateKey::Metadata { .. } => DuplicateMatchKind::MatchingNameAndSize,
-        };
+        members.sort_by(duplicate_cross_drive::keeper_order);
+        let match_kind = key;
         let size = members[0].size;
         let copies = members.len();
-        let extra_copies = u64::try_from(copies.saturating_sub(1)).unwrap_or(u64::MAX);
+        let extra_copies = u64::try_from(members.iter().skip(1).filter(|file| file.source == duplicate_cross_drive::DuplicateSource::Pikpak).count()).unwrap_or(u64::MAX);
         let reclaimable_bytes = size.saturating_mul(extra_copies);
         groups.push(DuplicateGroup {
             id: String::new(),
@@ -2378,6 +2546,9 @@ fn build_duplicate_scan(
                     path: file.path,
                     size: file.size,
                     modified_time: file.modified_time,
+                    source: file.source,
+                    folder_created_time: file.folder_created_time,
+                    local_identity: file.local_identity,
                 })
                 .collect(),
         });
@@ -2427,7 +2598,7 @@ fn normalized_digest(value: Option<&str>) -> Option<String> {
 }
 
 fn normalize_remote_path(path: &str) -> String {
-    let trimmed = path.trim().trim_matches('/');
+    let trimmed = path.trim_matches('/');
     if trimmed.is_empty() {
         "/".to_string()
     } else {
@@ -2444,16 +2615,29 @@ fn join_remote_display_path(parent: &str, name: &str) -> String {
 }
 
 async fn cmd_trash(client: &Client, args: TrashArgs) -> Result<()> {
-    if !args.yes { bail!("refusing to move items to Trash without --yes"); }
-    let selection = args.ids_file.map(|path| -> Result<trash_selection::Selection> {
-        let encoded = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read ids file {}", path.display()))?;
-        serde_json::from_str(&encoded).context("ids file must contain a JSON string array or a guarded Trash selection")
-    }).transpose()?;
+    if !args.yes {
+        bail!("refusing to move items to Trash without --yes");
+    }
+    let selection = args
+        .ids_file
+        .map(|path| -> Result<trash_selection::Selection> {
+            let encoded = std::fs::read_to_string(&path)
+                .with_context(|| format!("failed to read ids file {}", path.display()))?;
+            serde_json::from_str(&encoded)
+                .context("ids file must contain a JSON string array or a guarded Trash selection")
+        })
+        .transpose()?;
     let request = trash_selection::Request::new(args.ids, selection)?;
     let outcome = trash_selection::execute(client, request).await?;
-    println!("{}", serde_json::to_string(&TrashResult { trashed_ids: outcome.confirmed })?);
-    if let Some(error) = outcome.error { return Err(error); }
+    println!(
+        "{}",
+        serde_json::to_string(&TrashResult {
+            trashed_ids: outcome.confirmed
+        })?
+    );
+    if let Some(error) = outcome.error {
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -2485,9 +2669,13 @@ async fn cmd_move(client: &Client, args: MoveArgs) -> Result<()> {
     let mut confirmed = Vec::new();
     for batch in ids.chunks(MOVE_BATCH_SIZE) {
         if let Err(error) = client.move_files(batch, &args.to_parent_id).await {
-            println!("{}", serde_json::to_string(&MoveResult {
-                moved_ids: confirmed, parent_id: args.to_parent_id,
-            })?);
+            println!(
+                "{}",
+                serde_json::to_string(&MoveResult {
+                    moved_ids: confirmed,
+                    parent_id: args.to_parent_id,
+                })?
+            );
             return Err(error).context("move item batch to another PikPak folder failed");
         }
         confirmed.extend_from_slice(batch);
@@ -3305,14 +3493,22 @@ async fn create_remote_upload_directories(
             let task_client = client.clone();
             let checkpoint = checkpoint.clone();
             set.spawn(async move {
-                let result = resume_upload_folder(&task_client, index, &parent_id, &name, checkpoint.as_deref()).await;
+                let result = resume_upload_folder(
+                    &task_client,
+                    index,
+                    &parent_id,
+                    &name,
+                    checkpoint.as_deref(),
+                )
+                .await;
                 (index, parent_id, display_name, result)
             });
         }
 
         let mut first_error = None;
         while let Some(joined) = set.join_next().await {
-            let (index, parent_id, display_name, result) = joined.context("folder creation task panicked")?;
+            let (index, parent_id, display_name, result) =
+                joined.context("folder creation task panicked")?;
             match result {
                 Ok(remote_id) => {
                     remote_ids[index] = Some(remote_id.clone());
@@ -3342,7 +3538,14 @@ async fn create_remote_upload_directories(
                 let task_client = client.clone();
                 let checkpoint = checkpoint.clone();
                 set.spawn(async move {
-                    let result = resume_upload_folder(&task_client, index, &parent_id, &name, checkpoint.as_deref()).await;
+                    let result = resume_upload_folder(
+                        &task_client,
+                        index,
+                        &parent_id,
+                        &name,
+                        checkpoint.as_deref(),
+                    )
+                    .await;
                     (index, parent_id, display_name, result)
                 });
             }
@@ -3366,31 +3569,71 @@ async fn create_remote_upload_directories(
         .collect()
 }
 
-async fn resume_upload_folder(client: &Client, index: usize, parent: &str, name: &str,
-                              checkpoint: Option<&UploadCheckpoint>) -> Result<String> {
-    let Some(checkpoint) = checkpoint else { return Ok(client.create_folder(parent, name).await?); };
+async fn resume_upload_folder(
+    client: &Client,
+    index: usize,
+    parent: &str,
+    name: &str,
+    checkpoint: Option<&UploadCheckpoint>,
+) -> Result<String> {
+    let Some(checkpoint) = checkpoint else {
+        return Ok(client.create_folder(parent, name).await?);
+    };
     if let Some(mut saved) = checkpoint.folder(index)? {
-        if saved.parent_id != parent || saved.name != name { bail!("saved upload folder destination changed"); }
+        if saved.parent_id != parent || saved.name != name {
+            bail!("saved upload folder destination changed");
+        }
         let children = client.list_folder(parent).await?;
         if let Some(id) = &saved.remote_id {
-            if children.iter().any(|item| item.id == *id && item.kind.is_folder()) { return Ok(id.clone()); }
+            if children
+                .iter()
+                .any(|item| item.id == *id && item.kind.is_folder())
+            {
+                return Ok(id.clone());
+            }
             bail!("a folder created by this upload was moved or deleted; it was not recreated automatically");
         }
         // A quit may occur after the server creates a folder but before its
         // response reaches disk. Reconcile only IDs absent before that request.
-        let matches: Vec<_> = children.iter().filter(|item| item.kind.is_folder() && item.name == name && !saved.previous_ids.contains(&item.id)).collect();
+        let matches: Vec<_> = children
+            .iter()
+            .filter(|item| {
+                item.kind.is_folder() && item.name == name && !saved.previous_ids.contains(&item.id)
+            })
+            .collect();
         if matches.len() == 1 {
             saved.remote_id = Some(matches[0].id.clone());
             checkpoint.save_folder(index, &saved)?;
             return Ok(matches[0].id.clone());
         }
-        bail!("could not safely identify a folder created just before interruption; inspect the destination before starting a new batch");
+        return Err(PikPakError::MutationUncertain(
+            "the folder is not uniquely visible in its recovery listing yet",
+        )
+        .into());
     }
-    let previous_ids = client.list_folder(parent).await?.into_iter()
-        .filter(|item| item.kind.is_folder() && item.name == name).map(|item| item.id).collect();
-    let mut saved = FolderCheckpoint { parent_id: parent.into(), name: name.into(), previous_ids, remote_id: None };
+    let previous_ids = client
+        .list_folder(parent)
+        .await?
+        .into_iter()
+        .filter(|item| item.kind.is_folder() && item.name == name)
+        .map(|item| item.id)
+        .collect();
+    let mut saved = FolderCheckpoint {
+        parent_id: parent.into(),
+        name: name.into(),
+        previous_ids,
+        remote_id: None,
+    };
     checkpoint.save_folder(index, &saved)?;
-    let id = client.create_folder(parent, name).await?;
+    let id = match client.create_folder(parent, name).await {
+        Ok(id) => id,
+        Err(error) => {
+            if error.mutation_was_rejected() {
+                checkpoint.clear_rejected_folder_intent(index)?;
+            }
+            return Err(error.into());
+        }
+    };
     saved.remote_id = Some(id.clone());
     checkpoint.save_folder(index, &saved)?;
     Ok(id)
@@ -3415,12 +3658,26 @@ async fn cmd_upload(client: &Client, args: UploadArgs) -> Result<()> {
     // thousands of entries. Keep it off Tokio's network worker threads.
     let mut checkpoint = if let Some(directory) = args.checkpoint_dir {
         let account_id = client.tokens().user_id().await?;
-        Some(UploadCheckpoint::open(directory, account_id, args.parent_id.clone(), requested_inputs.clone())?)
-    } else { None };
-    let saved_plan = checkpoint.as_ref().map(|checkpoint| checkpoint.plan::<LocalUploadPlan>()).transpose()?.flatten();
-    let plan = if let Some(plan) = saved_plan { plan } else {
+        Some(UploadCheckpoint::open(
+            directory,
+            account_id,
+            args.parent_id.clone(),
+            requested_inputs.clone(),
+        )?)
+    } else {
+        None
+    };
+    let saved_plan = checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.plan::<LocalUploadPlan>())
+        .transpose()?
+        .flatten();
+    let plan = if let Some(plan) = saved_plan {
+        plan
+    } else {
         tokio::task::spawn_blocking(move || discover_local_uploads(requested_inputs))
-            .await.context("local upload discovery task panicked")??
+            .await
+            .context("local upload discovery task panicked")??
     };
     if let Some(checkpoint) = &mut checkpoint {
         checkpoint.initialize(&plan, plan.files.iter().map(|file| file.path.clone()))?;
@@ -3532,15 +3789,27 @@ async fn cmd_upload(client: &Client, args: UploadArgs) -> Result<()> {
     let mut first_error: Option<anyhow::Error> = None;
     let mut completed = 0usize;
     let batch_sent_bytes = Arc::new(AtomicU64::new(0));
-    transfer_control::schedule(sources, transfer_control::Concurrency::adaptive(file_workers, batch_sent_bytes.clone()),
+    transfer_control::schedule(
+        sources,
+        transfer_control::Concurrency::adaptive(file_workers, batch_sent_bytes.clone()),
         |source: UploadSource| {
-            let client = client.clone(); let checkpoint = checkpoint.clone();
+            let client = client.clone();
+            let checkpoint = checkpoint.clone();
             let batch_sent_bytes = batch_sent_bytes.clone();
-            async move { upload_one_file_with_retry(&client, &source, progress_json, multipart_workers, checkpoint.as_deref(), batch_sent_bytes).await }
+            async move {
+                upload_one_file_with_retry(
+                    &client,
+                    &source,
+                    progress_json,
+                    multipart_workers,
+                    checkpoint.as_deref(),
+                    batch_sent_bytes,
+                )
+                .await
+            }
         },
         |source| source.upload_id.clone(),
-        |source, result| {
-        match result {
+        |source, result| match result {
             Ok(instant) => {
                 completed = completed.saturating_add(1);
                 emit_upload_progress(
@@ -3560,7 +3829,13 @@ async fn cmd_upload(client: &Client, args: UploadArgs) -> Result<()> {
                 }
             }
             Err(error) if error.is::<transfer_control::Cancelled>() => {
-                emit_transfer_cancelled(progress_json, true, &source.upload_id, &source.display_name, source.size);
+                emit_transfer_cancelled(
+                    progress_json,
+                    true,
+                    &source.upload_id,
+                    &source.display_name,
+                    source.size,
+                );
             }
             Err(error) => {
                 let failure_detail = format!("{error:#}");
@@ -3583,15 +3858,21 @@ async fn cmd_upload(client: &Client, args: UploadArgs) -> Result<()> {
                     first_error = Some(error);
                 }
             }
-        }
         },
         |source, attempt, delay| {
-            emit_upload_progress(progress_json, UploadProgressEvent::FileRetrying {
-                upload_id: &source.upload_id, name: &source.display_name, attempt,
-                max_attempts: 0, retry_in_millis: delay.as_millis() as u64,
-            });
-        }
-    ).await?;
+            emit_upload_progress(
+                progress_json,
+                UploadProgressEvent::FileRetrying {
+                    upload_id: &source.upload_id,
+                    name: &source.display_name,
+                    attempt,
+                    max_attempts: 0,
+                    retry_in_millis: delay.as_millis() as u64,
+                },
+            );
+        },
+    )
+    .await?;
 
     if let Some(error) = first_error {
         bail!("uploaded {completed} of {source_count} file(s); first failure: {error:#}");
@@ -3611,35 +3892,72 @@ async fn upload_one_file_with_retry(
     let mut attempt = 0u32;
     loop {
         attempt = attempt.saturating_add(1);
-        let result = match transfer_control::interruptible(&source.upload_id,
-            upload_one_file(client, source, progress_json, multipart_workers, checkpoint, batch_sent_bytes.clone())).await {
+        let result = match transfer_control::interruptible(
+            &source.upload_id,
+            upload_one_file(
+                client,
+                source,
+                progress_json,
+                multipart_workers,
+                checkpoint,
+                batch_sent_bytes.clone(),
+            ),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(cancelled) => {
-                if cancelled.is::<transfer_control::Cancelled>() { if let Some(checkpoint) = checkpoint {
-                    let mut state = checkpoint.file(&source.path)?;
-                    state.cancelled = true;
-                    checkpoint.save_file(&source.path, &state)?;
-                } }
+                if cancelled.is::<transfer_control::Cancelled>() {
+                    if let Some(checkpoint) = checkpoint {
+                        let mut state = checkpoint.file(&source.path)?;
+                        state.cancelled = true;
+                        checkpoint.save_file(&source.path, &state)?;
+                    }
+                }
                 return Err(cancelled);
             }
         };
         match result {
             Ok(instant) => return Ok(instant),
             Err(error) if error.is::<transfer_control::Cancelled>() => return Err(error),
-            Err(error) if transfer_control::enabled() => return Err(error.context(transfer_control::Retry("Waiting to retry the upload".into()))),
-            Err(error) if attempt < MAX_UPLOAD_FILE_ATTEMPTS && upload_file_failure_is_retryable(&error) => {
-                let delay = if transfer_control::enabled() { transfer_retry_delay(attempt) }
-                    else { upload_file_retry_delay(attempt) };
-                emit_upload_progress(progress_json, UploadProgressEvent::FileRetrying {
-                    upload_id: &source.upload_id, name: &source.display_name,
-                    attempt: attempt.saturating_add(1), max_attempts: if transfer_control::enabled() { 0 } else { MAX_UPLOAD_FILE_ATTEMPTS },
-                    retry_in_millis: delay.as_millis() as u64,
-                });
+            Err(error)
+                if transfer_control::enabled() && upload_file_failure_is_retryable(&error) =>
+            {
+                return Err(error.context(transfer_control::Retry(
+                    "Waiting to retry the upload".into(),
+                )))
+            }
+            Err(error)
+                if attempt < MAX_UPLOAD_FILE_ATTEMPTS
+                    && upload_file_failure_is_retryable(&error) =>
+            {
+                let delay = if transfer_control::enabled() {
+                    transfer_retry_delay(attempt)
+                } else {
+                    upload_file_retry_delay(attempt)
+                };
+                emit_upload_progress(
+                    progress_json,
+                    UploadProgressEvent::FileRetrying {
+                        upload_id: &source.upload_id,
+                        name: &source.display_name,
+                        attempt: attempt.saturating_add(1),
+                        max_attempts: if transfer_control::enabled() {
+                            0
+                        } else {
+                            MAX_UPLOAD_FILE_ATTEMPTS
+                        },
+                        retry_in_millis: delay.as_millis() as u64,
+                    },
+                );
                 eprintln!("Upload attempt {attempt} failed: {error:#}; waiting to retry");
-                if let Err(cancelled) = transfer_control::run(&source.upload_id, tokio::time::sleep(delay)).await {
+                if let Err(cancelled) =
+                    transfer_control::run(&source.upload_id, tokio::time::sleep(delay)).await
+                {
                     if let Some(checkpoint) = checkpoint {
                         let mut state = checkpoint.file(&source.path)?;
-                        state.cancelled = true; checkpoint.save_file(&source.path, &state)?;
+                        state.cancelled = true;
+                        checkpoint.save_file(&source.path, &state)?;
                     }
                     return Err(cancelled.into());
                 }
@@ -3654,6 +3972,14 @@ fn transfer_retry_delay(attempt: u32) -> Duration {
 }
 
 fn upload_file_failure_is_retryable(error: &anyhow::Error) -> bool {
+    if error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<PikPakError>(),
+            Some(PikPakError::MutationUncertain(_))
+        )
+    }) {
+        return false;
+    }
     let message = format!("{error:#}").to_ascii_lowercase();
     let permanent_local_failure = [
         "permission denied",
@@ -3673,6 +3999,26 @@ fn upload_file_failure_is_retryable(error: &anyhow::Error) -> bool {
     .any(|needle| message.contains(needle));
     if permanent_local_failure {
         return false;
+    }
+
+    // Authentication/captcha preparation carries typed provider failures. Its
+    // error text says "API error 503", rather than the "HTTP 503" used by OSS,
+    // so use the status directly when deciding whether a safe retry can run.
+    if error
+        .chain()
+        .any(|cause| match cause.downcast_ref::<PikPakError>() {
+            Some(PikPakError::Api { status, .. } | PikPakError::RetryAfter { status, .. }) => {
+                pikpak::download_policy::transient_status(*status)
+            }
+            Some(PikPakError::Auth(message)) => message
+                .strip_prefix("status ")
+                .and_then(|message| message.split(':').next())
+                .and_then(|status| status.parse::<u16>().ok())
+                .is_some_and(pikpak::download_policy::transient_status),
+            _ => false,
+        })
+    {
+        return true;
     }
 
     [
@@ -3703,10 +4049,51 @@ fn upload_file_retry_delay(failed_attempt: u32) -> Duration {
 
 fn emit_upload_committed(source: &UploadSource, file_id: Option<&str>, enabled: bool) {
     if let Some(file_id) = file_id.filter(|id| !id.is_empty()) {
-        emit_upload_progress(enabled, UploadProgressEvent::FileCommitted {
-            file_id, parent_id: &source.remote_parent_id, name: &source.name,
-        });
+        emit_upload_progress(
+            enabled,
+            UploadProgressEvent::FileCommitted {
+                file_id,
+                parent_id: &source.remote_parent_id,
+                name: &source.name,
+            },
+        );
     }
+}
+
+async fn discard_upload_placeholder(
+    client: &Client,
+    source: &UploadSource,
+    gcid: &str,
+    saved: &mut pikpak::upload_checkpoint::FileCheckpoint,
+    checkpoint: Option<&UploadCheckpoint>,
+) -> Result<()> {
+    let id = saved
+        .remote_file_id
+        .clone()
+        .context("saved upload discard is missing its owned file identity")?;
+    if saved
+        .discarding_remote_file_id
+        .as_ref()
+        .is_some_and(|discarding| discarding != &id)
+    {
+        bail!("saved upload discard belongs to a different remote file");
+    }
+    // Write the intent before Trash. If either its reply or the following
+    // checkpoint update is lost, the same owned ID must be reconciled first.
+    saved.discarding_remote_file_id = Some(id.clone());
+    if let Some(checkpoint) = checkpoint {
+        checkpoint.save_file(&source.path, saved)?;
+    }
+    client
+        .discard_owned_incomplete_upload(&id, gcid, source.size)
+        .await?;
+    saved.remote_file_id = None;
+    saved.discarding_remote_file_id = None;
+    saved.creation_previous_ids = None;
+    if let Some(checkpoint) = checkpoint {
+        checkpoint.save_file(&source.path, saved)?;
+    }
+    Ok(())
 }
 
 async fn upload_one_file(
@@ -3717,17 +4104,70 @@ async fn upload_one_file(
     checkpoint: Option<&UploadCheckpoint>,
     batch_sent_bytes: Arc<AtomicU64>,
 ) -> Result<bool> {
-    let mut saved = checkpoint.map(|checkpoint| checkpoint.file(&source.path)).transpose()?.unwrap_or_default();
-    if saved.cancelled { return Err(transfer_control::Cancelled.into()); }
+    let mut saved = checkpoint
+        .map(|checkpoint| checkpoint.file(&source.path))
+        .transpose()?
+        .unwrap_or_default();
+    if saved
+        .discarding_remote_file_id
+        .as_ref()
+        .is_some_and(|discarding| saved.remote_file_id.as_ref() != Some(discarding))
+    {
+        bail!("saved upload discard belongs to a different remote file");
+    }
+    if saved.cancelled {
+        return Err(transfer_control::Cancelled.into());
+    }
     if saved.completed {
         emit_upload_committed(source, saved.remote_file_id.as_deref(), progress_json);
         return Ok(true);
     }
-    if let Some(checkpoint) = checkpoint { checkpoint.validate_source(&source.path)?; }
+    if let Some(checkpoint) = checkpoint {
+        checkpoint.validate_source(&source.path)?;
+    }
+    if let (Some(checkpoint), Some(gcid)) = (checkpoint, saved.gcid.as_deref()) {
+        if !checkpoint.has_source_identity(&source.path) {
+            let verified =
+                pikpak::upload::gcid_file(&source.path, source.size, Arc::new(|_| {})).await?;
+            if !verified.eq_ignore_ascii_case(gcid) {
+                bail!("local file changed since this upload was started; choose it as a new upload instead");
+            }
+        }
+    }
+    if saved.remote_file_id.is_none() {
+        if let Some(previous) = &saved.creation_previous_ids {
+            let gcid = saved
+                .gcid
+                .as_deref()
+                .context("saved upload creation is missing its content identity")?;
+            saved.remote_file_id = Some(
+                client
+                    .reconcile_upload_creation(
+                        &source.remote_parent_id,
+                        &source.name,
+                        source.size,
+                        gcid,
+                        previous,
+                    )
+                    .await?,
+            );
+            if let Some(checkpoint) = checkpoint {
+                checkpoint.save_file(&source.path, &saved)?;
+            }
+        }
+    }
     if let (Some(file_id), Some(gcid)) = (&saved.remote_file_id, &saved.gcid) {
-        if client.completed_upload_matches(file_id, gcid, source.size).await? {
+        if client
+            .completed_upload_matches(file_id, gcid, source.size)
+            .await?
+        {
             saved.completed = true;
-            if let Some(checkpoint) = checkpoint { checkpoint.save_file(&source.path, &saved)?; }
+            // The placeholder may finish after the discard was armed but
+            // before Trash was sent. Preserve the now-complete live upload.
+            saved.discarding_remote_file_id = None;
+            if let Some(checkpoint) = checkpoint {
+                checkpoint.save_file(&source.path, &saved)?;
+            }
             emit_upload_committed(source, saved.remote_file_id.as_deref(), progress_json);
             return Ok(true);
         }
@@ -3743,36 +4183,66 @@ async fn upload_one_file(
     let hashing_id = source.upload_id.clone();
     let hashing_name = source.display_name.clone();
     let hashing_size = source.size;
-    let gcid = if let Some(gcid) = saved.gcid.clone() { gcid } else { pikpak::upload::gcid_file(
-        &source.path,
-        source.size,
-        Arc::new(move |hashed_bytes| {
-            emit_upload_progress(
-                progress_json,
-                UploadProgressEvent::FileHashProgress {
-                    upload_id: &hashing_id,
-                    name: &hashing_name,
-                    hashed_bytes,
-                    total_bytes: hashing_size,
-                },
-            );
-        }),
-    )
-    .await
-    .with_context(|| format!("calculate content identifier for {}", source.name))? };
+    let gcid = if let Some(gcid) = saved.gcid.clone() {
+        gcid
+    } else {
+        pikpak::upload::gcid_file(
+            &source.path,
+            source.size,
+            Arc::new(move |hashed_bytes| {
+                emit_upload_progress(
+                    progress_json,
+                    UploadProgressEvent::FileHashProgress {
+                        upload_id: &hashing_id,
+                        name: &hashing_name,
+                        hashed_bytes,
+                        total_bytes: hashing_size,
+                    },
+                );
+            }),
+        )
+        .await
+        .with_context(|| format!("calculate content identifier for {}", source.name))?
+    };
     if let Some(checkpoint) = checkpoint {
         checkpoint.validate_source(&source.path)?;
         saved.gcid = Some(gcid.clone());
         checkpoint.save_file(&source.path, &saved)?;
     }
 
-    let task = client
+    if saved.remote_file_id.is_some() {
+        discard_upload_placeholder(client, source, &gcid, &mut saved, checkpoint).await?;
+    }
+    if let Some(checkpoint) = checkpoint {
+        saved.creation_previous_ids = Some(
+            client
+                .upload_creation_snapshot(&source.remote_parent_id, &source.name)
+                .await?,
+        );
+        checkpoint.save_file(&source.path, &saved)?;
+    }
+    let created = client
         .create_upload_task(&source.remote_parent_id, &source.name, source.size, &gcid)
-        .await
-        .with_context(|| format!("create PikPak upload task for {}", source.display_name))?;
+        .await;
+    let task = match created {
+        Ok(task) => task,
+        Err(error) => {
+            if error.mutation_was_rejected() {
+                saved.creation_previous_ids = None;
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.save_file(&source.path, &saved)?;
+                }
+            }
+            return Err(error)
+                .with_context(|| format!("create PikPak upload task for {}", source.display_name));
+        }
+    };
     saved.remote_file_id = task.file_id.clone();
+    saved.creation_previous_ids = None;
     saved.completed = task.completed;
-    if let Some(checkpoint) = checkpoint { checkpoint.save_file(&source.path, &saved)?; }
+    if let Some(checkpoint) = checkpoint {
+        checkpoint.save_file(&source.path, &saved)?;
+    }
     if task.completed {
         emit_upload_committed(source, saved.remote_file_id.as_deref(), progress_json);
         return Ok(true);
@@ -3815,14 +4285,45 @@ async fn upload_one_file(
     .await;
 
     if result.is_err() {
-        // Failed upload tasks are incomplete placeholders. Best-effort removal
-        // prevents them accumulating invisibly in the account; the original
-        // upload error remains authoritative if cleanup also fails.
-        if let Some(file_id) = task.file_id {
-            let _ = client.trash_files(&[file_id]).await;
+        if let Some(file_id) = saved.remote_file_id.as_deref() {
+            if client
+                .completed_upload_matches(file_id, &gcid, source.size)
+                .await
+                .unwrap_or(false)
+            {
+                saved.completed = true;
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.save_file(&source.path, &saved)?;
+                }
+                emit_upload_committed(source, saved.remote_file_id.as_deref(), progress_json);
+                return Ok(false);
+            }
+            if discard_upload_placeholder(client, source, &gcid, &mut saved, checkpoint)
+                .await
+                .is_err()
+            {
+                return Err(PikPakError::MutationUncertain(
+                    "the existing upload needs confirmation before retry",
+                )
+                .into());
+            }
+        } else {
+            return Err(PikPakError::MutationUncertain(
+                "the existing upload needs confirmation before retry",
+            )
+            .into());
         }
     }
     result.with_context(|| format!("send {} to PikPak upload storage", source.display_name))?;
+    if client.duplicate_cache().await.is_some() {
+        if let Some(file_id) = saved.remote_file_id.as_deref() {
+            // OSS can finish before PikPak publishes the completed entry. A
+            // failed observation leaves its parent dirty for the next scan.
+            let _ = client
+                .completed_upload_matches(file_id, &gcid, source.size)
+                .await;
+        }
+    }
     if let Some(checkpoint) = checkpoint {
         checkpoint.validate_source(&source.path)?;
         saved.completed = true;
@@ -3836,28 +4337,42 @@ async fn cmd_download(client: &Client, args: DownloadArgs) -> Result<()> {
     let progress_json = args.progress_json;
     let result = cmd_download_inner(client, args).await;
     if let Err(error) = &result {
-        emit_download_progress(progress_json, DownloadProgressEvent::BatchFailed {
-            retryable: pikpak::download_policy::retryable(error),
-            retry_in_millis: pikpak::download_policy::delay(error).map(|delay| delay.as_millis() as u64),
-        });
+        let destination_unavailable = pikpak::download_policy::destination_unavailable(error);
+        let message = format!("{error:#}");
+        emit_download_progress(
+            progress_json,
+            DownloadProgressEvent::BatchFailed {
+                retryable: pikpak::download_policy::retryable(error),
+                retry_in_millis: pikpak::download_policy::delay(error)
+                    .map(|delay| delay.as_millis() as u64),
+                destination_unavailable: destination_unavailable.then_some(true),
+                error: destination_unavailable.then_some(message.as_str()),
+            },
+        );
     }
     result
 }
 
 async fn cmd_download_inner(client: &Client, args: DownloadArgs) -> Result<()> {
-    let output = StdPath::new(&args.output);
-    tokio::fs::create_dir_all(output)
-        .await
-        .context("failed to create output directory")?;
+    let output_directory = download_fs::selected_directory(StdPath::new(&args.output))
+        .context("failed to open selected output directory")?;
+    let output = output_directory.as_path();
 
     let mut requested: Vec<AccountDownloadRootInput> = if let Some(path) = args.roots_file {
         read_json_request::<AccountDownloadInput>(&path)?.roots
     } else {
-        args.paths.into_iter().map(|path| AccountDownloadRootInput {
-            path, file: None, relative_parent: None,
-        }).collect()
+        args.paths
+            .into_iter()
+            .map(|path| AccountDownloadRootInput {
+                path,
+                file: None,
+                relative_parent: None,
+            })
+            .collect()
     };
-    for root in &mut requested { root.path = normalize_remote_path(&root.path); }
+    for root in &mut requested {
+        root.path = normalize_remote_path(&root.path);
+    }
     let mut seen_paths = HashSet::new();
     requested.retain(|root| seen_paths.insert(root.path.clone()));
     requested.sort_by(|left, right| {
@@ -3878,7 +4393,9 @@ async fn cmd_download_inner(client: &Client, args: DownloadArgs) -> Result<()> {
         }
         let info = match root.file {
             Some(file) if !file.id.is_empty() => file,
-            _ => client.resolve_path_info(&root.path).await
+            _ => client
+                .resolve_path_info(&root.path)
+                .await
                 .with_context(|| format!("failed to resolve download path {}", root.path))?,
         };
         roots.push((root.path, info, root.relative_parent));
@@ -3895,9 +4412,13 @@ async fn cmd_download_inner(client: &Client, args: DownloadArgs) -> Result<()> {
     // prevents same-named files/folders from overwriting one another.
     let mut tasks: Vec<DownloadTask> = Vec::new();
     for (path, info, relative_parent) in roots {
-        let destination = download_root_destination(output, &path, common_parent_depth, relative_parent.as_deref())?;
-        tokio::fs::create_dir_all(&destination)
-            .await
+        let destination = download_root_destination(
+            output,
+            &path,
+            common_parent_depth,
+            relative_parent.as_deref(),
+        )?;
+        download_fs::create_dir_all(&destination)
             .context("failed to create selected path destination")?;
 
         if info.kind.is_folder() {
@@ -3907,6 +4428,7 @@ async fn cmd_download_inner(client: &Client, args: DownloadArgs) -> Result<()> {
                 file: info,
                 output_directory: destination,
                 remote_path: path,
+                retry_state: Arc::default(),
             });
         }
     }
@@ -3963,34 +4485,80 @@ async fn cmd_download_inner(client: &Client, args: DownloadArgs) -> Result<()> {
     // completed files, without counting partial data already saved on disk.
     let batch_received_bytes = Arc::new(AtomicU64::new(0));
     let mut first_err: Option<anyhow::Error> = None;
-    transfer_control::schedule(tasks, transfer_control::Concurrency::download(jobs, batch_received_bytes.clone()),
+    transfer_control::schedule(
+        tasks,
+        transfer_control::Concurrency::download(jobs, batch_received_bytes.clone()),
         |task: DownloadTask| {
             let client = client.clone();
             let batch_received_bytes = batch_received_bytes.clone();
             async move {
-                emit_download_progress(progress_json, DownloadProgressEvent::FileDequeued {
-                    file_id: &task.file.id, name: &task.file.name, total_bytes: task.file.size,
-                });
-                download_file(&client, &task.file, &task.output_directory, show_progress, progress_json, batch_received_bytes).await
+                emit_download_progress(
+                    progress_json,
+                    DownloadProgressEvent::FileDequeued {
+                        file_id: &task.file.id,
+                        name: &task.file.name,
+                        total_bytes: task.file.size,
+                    },
+                );
+                download_file_as_with_retry(
+                    &client,
+                    &task.file,
+                    &task.output_directory,
+                    show_progress,
+                    progress_json,
+                    batch_received_bytes,
+                    &task.file.id,
+                    None,
+                    task.retry_state.clone(),
+                )
+                .await
             }
         },
         |task| task.file.id.clone(),
-        |_, result| { if let Err(error) = result { if first_err.is_none() { first_err = Some(error); } } },
-        |task, attempt, delay| { emit_download_progress(progress_json, DownloadProgressEvent::FileRetrying {
-            file_id: &task.file.id, name: &task.file.name, attempt, retry_in_millis: delay.as_millis() as u64,
-        }); }
-    ).await?;
-    match first_err { Some(error) => Err(error), None => Ok(()) }
+        |_, result| {
+            if let Err(error) = result {
+                if first_err.is_none() {
+                    first_err = Some(error);
+                }
+            }
+        },
+        |task, attempt, delay| {
+            emit_download_progress(
+                progress_json,
+                DownloadProgressEvent::FileRetrying {
+                    file_id: &task.file.id,
+                    name: &task.file.name,
+                    attempt,
+                    retry_in_millis: delay.as_millis() as u64,
+                    destination_unavailable: None,
+                    error: None,
+                },
+            );
+        },
+    )
+    .await?;
+    match first_err {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 async fn cmd_share_download(account: &Client, args: ShareDownloadArgs) -> Result<()> {
     let progress_json = args.progress_json;
     let result = cmd_share_download_inner(account, args).await;
     if let Err(error) = &result {
-        emit_download_progress(progress_json, DownloadProgressEvent::BatchFailed {
-            retryable: pikpak::download_policy::retryable(error),
-            retry_in_millis: pikpak::download_policy::delay(error).map(|delay| delay.as_millis() as u64),
-        });
+        let destination_unavailable = pikpak::download_policy::destination_unavailable(error);
+        let message = format!("{error:#}");
+        emit_download_progress(
+            progress_json,
+            DownloadProgressEvent::BatchFailed {
+                retryable: pikpak::download_policy::retryable(error),
+                retry_in_millis: pikpak::download_policy::delay(error)
+                    .map(|delay| delay.as_millis() as u64),
+                destination_unavailable: destination_unavailable.then_some(true),
+                error: destination_unavailable.then_some(message.as_str()),
+            },
+        );
     }
     result
 }
@@ -3998,10 +4566,9 @@ async fn cmd_share_download(account: &Client, args: ShareDownloadArgs) -> Result
 async fn cmd_share_download_inner(account: &Client, args: ShareDownloadArgs) -> Result<()> {
     let request: ShareDownloadInput = read_json_request(&args.request_file)?;
     let client = build_share_client(&request.access, account)?;
-    let output = StdPath::new(&args.output);
-    tokio::fs::create_dir_all(output)
-        .await
-        .context("failed to create output directory")?;
+    let output_directory = download_fs::selected_directory(StdPath::new(&args.output))
+        .context("failed to open selected output directory")?;
+    let output = output_directory.as_path();
 
     let mut seen_ids = HashSet::new();
     let mut roots: Vec<ShareDownloadRoot> = request
@@ -4031,9 +4598,13 @@ async fn cmd_share_download_inner(account: &Client, args: ShareDownloadArgs) -> 
     let common_parent_depth = common_download_parent_depth(&root_paths);
     let mut tasks: Vec<DownloadTask> = Vec::new();
     for root in accepted {
-        let destination = download_root_destination(output, &root.path, common_parent_depth, root.relative_parent.as_deref())?;
-        tokio::fs::create_dir_all(&destination)
-            .await
+        let destination = download_root_destination(
+            output,
+            &root.path,
+            common_parent_depth,
+            root.relative_parent.as_deref(),
+        )?;
+        download_fs::create_dir_all(&destination)
             .context("failed to create shared path destination")?;
         let info = root.file_info();
         if info.kind.is_folder() {
@@ -4043,6 +4614,7 @@ async fn cmd_share_download_inner(account: &Client, args: ShareDownloadArgs) -> 
                 file: info,
                 output_directory: destination,
                 remote_path: root.path,
+                retry_state: Arc::default(),
             });
         }
     }
@@ -4090,24 +4662,61 @@ async fn cmd_share_download_inner(account: &Client, args: ShareDownloadArgs) -> 
 
     let batch_received_bytes = Arc::new(AtomicU64::new(0));
     let mut first_err: Option<anyhow::Error> = None;
-    transfer_control::schedule(tasks, transfer_control::Concurrency::download(jobs, batch_received_bytes.clone()),
+    transfer_control::schedule(
+        tasks,
+        transfer_control::Concurrency::download(jobs, batch_received_bytes.clone()),
         |task: DownloadTask| {
             let client = client.clone();
             let batch_received_bytes = batch_received_bytes.clone();
             async move {
-                emit_download_progress(progress_json, DownloadProgressEvent::FileDequeued {
-                    file_id: &task.file.id, name: &task.file.name, total_bytes: task.file.size,
-                });
-                download_share_file(&client, &task.file, &task.output_directory, show_progress, progress_json, batch_received_bytes).await
+                emit_download_progress(
+                    progress_json,
+                    DownloadProgressEvent::FileDequeued {
+                        file_id: &task.file.id,
+                        name: &task.file.name,
+                        total_bytes: task.file.size,
+                    },
+                );
+                download_share_file_as_with_retry(
+                    &client,
+                    &task.file,
+                    &task.output_directory,
+                    show_progress,
+                    progress_json,
+                    batch_received_bytes,
+                    &task.file.id,
+                    task.retry_state.clone(),
+                )
+                .await
             }
         },
         |task| task.file.id.clone(),
-        |_, result| { if let Err(error) = result { if first_err.is_none() { first_err = Some(error); } } },
-        |task, attempt, delay| { emit_download_progress(progress_json, DownloadProgressEvent::FileRetrying {
-            file_id: &task.file.id, name: &task.file.name, attempt, retry_in_millis: delay.as_millis() as u64,
-        }); }
-    ).await?;
-    match first_err { Some(error) => Err(error), None => Ok(()) }
+        |_, result| {
+            if let Err(error) = result {
+                if first_err.is_none() {
+                    first_err = Some(error);
+                }
+            }
+        },
+        |task, attempt, delay| {
+            emit_download_progress(
+                progress_json,
+                DownloadProgressEvent::FileRetrying {
+                    file_id: &task.file.id,
+                    name: &task.file.name,
+                    attempt,
+                    retry_in_millis: delay.as_millis() as u64,
+                    destination_unavailable: None,
+                    error: None,
+                },
+            );
+        },
+    )
+    .await?;
+    match first_err {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn remote_path_components(path: &str) -> Vec<String> {
@@ -4161,8 +4770,12 @@ fn download_root_destination(
     relative_parent: Option<&[String]>,
 ) -> Result<PathBuf> {
     let components = remote_path_components(remote_path);
-    let fallback: Vec<String> = components.iter()
-        .take(components.len().saturating_sub(1)).skip(common_parent_depth).cloned().collect();
+    let fallback: Vec<String> = components
+        .iter()
+        .take(components.len().saturating_sub(1))
+        .skip(common_parent_depth)
+        .cloned()
+        .collect();
     let mut destination = output.to_path_buf();
     for component in relative_parent.unwrap_or(&fallback) {
         destination.push(safe_component(component)?);
@@ -4172,12 +4785,9 @@ fn download_root_destination(
 
 /// Reduce a server-provided name to a single safe path component,
 /// preventing path traversal via absolute paths, `..`, or embedded
-/// separators. Returns the basename, or an error if none remains.
+/// separators, and leave room for the partial file's suffix.
 fn safe_component(name: &str) -> Result<String> {
-    match StdPath::new(name).file_name().and_then(|s| s.to_str()) {
-        Some(base) => Ok(base.to_string()),
-        None => bail!("refusing unsafe remote name: {name:?}"),
-    }
+    download_names::component(name)
 }
 
 /// A download failure classified for retry: transient conditions are retried,
@@ -4199,6 +4809,73 @@ impl DlError {
 /// Maximum download attempts (initial try + retries) per file.
 const MAX_DOWNLOAD_ATTEMPTS: u32 = 5;
 
+fn signed_download_url_rejected(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let failure = cause
+            .downcast_ref::<pikpak::download_policy::HttpFailure>()
+            .or_else(
+                || match cause.downcast_ref::<pikpak::download_ranges::Error>() {
+                    Some(pikpak::download_ranges::Error::Http(failure)) => Some(failure),
+                    _ => None,
+                },
+            );
+        failure.is_some_and(|failure| matches!(failure.status, 401 | 403))
+    })
+}
+
+fn download_range_rejected(error: &anyhow::Error) -> bool {
+    if error.is::<pikpak::download_policy::InvalidByteRange>() {
+        return true;
+    }
+    error.chain().any(|cause| {
+        cause.is::<pikpak::download_policy::InvalidByteRange>() || cause
+            .downcast_ref::<pikpak::download_policy::HttpFailure>()
+            .or_else(
+                || match cause.downcast_ref::<pikpak::download_ranges::Error>() {
+                    Some(pikpak::download_ranges::Error::Http(failure)) => Some(failure),
+                    _ => None,
+                },
+            )
+            .is_some_and(|failure| failure.status == 416)
+    })
+}
+
+fn download_route_unavailable(error: &anyhow::Error) -> bool {
+    pikpak::content_mode::content_access_denied(error) || download_range_rejected(error)
+}
+
+/// A helper holds filesystem identities for its lifetime. Ask the native queue
+/// to revalidate the original volume before restarting a helper with new FDs.
+fn download_destination_error(
+    error: anyhow::Error,
+    progress_json: bool,
+    transfer_id: &str,
+    name: &str,
+) -> anyhow::Error {
+    if !pikpak::download_policy::destination_unavailable(&error) {
+        return error;
+    }
+    let message = format!("{error:#}");
+    emit_download_progress(
+        progress_json,
+        DownloadProgressEvent::FileRetrying {
+            file_id: transfer_id,
+            name,
+            attempt: 0,
+            retry_in_millis: 1000,
+            destination_unavailable: Some(true),
+            error: Some(&message),
+        },
+    );
+    if transfer_control::enabled() && !error.is::<transfer_control::Retry>() {
+        error.context(transfer_control::Retry(
+            "Waiting for the original download destination".into(),
+        ))
+    } else {
+        error
+    }
+}
+
 async fn download_file(
     client: &Client,
     file: &pikpak::FileInfo,
@@ -4207,7 +4884,68 @@ async fn download_file(
     progress_json: bool,
     batch_received_bytes: Arc<AtomicU64>,
 ) -> Result<()> {
-    download_file_as(client, file, output_dir, show_progress, progress_json, batch_received_bytes, &file.id).await
+    download_file_as(
+        client,
+        file,
+        output_dir,
+        show_progress,
+        progress_json,
+        batch_received_bytes,
+        &file.id,
+        None,
+    )
+    .await
+}
+
+/// Receipt rejection can happen before the transport starts. Only the
+/// receipt's independently verified original may contribute retained bytes;
+/// an unverified partial length must never create apparent progress.
+fn download_failure_progress_events<'a>(
+    error: &anyhow::Error,
+    transfer_id: &'a str,
+    name: &'a str,
+    fallback_total: u64,
+    message: &'a str,
+) -> Vec<DownloadProgressEvent<'a>> {
+    let verified = error.downcast_ref::<download_receipt::VerifiedStagingProgress>();
+    let mut events = Vec::with_capacity(if verified.is_some() { 2 } else { 1 });
+    if let Some(progress) = verified {
+        events.push(DownloadProgressEvent::FileStarted {
+            file_id: transfer_id,
+            name,
+            downloaded_bytes: progress.downloaded_bytes,
+            transferred_bytes: 0,
+            total_bytes: progress.total_bytes,
+        });
+    }
+    events.push(DownloadProgressEvent::FileFailed {
+        error: message,
+        file_id: transfer_id,
+        name,
+        downloaded_bytes: verified.map_or(0, |progress| progress.downloaded_bytes),
+        transferred_bytes: 0,
+        total_bytes: verified.map_or(fallback_total, |progress| progress.total_bytes),
+        permanent: pikpak::download_policy::permanent_failure(error),
+    });
+    events
+}
+
+fn emit_download_failure_progress(
+    enabled: bool,
+    error: &anyhow::Error,
+    transfer_id: &str,
+    name: &str,
+    fallback_total: u64,
+) {
+    let message = error
+        .downcast_ref::<download_receipt::VerifiedStagingProgress>()
+        .map(|progress| progress.failure.clone())
+        .unwrap_or_else(|| format!("{error:#}"));
+    for event in
+        download_failure_progress_events(error, transfer_id, name, fallback_total, &message)
+    {
+        emit_download_progress(enabled, event);
+    }
 }
 
 async fn download_file_as(
@@ -4218,7 +4956,24 @@ async fn download_file_as(
     progress_json: bool,
     batch_received_bytes: Arc<AtomicU64>,
     transfer_id: &str,
+    delete_after_download: Option<&AtomicBool>,
 ) -> Result<()> {
+    download_file_as_with_retry(client, file, output_dir, show_progress, progress_json,
+        batch_received_bytes, transfer_id, delete_after_download, Arc::default()).await
+}
+
+async fn download_file_as_with_retry(
+    client: &Client,
+    file: &pikpak::FileInfo,
+    output_dir: &StdPath,
+    show_progress: bool,
+    progress_json: bool,
+    batch_received_bytes: Arc<AtomicU64>,
+    transfer_id: &str,
+    delete_after_download: Option<&AtomicBool>,
+    retry_state: Arc<download_transport::RetryState>,
+) -> Result<()> {
+    let mut preparation = retry_state.preparation.attempt();
     let expected = output_dir.join(safe_component(&file.name)?);
     let _output_lease = match transfer_control::output_lock(&expected, transfer_id).await {
         Ok(lease) => lease,
@@ -4226,39 +4981,219 @@ async fn download_file_as(
             emit_transfer_cancelled(progress_json, false, transfer_id, &file.name, file.size);
             return Ok(());
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(download_destination_error(
+                error,
+                progress_json,
+                transfer_id,
+                &file.name,
+            ))
+        }
     };
-    let mut route = client.clone();
+    let original_mode = client.content_mode();
+    let mut account_handoff = original_mode == pikpak::ContentMode::Dynamic
+        && retry_state.preparation.user_handoff(file, Some(original_mode));
+    let mut route = if account_handoff { client.clone().with_content_mode(pikpak::ContentMode::User) } else { client.clone() };
     let network_counter = transfer_control::network_counter(transfer_id);
     loop {
-        let result = download_file_inner(&route, file, output_dir, show_progress, progress_json, network_counter.clone(), batch_received_bytes.clone(), transfer_id).await;
+        let result = download_file_inner(
+            &route,
+            file,
+            output_dir,
+            show_progress,
+            progress_json,
+            network_counter.clone(),
+            batch_received_bytes.clone(),
+            transfer_id,
+            account_handoff,
+            original_mode,
+            _output_lease.as_ref(),
+            retry_state.clone(),
+        )
+        .await;
         match result {
-            Ok(()) => return Ok(()),
+            Ok(finished) => {
+                // Only a download that is verified complete may lead to its source being moved to Trash.
+                if let (Finished::Complete, Some(enabled)) = (finished, delete_after_download) {
+                    download_cleanup::after_complete(
+                        client, file, &expected, transfer_id, progress_json, enabled,
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
             Err(error) if error.is::<transfer_control::Cancelled>() => {
                 let partial = output_dir.join(format!("{}.part", safe_component(&file.name)?));
-                transfer_control::remove_owned_partial(&partial, &file.id).await?;
+                transfer_control::remove_owned_partial_as(&partial, &file.id, transfer_id).await?;
                 emit_transfer_cancelled(progress_json, false, transfer_id, &file.name, file.size);
                 return Ok(());
             }
+            Err(error) if error.is::<download_verification::Deferred>() => {
+                preparation.defer();
+                return Err(error);
+            }
             Err(error) if error.is::<transfer_control::Paused>() => return Err(error),
-            Err(error) if route.content_mode() == pikpak::ContentMode::Dynamic && pikpak::content_mode::content_access_denied(&error) => {
+            Err(error) if error.is::<transfer_control::Retry>() => return Err(error),
+            Err(error) if pikpak::download_policy::destination_unavailable(&error) => {
+                return Err(download_destination_error(
+                    error,
+                    progress_json,
+                    transfer_id,
+                    &file.name,
+                ));
+            }
+            Err(error)
+                if route.content_mode() == pikpak::ContentMode::Dynamic
+                    && download_route_unavailable(&error) =>
+            {
                 // This route belongs to one file; other items keep trying guest.
                 route = route.with_content_mode(pikpak::ContentMode::User);
+                account_handoff = true;
                 continue;
             }
-            Err(error) if transfer_control::enabled() && pikpak::download_policy::retryable(&error) => {
-                return Err(error.context(transfer_control::Retry("Waiting to retry the download".into())));
+            Err(error)
+                if transfer_control::enabled() && pikpak::download_policy::retryable(&error) =>
+            {
+                return Err(error.context(transfer_control::Retry(
+                    "Waiting to retry the download".into(),
+                )));
             }
             Err(error) => {
-                emit_download_progress(progress_json, DownloadProgressEvent::FileFailed {
-                    error: &format!("{error:#}"),
-                    file_id: transfer_id, name: &file.name, downloaded_bytes: 0,
-                    transferred_bytes: 0, total_bytes: file.size,
-                });
+                if let Err(destination) = download_fs::validate(output_dir) {
+                    if pikpak::download_policy::destination_io_interrupted(&destination) {
+                        return Err(download_destination_error(
+                            error.context(pikpak::download_policy::DestinationUnavailable),
+                            progress_json,
+                            transfer_id,
+                            &file.name,
+                        ));
+                    }
+                }
+                emit_download_failure_progress(
+                    progress_json,
+                    &error,
+                    transfer_id,
+                    &file.name,
+                    file.size,
+                );
                 return Err(error);
             }
         }
     }
+}
+
+/// Progress reporter for a full read of an existing file, or none when events are off.
+fn verification_progress(
+    progress_json: bool,
+    transfer_id: &str,
+    name: &str,
+) -> Option<download_receipt::VerifyProgress> {
+    if !progress_json {
+        return None;
+    }
+    let (id, name) = (transfer_id.to_owned(), name.to_owned());
+    Some(Arc::new(move |verified, total| {
+        emit_download_progress(
+            true,
+            DownloadProgressEvent::FileVerifying {
+                file_id: &id,
+                name: &name,
+                verified_bytes: verified,
+                total_bytes: total,
+            },
+        );
+    }))
+}
+
+/// Skips a finished file that its receipt already vouches for, from metadata alone, before a download link is
+/// requested: the link would never be used. Anything the receipt cannot vouch for takes the normal route.
+async fn skip_receipted_without_link(
+    file: &FileInfo,
+    file_path: &StdPath,
+    scope: String,
+    progress_json: bool,
+    transfer_id: &str,
+    output_lease: Option<&std::fs::File>,
+) -> Result<bool> {
+    let revision = pikpak::client::download_revision(file.hash.as_deref(), file.modified_time.as_deref());
+    if file.size == 0 || revision.is_none() {
+        return Ok(false);
+    }
+    let listed = pikpak::DownloadInfo {
+        web_content_link: String::new(),
+        name: file.name.clone(),
+        size: file.size,
+        source_revision: revision,
+    };
+    let source = download_receipt::Source::from_download(scope, &file.id, &listed, file.size);
+    let Some(published_output) =
+        download_receipt::completed_without_reading(file_path, &source, transfer_id).await?
+    else {
+        return Ok(false);
+    };
+    if let Some(lease) = output_lease {
+        let _ = download_receipt::cleanup_completed_staging_async_with_lease(
+            file_path,
+            &source,
+            transfer_id,
+            lease,
+        )
+        .await;
+    }
+    println!(
+        "Skipped (verified complete): {}",
+        published_output.display()
+    );
+    emit_download_progress(
+        progress_json,
+        DownloadProgressEvent::FileSkipped {
+            file_id: transfer_id,
+            name: &file.name,
+            output_path: published_output.to_str(),
+            downloaded_bytes: file.size,
+            transferred_bytes: 0,
+            total_bytes: file.size,
+        },
+    );
+    Ok(true)
+}
+
+/// Reports a file whose source is already in PikPak's recycle bin as skipped. The delivered copy is named only
+/// when it is still in the output folder at its full size.
+fn skip_recycled_source(
+    file: &FileInfo,
+    output_dir: &StdPath,
+    progress_json: bool,
+    transfer_id: &str,
+) -> Result<()> {
+    let delivered = output_dir.join(safe_component(&file.name)?);
+    let delivered = std::fs::metadata(&delivered)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == file.size)
+        .then_some(delivered);
+    println!(
+        "Skipped (already in PikPak's recycle bin, so it was downloaded before): {}",
+        file.name
+    );
+    emit_download_progress(
+        progress_json,
+        DownloadProgressEvent::FileSkipped {
+            file_id: transfer_id,
+            name: &file.name,
+            output_path: delivered.as_deref().and_then(StdPath::to_str),
+            downloaded_bytes: file.size,
+            transferred_bytes: 0,
+            total_bytes: file.size,
+        },
+    );
+    Ok(())
+}
+
+/// How a download call that did not fail ended.
+enum Finished {
+    /// The file is in the output folder, verified, and its PikPak source may be cleaned up if the user asked.
+    Complete,
+    /// The source was already in PikPak's recycle bin. Nothing was fetched and there is nothing left to clean up.
+    SourceInRecycleBin,
 }
 
 async fn download_file_inner(
@@ -4270,9 +5205,49 @@ async fn download_file_inner(
     network_counter: Arc<AtomicU64>,
     batch_received_bytes: Arc<AtomicU64>,
     transfer_id: &str,
-) -> Result<()> {
-    let dl: pikpak::DownloadInfo = transfer_control::interruptible(transfer_id, client.get_download_url_for_file(file)).await?
-        .context("failed to get download URL")?;
+    account_handoff: bool,
+    original_mode: pikpak::ContentMode,
+    output_lease: Option<&std::fs::File>,
+    retry_state: Arc<download_transport::RetryState>,
+) -> Result<Finished> {
+    let early_account =
+        transfer_control::metadata_interruptible(transfer_id, client.tokens().user_id()).await??;
+    let setup_key = download_preparation::Key::for_file(format!("account:{early_account}"), file, Some(original_mode));
+    if skip_receipted_without_link(
+        file,
+        &output_dir.join(safe_component(&file.name)?),
+        setup_key.scope.clone(),
+        progress_json,
+        transfer_id,
+        output_lease,
+    )
+    .await?
+    {
+        return Ok(Finished::Complete);
+    }
+    let mut dl = if let Some(info) = retry_state.preparation.download(&setup_key, account_handoff) {
+        info
+    } else {
+        match transfer_control::metadata_interruptible(
+            transfer_id,
+            client.get_download_url_for_file(file),
+        ).await? {
+            Ok(dl) => {
+                retry_state.preparation.remember_download(&setup_key, &dl, account_handoff);
+                dl
+            }
+            // The app moves a source to PikPak's recycle bin only after its download completed, so a file found
+            // there has already been delivered. It is skipped, not reported as an interrupted download.
+            Err(error) if error.is_file_in_recycle_bin() => {
+                skip_recycled_source(file, output_dir, progress_json, transfer_id)?;
+                return Ok(Finished::SourceInRecycleBin);
+            }
+            Err(error) => return Err(error).context("failed to get download URL"),
+        }
+    };
+    // Keep one destination through URL refresh and Guest/User handoff, even
+    // if the cloud item is renamed while this download is running.
+    dl.name.clone_from(&file.name);
     let size = if dl.size == 0 { file.size } else { dl.size };
 
     let file_path = output_dir.join(safe_component(&dl.name)?);
@@ -4280,28 +5255,59 @@ async fn download_file_inner(
     part.push(".part");
     let part_path = PathBuf::from(part);
     let expected_name = safe_component(&file.name)?;
-    let _renamed_output_lease = if !transfer_control::same_output(&file_path, &output_dir.join(&expected_name))? {
-        transfer_control::output_lock(&file_path, transfer_id).await?
-    } else { None };
+    let _renamed_output_lease =
+        if !transfer_control::same_output(&file_path, &output_dir.join(&expected_name))? {
+            transfer_control::output_lock(&file_path, transfer_id).await?
+        } else {
+            None
+        };
 
-    if let Ok(metadata) = tokio::fs::metadata(&file_path).await {
-        if size > 0 && metadata.len() == size {
-            println!("Skipped (already complete): {}", file_path.display());
-            emit_download_progress(
-                progress_json,
-                DownloadProgressEvent::FileSkipped {
-                    file_id: transfer_id,
-                    name: &dl.name,
-                    downloaded_bytes: size,
-                    transferred_bytes: 0,
-                    total_bytes: size,
-                },
-            );
-            return Ok(());
+    let source =
+        download_receipt::Source::from_download(setup_key.scope.clone(), &file.id, &dl, size);
+    if let Some(published_output) = download_receipt::ensure_available_path_async_replacing(
+        &file_path,
+        &source,
+        transfer_id,
+        verification_progress(progress_json, transfer_id, &dl.name),
+        _renamed_output_lease.as_ref().or(output_lease),
+    )
+    .await?
+    {
+        if let Some(lease) = _renamed_output_lease.as_ref().or(output_lease) {
+            // The destination is already verified. Cleanup is best effort:
+            // a held ancestor, changed staging file, or disk error preserves
+            // the original without turning completion into another failure.
+            let _ = download_receipt::cleanup_completed_staging_async_with_lease(
+                &file_path,
+                &source,
+                transfer_id,
+                lease,
+            )
+            .await;
         }
+        println!(
+            "Skipped (verified complete): {}",
+            published_output.display()
+        );
+        emit_download_progress(
+            progress_json,
+            DownloadProgressEvent::FileSkipped {
+                file_id: transfer_id,
+                name: &dl.name,
+                output_path: published_output.to_str(),
+                downloaded_bytes: size,
+                transferred_bytes: 0,
+                total_bytes: size,
+            },
+        );
+        return Ok(Finished::Complete);
     }
 
-    transfer_control::claim_partial(&part_path, &file.id)?;
+    if let Some(lease) = _renamed_output_lease.as_ref().or(output_lease) {
+        transfer_control::claim_partial_as_with_lease(&part_path, &file.id, transfer_id, lease)?;
+    } else {
+        transfer_control::claim_partial_as(&part_path, &file.id, transfer_id)?;
+    }
     let existing_bytes = download_transport::saved_bytes(&part_path, &file.id, size).await;
     emit_download_progress(
         progress_json,
@@ -4313,7 +5319,7 @@ async fn download_file_inner(
             } else {
                 existing_bytes
             },
-            transferred_bytes: 0,
+            transferred_bytes: network_counter.load(Ordering::Relaxed),
             total_bytes: size,
         },
     );
@@ -4322,12 +5328,18 @@ async fn download_file_inner(
 
     // The download link is time-limited; refresh it on each retry.
     let mut link = dl.web_content_link.clone();
+    let mut guest_url_refreshed = false;
     let mut attempt: u32 = 0;
     let mut progress = DownloadProgressContext::new(progress_json, transfer_id, &dl.name);
+    progress.retry_state = retry_state.clone();
     progress.source_file_id = &file.id;
+    progress.source_revision = dl.source_revision.clone();
+    progress.require_content_hash =
+        account_handoff || client.content_mode() == pikpak::ContentMode::Dynamic;
+    progress.guest_range_fallback = client.content_mode() == pikpak::ContentMode::Dynamic;
     progress.transferred_bytes = network_counter;
     progress.batch_received_bytes = Some(batch_received_bytes);
-    loop {
+    let verified = loop {
         attempt += 1;
         match download_attempt(
             client,
@@ -4339,18 +5351,66 @@ async fn download_file_inner(
         )
         .await
         {
-            Ok(()) => break,
+            Ok(verified) => break verified,
             Err(err) => {
                 let retryable = matches!(err, DlError::Retryable(_));
                 let e = err.into_inner();
-                if e.is::<transfer_control::Paused>() { return Err(e); }
-                if e.is::<transfer_control::Cancelled>() {
-                    transfer_control::remove_owned_partial(&part_path, &file.id).await?;
+                if e.is::<transfer_control::Paused>() || e.is::<download_verification::Deferred>() {
                     return Err(e);
                 }
-                if client.content_mode() == pikpak::ContentMode::Dynamic && pikpak::content_mode::content_access_denied(&e) { return Err(e); }
+                if e.is::<transfer_control::Cancelled>() {
+                    transfer_control::remove_owned_partial_as(&part_path, &file.id, transfer_id)
+                        .await?;
+                    return Err(e);
+                }
+                if client.content_mode() == pikpak::ContentMode::Dynamic
+                    && download_route_unavailable(&e)
+                {
+                    if !guest_url_refreshed
+                        && (signed_download_url_rejected(&e) || download_range_rejected(&e))
+                    {
+                        guest_url_refreshed = true;
+                        let guest = client.clone().with_content_mode(pikpak::ContentMode::Guest);
+                        match transfer_control::interruptible(
+                            transfer_id,
+                            guest.get_download_url_for_file(file),
+                        )
+                        .await?
+                        {
+                            Ok(fresh) => {
+                                let fresh_size = if fresh.size == 0 {
+                                    file.size
+                                } else {
+                                    fresh.size
+                                };
+                                anyhow::ensure!(fresh_size == size && (fresh.source_revision == dl.source_revision
+                                    || pikpak::content_mode::matching_content_revision(fresh.source_revision.as_deref(), dl.source_revision.as_deref())),
+                                    "The download source changed while refreshing its Guest URL; resume to retrieve the current original");
+                                dl.web_content_link = fresh.web_content_link;
+                                retry_state.preparation.remember_download(&setup_key, &dl, account_handoff);
+                                link = dl.web_content_link.clone();
+                                continue;
+                            }
+                            Err(error) => {
+                                let error = anyhow::Error::new(error);
+                                if pikpak::download_policy::retryable(&error) {
+                                    return Err(error)
+                                        .context("Failed to refresh the Guest download URL");
+                                }
+                            }
+                        }
+                    }
+                    return Err(e);
+                }
+                if e.is::<pikpak::download_policy::PartialContent>() {
+                    // A shorter response may still permit Guest access to the
+                    // next range. Each continuation must advance saved bytes.
+                    attempt = attempt.saturating_sub(1);
+                    continue;
+                }
                 if retryable && attempt < MAX_DOWNLOAD_ATTEMPTS && !transfer_control::enabled() {
-                    let delay = download_backoff(attempt - 1).max(pikpak::download_policy::delay(&e).unwrap_or_default());
+                    let delay = download_backoff(attempt - 1)
+                        .max(pikpak::download_policy::delay(&e).unwrap_or_default());
                     eprintln!(
                         "  {}: attempt {attempt} failed ({e:#}); retrying in {:.1}s",
                         dl.name,
@@ -4363,50 +5423,88 @@ async fn download_file_inner(
                             name: &dl.name,
                             attempt,
                             retry_in_millis: delay.as_millis() as u64,
+                            destination_unavailable: None,
+                            error: None,
                         },
                     );
-                    if let Err(cancelled) = transfer_control::run(transfer_id, tokio::time::sleep(delay)).await {
-                        transfer_control::remove_owned_partial(&part_path, &file.id).await?;
+                    if let Err(cancelled) =
+                        transfer_control::run(transfer_id, tokio::time::sleep(delay)).await
+                    {
+                        transfer_control::remove_owned_partial_as(
+                            &part_path,
+                            &file.id,
+                            transfer_id,
+                        )
+                        .await?;
                         return Err(cancelled.into());
                     }
                     if let Ok(fresh) = client.get_download_url_for_file(file).await {
-                        link = fresh.web_content_link;
+                        let fresh_size = if fresh.size == 0 {
+                            file.size
+                        } else {
+                            fresh.size
+                        };
+                        anyhow::ensure!(fresh_size == size && fresh.source_revision == dl.source_revision,
+                            "The download source changed while refreshing its URL; resume to retrieve the current original");
+                        dl.web_content_link = fresh.web_content_link;
+                        retry_state.preparation.remember_download(&setup_key, &dl, account_handoff);
+                        link = dl.web_content_link.clone();
                     }
                     continue;
                 }
                 return Err(e).with_context(|| format!("failed to download {}", dl.name));
             }
         }
-    }
+    };
 
     let completed_size = if size > 0 {
         size
     } else {
-        tokio::fs::metadata(&part_path)
+        download_fs::metadata_async(&part_path)
             .await
             .map(|metadata| metadata.len())
             .unwrap_or(0)
     };
-    if let Err(cancelled) = transfer_control::interruptible(transfer_id, std::future::ready(())).await {
-        if cancelled.is::<transfer_control::Cancelled>() { transfer_control::remove_owned_partial(&part_path, &file.id).await?; }
+    if let Err(cancelled) =
+        transfer_control::disk_interruptible(transfer_id, std::future::ready(())).await
+    {
+        if cancelled.is::<transfer_control::Cancelled>() {
+            transfer_control::remove_owned_partial_as(&part_path, &file.id, transfer_id).await?;
+        }
         return Err(cancelled);
     }
-    tokio::fs::rename(&part_path, &file_path)
-        .await
-        .context("failed to finalize output file")?;
+    let published_output = match download_receipt::finish_resolved_verified(
+        &part_path,
+        &file_path,
+        source,
+        transfer_id,
+        verified,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            if error.is::<transfer_control::Cancelled>() {
+                transfer_control::remove_owned_partial_as(&part_path, &file.id, transfer_id)
+                    .await?;
+            }
+            return Err(error);
+        }
+    };
     download_transport::remove_state(&part_path)?;
-    println!("Saved: {}", file_path.display());
+    println!("Saved: {}", published_output.display());
     emit_download_progress(
         progress_json,
         DownloadProgressEvent::FileCompleted {
             file_id: transfer_id,
             name: &dl.name,
+            output_path: published_output.to_str(),
             downloaded_bytes: completed_size,
             transferred_bytes: progress.transferred_bytes(),
             total_bytes: completed_size,
         },
     );
-    Ok(())
+    Ok(Finished::Complete)
 }
 
 /// A single download attempt. Resumes from an existing `.part` file via an HTTP
@@ -4418,7 +5516,7 @@ async fn download_attempt(
     part_path: &StdPath,
     show_progress: bool,
     progress: DownloadProgressContext<'_>,
-) -> std::result::Result<(), DlError> {
+) -> std::result::Result<Option<download_transport::VerifiedCompletion>, DlError> {
     download_attempt_with_http(
         client.download_http_client(),
         link,
@@ -4439,8 +5537,17 @@ async fn download_attempt_with_http(
     show_progress: bool,
     progress: DownloadProgressContext<'_>,
     referer: Option<&str>,
-) -> std::result::Result<(), DlError> {
-    download_transport::attempt(http, link, total, part_path, show_progress, progress, referer).await
+) -> std::result::Result<Option<download_transport::VerifiedCompletion>, DlError> {
+    download_transport::attempt_for_publication(
+        http,
+        link,
+        total,
+        part_path,
+        show_progress,
+        progress,
+        referer,
+    )
+    .await
 }
 
 /// Wrap an I/O error as a fatal download error with context.
@@ -4450,7 +5557,11 @@ fn fatal(err: impl std::error::Error + Send + Sync + 'static, ctx: &'static str)
 
 /// Classify a reqwest error as retryable (transient network) or fatal.
 fn classify(err: reqwest::Error, ctx: &'static str) -> DlError {
-    let transient = err.is_timeout() || err.is_connect() || err.is_request() || err.is_body() || err.is_decode();
+    let transient = err.is_timeout()
+        || err.is_connect()
+        || err.is_request()
+        || err.is_body()
+        || err.is_decode();
     let e = anyhow::Error::new(err.without_url()).context(ctx);
     if transient {
         DlError::Retryable(e)
@@ -4474,7 +5585,16 @@ async fn download_share_file(
     progress_json: bool,
     batch_received_bytes: Arc<AtomicU64>,
 ) -> Result<()> {
-    download_share_file_as(client, file, output_dir, show_progress, progress_json, batch_received_bytes, &file.id).await
+    download_share_file_as(
+        client,
+        file,
+        output_dir,
+        show_progress,
+        progress_json,
+        batch_received_bytes,
+        &file.id,
+    )
+    .await
 }
 
 async fn download_share_file_as(
@@ -4486,6 +5606,21 @@ async fn download_share_file_as(
     batch_received_bytes: Arc<AtomicU64>,
     transfer_id: &str,
 ) -> Result<()> {
+    download_share_file_as_with_retry(client, file, output_dir, show_progress, progress_json,
+        batch_received_bytes, transfer_id, Arc::default()).await
+}
+
+async fn download_share_file_as_with_retry(
+    client: &ShareClient,
+    file: &FileInfo,
+    output_dir: &StdPath,
+    show_progress: bool,
+    progress_json: bool,
+    batch_received_bytes: Arc<AtomicU64>,
+    transfer_id: &str,
+    retry_state: Arc<download_transport::RetryState>,
+) -> Result<()> {
+    let mut preparation = retry_state.preparation.attempt();
     let expected = output_dir.join(safe_component(&file.name)?);
     let _output_lease = match transfer_control::output_lock(&expected, transfer_id).await {
         Ok(lease) => lease,
@@ -4493,34 +5628,86 @@ async fn download_share_file_as(
             emit_transfer_cancelled(progress_json, false, transfer_id, &file.name, file.size);
             return Ok(());
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(download_destination_error(
+                error,
+                progress_json,
+                transfer_id,
+                &file.name,
+            ))
+        }
     };
-    let mut route = client.clone();
+    let mut account_handoff = client.user_fallback().is_some()
+        && retry_state.preparation.user_handoff(file, None);
+    let mut route = if account_handoff { client.user_fallback().expect("Deferred Dynamic share route") } else { client.clone() };
     let network_counter = transfer_control::network_counter(transfer_id);
     loop {
-        let result = download_share_file_inner(&route, file, output_dir, show_progress, progress_json, network_counter.clone(), batch_received_bytes.clone(), transfer_id).await;
+        let result = download_share_file_inner(
+            &route,
+            file,
+            output_dir,
+            show_progress,
+            progress_json,
+            network_counter.clone(),
+            batch_received_bytes.clone(),
+            transfer_id,
+            account_handoff,
+            _output_lease.as_ref(),
+            retry_state.clone(),
+        )
+        .await;
         match result {
             Ok(()) => return Ok(()),
             Err(error) if error.is::<transfer_control::Cancelled>() => {
                 let partial = output_dir.join(format!("{}.part", safe_component(&file.name)?));
-                transfer_control::remove_owned_partial(&partial, &file.id).await?;
+                transfer_control::remove_owned_partial_as(&partial, &file.id, transfer_id).await?;
                 emit_transfer_cancelled(progress_json, false, transfer_id, &file.name, file.size);
                 return Ok(());
             }
+            Err(error) if error.is::<download_verification::Deferred>() => {
+                preparation.defer();
+                return Err(error);
+            }
             Err(error) if error.is::<transfer_control::Paused>() => return Err(error),
-            Err(error) if route.user_fallback().is_some() && pikpak::content_mode::content_access_denied(&error) => {
+            Err(error) if error.is::<transfer_control::Retry>() => return Err(error),
+            Err(error) if pikpak::download_policy::destination_unavailable(&error) => {
+                return Err(download_destination_error(
+                    error,
+                    progress_json,
+                    transfer_id,
+                    &file.name,
+                ));
+            }
+            Err(error) if route.user_fallback().is_some() && download_route_unavailable(&error) => {
                 route = route.user_fallback().expect("Dynamic share fallback");
+                account_handoff = true;
                 continue;
             }
-            Err(error) if transfer_control::enabled() && pikpak::download_policy::retryable(&error) => {
-                return Err(error.context(transfer_control::Retry("Waiting to retry the download".into())));
+            Err(error)
+                if transfer_control::enabled() && pikpak::download_policy::retryable(&error) =>
+            {
+                return Err(error.context(transfer_control::Retry(
+                    "Waiting to retry the download".into(),
+                )));
             }
             Err(error) => {
-                emit_download_progress(progress_json, DownloadProgressEvent::FileFailed {
-                    error: &format!("{error:#}"),
-                    file_id: transfer_id, name: &file.name, downloaded_bytes: 0,
-                    transferred_bytes: 0, total_bytes: file.size,
-                });
+                if let Err(destination) = download_fs::validate(output_dir) {
+                    if pikpak::download_policy::destination_io_interrupted(&destination) {
+                        return Err(download_destination_error(
+                            error.context(pikpak::download_policy::DestinationUnavailable),
+                            progress_json,
+                            transfer_id,
+                            &file.name,
+                        ));
+                    }
+                }
+                emit_download_failure_progress(
+                    progress_json,
+                    &error,
+                    transfer_id,
+                    &file.name,
+                    file.size,
+                );
                 return Err(error);
             }
         }
@@ -4536,14 +5723,32 @@ async fn download_share_file_inner(
     network_counter: Arc<AtomicU64>,
     batch_received_bytes: Arc<AtomicU64>,
     transfer_id: &str,
+    account_handoff: bool,
+    output_lease: Option<&std::fs::File>,
+    retry_state: Arc<download_transport::RetryState>,
 ) -> Result<()> {
-    let detail = transfer_control::interruptible(transfer_id, client.get_download_url(&file.id)).await?
-        .context("failed to get shared download URL")?;
-    let name = if detail.name.trim().is_empty() {
-        file.name.clone()
+    if skip_receipted_without_link(
+        file,
+        &output_dir.join(safe_component(&file.name)?),
+        format!("share:{}", client.parsed_link().share_id),
+        progress_json,
+        transfer_id,
+        output_lease,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let setup_key = download_preparation::Key::for_file(format!("share:{}", client.parsed_link().share_id), file, None);
+    let mut detail = if let Some(info) = retry_state.preparation.download(&setup_key, account_handoff) {
+        info
     } else {
-        detail.name
+        let info = transfer_control::metadata_interruptible(transfer_id, client.get_download_url(&file.id))
+            .await?.context("failed to get shared download URL")?;
+        retry_state.preparation.remember_download(&setup_key, &info, account_handoff);
+        info
     };
+    let name = file.name.clone();
     let size = if detail.size == 0 {
         file.size
     } else {
@@ -4554,28 +5759,60 @@ async fn download_share_file_inner(
     partial_name.push(".part");
     let part_path = PathBuf::from(partial_name);
     let expected_name = safe_component(&file.name)?;
-    let _renamed_output_lease = if !transfer_control::same_output(&file_path, &output_dir.join(&expected_name))? {
-        transfer_control::output_lock(&file_path, transfer_id).await?
-    } else { None };
+    let _renamed_output_lease =
+        if !transfer_control::same_output(&file_path, &output_dir.join(&expected_name))? {
+            transfer_control::output_lock(&file_path, transfer_id).await?
+        } else {
+            None
+        };
 
-    if let Ok(metadata) = tokio::fs::metadata(&file_path).await {
-        if size > 0 && metadata.len() == size {
-            println!("Skipped (already complete): {}", file_path.display());
-            emit_download_progress(
-                progress_json,
-                DownloadProgressEvent::FileSkipped {
-                    file_id: transfer_id,
-                    name: &name,
-                    downloaded_bytes: size,
-                    transferred_bytes: 0,
-                    total_bytes: size,
-                },
-            );
-            return Ok(());
+    let source = download_receipt::Source::from_download(
+        format!("share:{}", client.parsed_link().share_id),
+        &file.id,
+        &detail,
+        size,
+    );
+    if let Some(published_output) = download_receipt::ensure_available_path_async_replacing(
+        &file_path,
+        &source,
+        transfer_id,
+        verification_progress(progress_json, transfer_id, &name),
+        _renamed_output_lease.as_ref().or(output_lease),
+    )
+    .await?
+    {
+        if let Some(lease) = _renamed_output_lease.as_ref().or(output_lease) {
+            let _ = download_receipt::cleanup_completed_staging_async_with_lease(
+                &file_path,
+                &source,
+                transfer_id,
+                lease,
+            )
+            .await;
         }
+        println!(
+            "Skipped (verified complete): {}",
+            published_output.display()
+        );
+        emit_download_progress(
+            progress_json,
+            DownloadProgressEvent::FileSkipped {
+                file_id: transfer_id,
+                name: &name,
+                output_path: published_output.to_str(),
+                downloaded_bytes: size,
+                transferred_bytes: 0,
+                total_bytes: size,
+            },
+        );
+        return Ok(());
     }
 
-    transfer_control::claim_partial(&part_path, &file.id)?;
+    if let Some(lease) = _renamed_output_lease.as_ref().or(output_lease) {
+        transfer_control::claim_partial_as_with_lease(&part_path, &file.id, transfer_id, lease)?;
+    } else {
+        transfer_control::claim_partial_as(&part_path, &file.id, transfer_id)?;
+    }
     let existing_bytes = download_transport::saved_bytes(&part_path, &file.id, size).await;
     emit_download_progress(
         progress_json,
@@ -4587,7 +5824,7 @@ async fn download_share_file_inner(
             } else {
                 existing_bytes
             },
-            transferred_bytes: 0,
+            transferred_bytes: network_counter.load(Ordering::Relaxed),
             total_bytes: size,
         },
     );
@@ -4597,13 +5834,18 @@ async fn download_share_file_inner(
         format_size(size, BINARY)
     );
 
-    let mut link = detail.web_content_link;
+    let mut link = detail.web_content_link.clone();
+    let mut guest_url_refreshed = false;
     let mut attempt = 0u32;
     let mut progress = DownloadProgressContext::new(progress_json, transfer_id, &name);
+    progress.retry_state = retry_state.clone();
     progress.source_file_id = &file.id;
+    progress.source_revision = detail.source_revision.clone();
+    progress.require_content_hash = account_handoff || client.user_fallback().is_some();
+    progress.guest_range_fallback = client.user_fallback().is_some();
     progress.transferred_bytes = network_counter;
     progress.batch_received_bytes = Some(batch_received_bytes);
-    loop {
+    let verified = loop {
         attempt += 1;
         match download_attempt_with_http(
             client.download_http_client(),
@@ -4616,18 +5858,62 @@ async fn download_share_file_inner(
         )
         .await
         {
-            Ok(()) => break,
+            Ok(verified) => break verified,
             Err(error) => {
                 let retryable = matches!(error, DlError::Retryable(_));
                 let inner = error.into_inner();
-                if inner.is::<transfer_control::Paused>() { return Err(inner); }
-                if inner.is::<transfer_control::Cancelled>() {
-                    transfer_control::remove_owned_partial(&part_path, &file.id).await?;
+                if inner.is::<transfer_control::Paused>() || inner.is::<download_verification::Deferred>() {
                     return Err(inner);
                 }
-                if client.user_fallback().is_some() && pikpak::content_mode::content_access_denied(&inner) { return Err(inner); }
+                if inner.is::<transfer_control::Cancelled>() {
+                    transfer_control::remove_owned_partial_as(&part_path, &file.id, transfer_id)
+                        .await?;
+                    return Err(inner);
+                }
+                if client.user_fallback().is_some() && download_route_unavailable(&inner) {
+                    if !guest_url_refreshed
+                        && (signed_download_url_rejected(&inner) || download_range_rejected(&inner))
+                    {
+                        guest_url_refreshed = true;
+                        match transfer_control::interruptible(
+                            transfer_id,
+                            client.get_download_url_on_current_route(&file.id),
+                        )
+                        .await?
+                        {
+                            Ok(fresh) => {
+                                let fresh_size = if fresh.size == 0 {
+                                    file.size
+                                } else {
+                                    fresh.size
+                                };
+                                anyhow::ensure!(fresh_size == size && (fresh.source_revision == detail.source_revision
+                                    || pikpak::content_mode::matching_content_revision(fresh.source_revision.as_deref(), detail.source_revision.as_deref())),
+                                    "The shared download source changed while refreshing its Guest URL; resume to retrieve the current original");
+                                detail.web_content_link = fresh.web_content_link;
+                                retry_state.preparation.remember_download(&setup_key, &detail, account_handoff);
+                                link = detail.web_content_link.clone();
+                                continue;
+                            }
+                            Err(error) => {
+                                let error = anyhow::Error::new(error);
+                                if pikpak::download_policy::retryable(&error) {
+                                    return Err(error).context(
+                                        "Failed to refresh the Guest shared download URL",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    return Err(inner);
+                }
+                if inner.is::<pikpak::download_policy::PartialContent>() {
+                    attempt = attempt.saturating_sub(1);
+                    continue;
+                }
                 if retryable && attempt < MAX_DOWNLOAD_ATTEMPTS && !transfer_control::enabled() {
-                    let delay = download_backoff(attempt - 1).max(pikpak::download_policy::delay(&inner).unwrap_or_default());
+                    let delay = download_backoff(attempt - 1)
+                        .max(pikpak::download_policy::delay(&inner).unwrap_or_default());
                     eprintln!(
                         "  {}: attempt {attempt} failed ({inner:#}); retrying in {:.1}s",
                         name,
@@ -4640,44 +5926,82 @@ async fn download_share_file_inner(
                             name: &name,
                             attempt,
                             retry_in_millis: delay.as_millis() as u64,
+                            destination_unavailable: None,
+                            error: None,
                         },
                     );
-                    if let Err(cancelled) = transfer_control::run(transfer_id, tokio::time::sleep(delay)).await {
-                        transfer_control::remove_owned_partial(&part_path, &file.id).await?;
+                    if let Err(cancelled) =
+                        transfer_control::run(transfer_id, tokio::time::sleep(delay)).await
+                    {
+                        transfer_control::remove_owned_partial_as(
+                            &part_path,
+                            &file.id,
+                            transfer_id,
+                        )
+                        .await?;
                         return Err(cancelled.into());
                     }
                     if let Ok(fresh) = client.get_download_url(&file.id).await {
-                        link = fresh.web_content_link;
+                        let fresh_size = if fresh.size == 0 {
+                            file.size
+                        } else {
+                            fresh.size
+                        };
+                        anyhow::ensure!(fresh_size == size && fresh.source_revision == detail.source_revision,
+                            "The shared download source changed while refreshing its URL; resume to retrieve the current original");
+                        detail.web_content_link = fresh.web_content_link;
+                        retry_state.preparation.remember_download(&setup_key, &detail, account_handoff);
+                        link = detail.web_content_link.clone();
                     }
                     continue;
                 }
                 return Err(inner).with_context(|| format!("failed to download {name}"));
             }
         }
-    }
+    };
 
     let completed_size = if size > 0 {
         size
     } else {
-        tokio::fs::metadata(&part_path)
+        download_fs::metadata_async(&part_path)
             .await
             .map(|metadata| metadata.len())
             .unwrap_or(0)
     };
-    if let Err(cancelled) = transfer_control::interruptible(transfer_id, std::future::ready(())).await {
-        if cancelled.is::<transfer_control::Cancelled>() { transfer_control::remove_owned_partial(&part_path, &file.id).await?; }
+    if let Err(cancelled) =
+        transfer_control::disk_interruptible(transfer_id, std::future::ready(())).await
+    {
+        if cancelled.is::<transfer_control::Cancelled>() {
+            transfer_control::remove_owned_partial_as(&part_path, &file.id, transfer_id).await?;
+        }
         return Err(cancelled);
     }
-    tokio::fs::rename(&part_path, &file_path)
-        .await
-        .context("failed to finalize shared output file")?;
+    let published_output = match download_receipt::finish_resolved_verified(
+        &part_path,
+        &file_path,
+        source,
+        transfer_id,
+        verified,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            if error.is::<transfer_control::Cancelled>() {
+                transfer_control::remove_owned_partial_as(&part_path, &file.id, transfer_id)
+                    .await?;
+            }
+            return Err(error);
+        }
+    };
     download_transport::remove_state(&part_path)?;
-    println!("Saved: {}", file_path.display());
+    println!("Saved: {}", published_output.display());
     emit_download_progress(
         progress_json,
         DownloadProgressEvent::FileCompleted {
             file_id: transfer_id,
             name: &name,
+            output_path: published_output.to_str(),
             downloaded_bytes: completed_size,
             transferred_bytes: progress.transferred_bytes(),
             total_bytes: completed_size,
@@ -4695,12 +6019,15 @@ fn collect_share_folder<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
         let control_key = format!("path:{remote_path}");
-        if transfer_control::run(&control_key, std::future::ready(())).await.is_err() { return Ok(()); }
+        if transfer_control::run(&control_key, std::future::ready(()))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
 
         let dir_path = output_dir.join(safe_component(&folder.name)?);
-        tokio::fs::create_dir_all(&dir_path)
-            .await
-            .context("failed to create shared folder")?;
+        download_fs::create_dir_all(&dir_path).context("failed to create shared folder")?;
         println!("Scanning shared folder: {}", folder.name);
         for child in client.list_folder(&folder.id).await? {
             let child_remote_path = appending_remote_path_component(remote_path, &child.name);
@@ -4711,6 +6038,7 @@ fn collect_share_folder<'a>(
                     file: child,
                     output_directory: dir_path.clone(),
                     remote_path: child_remote_path,
+                    retry_state: Arc::default(),
                 });
             }
         }
@@ -4729,12 +6057,15 @@ fn collect_folder<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
         let control_key = format!("path:{remote_path}");
-        if transfer_control::run(&control_key, std::future::ready(())).await.is_err() { return Ok(()); }
+        if transfer_control::run(&control_key, std::future::ready(()))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
 
         let dir_path = output_dir.join(safe_component(&folder.name)?);
-        tokio::fs::create_dir_all(&dir_path)
-            .await
-            .context("failed to create folder")?;
+        download_fs::create_dir_all(&dir_path).context("failed to create folder")?;
 
         println!("Scanning folder: {}", folder.name);
 
@@ -4748,6 +6079,7 @@ fn collect_folder<'a>(
                     file: f,
                     output_directory: dir_path.clone(),
                     remote_path: child_remote_path,
+                    retry_state: Arc::default(),
                 });
             }
         }
@@ -4755,13 +6087,15 @@ fn collect_folder<'a>(
     })
 }
 
-async fn cmd_account(client: &Client) -> Result<()> {
+async fn cmd_account(client: &Client, validate_personal_scope: bool) -> Result<()> {
     let profile = client
         .account_profile()
         .await
         .context("account check failed")?;
-    if client.tokens().is_personal_access_token() {
-        client.list_folder_page("", None, 1).await
+    if validate_personal_scope && client.tokens().is_personal_access_token() {
+        client
+            .list_folder_page("", None, 1)
+            .await
             .context("Personal Access Token needs Read files permission")?;
     }
     println!("{}", serde_json::to_string(&profile)?);
@@ -4770,8 +6104,15 @@ async fn cmd_account(client: &Client) -> Result<()> {
 
 async fn cmd_quota(client: &Client, args: QuotaArgs) -> Result<()> {
     let details = if args.with_transfer {
-        Some(client.quota_details().await.context("quota details failed")?)
-    } else { None };
+        Some(
+            client
+                .quota_details()
+                .await
+                .context("quota details failed")?,
+        )
+    } else {
+        None
+    };
     let q = match details {
         Some(details) => details.storage,
         None => client.quota().await.context("quota failed")?,
@@ -4812,15 +6153,36 @@ async fn cmd_quota(client: &Client, args: QuotaArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn remote_path_normalization_preserves_filename_whitespace() {
+        assert_eq!(
+            super::normalize_remote_path("/folder/file.txt "),
+            "/folder/file.txt "
+        );
+        assert_eq!(
+            super::normalize_remote_path(" leading/final "),
+            "/ leading/final "
+        );
+    }
+    #[test]
     fn rejected_session_diagnostic_survives_context_without_matching_other_errors() {
-        assert!(super::duplicate_error_requires_abort(&pikpak::Error::SessionRejected("fixture rejection")));
+        assert!(super::duplicate_error_requires_abort(
+            &pikpak::Error::SessionRejected("fixture rejection")
+        ));
         let error = anyhow::Error::new(pikpak::Error::SessionRejected("fixture rejection"))
             .context("browse folder failed");
-        assert_eq!(super::rejected_session_reason(&error), Some("fixture rejection"));
+        assert_eq!(
+            super::rejected_session_reason(&error),
+            Some("fixture rejection")
+        );
         let error = anyhow::Error::new(pikpak::Error::Auth("status 400: invalid_client".into()))
             .context("account check failed");
         assert_eq!(super::rejected_session_reason(&error), None);
-        assert_eq!(super::rejected_session_reason(&anyhow::anyhow!("a filename mentioning invalid_grant or 401")), None);
+        assert_eq!(
+            super::rejected_session_reason(&anyhow::anyhow!(
+                "a filename mentioning invalid_grant or 401"
+            )),
+            None
+        );
     }
 
     #[test]
@@ -4846,7 +6208,10 @@ mod tests {
     #[test]
     fn removed_catalog_commands_are_not_exposed() {
         for command in [
-            "open-source-catalog", "open-source-inspect", "open-source-save", "open-source-status",
+            "open-source-catalog",
+            "open-source-inspect",
+            "open-source-save",
+            "open-source-status",
         ] {
             let error = Cli::try_parse_from(["pikpak", command]).unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
@@ -4869,6 +6234,9 @@ mod tests {
             modified_time: None,
             content_hash: content_hash.map(str::to_string),
             md5_checksum: md5_checksum.map(str::to_string),
+            source: crate::duplicate_cross_drive::DuplicateSource::Pikpak,
+            folder_created_time: None,
+            local_identity: None,
         }
     }
 
@@ -4965,6 +6333,263 @@ mod tests {
         assert_eq!(value["downloaded_bytes"], 25);
         assert_eq!(value["transferred_bytes"], 20);
         assert_eq!(value["total_bytes"], 100);
+    }
+
+    #[test]
+    fn download_terminal_events_report_the_committed_output_path() {
+        let output = "/generated destination/video (recovered \"copy\").mp4";
+        for event in [
+            DownloadProgressEvent::FileCompleted {
+                file_id: "generated-transfer",
+                name: "video.mp4",
+                output_path: Some(output),
+                downloaded_bytes: 8,
+                transferred_bytes: 0,
+                total_bytes: 8,
+            },
+            DownloadProgressEvent::FileSkipped {
+                file_id: "generated-transfer",
+                name: "video.mp4",
+                output_path: Some(output),
+                downloaded_bytes: 8,
+                transferred_bytes: 0,
+                total_bytes: 8,
+            },
+        ] {
+            let value = serde_json::to_value(event).unwrap();
+            assert_eq!(value["output_path"], output);
+            assert_eq!(value["name"], "video.mp4");
+            assert_eq!(value["file_id"], "generated-transfer");
+            assert_eq!(value["downloaded_bytes"], 8);
+            assert_eq!(value["transferred_bytes"], 0);
+            assert_eq!(value["total_bytes"], 8);
+            assert!(value.get("outputPath").is_none());
+        }
+        let legacy = serde_json::to_value(DownloadProgressEvent::FileCompleted {
+            file_id: "generated-transfer",
+            name: "video.mp4",
+            output_path: None,
+            downloaded_bytes: 8,
+            transferred_bytes: 0,
+            total_bytes: 8,
+        })
+        .unwrap();
+        assert!(legacy.get("output_path").is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_staging_finalizes_and_reports_verified_path_without_cdn() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("generated complete.bin");
+        let partial = directory.path().join("generated complete.bin.part");
+        let source_id = "generated-terminal-source";
+        let transfer_id = "generated-terminal-transfer";
+        std::fs::write(&partial, b"abcdefgh").unwrap();
+        crate::download_transport::seed_resume(&partial, source_id, 8, "\"generated\"");
+        let checkpoint = partial.with_file_name("generated complete.bin.part.resume.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&checkpoint).unwrap()).unwrap();
+        state["source_revision"] = "gcid:GENERATEDTERMINAL".into();
+        state["require_content_hash"] = true.into();
+        std::fs::write(&checkpoint, serde_json::to_vec(&state).unwrap()).unwrap();
+        let mut progress =
+            crate::DownloadProgressContext::new(false, transfer_id, "generated complete.bin");
+        progress.source_file_id = source_id;
+        progress.source_revision = Some("gcid:GENERATEDTERMINAL".into());
+        progress.require_content_hash = true;
+        let network = progress.transferred_bytes.clone();
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::download_transport::attempt(
+                &reqwest::Client::new(),
+                "http://127.0.0.1:1/generated-unreachable-cdn",
+                8,
+                &partial,
+                false,
+                progress,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            recovered.is_ok(),
+            "Verified complete staging contacted the unreachable CDN"
+        );
+        assert_eq!(network.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let download = pikpak::DownloadInfo {
+            web_content_link: "unused-generated".into(),
+            name: "generated complete.bin".into(),
+            size: 8,
+            source_revision: Some("gcid:GENERATEDTERMINAL".into()),
+        };
+        let source = crate::download_receipt::Source::from_download(
+            "account:generated-terminal".into(),
+            source_id,
+            &download,
+            8,
+        );
+        let published = crate::download_receipt::finish_resolved(
+            &partial,
+            &output,
+            source.clone(),
+            transfer_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(published, output);
+        assert_eq!(std::fs::read(&published).unwrap(), b"abcdefgh");
+        assert!(!partial.exists());
+        let on_retry = crate::download_receipt::ensure_available_path_async_with_control(
+            &output,
+            &source,
+            transfer_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(on_retry.as_ref(), Some(&published));
+        let completed = serde_json::to_value(DownloadProgressEvent::FileCompleted {
+            file_id: transfer_id,
+            name: "generated complete.bin",
+            output_path: published.to_str(),
+            downloaded_bytes: 8,
+            transferred_bytes: 0,
+            total_bytes: 8,
+        })
+        .unwrap();
+        let skipped = serde_json::to_value(DownloadProgressEvent::FileSkipped {
+            file_id: transfer_id,
+            name: "generated complete.bin",
+            output_path: on_retry.as_ref().and_then(|path| path.to_str()),
+            downloaded_bytes: 8,
+            transferred_bytes: 0,
+            total_bytes: 8,
+        })
+        .unwrap();
+        assert_eq!(completed["output_path"], skipped["output_path"]);
+        assert_eq!(skipped["transferred_bytes"], 0);
+    }
+
+    #[test]
+    fn receipt_failure_reports_only_verified_retained_bytes_before_failure() {
+        use crate::{download_failure_progress_events, download_receipt, transfer_control};
+        let message = "Download copy destination changed; it was preserved";
+        let error = anyhow::anyhow!(message).context(download_receipt::VerifiedStagingProgress {
+            downloaded_bytes: 8,
+            total_bytes: 8,
+            failure: message.into(),
+        });
+        let events: Vec<_> = download_failure_progress_events(
+            &error,
+            "generated-transfer",
+            "generated.bin",
+            4,
+            message,
+        )
+        .into_iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "file_started");
+        assert_eq!(events[1]["event"], "file_failed");
+        for event in &events {
+            assert_eq!(event["downloaded_bytes"], 8);
+            assert_eq!(event["total_bytes"], 8);
+            assert_eq!(event["transferred_bytes"], 0);
+        }
+        assert_eq!(events[1]["error"], message);
+        for unverified in [
+            anyhow::anyhow!(message),
+            anyhow::anyhow!("Download copy staging file changed; it was preserved"),
+        ] {
+            let events: Vec<_> = download_failure_progress_events(
+                &unverified,
+                "generated-transfer",
+                "generated.bin",
+                8,
+                message,
+            )
+            .into_iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["event"], "file_failed");
+            assert_eq!(events[0]["downloaded_bytes"], 0);
+            assert_eq!(events[0]["transferred_bytes"], 0);
+        }
+        let paused = anyhow::Error::new(transfer_control::Paused).context(
+            download_receipt::VerifiedStagingProgress {
+                downloaded_bytes: 8,
+                total_bytes: 8,
+                failure: "Download paused".into(),
+            },
+        );
+        assert!(paused.is::<transfer_control::Paused>());
+    }
+
+    #[test]
+    fn failure_event_names_a_permanent_cause_only_when_one_is_proven() {
+        use crate::download_failure_progress_events;
+        use pikpak::download_policy::{self, HttpFailure};
+        let event = |error: anyhow::Error| {
+            let message = format!("{error:#}");
+            let mut events: Vec<_> = download_failure_progress_events(&error, "id", "A.bin", 4, &message)
+                .into_iter()
+                .map(|event| serde_json::to_value(event).unwrap())
+                .collect();
+            assert_eq!(events.len(), 1);
+            events.remove(0)
+        };
+        let gone = event(
+            anyhow::Error::new(pikpak::Error::NotFound { path: "/A.bin".into(), segment: "A.bin".into() })
+                .context("failed to download A.bin"),
+        );
+        assert_eq!(gone["event"], "file_failed");
+        assert_eq!(gone["permanent"], download_policy::FILE_MISSING);
+        assert_eq!(
+            event(anyhow::Error::new(HttpFailure { status: 410, retry_after: None }))["permanent"],
+            download_policy::CONTENT_GONE
+        );
+        assert_eq!(event(download_policy::SourceReplaced.into())["permanent"], download_policy::PATH_REPLACED);
+        assert_eq!(event(download_policy::OriginalSizeMismatch { expected: 8, received: 9 }.into())["permanent"],
+            download_policy::ORIGINAL_SIZE_MISMATCH);
+        // Anything that may clear leaves the field out entirely, so older apps and newer ones agree.
+        for transient in [
+            anyhow::Error::new(HttpFailure { status: 503, retry_after: None }),
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull)),
+            anyhow::anyhow!("The download source changed while refreshing its URL; resume"),
+        ] {
+            let event = event(transient);
+            assert_eq!(event["event"], "file_failed");
+            assert!(event.get("permanent").is_none(), "{event}");
+        }
+    }
+
+    #[test]
+    fn disk_interruption_progress_is_distinct_from_network_retry() {
+        let ordinary = serde_json::to_value(DownloadProgressEvent::FileRetrying {
+            file_id: "file-1",
+            name: "generated.bin",
+            attempt: 2,
+            retry_in_millis: 2000,
+            destination_unavailable: None,
+            error: None,
+        })
+        .unwrap();
+        assert!(ordinary.get("destination_unavailable").is_none());
+        assert!(ordinary.get("error").is_none());
+        let disk = serde_json::to_value(DownloadProgressEvent::FileRetrying {
+            file_id: "file-1",
+            name: "generated.bin",
+            attempt: 0,
+            retry_in_millis: 1000,
+            destination_unavailable: Some(true),
+            error: Some("Reconnect the original disk"),
+        })
+        .unwrap();
+        assert_eq!(disk["event"], "file_retrying");
+        assert_eq!(disk["destination_unavailable"], true);
+        assert_eq!(disk["error"], "Reconnect the original disk");
     }
 
     #[test]
@@ -5432,17 +7057,37 @@ mod tests {
     #[test]
     fn cached_account_download_request_preserves_ids_and_destinations() {
         use clap::Parser;
-        let cli = super::Cli::try_parse_from(["pikpak", "download", "--roots-file", "/tmp/roots.json", "--jobs", "32"]).unwrap();
-        assert!(matches!(cli.command, super::Command::Download(args) if args.paths.is_empty() && args.roots_file.is_some() && args.jobs == 32));
+        let cli = super::Cli::try_parse_from([
+            "pikpak",
+            "download",
+            "--roots-file",
+            "/tmp/roots.json",
+            "--jobs",
+            "32",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, super::Command::Download(args) if args.paths.is_empty() && args.roots_file.is_some() && args.jobs == 32)
+        );
         let request: super::AccountDownloadInput = serde_json::from_value(serde_json::json!({
             "roots": [{ "path": "/A/report.txt", "relative_parent": [],
                 "file": { "id": "stable-id", "name": "report.txt", "kind": "drive#file", "size": "42" } }]
         })).unwrap();
         assert_eq!(request.roots[0].file.as_ref().unwrap().id, "stable-id");
         let output = std::path::Path::new("/tmp/test-output");
-        assert_eq!(super::download_root_destination(output, "/A/report.txt", 0, Some(&[])).unwrap(), output);
-        assert_eq!(super::download_root_destination(output, "/A/report.txt", 0, Some(&["A".into()])).unwrap(), output.join("A"));
-        assert!(super::download_root_destination(output, "/A/report.txt", 0, Some(&["..".into()])).is_err());
+        assert_eq!(
+            super::download_root_destination(output, "/A/report.txt", 0, Some(&[])).unwrap(),
+            output
+        );
+        assert_eq!(
+            super::download_root_destination(output, "/A/report.txt", 0, Some(&["A".into()]))
+                .unwrap(),
+            output.join("A")
+        );
+        assert!(
+            super::download_root_destination(output, "/A/report.txt", 0, Some(&["..".into()]))
+                .is_err()
+        );
     }
 
     #[test]
@@ -5504,7 +7149,8 @@ mod tests {
     fn download_worker_count_is_bounded_and_never_exceeds_file_count() {
         assert_eq!(bounded_download_workers(0, 100), 1);
         assert_eq!(bounded_download_workers(32, 100), 32);
-        assert_eq!(bounded_download_workers(128, 100), 64);
+        assert_eq!(bounded_download_workers(128, 100), 100);
+        assert_eq!(bounded_download_workers(usize::MAX, 1_000), 1_000);
         assert_eq!(bounded_download_workers(64, 7), 7);
         assert_eq!(bounded_download_workers(64, 0), 0);
     }
@@ -5615,7 +7261,9 @@ mod tests {
         assert!(!args.raw);
         assert!(!args.with_transfer);
         let cli = Cli::try_parse_from(["pikpak", "quota", "--json", "--with-transfer"]).unwrap();
-        let Command::Quota(args) = cli.command else { panic!("quota command should parse"); };
+        let Command::Quota(args) = cli.command else {
+            panic!("quota command should parse");
+        };
         assert!(args.with_transfer);
         assert!(Cli::try_parse_from(["pikpak", "quota", "--with-transfer"]).is_err());
     }
@@ -5841,7 +7489,8 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "id": id, "name": id, "size": size.to_string(),
             "kind": if folder { "drive#folder" } else { "drive#file" }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     #[tokio::test]
@@ -5851,10 +7500,18 @@ mod tests {
         for i in 0..1_000 {
             let id = format!("cached-{i}");
             root_entries.push(size_fixture_entry(&id, true, 999_999));
-            seed.folders.insert(id, FolderMeasurement { total_bytes: 10, file_count: 1, folder_count: 0 });
+            seed.folders.insert(
+                id,
+                FolderMeasurement {
+                    total_bytes: 10,
+                    file_count: 1,
+                    folder_count: 0,
+                },
+            );
         }
         // Even a stale root in a seed must never suppress refreshing the root.
-        seed.folders.insert("root".into(), FolderMeasurement::default());
+        seed.folders
+            .insert("root".into(), FolderMeasurement::default());
         root_entries.push(size_fixture_entry("new-folder", true, 999_999));
         let mut calls = Vec::new();
         let report = super::measure_folder_tree("root", seed, 4, |id| {
@@ -5865,7 +7522,9 @@ mod tests {
                 other => panic!("unnecessarily scanned {other}"),
             };
             async move { Ok(entries) }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert_eq!(calls, ["root", "new-folder"]);
         assert_eq!(report.root.total_bytes, 10_025);
         assert_eq!(report.root.file_count, 1_001);
@@ -5879,19 +7538,38 @@ mod tests {
     #[tokio::test]
     async fn folder_measurement_rejects_partial_failure_and_deduplicates_entries() {
         let failure = super::measure_folder_tree("root", Default::default(), 4, |id| async move {
-            if id == "root" { Ok(vec![size_fixture_entry("missing", true, 0)]) }
-            else { anyhow::bail!("fixture listing failed") }
-        }).await;
-        assert!(failure.is_err(), "a partial scan must never be persisted as a full size");
+            if id == "root" {
+                Ok(vec![size_fixture_entry("missing", true, 0)])
+            } else {
+                anyhow::bail!("fixture listing failed")
+            }
+        })
+        .await;
+        assert!(
+            failure.is_err(),
+            "a partial scan must never be persisted as a full size"
+        );
         let report = super::measure_folder_tree("root", Default::default(), 4, |id| async move {
-            if id == "root" { Ok(vec![size_fixture_entry("child", true, 0)]) }
-            else { Ok(vec![size_fixture_entry("root", true, 0),
-                          size_fixture_entry("file", false, 15), size_fixture_entry("file", false, 15)]) }
-        }).await.unwrap();
+            if id == "root" {
+                Ok(vec![size_fixture_entry("child", true, 0)])
+            } else {
+                Ok(vec![
+                    size_fixture_entry("root", true, 0),
+                    size_fixture_entry("file", false, 15),
+                    size_fixture_entry("file", false, 15),
+                ])
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(report.root.total_bytes, 15);
         assert_eq!(report.root.file_count, 1);
         assert_eq!(report.root.folder_count, 1);
-        assert!(report.listings.values().flatten().all(|entry| entry.id != "root"));
+        assert!(report
+            .listings
+            .values()
+            .flatten()
+            .all(|entry| entry.id != "root"));
     }
 
     #[tokio::test]
@@ -5907,21 +7585,36 @@ mod tests {
             async move {
                 in_flight.set(in_flight.get() + 1);
                 peak.set(peak.get().max(in_flight.get()));
-                let yields = if id == "root" { 1 } else { 40 - id.len() % 7 * 5 };
-                for _ in 0..yields { tokio::task::yield_now().await; }
+                let yields = if id == "root" {
+                    1
+                } else {
+                    40 - id.len() % 7 * 5
+                };
+                for _ in 0..yields {
+                    tokio::task::yield_now().await;
+                }
                 in_flight.set(in_flight.get() - 1);
                 Ok(match id.as_str() {
-                    "root" => (0..12).map(|i| size_fixture_entry(&format!("folder-{i}"), true, 0)).collect(),
-                    folder if folder.ends_with("-nested") =>
-                        vec![size_fixture_entry(&format!("{folder}-file"), false, 7)],
+                    "root" => (0..12)
+                        .map(|i| size_fixture_entry(&format!("folder-{i}"), true, 0))
+                        .collect(),
+                    folder if folder.ends_with("-nested") => {
+                        vec![size_fixture_entry(&format!("{folder}-file"), false, 7)]
+                    }
                     folder => vec![
                         size_fixture_entry(&format!("{folder}-nested"), true, 0),
                         size_fixture_entry(&format!("{folder}-file"), false, 3),
                     ],
                 })
             }
-        }).await.unwrap();
-        assert_eq!(peak.get(), 4, "a wide tree must keep the listing pool full but bounded");
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            peak.get(),
+            4,
+            "a wide tree must keep the listing pool full but bounded"
+        );
         assert_eq!(in_flight.get(), 0);
         assert_eq!(report.root.total_bytes, 12 * 10);
         assert_eq!(report.root.file_count, 24);
@@ -5936,28 +7629,53 @@ mod tests {
     async fn folder_measurement_failure_stops_concurrent_walk() {
         let failure = super::measure_folder_tree("root", Default::default(), 4, |id| async move {
             match id.as_str() {
-                "root" => Ok((0..8).map(|i| size_fixture_entry(&format!("folder-{i}"), true, 0)).collect()),
+                "root" => Ok((0..8)
+                    .map(|i| size_fixture_entry(&format!("folder-{i}"), true, 0))
+                    .collect()),
                 "folder-3" => anyhow::bail!("fixture listing failed"),
                 _ => {
                     tokio::task::yield_now().await;
                     Ok(vec![size_fixture_entry(&format!("{id}-file"), false, 1)])
                 }
             }
-        }).await;
-        let message = format!("{:#}", failure.expect_err("a failed sibling must fail the walk"));
+        })
+        .await;
+        let message = format!(
+            "{:#}",
+            failure.expect_err("a failed sibling must fail the walk")
+        );
         assert!(message.contains("folder-3"), "{message}");
     }
 
     #[test]
     fn folder_measurement_seed_accepts_native_cache_encoding() {
         let seed: super::FolderMeasurementSeed = serde_json::from_str(
-            r#"{"folders":{"folder":{"totalBytes":40,"fileCount":2,"folderCount":1}}}"#
-        ).unwrap();
+            r#"{"folders":{"folder":{"totalBytes":40,"fileCount":2,"folderCount":1}}}"#,
+        )
+        .unwrap();
         assert_eq!(seed.folders["folder"].total_bytes, 40);
-        let args = Cli::try_parse_from(["pikpak", "measure", "--id", "root", "--cache-file", "/tmp/cache.json"]).unwrap();
-        assert!(matches!(args.command, Command::Measure(super::MeasureArgs { cache_file: Some(_), .. })));
+        let args = Cli::try_parse_from([
+            "pikpak",
+            "measure",
+            "--id",
+            "root",
+            "--cache-file",
+            "/tmp/cache.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Command::Measure(super::MeasureArgs {
+                cache_file: Some(_),
+                ..
+            })
+        ));
         let event = UploadProgressEvent::FileCompleted {
-            upload_id: "1", name: "fixture", total_bytes: 5, instant: true, parent_id: "destination",
+            upload_id: "1",
+            name: "fixture",
+            total_bytes: 5,
+            instant: true,
+            parent_id: "destination",
         };
         let json = serde_json::to_value(event).unwrap();
         assert_eq!(json["parent_id"], "destination");
@@ -6117,9 +7835,20 @@ mod tests {
     #[test]
     fn download_pause_cancel_flushes_writes_and_resumes_in_isolation() {
         let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tests::download_pause_cancel_child", "--ignored", "--nocapture"])
-            .output().unwrap();
-        assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stdout).to_string() + &String::from_utf8_lossy(&child.stderr));
+            .args([
+                "--exact",
+                "tests::download_pause_cancel_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stdout).to_string()
+                + &String::from_utf8_lossy(&child.stderr)
+        );
     }
     #[tokio::test]
     #[ignore = "isolated environment configured by parent test"]
@@ -6134,7 +7863,10 @@ mod tests {
         let final_file = directory.path().join("completed.bin");
         std::fs::write(&final_file, b"finished file").unwrap();
         let full = vec![0x4au8; 2 * 1024 * 1024];
-        let client = pikpak::Client::builder().refresh_token("dummy").build().unwrap();
+        let client = pikpak::Client::builder()
+            .refresh_token("dummy")
+            .build()
+            .unwrap();
         for command in ["pause", "cancel"] {
             std::fs::write(&control, br#"{"actions":{}}"#).unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(110)).await;
@@ -6143,25 +7875,51 @@ mod tests {
             let bytes = full.clone();
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0u8; 2048]; let _ = socket.read(&mut request).await;
-                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
+                let mut request = [0u8; 2048];
+                let _ = socket.read(&mut request).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
                 socket.write_all(header.as_bytes()).await.unwrap();
-                socket.write_all(&bytes[..65536]).await.unwrap(); socket.flush().await.unwrap();
+                socket.write_all(&bytes[..65536]).await.unwrap();
+                socket.flush().await.unwrap();
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             });
-            let path = partial.clone(); let instance = client.clone(); let total = full.len() as u64;
+            let path = partial.clone();
+            let instance = client.clone();
+            let total = full.len() as u64;
             let attempt = tokio::spawn(async move {
-                super::download_attempt(&instance, &format!("http://{address}/file"), total, &path, false,
-                    super::DownloadProgressContext::new(false, "controlled-file", "file")).await
+                super::download_attempt(
+                    &instance,
+                    &format!("http://{address}/file"),
+                    total,
+                    &path,
+                    false,
+                    super::DownloadProgressContext::new(false, "controlled-file", "file"),
+                )
+                .await
             });
             for _ in 0..100 {
-                if std::fs::metadata(&partial).is_ok_and(|value| value.len() == 65536) { break; }
+                if std::fs::metadata(&partial).is_ok_and(|value| value.len() == 65536) {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
             assert_eq!(std::fs::metadata(&partial).unwrap().len(), 65536);
-            std::fs::write(&control, format!(r#"{{"actions":{{"controlled-file":"{command}"}}}}"#)).unwrap();
-            let result = tokio::time::timeout(std::time::Duration::from_secs(2), attempt).await.unwrap().unwrap();
-            let error = match result { Err(error) => error.into_inner(), Ok(()) => panic!("control should interrupt stalled I/O") };
+            std::fs::write(
+                &control,
+                format!(r#"{{"actions":{{"controlled-file":"{command}"}}}}"#),
+            )
+            .unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), attempt)
+                .await
+                .unwrap()
+                .unwrap();
+            let error = match result {
+                Err(error) => error.into_inner(),
+                Ok(_) => panic!("control should interrupt stalled I/O"),
+            };
             server.abort();
             if command == "pause" {
                 assert!(error.is::<super::transfer_control::Paused>());
@@ -6169,9 +7927,17 @@ mod tests {
                 std::fs::write(&control, br#"{"actions":{}}"#).unwrap();
                 tokio::time::sleep(std::time::Duration::from_millis(110)).await;
                 let address = spawn_range_server(full.clone()).await;
-                let result = super::download_attempt(&client, &format!("http://{address}/file"), total, &partial, false,
-                    super::DownloadProgressContext::new(false, "controlled-file", "file")).await;
-                assert!(result.is_ok()); assert_eq!(std::fs::read(&partial).unwrap(), full);
+                let result = super::download_attempt(
+                    &client,
+                    &format!("http://{address}/file"),
+                    total,
+                    &partial,
+                    false,
+                    super::DownloadProgressContext::new(false, "controlled-file", "file"),
+                )
+                .await;
+                assert!(result.is_ok());
+                assert_eq!(std::fs::read(&partial).unwrap(), full);
                 std::fs::remove_file(&partial).unwrap();
             } else {
                 assert!(error.is::<super::transfer_control::Cancelled>());
@@ -6194,7 +7960,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let part = dir.join("f.part");
         std::fs::write(&part, &full[..10]).unwrap();
-        super::download_transport::seed_resume(&part, "test-file", full.len() as u64, "\"fixture\"");
+        super::download_transport::seed_resume(
+            &part,
+            "test-file",
+            full.len() as u64,
+            "\"fixture\"",
+        );
 
         let url = format!("http://{addr}/f");
         let progress = super::DownloadProgressContext::new(false, "test-file", "f");
@@ -6222,24 +7993,82 @@ mod tests {
     #[tokio::test]
     async fn upload_restart_skips_completed_file_without_local_source_or_network() {
         use pikpak::upload_checkpoint::{FileCheckpoint, UploadCheckpoint};
-        let directory = std::env::temp_dir().join(format!("pikpak-upload-restart-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("pikpak-upload-restart-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("source.txt");
         std::fs::write(&path, b"already uploaded").unwrap();
-        let mut checkpoint = UploadCheckpoint::open(directory.join("state"), "account".into(), "parent".into(), vec![path.clone()]).unwrap();
-        checkpoint.initialize(&serde_json::json!({"test": true}), [path.clone()].into_iter()).unwrap();
-        checkpoint.save_file(&path, &FileCheckpoint { gcid: Some("ABC".into()), remote_file_id: Some("remote-file".into()), completed: true, cancelled: false }).unwrap();
+        let mut checkpoint = UploadCheckpoint::open(
+            directory.join("state"),
+            "account".into(),
+            "parent".into(),
+            vec![path.clone()],
+        )
+        .unwrap();
+        checkpoint
+            .initialize(
+                &serde_json::json!({"test": true}),
+                [path.clone()].into_iter(),
+            )
+            .unwrap();
+        checkpoint
+            .save_file(
+                &path,
+                &FileCheckpoint {
+                    gcid: Some("ABC".into()),
+                    remote_file_id: Some("remote-file".into()),
+                    completed: true,
+                    cancelled: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         drop(checkpoint); // Old helper exited; next helper reads only durable files.
         std::fs::remove_file(&path).unwrap();
-        let restored = UploadCheckpoint::open(directory.join("state"), "account".into(), "parent".into(), vec![path.clone()]).unwrap();
-        let client = pikpak::Client::builder().refresh_token("dummy").build().unwrap();
-        let source = super::UploadSource { upload_id: "0".into(), path: path.clone(), name: "source.txt".into(), display_name: "source.txt".into(), size: 16, remote_parent_id: "parent".into() };
+        let restored = UploadCheckpoint::open(
+            directory.join("state"),
+            "account".into(),
+            "parent".into(),
+            vec![path.clone()],
+        )
+        .unwrap();
+        let client = pikpak::Client::builder()
+            .refresh_token("dummy")
+            .build()
+            .unwrap();
+        let source = super::UploadSource {
+            upload_id: "0".into(),
+            path: path.clone(),
+            name: "source.txt".into(),
+            display_name: "source.txt".into(),
+            size: 16,
+            remote_parent_id: "parent".into(),
+        };
         let network = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        assert!(super::upload_one_file(&client, &source, false, 1, Some(&restored), network.clone()).await.unwrap());
-        assert_eq!(network.load(std::sync::atomic::Ordering::Relaxed), 0, "completed checkpoints must not inflate adaptive throughput");
+        assert!(super::upload_one_file(
+            &client,
+            &source,
+            false,
+            1,
+            Some(&restored),
+            network.clone()
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            network.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "completed checkpoints must not inflate adaptive throughput"
+        );
         // Incomplete entries must NOT quietly skip a missing/changed source.
-        restored.save_file(&path, &FileCheckpoint::default()).unwrap();
-        assert!(super::upload_one_file(&client, &source, false, 1, Some(&restored), network).await.is_err());
+        restored
+            .save_file(&path, &FileCheckpoint::default())
+            .unwrap();
+        assert!(
+            super::upload_one_file(&client, &source, false, 1, Some(&restored), network)
+                .await
+                .is_err()
+        );
         drop(restored);
         std::fs::remove_dir_all(directory).unwrap();
     }

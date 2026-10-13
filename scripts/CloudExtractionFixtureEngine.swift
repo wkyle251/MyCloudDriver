@@ -15,6 +15,10 @@ struct CloudExtractionFixtureEngine {
         precondition(permissions.intValue == 0o600)
         if args[1] == "archive-inspect" {
             Thread.sleep(forTimeInterval: id == "cancel" ? 2 : 0.25)
+            if id == "permission-always" || (id.hasPrefix("permission") && ProcessInfo.processInfo.environment["MYCLOUD_ARCHIVE_CONNECTION"] != "desktop-oauth") {
+                FileHandle.standardError.write(Data("API error 403: {\"error_code\":7,\"error_description\":\"Permission denied\"}\n".utf8))
+                exit(1)
+            }
             let needsPassword = id.hasPrefix("protected") && request["password"] as? String != expectedPassword
             let result: [String: Any] = [
                 "title": "\(id).zip", "status": needsPassword ? "PASSWORD_REQUIRED" : "OK",

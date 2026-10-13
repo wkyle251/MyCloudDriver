@@ -1,8 +1,200 @@
 # PikPak download channels
 
-Status: implemented for normal, shared-link and similarity downloads in
-2.2.25 (build 200). The implementation uses automatic parallel ranges and keeps
-the existing sequential path for small originals and incompatible servers.
+## Being gentle with external disks and network shares
+
+A running download saves its progress with a flush of the drive's cache (`F_FULLFSYNC` on macOS)
+for the data, the journal and its directory. Once a second is fine for an internal SSD, but a
+spinning external disk or a network share is kept busy, and warm, for as long as the download runs.
+
+- **Calmer saves.** The app tells the download helper when the destination is an external disk or a
+  network share (`MYCLOUDDRIVER_DOWNLOAD_DESTINATION`). Those destinations save progress every 20
+  seconds, or sooner once 512 MiB is unsaved, instead of every second. Pause, Stop and errors still
+  save at once. After a crash or an unplug only the network bytes since the last save are fetched
+  again. Internal disks keep the one-second save.
+- **Resuming without reading the whole file again.** Each save records the staging file's identity
+  (device, inode, size, modified and changed times) right after the data is synced. A resume of a
+  ranged download (64 MiB and larger) trusts the saved digest of every complete 16 MiB piece while
+  that identity is exactly unchanged, and reads back only the partial pieces. If the journal has no
+  identity (an older one), or the file changed in any way (edited, copied, replaced, remounted),
+  every piece is read and verified as before. Sequential resumes verify their saved prefix when
+  no valid in-process checksum context is available, including after a helper restart.
+- **Retry without repeated verification reads.** Each queued transfer retains its incremental
+  SHA-256 contexts across interruptions, pauses and Guest/User attempts. Reuse requires the exact
+  checkpoint, staging path, device, inode, size and both timestamps to match an open descriptor.
+  Changed data or checkpoints take the normal verification path. Contexts are memory-only, bounded
+  to 16 MiB and 64 descriptors across the helper, with a 1 MiB per-transfer limit; unsuccessful
+  admission simply uses ordinary verification. Completion releases the contexts. This changes no
+  network limits, connection scheduling or retry delays. It removes repeated partial-piece and
+  serial-prefix reads without removing the final disk read-back, including an interruption after
+  the last byte but before EOF.
+- **A safety net at the end.** Every finished ranged download is read once, end to end, and each
+  piece is compared with its digest before the file is finalized. A piece that was damaged without
+  leaving any trace outside the file therefore cannot be finalized, even if a resume trusted it.
+  When that check fails the journal stops vouching for the file, so the next attempt reads every
+  piece back.
+- **One completion read.** That same verification pass computes the whole-file SHA-256 used by
+  the completion receipt. The helper keeps an open descriptor and an in-memory proof bound to the
+  source, device, inode, size and both timestamps, and reuses the digest only while all still match.
+  Changed metadata falls back to a full checksum against the durable expected digest. A restarted
+  helper verifies the retained bytes again before producing a new proof. Copy-based publication
+  retains its separate source and destination checks. This removes one full-file reread from the
+  normal range-download completion path without weakening its piece verification.
+- **Damage costs the damaged pieces, not the file.** When a resume finds that some pieces no longer
+  match their saved digests, it forgets only those pieces and fetches them again; every piece that
+  still matches is kept. (Journals without digests still fall back to comparing a contiguous
+  prefix with the server.)
+
+Parallel range support for normal, shared-link and similarity downloads was introduced in
+2.2.25 (build 200). The disk-pressure improvements above require a helper rebuilt from current
+source. Small originals and incompatible servers keep the existing sequential path.
+
+## Streaming download RAM and disk phases (build 240)
+
+Disk downloads now receive into a bounded streaming RAM queue. A separate writer
+drains chunks as the disk allows; it never waits for a complete file. Only bytes
+accepted by the disk writer advance checkpoint coverage or checksum state. A
+pause/error saves written bytes, discards uncommitted receive-ahead, and aborts
+the HTTP producer. A crash recovers from the last synced checkpoint. Final
+read-back verification is still required before publication and cloud cleanup.
+Small network frames are combined into batches of up to 1 MiB. A partial batch
+is released after 25 ms, so slow streams do not wait to fill the batch.
+
+Settings → General provides a shared buffer ceiling for the download helper
+and a RAM reserve for other work. Automatic uses detected physical memory minus
+the reserve (8 GiB by default), so a 16 GiB Mac allows up to 8 GiB. On smaller
+Macs the reserve is clamped to three quarters of physical memory. A custom
+ceiling can lower the resulting budget. Nothing is allocated up front. Each
+transfer can receive at most 2 GiB ahead, within the helper's shared budget.
+System memory pressure reduces admission; existing queued bytes drain rather
+than being discarded. Normal admission recovers gradually. Settings changes
+apply to the next helper session. Separate helper sessions have separate
+ceilings and react to the same system memory pressure.
+
+Rotating disks also coordinate application read and write operations. Pending
+verification work is measured in bytes. Read batches are bounded to 512 MiB or
+five seconds, and small queues run after a short wait rather than waiting for a
+full batch. During a read batch HTTP continues into RAM and writers wait for
+the current read operation. At three quarters of the effective RAM limit the
+disk switches to writes; it normally drains toward one quarter (at most 64 MiB) before another
+read batch. A maximum write interval prevents verification starvation. Large
+files resume hashing between batches, without rereading completed regions.
+Pause/cancel lets checkpoint writers proceed after the in-flight read chunk.
+Known SSDs bypass this disk-phase gate. Physical cache writeback and other apps
+remain controlled by macOS. The existing verification process lock is retained
+across helpers; phase coordination is local to one download helper.
+
+From build 242, excess verification phases leave the running-attempt pool
+entirely. A FIFO ticket retains only queue metadata and diagnostics, without
+open download files, RAM payloads or network workers. Each rotating drive admits
+at most eight verification phases and 1 GiB of estimated file bytes; an original
+larger than that progresses alone. A multi-piece resume keeps its reservation
+until its HTTP-to-RAM producer starts. Once received chunks have been written
+and checkpointed, final read-back acquires separate admission. Deferring that
+check preserves the durable journal and complete-piece proof; no network retry
+or integrity failure is reported. Eligible checks have independent admission
+even while receiving fills the adaptive network target, so older pending reads
+continue to advance. The separate socket budget and adaptive throughput
+controller retain their existing limits.
+Queued tickets are reconstructed from saved transfers and durable checkpoints
+after restart; ticket metadata itself holds no downloaded bytes. Normal Quit
+still stops producers, drains received RAM, syncs checkpoints and waits for the
+helper's acknowledgement. The RAM panel and private activity diagnostics now
+also distinguish admitted checks from deferred jobs and record their byte
+estimates and the cumulative admission-deferral count.
+
+Build 243 also excludes a deferred verifier's metadata/output preparation from
+network admission. An HTTP producer releases its network slot as soon as its
+body finishes, while its disk consumer keeps ownership of queued RAM and
+checkpoints. Replacement bodies can therefore enter RAM during verification,
+read waits, writes and final saves. This applies to sequential and ranged
+streams. Activity Log and private diagnostics distinguish receiving tasks,
+completed bodies draining RAM, and preparation/verification tasks. Receiving
+still applies bounded backpressure when the shared or per-transfer RAM budget
+is exhausted or memory pressure requires a smaller budget. Pause, Quit, sleep,
+network loss and server limits can also stop receiving.
+RAM absorbs bursts and short disk stalls; sustained throughput is still bounded
+by the connection, required verification work and disk performance.
+
+Verification deferrals now retain prepared download metadata, the selected
+Dynamic fallback route and resolved legacy queue paths for at most 60 seconds
+from the original lookup. Cache hits do not renew that deadline. Entries are
+transfer-owned and remain in RAM only, with a 32 KiB entry limit and a 16 MiB
+helper-wide budget. Account/share, file ID, listed size/revision and content
+mode bind download reuse. Expiry, changed source metadata, Pause, Cancel, real
+failures and completion take the ordinary fresh-setup path. Rejected signed
+URLs still follow the existing refresh/fallback policy.
+
+Receiving eligibility is also recomputed when a deferred attempt starts. A
+previously eligible prefix cannot keep reopening cloud setup every five
+seconds after its route or journal stops qualifying for receive-ahead. The
+original FIFO verification ticket survives that change. Eligible unfinished
+downloads may still receive into bounded RAM while verification waits, and
+their saved bytes must pass the existing checks before RAM becomes durable
+coverage.
+
+The **Download RAM buffer** panel directly beneath Download progress displays
+current bytes, peak, effective/configured limits, memory pressure, pending read
+bytes, remaining verification bytes and the current read/write phase. Speed
+uses independently sampled received bytes, even while disk progress waits.
+
+### Completed-piece proof and queue progress (build 241)
+
+The streaming queue now delivers a validated EOF event for each piece, after
+that piece's data events. The disk consumer retains this proof only after it
+has accepted every byte of that piece. Checkpoints flush and sync those bytes
+before saving coverage and proof. Previously, the RAM consumer learned EOF
+flags only when the entire transfer ended; an interruption could therefore
+make a later resume read already completed pieces again. A matching saved
+staging identity can now reuse those pieces' digests normally. Missing EOF,
+changed metadata, incomplete bytes and final read-back remain conservative.
+
+The RAM panel also shows the oldest pending-read wait. Anonymous diagnostic
+windows include `oldest_pending_read_ms`, `read_tasks_started` and
+`read_tasks_finished` (process-lifetime totals). Queue bytes alone do not show
+starvation: new final checks can raise the backlog while older reads finish.
+Compare age and task progress with actual resume/final read bytes. The existing
+FIFO verifier and 512 MiB / five-second read batches are retained. At a practical
+220 MiB/s, 512 MiB needs about 2.3 seconds of pure reading; queue drain time is
+longer because checksum work and disk writes also need service. Buffering
+cannot exceed the disk's sustained capacity, and no artificial read-rate cap
+or new network throttle is introduced.
+
+Normal Quit also waits for a graceful download shutdown: the helper stops new
+admission and HTTP reception, drains queued data (including a partial receive
+batch), flushes/syncs the staging files and saves their journals before exiting.
+AppKit uses asynchronous termination, so the app and its output handlers remain
+alive until this finishes. All workspaces request the drain concurrently. The
+selection and its original pause intent stay durable; the next launch recreates
+unfinished verification from those checkpoints. Interrupting verification does
+not withdraw saved identity/checksum trust merely because the user is quitting.
+Large buffers can take time to drain. There is no shutdown timeout that kills a
+writer and silently discards its RAM. Pause/Cancel keep their existing behavior.
+An application crash, Force Quit or power loss cannot preserve volatile RAM;
+recovery re-downloads bytes beyond the last synced checkpoint and still verifies
+the file before completion or cloud cleanup.
+
+## Saved download diagnostics (build 240)
+
+Activity Log adds ten-second network summaries including one-second minimum and
+maximum speed, resume/final read bytes, retry-cache hits, checkpoint latency,
+RAM usage and verification queue counters. Slow operations and retries have
+stable anonymous transfer identifiers. Structured records also include helper
+and physical disk counters, allowing network stalls and disk phases to be
+compared after a long run. Physical reads may include other apps; completion
+and resume reads are expected when their diagnostic counters identify them.
+
+Only typed events, numeric counters and HMAC identifiers are saved in
+`~/Library/Logs/MyCloudDriver/Downloads`. Filenames, destination paths, signed
+URLs, tokens, response bodies and ordinary helper error text are excluded.
+The private identity key remains on that Mac. The writer is asynchronous with
+a 256-record pending cap; overflow is reported and never blocks a transfer.
+Logs rotate daily or at 16 MiB, retaining at most eight segments and eight days
+(128 MiB total). Repeated launches reuse the current day's segment.
+
+Use **Open Saved Logs** in Activity Log to read older JSONL segments with a
+text editor, Console or a streaming JSON reader. **Copy Diagnostics** copies a
+bounded recent tail (at most 512 KiB), without the identity key. A partial
+record left by a crash is skipped; the following valid event remains readable.
 
 ## Implementation
 

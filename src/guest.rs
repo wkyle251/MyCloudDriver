@@ -38,6 +38,7 @@ struct SourceParams {
 pub(crate) struct GuestState {
     files: Mutex<HashMap<String, (Instant, GuestFile)>>,
     shares: Mutex<HashMap<String, (Instant, ShareClient)>>,
+    pub(crate) download_shares: crate::download_share::DownloadShares,
 }
 
 impl GuestState {
@@ -111,6 +112,58 @@ impl GuestState {
     pub async fn download(&self, file: &GuestFile, account: &Client) -> Result<DownloadInfo> {
         let (share, original_id) = self.share(file, account)?;
         share.get_verified_original(&original_id, &file.info).await
+    }
+
+    /// Only explicit downloads create links. Previews and scans keep their
+    /// existing read-only original-share lookup.
+    pub async fn download_task(&self, file: &GuestFile, account: &Client) -> Result<DownloadInfo> {
+        let original = match self.share(file, account) {
+            Ok((share, original_id)) => share.get_verified_original(&original_id, &file.info).await,
+            Err(error) => Err(error),
+        };
+        let error = match original {
+            Ok(download) => return Ok(download),
+            // An outage or throttle does not establish that a link is gone.
+            Err(error) if crate::content_mode::guest_lookup_transient(&error) => return Err(error),
+            Err(error) => error,
+        };
+        let url = self.download_share(&file.info, account, share_unavailable_reason(&error)).await?;
+        let share = self.share_for_url(&url, account)?;
+        // A new link must identify the selected account copy, never the
+        // expired original's ID or an unverified same-named file.
+        let download = share.get_verified_original(&file.info.id, &file.info).await?;
+        tracing::info!(file_id = %file.info.id, "Download share ready; downloading from the share link.");
+        Ok(download)
+    }
+
+    fn share_for_url(&self, url: &str, account: &Client) -> Result<ShareClient> {
+        let link = ParsedShareLink::parse(url)?;
+        let mut shares = self.shares.lock().unwrap();
+        if let Some((at, client)) = shares.get_mut(&link.share_id) {
+            *at = Instant::now();
+            return Ok(client.clone());
+        }
+        let client = account.anonymous_share_client(url, "", "")?;
+        if shares.len() >= MAX_SHARES {
+            evict_oldest(&mut shares);
+        }
+        shares.insert(link.share_id, (Instant::now(), client.clone()));
+        Ok(client)
+    }
+}
+
+fn share_unavailable_reason(error: &Error) -> &'static str {
+    match error {
+        Error::Share(message) => {
+            let message = message.to_ascii_lowercase();
+            if message.contains("expir") { "expired" }
+            else if message.contains("delet") { "deleted" }
+            else if message.contains("pass_code") || message.contains("access code") { "access code required" }
+            else { "no longer available" }
+        }
+        Error::Api { status: 404, .. } => "not found",
+        Error::Api { status: 401 | 403, .. } => "access denied",
+        _ => "original unavailable",
     }
 }
 

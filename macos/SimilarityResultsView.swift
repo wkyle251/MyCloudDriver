@@ -441,7 +441,7 @@ struct SimilarityResultsView: View {
         if photos { return "Move “\(file.name)” to Recently Deleted in Apple Photos? This also affects iCloud Photos if enabled. Restore it from Photos → Recently Deleted." }
         if file.cloudId != nil { return "Move “\(file.name)” to PikPak Trash? You can undo this change in its drive window with Command-Z." }
         let sync = coordinator.externalTitle == CloudDriveKind.icloud.title ? " This change will sync to iCloud." : ""
-        return "Move “\(file.name)” to Finder’s Trash?\(sync) You can undo this change in its drive window with Command-Z."
+        return "Move “\(file.name)” to Trash?\(sync) External and network disks keep deleted items in their own Trash folder. Use the disk’s Trash tab to Put Back, or Command-Z in its drive window."
     }
     private func preview(_ file: SimilarityFile) {
         let reference = results.selectedFile

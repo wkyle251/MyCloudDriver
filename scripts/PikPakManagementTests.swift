@@ -6,10 +6,16 @@ import SwiftUI
         if CommandLine.arguments.contains("--ui") { launchUI(); return }
         try await paginationAndIsolation()
         try await mutationAndCredentials()
+        try await emptyTrashReconciliation()
+        try await emptyTrashPendingAndFailures()
+        try await emptyTrashStaleRepliesAndAccountSwitch()
+        try await emptyTrashSupersededByUndo()
         try await cloudTaskFailures()
+        try await cloudTaskRemovalConfirmation()
+        try await cloudTaskRemovalReconciliation()
         try DownloaderModel.testGuestMode()
         try await DownloaderModel.testPersonalAccessTokenConnection()
-        print("PikPak management tests passed: pagination, account isolation, stale replies, definite and uncertain creation failures, file-limit recovery, metadata, existing modes and token connections.")
+        print("PikPak management tests passed: confirmation dismissal, cloud-task removal, pagination, account isolation, stale replies, creation failures, Empty Trash, metadata and token connections.")
     }
 
     @MainActor static func context(_ owner: String = "owner", kind: PikPakCredentialKind = .personalAccessToken) -> PikPakManagementContext {
@@ -47,8 +53,9 @@ import SwiftUI
         precondition(model.trash.isEmpty && model.error == nil && !model.isLoading)
         precondition(!model.canPermanentlyDelete)
         model.configure(context("other",kind:.desktopOAuth)); precondition(model.canPermanentlyDelete)
-        precondition(FinderWorkspaceSection.standard.map(\.rawValue) == [0,1,3])
-        precondition(FinderWorkspaceSection.allCases.map(\.shortcut) == [1,2,3,4,5,6])
+        precondition(FinderWorkspaceSection.standard.map(\.rawValue) == [0,7,1], "Links belongs to PikPak alone")
+        precondition(FinderWorkspaceSection.allCases.contains(.links) && FinderWorkspaceSection.allCases.map(\.rawValue).prefix(4) == [0,7,1,3])
+        precondition(FinderWorkspaceSection.allCases.map(\.shortcut) == [1,7,2,3,4,5,6])
         let navigation = FinderWorkspaceNavigation(); navigation.showImmediately(6); precondition(navigation.section == 6)
     }
 
@@ -85,6 +92,163 @@ import SwiftUI
         }
         await model.load(4); complete = true; await model.load(4); await model.load(4)
         precondition(invalidations == 1, "Finishing a cloud task refreshes account files once")
+    }
+
+    @MainActor static func emptyTrashReconciliation() async throws {
+        let model = PikPakManagementModel(); model.configure(context(kind: .desktopOAuth))
+        defer { model.clear() }
+        var accepted = false, mutations = 0, confirmations = 0
+        model.fixture = { input in
+            if input["operation"] as? String == "empty_trash" {
+                accepted = true; mutations += 1
+                return try data(["account_id":"owner", "ok":true])
+            }
+            precondition(input["operation"] as? String == "list_trash")
+            if accepted {
+                confirmations += 1
+                precondition(model.notice != "Trash emptied.", "Empty Trash cannot report completion before a fresh empty listing")
+            }
+            return try data(["account_id":"owner", "files":accepted && confirmations >= 3 ? [] : [file("remaining")], "next_page_token":""])
+        }
+        await model.load(6)
+        _ = await model.mutate("empty_trash", values:["confirmed":true], section:6, success:"Trash emptied.")
+        precondition(model.trash.isEmpty && model.notice == "Trash emptied." && confirmations == 3 && mutations == 1,
+                     "Only refreshes are repeated while PikPak finishes emptying Trash")
+        print("PASS Empty Trash: completion waits for the server's empty listing without repeating permanent deletion")
+        model.fixture = { _ in try data(["account_id":"owner", "files":[file("new-trash")], "next_page_token":""]) }
+        await model.load(6)
+        precondition(model.notice == nil && model.trash.count == 1,
+                     "A later nonempty refresh cannot keep a stale Trash emptied notice")
+    }
+
+    @MainActor static func emptyTrashPendingAndFailures() async throws {
+        let model = PikPakManagementModel(); model.configure(context(kind: .desktopOAuth))
+        defer { model.clear() }
+        var accepted = false, empty = false, failRead = false, failMutation = false
+        var mutationCount = 0, readCount = 0, continuation = false
+        model.fixture = { input in
+            if input["operation"] as? String == "empty_trash" {
+                mutationCount += 1
+                if failMutation { throw PikPakManagementError.message("PikPak denied this action.") }
+                accepted = true
+                return try data(["account_id":"owner", "ok":true])
+            }
+            precondition(input["operation"] as? String == "list_trash")
+            readCount += 1
+            if failRead { throw PikPakManagementError.message("Trash response could not be read.") }
+            return try data(["account_id":"owner", "files":empty || (accepted && continuation) ? [] : [file("remaining")],
+                             "next_page_token":accepted && continuation && (input["page_token"] as? String ?? "").isEmpty ? "next" : ""])
+        }
+        await model.load(6)
+        failMutation = true
+        let rejected = await model.mutate("empty_trash", values:["confirmed":true], section:6, success:"Trash emptied.")
+        precondition(rejected == nil && model.trash.count == 1 && model.notice == nil && readCount == 1)
+        failMutation = false; failRead = true
+        let acceptedResponse = await model.mutate("empty_trash", values:["confirmed":true], section:6, success:"Trash emptied.")
+        precondition(acceptedResponse != nil && !model.isMutating && model.noticeIsPending && model.hasListError
+                     && model.notice != "Trash emptied." && model.trash.count == 1)
+        failRead = false
+        let before = mutationCount
+        _ = await model.mutate("empty_trash", values:["confirmed":true], section:6, success:"Trash emptied.")
+        precondition(!model.isMutating && model.noticeIsPending && model.hasPendingEmptyTrash
+                     && model.trash.count == 1 && mutationCount == before + 1,
+                     "Bounded verification keeps actual remaining rows and releases the mutation lane")
+        empty = true; await model.load(6)
+        precondition(model.trash.isEmpty && model.notice == "Trash emptied." && !model.noticeIsPending
+                     && !model.hasPendingEmptyTrash && mutationCount == before + 1)
+        empty = false; continuation = true
+        _ = await model.mutate("empty_trash", values:["confirmed":true], section:6, success:"Trash emptied.")
+        precondition(model.trash.isEmpty && model.hasMore(6) && model.noticeIsPending && model.hasPendingEmptyTrash,
+                     "An empty page with a continuation does not prove Trash is empty")
+        await model.load(6, more:true)
+        precondition(model.hasPendingEmptyTrash && model.notice != "Trash emptied.",
+                     "The empty end of a paginated listing cannot confirm the whole Trash")
+        continuation = false; empty = true; await model.load(6)
+        precondition(model.notice == "Trash emptied." && !model.hasPendingEmptyTrash)
+        print("PASS Empty Trash: failed checks and ongoing processing stay pending; a fresh first page confirms completion")
+    }
+
+    @MainActor static func waitFor(_ condition: () -> Bool) async throws {
+        for _ in 0..<200 {
+            if condition() { return }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        precondition(condition(), "Fixture did not reach its expected suspension")
+    }
+
+    @MainActor static func emptyTrashStaleRepliesAndAccountSwitch() async throws {
+        let model = PikPakManagementModel(); model.configure(context(kind: .desktopOAuth))
+        defer { model.clear() }
+        for failOldRead in [false, true] {
+            var accepted = false, slowRead = false, started = false, mutationCount = 0
+            model.fixture = { input in
+                if input["operation"] as? String == "empty_trash" {
+                    accepted = true; mutationCount += 1
+                    return try data(["account_id":"owner", "ok":true])
+                }
+                let captured = accepted
+                if slowRead && !captured {
+                    started = true
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                    if failOldRead { throw PikPakManagementError.message("An old Trash response could not be read.") }
+                }
+                return try data(["account_id":"owner", "files":captured ? [] : [file("stale")], "next_page_token":""])
+            }
+            await model.load(6)
+            slowRead = true
+            let oldRead = Task { await model.load(6) }
+            try await waitFor { started }
+            _ = await model.mutate("empty_trash", values:["confirmed":true], section:6, success:"Trash emptied.")
+            await oldRead.value
+            precondition(model.trash.isEmpty && model.notice == "Trash emptied." && model.error == nil && mutationCount == 1,
+                         "An old listing or its failure cannot overwrite confirmed Empty Trash state")
+        }
+        var checking = false
+        model.fixture = { input in
+            if input["operation"] as? String == "empty_trash" { return try data(["account_id":"owner", "ok":true]) }
+            checking = true
+            try await Task.sleep(nanoseconds: 100_000_000)
+            return try data(["account_id":"owner", "files":[], "next_page_token":""])
+        }
+        let pending = Task { await model.mutate("empty_trash", values:["confirmed":true], section:6, success:"Trash emptied.") }
+        try await waitFor { checking }
+        model.configure(context("other", kind:.desktopOAuth))
+        _ = await pending.value
+        precondition(model.trash.isEmpty && model.notice == nil && model.error == nil && !model.isMutating
+                     && !model.isConfirmingEmptyTrash && !model.hasPendingEmptyTrash,
+                     "A confirmation cannot cross an account switch")
+        print("PASS Empty Trash: stale successes, stale failures and account-switch replies cannot restore old rows")
+    }
+
+    @MainActor static func emptyTrashSupersededByUndo() async throws {
+        let model = PikPakManagementModel(); model.configure(context(kind: .desktopOAuth))
+        defer { model.clear() }
+        var accepted = false, checking = false, reads = 0
+        var rows = [file("restored")]
+        model.fixture = { input in
+            if input["operation"] as? String == "empty_trash" {
+                accepted = true
+                return try data(["account_id":"owner", "ok":true])
+            }
+            reads += 1
+            if accepted && !checking {
+                checking = true
+                try await Task.sleep(nanoseconds: 100_000_000)
+                return try data(["account_id":"owner", "files":[], "next_page_token":""])
+            }
+            return try data(["account_id":"owner", "files":rows, "next_page_token":""])
+        }
+        await model.load(6)
+        let pending = Task { await model.mutate("empty_trash", values:["confirmed":true], section:6, success:"Trash emptied.") }
+        try await waitFor { checking }
+        rows = [file("new-trash")]
+        model.fileTrashChanged([FinderFileMutation(fileId:"restored", kind:.trash, before:"true", after:"false", parentId:nil, name:nil)])
+        _ = await pending.value
+        try await waitFor { reads >= 3 && !model.isLoading }
+        precondition(model.trash.map(\.id) == ["new-trash"] && model.notice != "Trash emptied."
+                     && !model.hasPendingEmptyTrash && !model.isMutating,
+                     "An Undo supersedes an older Empty Trash confirmation and refreshes current rows")
+        print("PASS Empty Trash: Undo supersedes an in-flight completion check")
     }
 
     static func fileLimitError() -> PikPakManagementError {
@@ -155,6 +319,102 @@ import SwiftUI
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
         let failedTask = try decoder.decode(PikPakCloudTask.self,from:data(task))
         precondition(failedTask.hasFileCountLimit && failedTask.isFailed)
+    }
+
+    @MainActor static func cloudTaskRemovalConfirmation() async throws {
+        let model = PikPakManagementModel(); model.configure(context())
+        defer { model.clear() }
+        var mutations = 0
+        var confirmation: PikPakManagementConfirmation?
+        model.fixture = { input in
+            if input["operation"] as? String == "remove_task" {
+                precondition(confirmation == nil, "The native dialog must be dismissed before removal begins")
+                mutations += 1
+                return try data(["account_id":"owner", "ok":true])
+            }
+            return try data(["account_id":"owner", "tasks":[taskData()], "next_page_token":""])
+        }
+        await model.load(4)
+        let value = PikPakManagementConfirmation(revision: model.revision, title:"Remove this cloud task?", message:"Generated task",
+            button:"Remove Task", operation:"remove_task", ids:["task"], section:4)
+        confirmation = value
+        let removal = PikPakManagementConfirmation.submit(value, confirmation:&confirmation, management:model)
+        precondition(confirmation == nil && removal != nil, "The button must synchronously dismiss and claim its action")
+        precondition(PikPakManagementConfirmation.submit(value, confirmation:&confirmation, management:model) == nil)
+        let second = PikPakManagementConfirmation(revision:model.revision, title:"Second", message:"Generated", button:"Remove Task",
+            operation:"remove_task", ids:["task"], section:4)
+        confirmation = second
+        precondition(PikPakManagementConfirmation.submit(second, confirmation:&confirmation, management:model) == nil,
+                     "A second confirmation cannot dispatch before the first reserved mutation starts")
+        _ = await removal!.value
+        precondition(mutations == 1 && model.tasks.isEmpty && model.notice == "Task removed.")
+        precondition(PikPakManagementConfirmation.submit(value, confirmation:&confirmation, management:model) == nil,
+                     "A repeated callback after completion must not remove the task twice")
+        let nativeDismissed = PikPakManagementConfirmation(revision:model.revision, title:"Native dismissed", message:"Generated", button:"Remove Task",
+            operation:"remove_task", ids:["task"], section:4)
+        confirmation = nil
+        let nativeRemoval = PikPakManagementConfirmation.submit(nativeDismissed, confirmation:&confirmation, management:model)
+        precondition(nativeRemoval != nil, "Hosts that clear the native binding before the button callback must still dispatch")
+        _ = await nativeRemoval!.value
+        precondition(mutations == 2)
+        confirmation = value
+        model.configure(context("other"))
+        precondition(PikPakManagementConfirmation.submit(value, confirmation:&confirmation, management:model) == nil && confirmation == nil,
+                     "An old dialog cannot remove a task from a newly selected account")
+        let queued = PikPakManagementConfirmation(revision:model.revision, title:"Queued", message:"Generated", button:"Remove Task",
+            operation:"remove_task", ids:["task"], section:4)
+        confirmation = queued
+        let pending = PikPakManagementConfirmation.submit(queued, confirmation:&confirmation, management:model)!
+        model.configure(context("third"))
+        let rejected = await pending.value
+        precondition(rejected == nil && mutations == 2 && !model.isMutating,
+                     "A queued button callback must remain bound to its original account")
+        print("PASS cloud-task confirmation: synchronous dismissal, single dispatch, repeated clicks and stale/queued account rejection")
+    }
+
+    @MainActor static func cloudTaskRemovalReconciliation() async throws {
+        let model = PikPakManagementModel()
+        defer { model.clear() }
+        for failOldRead in [false, true] {
+            model.configure(context())
+            var slow = false, started = false, mutations = 0, invalidations = 0
+            model.onFilesChanged = { invalidations += 1 }
+            model.fixture = { input in
+                if input["operation"] as? String == "remove_task" {
+                    mutations += 1
+                    return try data(["account_id":"owner", "ok":true])
+                }
+                let capturedSlow = slow
+                if capturedSlow {
+                    started = true
+                    try await Task.sleep(nanoseconds:100_000_000)
+                    if failOldRead { throw PikPakManagementError.api(status:503, code:nil, message:"An older task listing failed") }
+                }
+                var removed = taskData(); removed["phase"] = mutations > 0 ? "PHASE_TYPE_COMPLETE" : "PHASE_TYPE_RUNNING"
+                var other = taskData(); other["id"] = "other"
+                return try data(["account_id":"owner", "tasks":[removed,other],
+                                 "next_page_token":(input["page_token"] as? String ?? "").isEmpty ? "next" : ""])
+            }
+            await model.load(4)
+            slow = true
+            let oldRead = Task { await model.load(4) }
+            try await waitFor { started }
+            _ = await model.mutate("remove_task", values:["id":"task", "confirmed":true], section:4, success:"Task removed.")
+            await oldRead.value
+            precondition(model.tasks.map(\.id) == ["other"] && model.error == nil && model.notice == "Task removed.",
+                         "Old task-list successes and failures cannot undo acknowledged removal")
+            slow = false
+            await model.load(4); await model.load(4, more:true)
+            precondition(model.tasks.map(\.id) == ["other"] && mutations == 1 && invalidations == 0,
+                         "Stale refreshes and older pages cannot resurrect a removed task or invalidate saved files")
+            model.configure(context())
+            await model.load(4)
+            precondition(model.tasks.contains { $0.id == "task" }, "Removal exclusions belong only to their configured account context")
+            model.fixture = { _ in throw PikPakManagementError.fromHelper("error: API error 403: Removal denied") }
+            let denied = await model.mutate("remove_task", values:["id":"task"], section:4, success:"Task removed.")
+            precondition(denied == nil && model.tasks.contains { $0.id == "task" } && model.notice == nil)
+        }
+        print("PASS cloud-task removal: acknowledged rows disappear, stale/in-flight/paginated replies stay excluded, failures preserve rows and accounts remain isolated")
     }
 
     static func taskData() -> [String: Any] {

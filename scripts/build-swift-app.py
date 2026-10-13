@@ -33,13 +33,14 @@ def build(cache, arguments, jobs):
     sources = [arg for arg in arguments if arg.endswith(".swift")]
     inputs = sources + [arg for arg in arguments if arg.endswith((".o", ".a"))]
     compiler = subprocess.check_output(["xcrun", "--find", "swiftc"], text=True).strip()
-    sdk = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True).strip()
+    sdk = os.environ.get("MYCLOUD_BUILD_SDK") or subprocess.check_output(
+        ["xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True).strip()
     configuration = {
         "compiler": compiler,
         "version": subprocess.check_output([compiler, "--version"], text=True, stderr=subprocess.STDOUT),
         "sdk": sdk,
         "sdk_build": subprocess.check_output(
-            ["xcrun", "--sdk", "macosx", "--show-sdk-build-version"], text=True).strip(),
+            ["xcrun", "--sdk", sdk, "--show-sdk-build-version"], text=True).strip(),
         "arguments": arguments,
         "recipe": digest(__file__),
     }
@@ -80,11 +81,13 @@ def build(cache, arguments, jobs):
     # binary was damaged or an object changed with its timestamp preserved.
     output.unlink(missing_ok=True)
     print(f"Swift: incremental release build, up to {jobs} compiler jobs…", flush=True)
+    # Running swiftc by path skips xcrun's SDKROOT. Without it the linker stamps the
+    # deployment target as the SDK version and macOS applies its legacy appearance.
     subprocess.run([
         compiler, "-incremental", "-enable-batch-mode", "-j", str(jobs),
         "-emit-dependencies", "-output-file-map", str(file_map), "-sdk", sdk,
         *arguments,
-    ], check=True)
+    ], check=True, env=dict(os.environ, SDKROOT=sdk))
     rebuilt = sum(before.get(path) != path.stat().st_mtime_ns for path in objects.glob("*.o"))
     stamp.write_text(json.dumps({
         "configuration": configuration, "inputs": hashes, "executable": digest(output),

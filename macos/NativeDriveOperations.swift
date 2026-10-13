@@ -25,7 +25,7 @@ enum NativeDriveArchive {
                     defer { Unmanaged<NativeArchiveProgress>.fromOpaque(pointer).release() }
                     var error = [CChar](repeating: 0, count: 1024)
                     let callback: @convention(c) (UnsafeMutableRawPointer?, Int64, UnsafePointer<CChar>?) -> Int32 = { context, bytes, name in
-                        if Task.isCancelled { return 1 }
+                        do { try CloudDriveFiles.checkCancellation() } catch { return 1 }
                         guard let context else { return 1 }
                         let value = Unmanaged<NativeArchiveProgress>.fromOpaque(context).takeUnretainedValue()
                         if Date().timeIntervalSince(value.last) > 0.2 {

@@ -65,8 +65,18 @@ import SwiftUI
             try await wait { abs(playback.player!.currentTime().seconds - 11) < 0.1 }
             precondition(MediaPreviewKeyView.handle(key(123, window: window)))
             try await wait { abs(playback.player!.currentTime().seconds - 6) < 0.1 }
+            precondition(MediaPreviewKeyView.handle(key(49, window: window)))
+            precondition(playback.wantsPlayback, "Space in the preview resumes playback")
+            precondition(MediaPreviewKeyView.handle(key(49, window: window, repeated: true)))
+            precondition(playback.wantsPlayback, "Holding Space must not pause again")
+            precondition(MediaPreviewKeyView.handle(key(49, window: window)))
+            precondition(!playback.wantsPlayback, "Space in the preview pauses playback")
         }
         window.makeFirstResponder(volume)
+        precondition(MediaPreviewKeyView.handle(key(49, window: window)))
+        precondition(playback.wantsPlayback && volume.value == 0.5, "Space on the volume control resumes playback")
+        precondition(MediaPreviewKeyView.handle(key(49, window: window)))
+        precondition(!playback.wantsPlayback, "Space on the volume control pauses playback")
         precondition(MediaPreviewKeyView.handle(key(125, window: window)))
         precondition(MediaPreviewKeyView.handle(key(126, window: window)))
         precondition(moved == [1, -1] && volume.value == 0.5, "Up/Down on volume must navigate files")
@@ -75,16 +85,23 @@ import SwiftUI
         precondition(volume.value == 0.5, "Left/Right on volume must seek the video")
         for modifiers: NSEvent.ModifierFlags in [.command, .shift, .option, .control] {
             precondition(!MediaPreviewKeyView.handle(key(125, window: window, modifiers: modifiers)))
+            precondition(!MediaPreviewKeyView.handle(key(49, window: window, modifiers: modifiers)))
         }
+        scope.playback = nil
+        precondition(MediaPreviewKeyView.handle(key(49, window: window)), "Space while preparing stays in the preview instead of opening Quick Look")
+        scope.playback = playback
         let field = NSTextField(frame: .init(x: 220, y: 70, width: 180, height: 24))
         root.addSubview(field); window.makeFirstResponder(field)
         precondition(!MediaPreviewKeyView.handle(key(123, window: window)), "Text editing keeps its arrows")
+        precondition(!MediaPreviewKeyView.handle(key(49, window: window)), "Text editing keeps its spaces")
         scope.focus(for: click(.init(x: 100, y: 200), window: window))
         precondition(!scope.hasPreviewFocus && !MediaPreviewKeyView.handle(key(125, window: window)))
+        precondition(!MediaPreviewKeyView.handle(key(49, window: window)), "Space outside the preview stays available for Quick Look")
         scope.focus(for: click(.init(x: 300, y: 200), window: window))
         scope.removeFromSuperview()
         precondition(!MediaPreviewKeyView.handle(key(125, window: window)), "Unmounted panes release focus")
-        print("PASS preview focus: header/video/controls, 5-second seeks, repeats, volume arrows, file steps, text editing and outside clicks")
+        precondition(!MediaPreviewKeyView.handle(key(49, window: window)), "Unmounted panes release Space")
+        print("PASS preview focus: header/video/controls, Space pause/resume and repeats, preparing player, 5-second seeks, volume arrows, file steps, text editing and outside clicks")
     }
     static func nativeRecovery(defaults: UserDefaults, unsupported: URL) async throws {
         let before = try Data(contentsOf: unsupported)
@@ -111,6 +128,33 @@ import SwiftUI
         let after = try Data(contentsOf: unsupported)
         precondition(before == after)
         print("PASS native video recovery: decoded compatible frame, paused intent, stale callback, bounded failure, cleanup and original preservation")
+    }
+    static func cachedSourceOwnership() throws {
+        let bytes = Data((0..<32).map(UInt8.init))
+        for mode in ["unknown", "partial", "sparse", "complete"] {
+            let cache = try PreviewResourceCache()
+            cache.updateMetadata(typeIdentifier: "public.mpeg-4", contentLength: mode == "unknown" ? nil : 32, supportsByteRanges: true)
+            cache.store(mode == "partial" || mode == "sparse" ? bytes.prefix(8) : bytes, at: 0)
+            if mode == "sparse" { cache.store(bytes.suffix(8), at: 24) }
+            if mode != "complete" {
+                let input = try cache.takeCompleteFile()
+                precondition(input == nil, "A sparse, partial or unknown-length buffer cannot become a local movie")
+                cache.removeFromDisk()
+                continue
+            }
+            let wrongSize = try cache.takeCompleteFile(expectedSize: 33)
+            precondition(wrongSize == nil)
+            var input = try cache.takeCompleteFile(expectedSize: 32)
+            let url = input!.url
+            cache.removeFromDisk()
+            let retainedBytes = try Data(contentsOf: url)
+            precondition(retainedBytes == bytes, "Clearing the old cache must preserve the complete conversion input")
+            let repeated = try cache.takeCompleteFile()
+            precondition(repeated == nil && cache.store(bytes, at: 0) == nil, "Ownership is transferred only once")
+            input = nil
+            precondition(!FileManager.default.fileExists(atPath: url.path), "Generated input is removed when preparation releases it")
+        }
+        print("PASS complete-cache ownership: no sparse inputs, size validation, no second download and cleanup")
     }
     static func showUI(defaults: UserDefaults, good: URL, bad: URL) throws {
         let third = good.deletingLastPathComponent().appendingPathComponent("Supported2.mp4")
@@ -172,6 +216,8 @@ import SwiftUI
         surface.clear()
         print("PASS actual AVKit frames: paused poster, ready-without-picture MP4, first-frame timeout and audio-only source rejection")
         try await nativeRecovery(defaults: defaults, unsupported: bad)
+        try cachedSourceOwnership()
+        try DownloaderModel.testExternalPreviewHandoff(defaults: defaults)
         try await DownloaderModel.testVideoFrameRecovery(defaults: defaults, unsupported: bad, supported: good)
 
     }

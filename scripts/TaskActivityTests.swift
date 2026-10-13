@@ -12,7 +12,9 @@ struct TaskActivityTests {
         navigation.select(2, needsLoading: false) { preconditionFailure("removed task workspace") }
         navigation.showImmediately(2)
         precondition(navigation.section == 3)
-        precondition(FinderWorkspaceSection.allCases.map(\.title) == ["Browser", "Transfers", "Links"])
+        precondition(FinderWorkspaceSection.standard.map(\.title) == ["Browser", "Bookmarks", "Transfers"], "Every drive but PikPak omits Links")
+        precondition(FinderWorkspaceSection.allCases.map(\.title).contains("Links"), "PikPak keeps Links")
+        precondition(!FinderWorkspaceSection.allCases.contains { $0.title == "Tasks" }, "the removed Tasks section stays removed")
         precondition(FinderWorkspaceSection.links.shortcut == 3)
         let store = FinderTaskActivityStore()
         store.begin(.duplicates, scope: "/A", message: "Checking A")

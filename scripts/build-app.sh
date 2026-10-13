@@ -55,6 +55,9 @@ mkdir -p "${CONTENTS}/MacOS" "${CONTENTS}/Resources"
 ARCHIVE_OBJECT="${SWIFT_CACHE}/DriveArchive.o"
 xcrun clang -target arm64-apple-macos13.0 -O2 -Wall -Wextra -c \
     "${PROJECT_ROOT}/macos/DriveArchive.c" -o "${ARCHIVE_OBJECT}"
+DISK_TEMPERATURE_OBJECT="${SWIFT_CACHE}/DiskTemperature.o"
+xcrun clang -target arm64-apple-macos13.0 -O2 -Wall -Wextra -c \
+    "${PROJECT_ROOT}/macos/DiskTemperature.c" -o "${DISK_TEMPERATURE_OBJECT}"
 
 python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" -- \
     -swift-version 5 \
@@ -62,6 +65,13 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     -O \
     -parse-as-library \
     "${PROJECT_ROOT}/macos/AutomaticRecovery.swift" \
+    "${PROJECT_ROOT}/macos/ActivityLog.swift" \
+    "${PROJECT_ROOT}/macos/DownloadDiagnostics.swift" \
+    "${PROJECT_ROOT}/macos/DownloadBufferPolicy.swift" \
+    "${PROJECT_ROOT}/macos/DownloadSleepPrevention.swift" \
+    "${PROJECT_ROOT}/macos/DownloadBufferDashboard.swift" \
+    "${PROJECT_ROOT}/macos/DownloadTransferSection.swift" \
+    "${PROJECT_ROOT}/macos/ActivityLogView.swift" \
     -framework SwiftUI \
     -framework AppKit \
     -framework AVFoundation \
@@ -71,11 +81,14 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     -framework Photos \
     -larchive.2 \
     "${ARCHIVE_OBJECT}" \
+    "${DISK_TEMPERATURE_OBJECT}" \
     -framework Security \
     -framework WebKit \
+    -framework AuthenticationServices \
     "${PROJECT_ROOT}/macos/LegacyKeychainStore.swift" \
     "${PROJECT_ROOT}/macos/LocalCredentialStore.swift" \
     "${PROJECT_ROOT}/macos/PikPakAccounts.swift" \
+    "${PROJECT_ROOT}/macos/PikPakRequestVerification.swift" \
     "${PROJECT_ROOT}/macos/PikPakAccountVerifier.swift" \
     "${PROJECT_ROOT}/macos/PikPakManagement.swift" \
     "${PROJECT_ROOT}/macos/PikPakManagementViews.swift" \
@@ -84,8 +97,18 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/PikPakConnectionSelector.swift" \
     "${PROJECT_ROOT}/macos/CredentialParser.swift" \
     "${PROJECT_ROOT}/macos/PreviewTransport.swift" \
+    "${PROJECT_ROOT}/macos/MediaFileDownload.swift" \
+    "${PROJECT_ROOT}/macos/MemoryRangeBuffer.swift" \
+    "${PROJECT_ROOT}/macos/FilePreviewResourceLoader.swift" \
+    "${PROJECT_ROOT}/macos/ExternalVolume.swift" \
+    "${PROJECT_ROOT}/macos/MountedVolumeIdentity.swift" \
+    "${PROJECT_ROOT}/macos/MediaContainer.swift" \
+    "${PROJECT_ROOT}/macos/ExternalMediaPlayer.swift" \
     "${PROJECT_ROOT}/macos/CloudDriveTypes.swift" \
     "${PROJECT_ROOT}/macos/LocalFileAccess.swift" \
+    "${PROJECT_ROOT}/macos/DiskTrash.swift" \
+    "${PROJECT_ROOT}/macos/NativeDiskTrashView.swift" \
+    "${PROJECT_ROOT}/macos/DownloadDestinationAccess.swift" \
     "${PROJECT_ROOT}/macos/LocalTorrentEngine.swift" \
     "${PROJECT_ROOT}/macos/LocalTorrentModel.swift" \
     "${PROJECT_ROOT}/macos/LocalTorrentViews.swift" \
@@ -102,17 +125,24 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/TorrentPaddingCleanup.swift" \
     "${PROJECT_ROOT}/macos/TorrentRelayViews.swift" \
     "${PROJECT_ROOT}/macos/CloudDriveHub.swift" \
+    "${PROJECT_ROOT}/macos/ExternalDiskCatalog.swift" \
     "${PROJECT_ROOT}/macos/ICloudDriveProvider.swift" \
     "${PROJECT_ROOT}/macos/ICloudStorage.swift" \
     "${PROJECT_ROOT}/macos/FinderICloudStorage.swift" \
+    "${PROJECT_ROOT}/macos/LocalVolumeStorage.swift" \
+    "${PROJECT_ROOT}/macos/FinderLocalStorage.swift" \
+    "${PROJECT_ROOT}/macos/DownloadReport.swift" \
     "${PROJECT_ROOT}/macos/PhotosDriveProvider.swift" \
     "${PROJECT_ROOT}/macos/PhotosSimilarityPreview.swift" \
     "${PROJECT_ROOT}/macos/NativeDriveModel.swift" \
     "${PROJECT_ROOT}/macos/NativeDriveTree.swift" \
     "${PROJECT_ROOT}/macos/NativeDriveOperations.swift" \
+    "${PROJECT_ROOT}/macos/BrowserEmptyFolders.swift" \
     "${PROJECT_ROOT}/macos/NativeDriveDuplicates.swift" \
+    "${PROJECT_ROOT}/macos/CrossDriveDuplicates.swift" \
     "${PROJECT_ROOT}/macos/NativeDriveWorkspace.swift" \
     "${PROJECT_ROOT}/macos/NativeMediaThumbnail.swift" \
+    "${PROJECT_ROOT}/macos/NativeThumbnailCache.swift" \
     "${PROJECT_ROOT}/macos/ImagePreview.swift" \
     "${PROJECT_ROOT}/macos/FolderThumbnails.swift" \
     "${PROJECT_ROOT}/macos/FinderBookmarks.swift" \
@@ -124,6 +154,7 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/SimilarityInventoryWriter.swift" \
     "${PROJECT_ROOT}/macos/SimilarityScopePicker.swift" \
     "${PROJECT_ROOT}/macos/FileSimilarity.swift" \
+    "${PROJECT_ROOT}/macos/SimilarityProcessingSpeed.swift" \
     "${PROJECT_ROOT}/macos/SimilarityDownloadsView.swift" \
     "${PROJECT_ROOT}/macos/SimilarityDriveRouting.swift" \
     "${PROJECT_ROOT}/macos/FileSimilarityView.swift" \
@@ -135,6 +166,7 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/FileSearch.swift" \
     "${PROJECT_ROOT}/macos/FileSearchView.swift" \
     "${PROJECT_ROOT}/macos/TransferScheduling.swift" \
+    "${PROJECT_ROOT}/macos/DownloadSpeedHistory.swift" \
     "${PROJECT_ROOT}/macos/BrowserDragDrop.swift" \
     "${PROJECT_ROOT}/macos/BrowserFolderExpansion.swift" \
     "${PROJECT_ROOT}/macos/BrowserFileFilter.swift" \
@@ -150,6 +182,7 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/FinderSidebar.swift" \
     "${PROJECT_ROOT}/macos/FinderWorkspaceChrome.swift" \
     "${PROJECT_ROOT}/macos/FinderTransferLayout.swift" \
+    "${PROJECT_ROOT}/macos/TransferRowPagination.swift" \
     "${PROJECT_ROOT}/macos/FinderPreviewPane.swift" \
     "${PROJECT_ROOT}/macos/MediaPlayback.swift" \
     "${PROJECT_ROOT}/macos/VideoPreviewPreparation.swift" \
@@ -161,6 +194,7 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/FinderCommands.swift" \
     "${PROJECT_ROOT}/macos/FinderTaskActivity.swift" \
     "${PROJECT_ROOT}/macos/TaskResourceMonitor.swift" \
+    "${PROJECT_ROOT}/macos/DiskResourceMonitor.swift" \
     "${PROJECT_ROOT}/macos/GPUResourceMonitor.swift" \
     "${PROJECT_ROOT}/macos/TransferPersistence.swift" \
     "${PROJECT_ROOT}/macos/SharedLinkInputBar.swift" \
@@ -169,6 +203,15 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/ArchiveExtractionActivity.swift" \
     "${PROJECT_ROOT}/macos/DownloaderModel.swift" \
     "${PROJECT_ROOT}/macos/PikPakLoginView.swift" \
+    "${PROJECT_ROOT}/macos/BrowserFileViews.swift" \
+    "${PROJECT_ROOT}/macos/BrowserSelectionNavigation.swift" \
+    "${PROJECT_ROOT}/macos/DownloadTransferPresentation.swift" \
+    "${PROJECT_ROOT}/macos/FilePromiseCancellation.swift" \
+    "${PROJECT_ROOT}/macos/FinderBookmarksWorkspace.swift" \
+    "${PROJECT_ROOT}/macos/ProcessSupport.swift" \
+    "${PROJECT_ROOT}/macos/SafeDisplayNumber.swift" \
+    "${PROJECT_ROOT}/macos/SharedLinkIdentity.swift" \
+    "${PROJECT_ROOT}/macos/TextPreviewDecoder.swift" \
     "${PROJECT_ROOT}/macos/ContentView.swift" \
     "${PROJECT_ROOT}/macos/PikPakDownloaderApp.swift" \
     -o "${SWIFT_CACHE}/${APP_EXECUTABLE}"

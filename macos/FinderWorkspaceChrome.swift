@@ -89,7 +89,7 @@ struct FinderContentModeSelector: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text("DOWNLOAD MODE").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+            Text("PREVIEW & SCAN MODE").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
             Button { isPresented.toggle() } label: {
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 7) {
@@ -109,9 +109,9 @@ struct FinderContentModeSelector: View {
                 .contentShape(RoundedRectangle(cornerRadius: 9))
             }
             .buttonStyle(.plain).pointingHandCursor()
-            .accessibilityLabel("Download mode").accessibilityValue(settings.contentMode.title)
-            .accessibilityHint("Choose User, Guest or Dynamic for PikPak downloads, previews and similarity scans")
-            .help("\(settings.contentMode.detail) Applies to new PikPak downloads, previews and similarity scans.")
+            .accessibilityLabel("Preview and scan mode").accessibilityValue(settings.contentMode.title)
+            .accessibilityHint("Choose User, Guest or Dynamic for PikPak previews and similarity scans")
+            .help("\(settings.contentMode.detail) Applies to new PikPak previews and similarity scans. Downloads always use Dynamic Mode.")
             .popover(isPresented: $isPresented, arrowEdge: .trailing) { choices }
         }.padding(.horizontal, 8).padding(.vertical, 4)
     }
@@ -119,8 +119,8 @@ struct FinderContentModeSelector: View {
     private var choices: some View {
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("PikPak download mode").font(.headline)
-                Text("Downloads, previews and similarity scans")
+                Text("PikPak preview and scan mode").font(.headline)
+                Text("Previews, Quick Look, Open and similarity scans")
                     .font(.caption).foregroundStyle(.secondary)
             }
             VStack(spacing: 5) {
@@ -149,7 +149,7 @@ struct FinderContentModeSelector: View {
                         .accessibilityHint(mode.detail)
                 }
             }
-            Text("User access uses your account’s downstream quota. Running downloads and scans keep their current mode.")
+            Text("Downloads always use Dynamic Mode: Guest first, then User for the remaining bytes. User access uses your account’s downstream quota. Running scans keep their current mode.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }.padding(16).frame(width: 320)
     }
@@ -250,6 +250,7 @@ struct FinderBrowserToolbar<Location: View>: View {
     var trashHelp = "Move selected items to Trash"
     var fileTypeFilter: Binding<BrowserFileFilter>? = nil
     var fileExtensions: [String] = []
+    var hidesEmptyFolders: Binding<Bool>? = nil
     let back: () -> Void
     let search: () -> Void
     let importFiles: () -> Void
@@ -297,7 +298,7 @@ struct FinderBrowserToolbar<Location: View>: View {
                 .menuStyle(.borderlessButton).fixedSize().help("Item size")
             tool("Find Files", "magnifyingglass", enabled: connected, action: search)
             if let fileTypeFilter {
-                BrowserFileFilterMenu(filter: fileTypeFilter, extensions: fileExtensions)
+                BrowserFileFilterMenu(filter: fileTypeFilter, extensions: fileExtensions, hidesEmptyFolders: hidesEmptyFolders)
                     .disabled(!connected)
             }
             Divider().frame(height: 18)
@@ -406,45 +407,20 @@ struct FinderTransferCanvas<Content: View>: View {
 
 struct FinderTransferOverview<Setup: View, Progress: View>: View {
     @Environment(\.finderTransferViewport) private var viewport
+    var emphasizeProgress = false
     @ViewBuilder var setup: () -> Setup
     @ViewBuilder var progress: () -> Progress
     var body: some View {
-        let horizontal = viewport.width >= FinderTransferGeometry.overviewMinimumWidth
+        let widths = FinderTransferGeometry.overviewCardWidths(for: viewport.width, emphasizeProgress: emphasizeProgress)
+        let horizontal = widths != nil
         let layout = horizontal
             ? AnyLayout(HStackLayout(alignment: .top, spacing: 12))
             : AnyLayout(VStackLayout(alignment: .leading, spacing: 12))
         layout {
             setup().frame(maxWidth: .infinity).fixedSize(horizontal: false, vertical: true)
+                .frame(width: widths?.setup)
             progress().frame(maxWidth: .infinity).fixedSize(horizontal: false, vertical: true)
-                .frame(width: horizontal ? 400 : nil)
-        }
-    }
-}
-
-struct FinderUnavailableLinks: View {
-    let kind: CloudDriveKind
-    let openPikPak: () -> Void
-    var body: some View {
-        VStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 9) {
-                SharedLinkInputBar(url: .constant(""), passcode: .constant(""), canSubmit: false, onSubmit: {})
-                    .disabled(true)
-                Label("Shared-link browsing is available for PikPak.", systemImage: "info.circle")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }.finderCard(padding: 12)
-            VStack(spacing: 0) {
-                HStack { Text("Name"); Spacer(); Text("Tools") }.font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary).padding(.horizontal, 12).frame(height: 28)
-                Divider()
-                VStack(spacing: 16) {
-                    Image(systemName: "link").font(.system(size: 36)).foregroundStyle(FinderAppearance.accent)
-                        .frame(width: 80, height: 80).background(FinderAppearance.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 20))
-                    Text("Links aren’t available for \(kind.title)").font(.title3.weight(.semibold))
-                    Text("Open PikPak to browse shared links and save their files. Your place in this drive will be kept.")
-                        .foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 400)
-                    Button("Open PikPak Links", action: openPikPak).buttonStyle(.borderedProminent)
-                }.padding(32).frame(maxWidth: .infinity, maxHeight: .infinity)
-            }.finderCard(padding: 0)
+                .frame(width: widths?.progress)
         }
     }
 }

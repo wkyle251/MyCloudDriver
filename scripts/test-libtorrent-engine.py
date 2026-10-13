@@ -510,12 +510,42 @@ def network_diagnostics_test(executable, root):
         engine.stop()
 
 
+def admission_and_large_focus_test(executable, root):
+    engine = Engine(executable, root / "engine", lt_focus_pieces="4", lt_enable_utp="false")
+    try:
+        engine.start()
+        gids = []
+        for index in range(4):
+            piece = bytes([index + 1]) * 16384
+            info = {"name": f"Generated-large-{index}", "piece length": len(piece),
+                    "length": len(piece) * 128, "pieces": hashlib.sha1(piece).digest() * 128}
+            gids.append(engine.add(bencode({"info": info}), root / f"payload-{index}", "1"))
+        wait(lambda: all(engine.status(gid)["status"] == "active" for gid in gids[:3]), "three admitted jobs")
+        assert engine.status(gids[3])["status"] == "waiting"
+        wait(lambda: all(0 < int(engine.status(gid)["focusedPieces"]) <= 4 for gid in gids[:3]), "bounded large-file focus")
+        assert len(engine.rpc("tellActive")) == 3
+        engine.rpc("pause", gids[0])
+        wait(lambda: engine.status(gids[3])["status"] == "active", "next queued job admitted on pause")
+        engine.rpc("unpause", gids[0])
+        assert engine.status(gids[0])["status"] == "waiting"
+        engine.rpc("pause", gids[0])
+        engine.rpc("forceRemove", gids[1])
+        assert engine.status(gids[0])["status"] == "paused", "a paused queued job must not be admitted"
+        engine.rpc("unpause", gids[0])
+        wait(lambda: engine.status(gids[0])["status"] == "active", "explicitly resumed queued job")
+        assert len(engine.rpc("tellActive")) == 3
+        print("PASS bounded large-file focus, three payload slots, queue admission, and queued pause/resume")
+    finally:
+        engine.stop()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", type=Path, default=ROOT / ".build/libtorrent/runtime/bin/mycloud-torrent")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="mycloud-libtorrent-tests-") as temp:
         root = Path(temp).resolve()
+        admission_and_large_focus_test(args.engine, root / "admission")
         migration_test(args.engine, root / "migration")
         resume_size_test(args.engine, root / "resume-size")
         padding_test(args.engine, root / "padding")

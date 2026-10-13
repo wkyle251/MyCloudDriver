@@ -168,11 +168,19 @@ import Foundation
         let cancelledID=cancelled.savedSession!.id
         cancelOwner.close(); try await until { !cancelled.isRunning }
         precondition(cancelled.isPaused && cancelled.savedSession?.id == cancelledID)
+        let cancelledPID=cancelled.processIdentifier!
         cancelled.cancel()
-        precondition(cancelled.isPaused && cancelled.savedSession?.state == "cancelled")
+        try await until { !cancelled.isRunning }
+        precondition(!cancelled.isPaused && cancelled.savedSession?.state == "cancelled")
+        precondition(cancelled.report?.status == "cancelled" && cancelled.report?.analysedFiles == 1)
+        precondition(cancelled.report?.files?.contains(where: { $0.name == "one.txt" }) == true)
+        precondition(cancelled.processIdentifier == nil && kill(cancelledPID,0) != 0)
+        precondition(cancelled.autoResumeDeadline == nil && !cancelled.interrupted && cancelled.error == nil)
         precondition(FileManager.default.fileExists(atPath:SimilaritySessionStore.directory(config,id:cancelledID).path))
         last.hold=false; cancelOwner.resume(cancelled); try await until { !cancelled.isRunning }
-        precondition(cancelled.report?.analysedFiles == 2)
+        precondition(cancelled.report?.analysedFiles == 2 && cancelled.report?.status == "completed")
+        precondition(last.resolved["one.txt"] == 1 && last.resolved["two.txt"] == 1,
+                     "Resume after cancellation must reuse the completed analysis")
         cancelled.clearSession()
         precondition(!cancelled.isPaused && cancelled.savedSession == nil)
         precondition(!FileManager.default.fileExists(atPath:SimilaritySessionStore.directory(config,id:cancelledID).path))
@@ -188,6 +196,6 @@ import Foundation
         precondition(SimilaritySessionStore.available(config,source:.local).isEmpty)
         let original=try String(contentsOf:inputs.appendingPathComponent("one.txt"),encoding:.utf8)
         precondition(original == text)
-        print("PASS close and Cancel preserve progress; resume succeeds; only Clear deletes saved state and results")
+        print("PASS Cancel on a paused helper opens its partial report; Resume reuses completed work; only Clear deletes saved state and results")
     }
 }

@@ -107,6 +107,26 @@ private final class SyntheticPhotosDrive: NativeCloudDrive, @unchecked Sendable 
             }
             let overlapping = try await provider.measureFiles([a, b], location: provider.root, directory: unused) { _ in }
             precondition(overlapping == CloudDriveMeasurement(files: 3, bytes: 9_000), "a folder and its subfolder count once")
+            // The same walk reports every folder's own total, so Calculate on a
+            // parent can size all of its subfolders without another pass.
+            let expected: [String: UInt64] = [
+                ICloudDriveProvider.folderID(folder.resolvingSymlinksInPath()): 11_502, a.id: 9_000, b.id: 7_000,
+                try ICloudDriveProvider.item(folder.appendingPathComponent("Many")).id: 1_500,
+            ]
+            precondition(whole.folders == expected, "\(kind): folder totals \(whole.folders) != \(expected)")
+            let base = folder.resolvingSymlinksInPath().path
+            let scannedFolders = scanned.reduce(into: [String: UInt64]()) { result, file in
+                var parent = file.url!.deletingLastPathComponent()
+                while parent.path.hasPrefix(base) {
+                    result[ICloudDriveProvider.folderID(parent), default: 0] += file.bytes ?? 0
+                    parent.deleteLastPathComponent()
+                }
+            }
+            for (id, bytes) in whole.folders { precondition(scannedFolders[id] == bytes, "\(kind): \(id) disagrees with item scan") }
+            let listedFolders = Set(page.items.filter(\.isFolder).map(\.id)).union([a.id])
+            precondition(listedFolders.isSubset(of: Set(whole.folders.keys)), "every listed folder id must have a total")
+            precondition(overlapping.folders == [a.id: 9_000, b.id: 7_000],
+                         "\(kind): a folder includes its measured subfolder: \(overlapping.folders)")
             print("  \(kind): size walk \(String(format: "%.3f", walkTime))s, item scan \(String(format: "%.3f", scanTime))s")
         }
         print("PASS Local Disk and iCloud size walks match item scans without hidden items, symbolic links or double counting")

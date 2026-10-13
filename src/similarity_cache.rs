@@ -62,9 +62,7 @@ impl VectorCache {
         };
         let key = (id.clone(), profile.clone());
         let bytes = vector.len() * 4;
-        if self.records.contains_key(&key)
-            || self.bytes + bytes > MAX_VECTOR_BYTES
-        {
+        if self.records.contains_key(&key) || self.bytes + bytes > MAX_VECTOR_BYTES {
             return;
         }
         let mut record = record.clone();

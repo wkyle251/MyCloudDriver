@@ -9,7 +9,11 @@ struct Server {
     connections: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
-impl Drop for Server { fn drop(&mut self) { self.task.abort(); } }
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 impl Server {
     async fn start(size: usize, setup_delay: Duration) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -50,17 +54,34 @@ impl Server {
                 }
             }
         });
-        Self { address, connections, task }
+        Self {
+            address,
+            connections,
+            task,
+        }
     }
-    fn url(&self, id: usize) -> String { format!("http://{}/{id}", self.address) }
+    fn url(&self, id: usize) -> String {
+        format!("http://{}/{id}", self.address)
+    }
 }
 
 #[test]
 fn inherited_proxies_cannot_reroute_downloads() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "download_speed_tests::direct_download_child", "--ignored", "--nocapture"])
-        .output().unwrap();
-    assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        .args([
+            "--exact",
+            "download_speed_tests::direct_download_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]
@@ -69,56 +90,105 @@ async fn direct_download_child() {
     let server = Server::start(1024, Duration::ZERO).await;
     let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", proxy.local_addr().unwrap());
-    for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] { std::env::set_var(key, &url); }
-    for key in ["NO_PROXY", "no_proxy"] { std::env::remove_var(key); }
-    let client = pikpak::Client::builder().refresh_token("synthetic-direct-test").build().unwrap();
-    let share = pikpak::ShareClient::new("https://mypikpak.com/s/fixture", "", "", None, None).unwrap();
-    for (id, http) in [client.download_http_client(), client.upload_http_client(), client.http_client(),
-                       share.download_http_client(), share.http_client()].into_iter().enumerate() {
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        std::env::set_var(key, &url);
+    }
+    for key in ["NO_PROXY", "no_proxy"] {
+        std::env::remove_var(key);
+    }
+    let client = pikpak::Client::builder()
+        .refresh_token("synthetic-direct-test")
+        .build()
+        .unwrap();
+    let share =
+        pikpak::ShareClient::new("https://mypikpak.com/s/fixture", "", "", None, None).unwrap();
+    for (id, http) in [
+        client.download_http_client(),
+        client.upload_http_client(),
+        client.http_client(),
+        share.download_http_client(),
+        share.http_client(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let response = tokio::time::timeout(Duration::from_secs(3), async {
-            http.get(server.url(id)).send().await.unwrap().bytes().await.unwrap()
-        }).await.expect("An inherited proxy diverted the request");
+            http.get(server.url(id))
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("An inherited proxy diverted the request");
         assert_eq!(response.len(), 1024);
         assert!(response.iter().all(|byte| *byte == 0x5a));
     }
     assert_eq!(server.connections.load(Ordering::Relaxed), 5);
-    assert!(tokio::time::timeout(Duration::from_millis(25), proxy.accept()).await.is_err(), "Proxy received a connection");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), proxy.accept())
+            .await
+            .is_err(),
+        "Proxy received a connection"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "manual loopback throughput benchmark; no cloud account or user files"]
 async fn download_speed_benchmark() {
     let start = Instant::now();
-    let mut connections = pikpak::download_connections::Connections::new(64, start)
-        .with_absolute_gain();
+    let mut connections =
+        pikpak::download_connections::Connections::new(64, start).with_absolute_gain();
     let mut bytes = 0;
     for tick in 0..1200 {
         connections.active = connections.limit;
         bytes += connections.active as u64 * (1 << 20) / 10;
         connections.observe(start + Duration::from_millis(tick * 100), bytes, || true);
         if connections.limit == 64 {
-            println!("BENCH ramp_seconds={:.1} (simulated independent 1 MiB/s streams, ceiling 64)", tick as f64 / 10.0);
+            println!(
+                "BENCH ramp_seconds={:.1} (simulated independent 1 MiB/s streams, ceiling 64)",
+                tick as f64 / 10.0
+            );
             break;
         }
     }
-    let client = pikpak::Client::builder().refresh_token("synthetic-benchmark").build().unwrap();
+    let client = pikpak::Client::builder()
+        .refresh_token("synthetic-benchmark")
+        .build()
+        .unwrap();
     let http = client.download_http_client();
     let server = Server::start(64 * 1024, Duration::from_millis(30)).await;
     let started = Instant::now();
     for _ in 0..6 {
         let mut requests = tokio::task::JoinSet::new();
         for id in 0..16 {
-            let http = http.clone(); let url = server.url(id);
+            let http = http.clone();
+            let url = server.url(id);
             requests.spawn(async move {
                 let body = http.get(url).send().await.unwrap().bytes().await.unwrap();
-                assert_eq!(body.len(), 64 * 1024); assert!(body.iter().all(|byte| *byte == 0x5a));
+                assert_eq!(body.len(), 64 * 1024);
+                assert!(body.iter().all(|byte| *byte == 0x5a));
             });
         }
-        while let Some(done) = requests.join_next().await { done.unwrap(); }
+        while let Some(done) = requests.join_next().await {
+            done.unwrap();
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    println!("BENCH pooled_requests=96 new_connections={} elapsed_seconds={:.3} (30ms setup delay)",
-        server.connections.load(Ordering::Relaxed), started.elapsed().as_secs_f64());
+    println!(
+        "BENCH pooled_requests=96 new_connections={} elapsed_seconds={:.3} (30ms setup delay)",
+        server.connections.load(Ordering::Relaxed),
+        started.elapsed().as_secs_f64()
+    );
     drop(server);
     const FILES: usize = 8;
     const SIZE: usize = 32 * 1024 * 1024;
@@ -128,20 +198,34 @@ async fn download_speed_benchmark() {
         let started = Instant::now();
         let mut downloads = tokio::task::JoinSet::new();
         for id in 0..FILES {
-            let http = http.clone(); let url = server.url(id);
+            let http = http.clone();
+            let url = server.url(id);
             let part = directory.path().join(format!("{id}.part"));
             downloads.spawn(async move {
                 let file_id = format!("synthetic-speed-{id}");
-                download_transport::attempt(&http, &url, SIZE as u64, &part, false,
-                    DownloadProgressContext::new(false, &file_id, "synthetic"), None)
-                    .await.map_err(DlError::into_inner).unwrap();
+                let scope = (std::env::var("MYCLOUDDRIVER_BENCH_SCOPED").as_deref() == Ok("1"))
+                    .then(|| crate::download_verification::Scope::new(file_id.clone(), None));
+                let attempt = download_transport::attempt(
+                    &http,
+                    &url,
+                    SIZE as u64,
+                    &part,
+                    false,
+                    DownloadProgressContext::new(false, &file_id, "synthetic"),
+                    None,
+                );
+                let result = match scope { Some(scope) => scope.run(attempt).await, None => attempt.await };
+                result.map_err(DlError::into_inner).unwrap();
             });
         }
-        while let Some(done) = downloads.join_next().await { done.unwrap(); }
+        while let Some(done) = downloads.join_next().await {
+            done.unwrap();
+        }
         let elapsed = started.elapsed().as_secs_f64();
         for id in 0..FILES {
             let bytes = std::fs::read(directory.path().join(format!("{id}.part"))).unwrap();
-            assert_eq!(bytes.len(), SIZE); assert!(bytes.iter().all(|byte| *byte == 0x5a));
+            assert_eq!(bytes.len(), SIZE);
+            assert!(bytes.iter().all(|byte| *byte == 0x5a));
         }
         println!("BENCH disk_round={round} mib_per_second={:.1} elapsed_seconds={elapsed:.3} verified_bytes={}",
             (FILES * SIZE) as f64 / (1 << 20) as f64 / elapsed, FILES * SIZE);

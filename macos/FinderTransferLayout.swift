@@ -8,6 +8,49 @@ enum FinderTransferGeometry {
     static let laneMinimumWidth: CGFloat = 300
     static let overviewMinimumWidth: CGFloat = 920
 
+    static func overviewCardWidths(for width: CGFloat, emphasizeProgress: Bool = false) -> (setup: CGFloat, progress: CGFloat)? {
+        let width = width.isFinite ? max(0, width) : 0
+        if emphasizeProgress {
+            let setupMinimum: CGFloat = 320, progressMinimum: CGFloat = 640
+            guard width >= setupMinimum + progressMinimum + spacing else { return nil }
+            let available = width - spacing
+            let progress = max(progressMinimum, min(available - setupMinimum, available * 0.6))
+            return (available - progress, progress)
+        }
+        guard width >= overviewMinimumWidth else { return nil }
+        return (width - spacing - 400, 400)
+    }
+
+    static func metricColumns(for width: CGFloat) -> Int {
+        guard width.isFinite else { return 1 }
+        if width >= 600 { return 4 }
+        if width >= 300 { return 2 }
+        return 1
+    }
+
+    static func metricColumnWidth(for width: CGFloat) -> CGFloat {
+        let width = width.isFinite ? max(0, width) : 0
+        let columns = metricColumns(for: width)
+        return max(0, (width - CGFloat(columns - 1) * spacing) / CGFloat(columns))
+    }
+
+    static func metricFrames(width: CGFloat, heights: [CGFloat]) -> [CGRect] {
+        let width = width.isFinite ? max(0, width) : 0
+        let columns = metricColumns(for: width), columnWidth = metricColumnWidth(for: width)
+        var frames: [CGRect] = []
+        var y: CGFloat = 0
+        for start in stride(from: 0, to: heights.count, by: columns) {
+            let end = min(heights.count, start + columns)
+            let rowHeight = heights[start..<end].map { $0.isFinite ? max(0, $0) : 0 }.max() ?? 0
+            for index in start..<end {
+                frames.append(.init(x: CGFloat(index - start) * (columnWidth + spacing), y: y,
+                    width: columnWidth, height: rowHeight))
+            }
+            y += rowHeight + spacing
+        }
+        return frames
+    }
+
     static func columns(for width: CGFloat) -> Int {
         let width = width.isFinite ? max(0, width) : 0
         if width >= laneMinimumWidth * 3 + spacing * 2 { return 3 }
@@ -79,16 +122,21 @@ extension EnvironmentValues {
 struct FinderTransferWorkspace<Content: View>: View {
     @Environment(\.finderTransferViewport) private var viewport
     var spacing: CGFloat = FinderTransferGeometry.spacing
+    var fillsViewport = true
     @ViewBuilder var content: () -> Content
     var body: some View {
-        FinderTransferFillLayout(minimumHeight: viewport.height, spacing: spacing) {
+        FinderTransferFillLayout(minimumHeight: fillsViewport ? viewport.height : 0, spacing: spacing) {
             content()
         }
     }
 }
 
-/// Top cards use their natural heights. The final transfer board uses the
-/// remaining space, instead of leaving blank space under a fixed-height list.
+struct FinderTransferExpandsVerticallyKey: LayoutValueKey {
+    static let defaultValue = false
+}
+
+/// Cards use their natural heights. The marked transfer board (or the final
+/// child by default) fills the remaining space, including with a chart below it.
 struct FinderTransferFillLayout: Layout {
     var minimumHeight: CGFloat
     var spacing: CGFloat = 12
@@ -97,7 +145,9 @@ struct FinderTransferFillLayout: Layout {
         let width = max(0, proposal.width ?? 0)
         var sizes = subviews.map { $0.sizeThatFits(.init(width: width, height: nil)) }
         let naturalHeight = sizes.reduce(0) { $0 + $1.height } + CGFloat(max(0, sizes.count - 1)) * spacing
-        if !sizes.isEmpty { sizes[sizes.count - 1].height += max(0, minimumHeight - naturalHeight) }
+        if let index = subviews.lastIndex(where: { $0[FinderTransferExpandsVerticallyKey.self] }) ?? sizes.indices.last {
+            sizes[index].height += max(0, minimumHeight - naturalHeight)
+        }
         return sizes
     }
 
@@ -151,6 +201,26 @@ struct FinderTransferActionLayout: Layout {
         return .init(width: width, height: frames(width: width, subviews: subviews).map(\.maxY).max() ?? 0)
     }
 
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        for (subview, frame) in zip(subviews, frames(width: bounds.width, subviews: subviews)) {
+            subview.place(at: .init(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY), anchor: .topLeading,
+                proposal: .init(width: frame.width, height: frame.height))
+        }
+    }
+}
+
+/// Four download metrics share a row when the pane has room. Narrow panes
+/// wrap complete metric cells, including multiline values, without clipping.
+struct FinderTransferMetricLayout: Layout {
+    private func frames(width: CGFloat, subviews: Subviews) -> [CGRect] {
+        let columnWidth = FinderTransferGeometry.metricColumnWidth(for: width)
+        return FinderTransferGeometry.metricFrames(width: width,
+            heights: subviews.map { $0.sizeThatFits(.init(width: columnWidth, height: nil)).height })
+    }
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = max(0, proposal.width ?? 0)
+        return .init(width: width, height: frames(width: width, subviews: subviews).map(\.maxY).max() ?? 0)
+    }
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
         for (subview, frame) in zip(subviews, frames(width: bounds.width, subviews: subviews)) {
             subview.place(at: .init(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY), anchor: .topLeading,

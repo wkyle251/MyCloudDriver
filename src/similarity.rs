@@ -37,39 +37,39 @@ const READY_QUEUE_CAPACITY: usize = 100_000;
 mod grouping;
 pub use grouping::{group_scores, GroupQuery};
 
+#[path = "similarity_acceleration.rs"]
+mod acceleration;
+#[path = "similarity_checkpoint.rs"]
+mod checkpoint;
+#[path = "similarity_control.rs"]
+mod control;
+#[path = "similarity_discovery.rs"]
+mod discovery;
 #[path = "similarity_encode.rs"]
 mod encoding;
+#[path = "similarity_fetch.rs"]
+mod fetch;
 #[path = "similarity_format.rs"]
 #[cfg(test)]
 mod format_filter;
+#[path = "similarity_inventory.rs"]
+mod inventory;
+#[path = "similarity_memory.rs"]
+mod memory;
+#[path = "similarity_password.rs"]
+mod password;
+#[path = "similarity_prefetch.rs"]
+mod prefetch;
+#[path = "similarity_resources.rs"]
+mod resources;
 #[path = "similarity_scope.rs"]
 mod scope;
+#[path = "similarity_source_cache.rs"]
+mod source_cache;
 #[path = "similarity_store.rs"]
 mod store;
 #[path = "similarity_cache.rs"]
 mod vector_cache;
-#[path = "similarity_source_cache.rs"]
-mod source_cache;
-#[path = "similarity_password.rs"]
-mod password;
-#[path = "similarity_discovery.rs"]
-mod discovery;
-#[path = "similarity_inventory.rs"]
-mod inventory;
-#[path = "similarity_prefetch.rs"]
-mod prefetch;
-#[path = "similarity_fetch.rs"]
-mod fetch;
-#[path = "similarity_memory.rs"]
-mod memory;
-#[path = "similarity_control.rs"]
-mod control;
-#[path = "similarity_resources.rs"]
-mod resources;
-#[path = "similarity_checkpoint.rs"]
-mod checkpoint;
-#[path = "similarity_acceleration.rs"]
-mod acceleration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -194,7 +194,10 @@ impl ScanResources {
         if !((512 << 20)..=(1 << 40)).contains(&self.memory_bytes) {
             bail!("Similarity memory allowance must be from 512 MiB to 1 TiB.");
         }
-        if self.download_memory_bytes.is_some_and(|bytes| bytes < (1 << 20) || bytes >= self.memory_bytes) {
+        if self
+            .download_memory_bytes
+            .is_some_and(|bytes| bytes < (1 << 20) || bytes >= self.memory_bytes)
+        {
             bail!("Download RAM must be positive and smaller than total scan memory.");
         }
         if !(1..=4096).contains(&self.batch_files) {
@@ -216,13 +219,24 @@ impl ScanResources {
             .min((self.analysis_budget() / (512 << 20)).max(1) as usize)
             .clamp(1, 64)
     }
-    fn download_budget(&self) -> u64 { self.download_memory_bytes.unwrap_or((self.memory_bytes / 4).min(12 << 30)) }
-    fn analysis_budget(&self) -> u64 { self.memory_bytes.saturating_sub(self.download_budget()) }
+    fn download_budget(&self) -> u64 {
+        self.download_memory_bytes
+            .unwrap_or((self.memory_bytes / 4).min(12 << 30))
+    }
+    fn analysis_budget(&self) -> u64 {
+        self.memory_bytes.saturating_sub(self.download_budget())
+    }
 }
 
 impl ScanRequest {
     pub fn validate(&self) -> Result<()> {
-        if self.checkpoint_id.as_ref().is_some_and(|id| !checkpoint::valid_id(id)) { bail!("Invalid scan checkpoint identifier."); }
+        if self
+            .checkpoint_id
+            .as_ref()
+            .is_some_and(|id| !checkpoint::valid_id(id))
+        {
+            bail!("Invalid scan checkpoint identifier.");
+        }
         self.resources.validate()?;
         if !self.threshold.is_finite() || !(0.0..=1.0).contains(&self.threshold) {
             bail!("The similarity score must be between 0 and 1.");
@@ -237,10 +251,15 @@ impl ScanRequest {
         }
         match self.source {
             ScanSource::Local
-                if (self.local_paths.is_empty() && self.external_sources.is_empty() && self.external_source_stream.is_none())
+                if (self.local_paths.is_empty()
+                    && self.external_sources.is_empty()
+                    && self.external_source_stream.is_none())
                     || !self.cloud_items.is_empty()
-                    || (!self.local_paths.is_empty() && (!self.external_sources.is_empty() || self.external_source_stream.is_some()))
-                    || (!self.external_sources.is_empty() && self.external_source_stream.is_some()) =>
+                    || (!self.local_paths.is_empty()
+                        && (!self.external_sources.is_empty()
+                            || self.external_source_stream.is_some()))
+                    || (!self.external_sources.is_empty()
+                        && self.external_source_stream.is_some()) =>
             {
                 bail!("Choose local files or folders only for a local scan.")
             }
@@ -257,10 +276,17 @@ impl ScanRequest {
             bail!("A PikPak scan cannot use a native drive inventory stream.");
         }
         if let Some(stream) = &self.external_source_stream {
-            if !stream.is_absolute() || stream.parent().and_then(|p| p.canonicalize().ok()).is_none()
+            if !stream.is_absolute()
+                || stream
+                    .parent()
+                    .and_then(|p| p.canonicalize().ok())
+                    .is_none()
                 || stream.parent().and_then(|p| p.canonicalize().ok())
-                != self.temp_dir.parent().and_then(|p| p.canonicalize().ok()) {
-                bail!("The provider inventory must be inside this scan's private request directory.");
+                    != self.temp_dir.parent().and_then(|p| p.canonicalize().ok())
+            {
+                bail!(
+                    "The provider inventory must be inside this scan's private request directory."
+                );
             }
         }
         if self.local_paths.len() + self.cloud_items.len() > 1000 {
@@ -268,15 +294,14 @@ impl ScanRequest {
         }
         let mut external_ids = HashSet::new();
         if self.external_sources.iter().any(|file| {
-                file.id.is_empty()
-                    || file.id.len() > 8192
-                    || !external_ids.insert(&file.id)
-                    || file
-                        .local_path
-                        .as_ref()
-                        .is_some_and(|path| !path.is_absolute())
-            })
-        {
+            file.id.is_empty()
+                || file.id.len() > 8192
+                || !external_ids.insert(&file.id)
+                || file
+                    .local_path
+                    .as_ref()
+                    .is_some_and(|path| !path.is_absolute())
+        }) {
             bail!("Choose files with unique provider identifiers and absolute local paths.");
         }
         for path in self.local_paths.iter().chain([
@@ -396,8 +421,15 @@ impl StagedCloud {
     }
     fn skip(&mut self, path: &str, reason: &str) {
         self.skipped += 1;
-        if let Some(summary) = self.issue_summary.iter_mut().find(|s| s.reason == reason) { summary.count += 1; }
-        else { self.issue_summary.push(IssueSummary { category: "failed".into(), reason: reason.into(), count: 1 }); }
+        if let Some(summary) = self.issue_summary.iter_mut().find(|s| s.reason == reason) {
+            summary.count += 1;
+        } else {
+            self.issue_summary.push(IssueSummary {
+                category: "failed".into(),
+                reason: reason.into(),
+                count: 1,
+            });
+        }
         if self.issues.len() < MAX_ISSUES {
             self.issues.push(ScanIssue {
                 path: path.into(),
@@ -423,12 +455,13 @@ fn check_cancel(cancel: &AtomicBool) -> Result<()> {
 }
 
 async fn cancellable<T>(cancel: &AtomicBool, future: impl Future<Output = Result<T>>) -> Result<T> {
-    let timeout = tokio::time::timeout(Duration::from_secs(90), future);
-    tokio::pin!(timeout);
+    // HTTP clients bound each individual request. A metadata operation may
+    // include a provider cooldown longer than a request deadline.
+    tokio::pin!(future);
     loop {
         check_cancel(cancel)?;
         tokio::select! {
-            result = &mut timeout => return result.context("The cloud request timed out.")?,
+            result = &mut future => return result,
             _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
     }
@@ -454,14 +487,29 @@ pub async fn scan(
     request.validate()?;
     // A crashed/quitting GUI must not leave downloads or native children alive.
     struct ParentMonitor(Option<tokio::task::JoinHandle<()>>);
-    impl Drop for ParentMonitor { fn drop(&mut self) { if let Some(task)=&self.0 { task.abort(); } } }
+    impl Drop for ParentMonitor {
+        fn drop(&mut self) {
+            if let Some(task) = &self.0 {
+                task.abort();
+            }
+        }
+    }
     let _monitor = ParentMonitor(request.parent_pid.map(|parent| {
-        let stop=cancel.clone();
-        tokio::spawn(async move { loop {
-            if stop.load(Ordering::Acquire) { return; }
-            if rustix::process::getppid().map_or(0, |pid| pid.as_raw_nonzero().get() as u32) != parent { stop.store(true,Ordering::Release); return; }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        } })
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+                if rustix::process::getppid().map_or(0, |pid| pid.as_raw_nonzero().get() as u32)
+                    != parent
+                {
+                    stop.store(true, Ordering::Release);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
     }));
     private_dir(&request.data_dir)?;
     private_dir(&request.temp_dir)?;
@@ -529,9 +577,26 @@ pub async fn scan(
     }
 
     if cancel.load(Ordering::Acquire) {
-        report.status = if request.checkpoint_id.as_ref().is_some_and(|id| request.data_dir.join("checkpoints").join(id).join("pause").is_file()) { "paused" } else { "cancelled" }.into();
+        report.status = if request.checkpoint_id.as_ref().is_some_and(|id| {
+            request
+                .data_dir
+                .join("checkpoints")
+                .join(id)
+                .join("pause")
+                .is_file()
+        }) {
+            "paused"
+        } else {
+            "cancelled"
+        }
+        .into();
     } else if report.skipped_files > 0 && report.status == "completed" {
-        report.status = if report.analysed_files == 0 && report.failed_files > 0 { "failed" } else { "partial" }.into();
+        report.status = if report.analysed_files == 0 && report.failed_files > 0 {
+            "failed"
+        } else {
+            "partial"
+        }
+        .into();
     }
     if report.coverage.is_empty() {
         report.coverage = if report.status == "cancelled" {
@@ -554,12 +619,19 @@ pub async fn scan(
 }
 
 #[cfg(test)]
-async fn inventory_cloud(request: &ScanRequest, client: &Client, temp: &Path, cancel: &AtomicBool, staged: &mut StagedCloud) -> Result<()> {
+async fn inventory_cloud(
+    request: &ScanRequest,
+    client: &Client,
+    temp: &Path,
+    cancel: &AtomicBool,
+    staged: &mut StagedCloud,
+) -> Result<()> {
     let mut files = HashMap::new();
     discover_cloud(request, client, temp, cancel, staged, &mut |item| {
         files.insert(temp.join(format!("cloud/{:08}", files.len())), item);
         Ok(())
-    }).await?;
+    })
+    .await?;
     staged.files = files;
     Ok(())
 }
@@ -577,29 +649,66 @@ fn cloud_listing_error(error: &anyhow::Error) -> String {
     }
 }
 
-async fn list_scan_folder(client: &Client, id: &str, token: Option<&str>, cancel: &AtomicBool, retry_forever: bool) -> Result<crate::types::FilePage> {
-    retry_scan_read(cancel, retry_forever, || async { client.list_folder_page(id, token, 500).await.map_err(Into::into) }).await
+async fn list_scan_folder(
+    client: &Client,
+    id: &str,
+    token: Option<&str>,
+    cancel: &AtomicBool,
+    retry_forever: bool,
+) -> Result<crate::types::FilePage> {
+    retry_scan_read(cancel, retry_forever, || async {
+        client
+            .list_folder_page(id, token, 500)
+            .await
+            .map_err(Into::into)
+    })
+    .await
 }
 
-async fn retry_scan_read<T, F, Fut>(cancel: &AtomicBool, retry_forever: bool, mut read: F) -> Result<T>
-where F: FnMut() -> Fut, Fut: std::future::Future<Output = Result<T>> {
-    let mut attempt=0u32;
+async fn retry_scan_read<T, F, Fut>(
+    cancel: &AtomicBool,
+    retry_forever: bool,
+    mut read: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 0u32;
     loop {
         let result = cancellable(cancel, read()).await;
-        let retry = match result.as_ref().err().and_then(|e| e.downcast_ref::<crate::Error>()) {
+        let retry = match result
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<crate::Error>())
+        {
             Some(crate::Error::Http(_)) => true,
-            Some(crate::Error::Api { status, .. } | crate::Error::RetryAfter { status, .. }) => crate::download_policy::transient_status(*status),
+            Some(crate::Error::Api { status, .. } | crate::Error::RetryAfter { status, .. }) => {
+                crate::download_policy::transient_status(*status)
+            }
             _ => false,
         };
         if !retry || (!retry_forever && attempt == 2) {
-            if result.is_ok() && attempt > 0 { let _=emit(&json!({"event":"network_wait","waiting":false})); }
+            if result.is_ok() && attempt > 0 {
+                let _ = emit(&json!({"event":"network_wait","waiting":false}));
+            }
             return result;
         }
-        let delay=(300u64 * (1 << attempt.min(7))).min(30_000)
-            .max(result.as_ref().err().and_then(crate::download_policy::delay).map(|delay| delay.as_millis() as u64).unwrap_or(0));
-        let _=emit(&json!({"event":"network_wait","waiting":true,"retry_seconds":delay / 1000}));
-        cancellable(cancel, async { tokio::time::sleep(Duration::from_millis(delay)).await; Ok(()) }).await?;
-        attempt=attempt.saturating_add(1);
+        let delay = (300u64 * (1 << attempt.min(7))).min(30_000).max(
+            result
+                .as_ref()
+                .err()
+                .and_then(crate::download_policy::delay)
+                .map(|delay| delay.as_millis() as u64)
+                .unwrap_or(0),
+        );
+        let _ = emit(&json!({"event":"network_wait","waiting":true,"retry_seconds":delay / 1000}));
+        cancellable(cancel, async {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            Ok(())
+        })
+        .await?;
+        attempt = attempt.saturating_add(1);
     }
 }
 
@@ -613,7 +722,12 @@ async fn discover_cloud(
 ) -> Result<()> {
     let _ = temp;
     let mut pending: VecDeque<_> = request.cloud_items.clone().into();
-    let direct_items: HashSet<_> = request.cloud_items.iter().filter(|f| !f.id.is_empty()).map(|f| f.id.clone()).collect();
+    let direct_items: HashSet<_> = request
+        .cloud_items
+        .iter()
+        .filter(|f| !f.id.is_empty())
+        .map(|f| f.id.clone())
+        .collect();
     let mut seen = HashSet::new();
     while let Some(mut item) = pending.pop_front() {
         check_cancel(cancel)?;
@@ -627,14 +741,25 @@ async fn discover_cloud(
             // Direct roots must still exist outside Trash. Fresh cloud
             // metadata also validates reuse for directly selected files.
             let revision = retry_scan_read(cancel, request.checkpoint_id.is_some(), || async {
-                client.similarity_file_revision(&item.id, item.ancestors.last().map(|parent| parent.id.as_str()).unwrap_or("")).await.map_err(Into::into)
-            }).await;
+                client
+                    .similarity_file_revision(
+                        &item.id,
+                        item.ancestors
+                            .last()
+                            .map(|parent| parent.id.as_str())
+                            .unwrap_or(""),
+                    )
+                    .await
+                    .map_err(Into::into)
+            })
+            .await;
             let (size, revision) = match revision {
                 Ok(value) => value,
                 Err(error) if cloud_item_missing(&error) => continue,
                 Err(error) => return Err(error),
             };
-            item.size=size; item.revision=revision;
+            item.size = size;
+            item.revision = revision;
         }
         if !item.is_folder {
             staged.discovered += 1;
@@ -644,14 +769,28 @@ async fn discover_cloud(
         let mut token: Option<String> = None;
         let mut tokens = HashSet::new();
         loop {
-            let page = list_scan_folder(client, &item.id, token.as_deref(), cancel, request.checkpoint_id.is_some()).await;
+            let page = list_scan_folder(
+                client,
+                &item.id,
+                token.as_deref(),
+                cancel,
+                request.checkpoint_id.is_some(),
+            )
+            .await;
             let page = match page {
-                Ok(page) => { let _=emit(&json!({"event":"network_wait","waiting":false})); page },
+                Ok(page) => {
+                    let _ = emit(&json!({"event":"network_wait","waiting":false}));
+                    page
+                }
                 Err(error) => {
                     check_cancel(cancel)?;
-                    if cloud_item_missing(&error) { break; }
+                    if cloud_item_missing(&error) {
+                        break;
+                    }
                     if request.checkpoint_id.is_some() {
-                        return Err(error.context("The drive could not finish finding files. Reconnect it, then resume."));
+                        return Err(error.context(
+                            "The drive could not finish finding files. Reconnect it, then resume.",
+                        ));
                     }
                     staged.skip(&item.path, &cloud_listing_error(&error));
                     break;
@@ -659,7 +798,9 @@ async fn discover_cloud(
             };
             for file in page.files {
                 check_cancel(cancel)?;
-                if file.name.starts_with('.') { continue; }
+                if file.name.starts_with('.') {
+                    continue;
+                }
                 let mut ancestors = item.ancestors.clone();
                 if !item.id.is_empty() {
                     ancestors.push(CloudAncestor {
@@ -667,16 +808,18 @@ async fn discover_cloud(
                         name: item.name.clone(),
                     });
                 }
-                let child = CloudItem {
-                    revision: file.hash.clone().filter(|s| !s.trim().is_empty())
-                        .or_else(|| file.modified_time.clone().filter(|s| !s.trim().is_empty())),
-                    id: file.id,
-                    name: file.name.clone(),
-                    path: format!("{}/{}", item.path.trim_end_matches('/'), file.name),
-                    is_folder: file.kind.is_folder(),
-                    size: file.size,
-                    ancestors,
-                };
+                let child =
+                    CloudItem {
+                        revision: file.hash.clone().filter(|s| !s.trim().is_empty()).or_else(
+                            || file.modified_time.clone().filter(|s| !s.trim().is_empty()),
+                        ),
+                        id: file.id,
+                        name: file.name.clone(),
+                        path: format!("{}/{}", item.path.trim_end_matches('/'), file.name),
+                        is_folder: file.kind.is_folder(),
+                        size: file.size,
+                        ancestors,
+                    };
                 if child.is_folder {
                     pending.push_back(child);
                 } else if seen.insert(child.id.clone()) {
@@ -704,7 +847,13 @@ async fn discover_cloud(
 }
 
 fn cloud_item_missing(error: &anyhow::Error) -> bool {
-    matches!(error.downcast_ref::<crate::Error>(), Some(crate::Error::Api { status:404 | 410, .. }))
+    matches!(
+        error.downcast_ref::<crate::Error>(),
+        Some(crate::Error::Api {
+            status: 404 | 410,
+            ..
+        })
+    )
 }
 
 #[cfg(test)]
@@ -769,6 +918,48 @@ mod adapter_tests;
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn metadata_and_provider_cooldowns_can_exceed_ninety_seconds() {
+        use super::*;
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let reader_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            retry_scan_read(&reader_cancel, true, || async {
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                Ok(7)
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(90)).await;
+        assert!(
+            !task.is_finished(),
+            "the outer scan must not cut off a valid provider cooldown"
+        );
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(task.await.unwrap().unwrap(), 7);
+
+        let mut attempts = 0;
+        let result = retry_scan_read(&cancel, true, || {
+            attempts += 1;
+            let attempt = attempts;
+            async move {
+                if attempt == 1 {
+                    Err(crate::Error::RetryAfter {
+                        status: 503,
+                        delay: Duration::from_secs(120),
+                    }
+                    .into())
+                } else {
+                    Ok(9)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 9);
+        assert_eq!(attempts, 2);
+    }
     #[test]
     fn session_rejection_keeps_cloud_listing_authentication_guidance() {
         let error = anyhow::Error::new(crate::Error::SessionRejected("synthetic private detail"));
@@ -780,7 +971,8 @@ mod tests {
     use super::*;
     pub(super) fn request(root: &Path) -> ScanRequest {
         ScanRequest {
-            checkpoint_id: None, parent_pid: None,
+            checkpoint_id: None,
+            parent_pid: None,
             source: ScanSource::Local,
             local_paths: vec![root.join("files")],
             cloud_items: vec![],
@@ -801,41 +993,83 @@ mod tests {
     }
     #[test]
     fn native_inventory_accepts_more_than_100000_files_and_still_rejects_duplicate_ids() {
-        let root=tempfile::tempdir().unwrap(); let mut request=request(root.path());
+        let root = tempfile::tempdir().unwrap();
+        let mut request = request(root.path());
         request.local_paths.clear();
-        request.external_sources=(0..100_137).map(|i|ExternalSource { content_kind: None,
-            id:format!("asset-{i}"),name:format!("{i}.txt"),path:format!("/Library/{i}.txt"),
-            size:1,local_path:None,revision:Some("revision".into()) }).collect();
+        request.external_sources = (0..100_137)
+            .map(|i| ExternalSource {
+                content_kind: None,
+                id: format!("asset-{i}"),
+                name: format!("{i}.txt"),
+                path: format!("/Library/{i}.txt"),
+                size: 1,
+                local_path: None,
+                revision: Some("revision".into()),
+            })
+            .collect();
         request.validate().unwrap();
         let mut report=serde_json::from_value(json!({"source":"local","scope":[],"status":"running","threshold":0.9,
             "scanned_files":0,"analysed_files":0,"skipped_files":0,"downloaded_bytes":0,"total_groups":0,"groups":[],
             "issues":[],"files":[],"scores_retained":0,"truncated":false,"coverage":"","elapsed_seconds":0.0})).unwrap();
-        let mut count=0;
-        scope::discover(&request,&StagedCloud::new(),&AtomicBool::new(false),&mut report,&mut |_|{count+=1;Ok(())}).unwrap();
-        assert_eq!(count,100_137); assert_eq!(report.scanned_files,100_137); assert!(!report.truncated);
-        request.external_sources.push(request.external_sources[0].clone());
+        let mut count = 0;
+        scope::discover(
+            &request,
+            &StagedCloud::new(),
+            &AtomicBool::new(false),
+            &mut report,
+            &mut |_| {
+                count += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(count, 100_137);
+        assert_eq!(report.scanned_files, 100_137);
+        assert!(!report.truncated);
+        request
+            .external_sources
+            .push(request.external_sources[0].clone());
         assert!(request.validate().is_err());
     }
     #[test]
     fn download_ram_is_an_independent_part_of_total_scan_memory() {
-        let legacy: ScanResources = serde_json::from_value(json!({"workers":52,"memory_bytes":48u64 << 30})).unwrap();
-        assert_eq!(legacy.download_budget(),12 << 30); assert_eq!(legacy.analysis_budget(),36 << 30);
-        let mut limits: ScanResources = serde_json::from_value(json!({"workers":52,"memory_bytes":64u64 << 30,"download_memory_bytes":12u64 << 30})).unwrap();
-        limits.validate().unwrap(); assert_eq!(limits.analysis_budget(),52 << 30); assert_eq!(limits.effective_workers(),52);
-        limits.download_memory_bytes = Some(0); assert!(limits.validate().is_err());
-        limits.download_memory_bytes = Some(64 << 30); assert!(limits.validate().is_err());
-        limits.download_memory_bytes = Some(63 << 30); assert_eq!(limits.effective_workers(),2);
+        let legacy: ScanResources =
+            serde_json::from_value(json!({"workers":52,"memory_bytes":48u64 << 30})).unwrap();
+        assert_eq!(legacy.download_budget(), 12 << 30);
+        assert_eq!(legacy.analysis_budget(), 36 << 30);
+        let mut limits: ScanResources = serde_json::from_value(
+            json!({"workers":52,"memory_bytes":64u64 << 30,"download_memory_bytes":12u64 << 30}),
+        )
+        .unwrap();
+        limits.validate().unwrap();
+        assert_eq!(limits.analysis_budget(), 52 << 30);
+        assert_eq!(limits.effective_workers(), 52);
+        limits.download_memory_bytes = Some(0);
+        assert!(limits.validate().is_err());
+        limits.download_memory_bytes = Some(64 << 30);
+        assert!(limits.validate().is_err());
+        limits.download_memory_bytes = Some(63 << 30);
+        assert_eq!(limits.effective_workers(), 2);
     }
     #[test]
     fn memory_scheduling_ignores_legacy_worker_preferences() {
-        let mut limits = ScanResources { memory_scheduling:true, workers:1,
-            memory_bytes:4 << 30, download_memory_bytes:Some(1 << 30), ..Default::default() };
+        let mut limits = ScanResources {
+            memory_scheduling: true,
+            workers: 1,
+            memory_bytes: 4 << 30,
+            download_memory_bytes: Some(1 << 30),
+            ..Default::default()
+        };
         limits.validate().unwrap();
         let capacity = limits.effective_workers();
-        assert_eq!(capacity,24);
-        limits.workers = 0; limits.validate().unwrap(); assert_eq!(limits.effective_workers(),capacity);
-        limits.workers = 64; assert_eq!(limits.effective_workers(),capacity);
-        limits.memory_bytes = 2 << 30; assert_eq!(limits.effective_workers(),8);
+        assert_eq!(capacity, 24);
+        limits.workers = 0;
+        limits.validate().unwrap();
+        assert_eq!(limits.effective_workers(), capacity);
+        limits.workers = 64;
+        assert_eq!(limits.effective_workers(), capacity);
+        limits.memory_bytes = 2 << 30;
+        assert_eq!(limits.effective_workers(), 8);
     }
     #[test]
     fn rejects_mixed_sources_and_invalid_thresholds() {
@@ -868,7 +1102,13 @@ mod tests {
             assert!(r.validate().is_err());
         }
         r.resources = ScanResources::default();
-        for field in ["workers", "memory_bytes", "download_memory_bytes", "batch_files", "batch_bytes"] {
+        for field in [
+            "workers",
+            "memory_bytes",
+            "download_memory_bytes",
+            "batch_files",
+            "batch_bytes",
+        ] {
             let mut json = serde_json::to_value(&r).unwrap();
             json["resources"][field] = 1.5.into();
             assert!(serde_json::from_value::<ScanRequest>(json).is_err());
@@ -1045,7 +1285,8 @@ mod tests {
         let mut staged = StagedCloud::new();
         staged.files.insert(
             PathBuf::from("/private/scan/0001.jpg"),
-            CloudItem { revision: None,
+            CloudItem {
+                revision: None,
                 id: "cloud-1".into(),
                 name: "Photo.jpg".into(),
                 path: "/Albums/Photo.jpg".into(),
@@ -1122,7 +1363,8 @@ mod tests {
                                 {"id":"hidden","name":".hidden","kind":"drive#folder"}],"next_page_token":"second"}).to_string()
                         }
                     } else if route.starts_with("GET /drive/v1/files/root?") {
-                        json!({"id":"root","name":"Root","kind":"drive#folder","trashed":false}).to_string()
+                        json!({"id":"root","name":"Root","kind":"drive#folder","trashed":false})
+                            .to_string()
                     } else if route.starts_with("GET /drive/v1/files/a?")
                         || route.starts_with("GET /drive/v1/files/b?")
                         || route.starts_with("GET /drive/v1/files/big?")
@@ -1155,7 +1397,8 @@ mod tests {
         r.include_hidden = true;
         r.local_paths.clear();
         r.cloud_items = vec![
-            CloudItem { revision: None,
+            CloudItem {
+                revision: None,
                 id: "".into(),
                 name: "PikPak".into(),
                 path: "/".into(),
@@ -1163,7 +1406,8 @@ mod tests {
                 size: 0,
                 ancestors: vec![],
             },
-            CloudItem { revision: None,
+            CloudItem {
+                revision: None,
                 id: "a".into(),
                 name: "unsafe/../../escape.txt".into(),
                 path: "/../../escape.txt".into(),
@@ -1171,7 +1415,8 @@ mod tests {
                 size,
                 ancestors: vec![],
             },
-            CloudItem { revision: None,
+            CloudItem {
+                revision: None,
                 id: "explicit-dot-file".into(),
                 name: ".gitignore".into(),
                 path: "/.gitignore".into(),
@@ -1179,7 +1424,8 @@ mod tests {
                 size: 1024,
                 ancestors: vec![],
             },
-            CloudItem { revision: None,
+            CloudItem {
+                revision: None,
                 id: "hidden-root".into(),
                 name: ".git".into(),
                 path: "/.git".into(),
@@ -1190,9 +1436,21 @@ mod tests {
         ];
         let inventory = tempfile::tempdir_in(dir.path()).unwrap();
         let mut queued = StagedCloud::new();
-        inventory_cloud(&r, &client, inventory.path(), &AtomicBool::new(false), &mut queued).await.unwrap();
+        inventory_cloud(
+            &r,
+            &client,
+            inventory.path(),
+            &AtomicBool::new(false),
+            &mut queued,
+        )
+        .await
+        .unwrap();
         assert_eq!(queued.files.len(), 3);
-        assert_eq!(downloads.load(Ordering::SeqCst), 0, "Cloud inventory must not fetch queued originals");
+        assert_eq!(
+            downloads.load(Ordering::SeqCst),
+            0,
+            "Cloud inventory must not fetch queued originals"
+        );
         assert!(queued.files.keys().all(|path| !path.exists()));
         inventory.close().unwrap();
         scan(r.clone(), Some(&client), Arc::new(AtomicBool::new(false)))

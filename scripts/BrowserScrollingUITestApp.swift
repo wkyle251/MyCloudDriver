@@ -100,7 +100,11 @@ struct BrowserScrollingUITestApp: App {
 
     init() {
         let model = DownloaderModel.finderWorkspaceFixture()
-        model.populateScrollingFixture(count: 5000, links: Bundle.main.object(forInfoDictionaryKey: "ScrollFixtureSource") as? String == "links")
+        if Bundle.main.object(forInfoDictionaryKey: "ScrollFixtureSource") as? String == "links" {
+            model.populateScrollingFixture(count: 5000, links: true)
+        } else {
+            model.populateExpandedScrollingFixture()
+        }
         _model = StateObject(wrappedValue: model)
     }
     var body: some Scene {
@@ -122,6 +126,8 @@ struct BrowserScrollingUITestApp: App {
                 Button("500 Rows") { BrowserScrollDiagnostics.reset(); model.populateScrollingFixture(count: 500) }
                 Button("5,000 Rows") { BrowserScrollDiagnostics.reset(); model.populateScrollingFixture(count: 5000) }
                 Button("20,000 Rows") { BrowserScrollDiagnostics.reset(); model.populateScrollingFixture(count: 20000) }
+                Button("20,200 Expanded Rows") { BrowserScrollDiagnostics.reset(); model.populateExpandedScrollingFixture() }
+                Button("50,500 Expanded Rows") { BrowserScrollDiagnostics.reset(); model.populateExpandedScrollingFixture(folderCount: 250) }
             }
         }
     }

@@ -1,6 +1,12 @@
 import AppKit
 import SwiftUI
 
+enum SimilarityRecoveryCountdown {
+    static func interval(until deadline: Date, now: Date = Date()) -> ClosedRange<Date> {
+        now...max(now, deadline)
+    }
+}
+
 private struct SimilarityProgressView: View {
     @ObservedObject var model: SimilarityScanModel
     var scrollToDownloads: () -> Void
@@ -34,7 +40,7 @@ private struct SimilarityProgressView: View {
                         .foregroundStyle(FinderAppearance.accent).frame(width: 48, height: 48)
                         .background(FinderAppearance.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
                     VStack(alignment: .leading, spacing: 5) {
-                        Text(model.isPaused ? "Scan paused · downloads retained" : model.isCancelling ? "Stopping scan…" : progress.displayTitle).font(.title2.weight(.semibold))
+                        Text(model.isPaused ? "Scan paused · downloads retained" : model.isFinishing ? "Finishing current analysis…" : model.isCancelling ? "Deleting scan…" : progress.displayTitle).font(.title2.weight(.semibold))
                         Text(progress.completedLabel).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
                         if progress.downloadCount > 0 {
                             Button("View Downloads (\(progress.downloadCount.formatted()))") {
@@ -61,7 +67,7 @@ private struct SimilarityProgressView: View {
                             .help("All waiting files, including ready originals and files waiting for downloads or memory.")
                         Divider().frame(height: 34)
                         metric("Analysing", value: progress.encodingFiles.formatted())
-                            .help("Files being analysed now. Ready files start when their estimated memory needs fit the analysis RAM budget.")
+                            .help("Files hashing or analysing now, using Analysis RAM. Ready files start when their estimated memory needs fit the analysis RAM budget.")
                         Divider().frame(height: 34)
                         metric("Processed", value: progress.completed.formatted())
                       }
@@ -69,8 +75,8 @@ private struct SimilarityProgressView: View {
                         Divider()
                         HStack(alignment: .top, spacing: 22) {
                             VStack(alignment: .leading, spacing: 8) {
-                                metric("Download RAM reserved", value: progress.originalMemoryLabel)
-                                    .help("Received original data and small receive windows for downloads and files waiting for analysis. When analysis starts, the original moves to Analysis RAM and frees this allowance for more downloads. Reservations are not measured process memory.")
+                                metric(model.source == .cloud || model.nativeScope?.drive == .photos ? "Download RAM reserved" : "Read RAM reserved", value: progress.originalMemoryLabel)
+                                    .help("RAM reserved only while originals are downloaded or copied from disk, or waiting to enter Analysis RAM. Once a complete original is admitted to hashing, its buffer moves to Analysis RAM without a second copy. Reservations are not measured process memory.")
                                 if progress.originalMemoryLimit > 0 {
                                     ProgressView(value: progress.originalMemoryFraction).progressViewStyle(.linear)
                                         .accessibilityLabel("Download RAM reserved")
@@ -78,19 +84,37 @@ private struct SimilarityProgressView: View {
                             }.frame(maxWidth: .infinity)
                             VStack(alignment: .leading, spacing: 8) {
                                 metric("Analysis RAM reserved", value: progress.analysisMemoryLabel)
-                                    .help("Originals being analysed plus memory reserved for readers, decoders and any required copies. The original is handed over from Download RAM without copying it. This is an allowance, not measured process RAM.")
+                                    .help("Complete originals being hashed or analysed, plus memory reserved for calculations, decoders and required copies. Download/Read RAM is released before hashing starts. This is an allowance, not measured process RAM.")
                                 if progress.memoryScheduling && progress.analysisMemoryLimit > 0 {
                                     ProgressView(value: progress.analysisMemoryFraction).progressViewStyle(.linear)
                                         .accessibilityLabel("Analysis RAM reserved")
                                 }
                             }.frame(maxWidth: .infinity)
                             metric("Ready for analysis", value: progress.readyFiles.formatted())
-                                .help("Completed originals waiting for reading or analysis. They are also included in Queued.")
-                            metric("Reading & hashing", value: progress.readingFiles.formatted())
+                                .help("Fully read originals waiting to enter Analysis RAM. File paths still waiting to be read are shown separately below.")
+                            VStack(alignment: .leading, spacing: 8) {
+                                metric("Reading", value: progress.readingFiles.formatted())
+                                if let hashing = progress.hashingFiles {
+                                    Text("\(hashing.formatted()) hashing in Analysis RAM").font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
                         }
+                        HStack {
+                            let downloading = model.source == .cloud || model.nativeScope?.drive == .photos
+                            let speed = downloading ? progress.downloadSpeed : model.readSpeed
+                            let rateBytes = SafeDisplayNumber.bytes(speed)
+                            Text("Download speed: \(rateBytes == 0 ? "0 B/s" : SimilarityScanProgress.bytes(rateBytes) + "/s")")
+                                .help("Bytes arriving from the source drive or service into RAM. Hashing and analysis reads are excluded.")
+                            Spacer()
+                            if !downloading, let bytes = progress.originalBytesRead {
+                                Text("\(SimilarityScanProgress.bytes(bytes)) read")
+                            }
+                        }.font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                         if progress.originalMemoryLimit > 0 {
                             HStack {
-                                Text("\(progress.fetchingFiles.formatted()) \(model.isPaused ? "downloads paused" : model.nativeScope?.drive == .photos ? "Photos requests" : "downloading") · \(progress.availableOriginalMemoryLabel) available")
+                                Text(model.source == .local && model.nativeScope?.drive != .photos
+                                     ? "\(progress.readingFiles.formatted()) reading · \(progress.availableOriginalMemoryLabel) available"
+                                     : "\(progress.fetchingFiles.formatted()) \(model.isPaused ? "downloads paused" : model.nativeScope?.drive == .photos ? "Photos requests" : "downloading") · \(progress.availableOriginalMemoryLabel) available")
                                 Spacer()
                                 Text("\(SimilarityScanProgress.memoryGB(progress.analysisMemoryLimit)) for analysis")
                             }.font(.caption).foregroundStyle(.secondary)
@@ -112,7 +136,8 @@ private struct SimilarityProgressView: View {
                         .background(FinderAppearance.accent.opacity(0.045), in: RoundedRectangle(cornerRadius: 9))
                 }
 
-                VStack(alignment: .leading, spacing: 8) {
+                if progress.usesCloudByteProgress || ![.inventory, .analysing, .comparison].contains(progress.stage) {
+                  VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Text(progress.progressTitle).font(.caption).foregroundStyle(.secondary)
                         Spacer()
@@ -144,7 +169,11 @@ private struct SimilarityProgressView: View {
                             }
                         }
                     }
+                  }
                 }
+
+                SimilarityProcessingView(progress: progress, history: model.processingSpeed,
+                    running: model.isRunning && !model.isPausing && !model.isCancelling, restoring: model.isRestoringProgress)
 
                 if progress.hasDownloadTelemetry {
                     SimilarityDownloadsView(progress: progress, running: model.isRunning && !model.isPausing && !model.isCancelling, expanded: $showDownloadList)
@@ -199,9 +228,9 @@ private struct SimilarityProgressView: View {
                         .font(.caption).foregroundStyle(.secondary)
                         .help("Ready files start when their estimated RAM fits. Larger decoders reserve more memory; reservations are released when each file finishes.")
                 }
-                Text(model.isPaused ? "Keep this app open to retain downloads in RAM. Quitting or a helper crash releases RAM; saved analysis can still be resumed. Only Clear deletes saved progress."
-                     : model.isCancelling ? "Stopping tasks and releasing original buffers."
-                     : "Keep browsing while this runs. Closing this window pauses and saves the scan. Only Clear removes its progress and results.")
+                Text(model.isPaused ? "Keep this app open to retain downloads in RAM. Quitting or a helper crash releases RAM; saved analysis can still be resumed. Only Delete Scan removes saved progress."
+                     : model.isFinishing ? "Finishing files already being analysed, then creating a report. Remaining files can be scanned later with Resume Scan." : model.isCancelling ? "Deleting this scan record and releasing original buffers."
+                     : "Keep browsing while this runs. Closing this window pauses and saves the scan. Delete Report removes the saved scan record and results.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }.padding(20)
             .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -337,8 +366,8 @@ private struct SimilarityScanView: View {
                                 Text(session.updatedAt,style:.date).font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Button(["completed","partial","failed"].contains(session.state) ? "Open Results" : "Resume") { coordinator.resume(model,session:session) }
-                            Button("Clear") { coordinator.discardRecovery(model,session:session) }
+                            Button(["completed","partial","failed","finished"].contains(session.state) ? "Open Report" : "Resume") { coordinator.resume(model,session:session) }
+                            Button("Delete Report") { coordinator.discardRecovery(model,session:session) }
                                 .help("Remove this saved scan and its results; original files are kept")
                         }
                     }
@@ -352,8 +381,12 @@ private struct SimilarityScanView: View {
                     Button { showsScanSettings.toggle() } label: {
                         Label("Scan Settings", systemImage: showsScanSettings ? "chevron.up" : "slider.horizontal.3")
                     }
+                    if model.canResumeReport {
+                        Button("Resume Scan") { coordinator.resume(model) }
+                            .help("Continue the saved scan, reusing completed analysis")
+                    }
                     Button("Scan Again") { coordinator.start(model) }.disabled(!model.canStart)
-                    Button("Clear") { model.clearSession() }.help("Remove this scan and its saved results")
+                    Button("Delete Report") { model.clearSession() }.help("Delete this saved scan record and report; files on the drive are kept")
                 }
             }
             if hasActiveScan {
@@ -617,8 +650,13 @@ private struct SimilarityScanView: View {
                 if !model.externalDuplicatesOnly {
                     Button(model.isPausing ? "Pausing…" : "Pause") { model.pause() }.disabled(!model.canPause)
                 }
-                Button("Clear") { model.clearSession() }
-                Button("Cancel Scan") { model.cancel() }.disabled(model.isCancelling)
+                Button("Delete Scan") { model.clearSession() }
+                if model.externalDuplicatesOnly {
+                    Button("Cancel Check") { model.cancel() }.disabled(model.isCancelling)
+                } else {
+                    Button(model.isFinishing ? "Finishing…" : "Finish Scan") { model.finishScan() }.disabled(!model.canFinish)
+                        .help("Finish files already being analysed and generate a resumable report")
+                }
             } else if model.isPaused {
                 Button { coordinator.resume(model) } label: {
                     Label(model.isAutoResuming ? "Resume Now" : "Resume",systemImage:"play.fill")
@@ -629,8 +667,8 @@ private struct SimilarityScanView: View {
                 } else {
                     Button("New Scan") { model.detachPausedForRecovery(); coordinator.refreshRecovery() }
                 }
-                Button("Clear") { model.clearSession() }
-                Button("Cancel Scan") { model.cancel() }
+                Button("Delete Scan") { model.clearSession() }
+                Button("Finish Scan") { model.finishScan() }.disabled(!model.canFinish)
             } else {
                 Button { coordinator.start(model) } label: { Label("Start Scan",systemImage:"magnifyingglass") }
                     .buttonStyle(.borderedProminent).disabled(!model.canStart)
@@ -644,7 +682,7 @@ private struct SimilarityScanView: View {
                 HStack(spacing: 12) {
                     Image(systemName: report.status == "completed" ? "checkmark.circle" : "exclamationmark.circle")
                         .foregroundStyle(report.status == "completed" ? Color.green : Color.orange)
-                    Text("\(report.status == "cancelled" ? "Cancelled · " : report.status == "failed" ? "Incomplete · " : "")\(report.outcomeSummary) · \(Int(report.elapsedSeconds))s")
+                    Text("\(report.status == "finished" ? "Finished early · " : report.status == "cancelled" ? "Cancelled · " : report.status == "failed" ? "Incomplete · " : "")\(report.outcomeSummary) · \(Int(report.elapsedSeconds))s")
                         .font(.callout).foregroundStyle(.secondary)
                     Spacer()
                     Button("Scan Coverage…") { showsIssues = true }
@@ -700,10 +738,11 @@ private struct SimilarityScanView: View {
     /// An interrupted scan recovers on its own. Show the countdown so the wait
     /// reads as deliberate, and how much of the budget is left before it stops.
     private func autoResumeNotice(_ deadline: Date) -> some View {
-        HStack(spacing: 5) {
+        let now = Date()
+        return HStack(spacing: 5) {
             Image(systemName: "arrow.clockwise.circle")
             Text("Resuming automatically in")
-            Text(timerInterval: Date()...deadline, countsDown: true).monospacedDigit()
+            Text(timerInterval: SimilarityRecoveryCountdown.interval(until: deadline, now: now), countsDown: true).monospacedDigit()
             Text("· attempt \(model.autoResumeAttempt) of \(model.autoResumeDelays.count)")
         }
         .font(.callout).foregroundStyle(.secondary)

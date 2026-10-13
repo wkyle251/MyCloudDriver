@@ -10,8 +10,9 @@ particular network will become faster.
 
 Originals still move through **download → ready queue → analysis → release**.
 Only complete originals reach FileTwin. Retries obtain fresh download URLs and
-retain partial bytes; validated byte ranges continue interrupted responses. Since 2.2.21, Pause/Cancel keeps original buffers and the
-existing helper alive; Clear or actual helper shutdown releases RAM. Restart
+retain partial bytes; validated byte ranges continue interrupted responses. Pause keeps original buffers and the
+existing helper alive; Cancel opens a partial report and releases RAM, while
+Clear also removes the saved scan. Actual helper shutdown releases RAM. Restart
 recovery reuses completed vectors; unfinished originals must be fetched again. Saved vectors and comparison results remain
 compatible. Image analysis still uses full originals, not thumbnails.
 

@@ -100,7 +100,8 @@ fn edits_after_native_acquisition_cannot_relabel_old_analysis() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("generated.txt");
     std::fs::write(&path, b"before").unwrap();
-    let mut file = scope::InputFile::external(ExternalSource { content_kind: None,
+    let mut file = scope::InputFile::external(ExternalSource {
+        content_kind: None,
         id: "native-generated".into(),
         name: "generated.txt".into(),
         path: path.to_string_lossy().into(),
@@ -250,7 +251,10 @@ async fn pikpak_refresh_handles_paginated_changes_trash_and_listing_failures() {
         get().unwrap().files.is_empty(),
         "A selected folder moved to Trash is outside the live scope"
     );
-    let error = client.similarity_download_info("gone", "").await.unwrap_err();
+    let error = client
+        .similarity_download_info("gone", "")
+        .await
+        .unwrap_err();
     assert!(matches!(error, crate::Error::Api { status: 404, .. }));
     phase.store(3, Ordering::Release);
     assert!(

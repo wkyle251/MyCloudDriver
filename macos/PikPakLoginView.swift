@@ -8,6 +8,19 @@ struct PikPakWebSession {
     var credentialKind: PikPakCredentialKind = .desktopOAuth
 }
 
+/// Asynchronous broker and token responses belong to one visible login attempt.
+struct PikPakLoginAttemptState {
+    private(set) var id = UUID()
+    private(set) var isActive = false
+
+    mutating func begin(active: Bool) {
+        id = UUID()
+        isActive = active
+    }
+
+    func accepts(_ capturedID: UUID) -> Bool { isActive && id == capturedID }
+}
+
 enum PikPakDesktopOAuth {
     static let clientID = "YvtoWO6GNHiuCl7x"
     /// Injected from ignored local configuration when the app is built.
@@ -75,6 +88,210 @@ enum PikPakLoginDataStore {
     }
 }
 
+/// Device approval leaves password entry, passkeys and AutoFill in the user's
+/// browser. Only the separately issued desktop refresh token reaches the app.
+@MainActor final class PikPakBrowserLogin: ObservableObject {
+    @Published private(set) var isWorking = false
+    @Published private(set) var verificationURL: URL?
+    @Published private(set) var status = "Sign in on PikPak’s website, then approve this connection."
+    @Published private(set) var error: String?
+
+    typealias Request = (URLRequest) async throws -> (Data, URLResponse)
+    typealias OpenBrowser = (URL, Bool) async throws -> Void
+    private let request: Request
+    private let openBrowser: OpenBrowser
+    private let pause: (TimeInterval) async throws -> Void
+    private var task: Task<Void, Never>?
+    private var attempt = PikPakLoginAttemptState()
+
+    init(request: Request? = nil, openBrowser: OpenBrowser? = nil,
+         pause: @escaping (TimeInterval) async throws -> Void = {
+             try await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000))
+         }) {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        let session = URLSession(configuration: configuration)
+        self.request = request ?? { try await session.data(for: $0) }
+        self.openBrowser = openBrowser ?? { url, safari in
+            if safari {
+                guard let application = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Safari") else {
+                    throw BrowserLoginError.message("Safari is unavailable. Choose Use Default Browser instead.")
+                }
+                _ = try await NSWorkspace.shared.open([url], withApplicationAt: application,
+                    configuration: NSWorkspace.OpenConfiguration())
+            } else if !NSWorkspace.shared.open(url) {
+                throw BrowserLoginError.message("Could not open your browser. Try Safari instead.")
+            }
+        }
+        self.pause = pause
+    }
+
+    func start(deviceID: String, safari: Bool, onSession: @escaping (PikPakWebSession) -> Void) {
+        cancel()
+        attempt.begin(active: true)
+        let id = attempt.id
+        isWorking = true
+        error = nil
+        status = "Preparing secure browser sign-in…"
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { if self.attempt.accepts(id) { self.isWorking = false; self.task = nil } }
+            do {
+                guard PikPakAccountSessionFiles.validDeviceID(deviceID) else {
+                    throw BrowserLoginError.message("The app device identity is unavailable. Close and reopen sign-in.")
+                }
+                let (data, response) = try await self.request(Self.makeRequest("device/code", deviceID: deviceID,
+                    body: ["client_id": PikPakDesktopOAuth.clientID, "scope": "user pan offline"]))
+                try self.checkAttempt(id)
+                try Self.requireSuccess(response, data: data)
+                let approval = try JSONDecoder().decode(BrowserDeviceApproval.self, from: data)
+                guard let url = Self.validVerificationURL(approval.verificationURI),
+                      !approval.deviceCode.isEmpty, approval.deviceCode.utf8.count <= 65_536,
+                      (1...1800).contains(approval.expiresIn) else {
+                    throw BrowserLoginError.message("PikPak returned an invalid approval page. Try again.")
+                }
+                self.verificationURL = url
+                self.status = "Waiting for you to approve the connection in your browser…"
+                try await self.openBrowser(url, safari)
+                try self.checkAttempt(id)
+                let deadline = Date().addingTimeInterval(TimeInterval(approval.expiresIn))
+                var interval = TimeInterval(min(60, max(1, approval.interval)))
+                while Date() < deadline {
+                    try await self.pause(interval)
+                    try self.checkAttempt(id)
+                    guard Date() < deadline else { break }
+                    let result: (Data, URLResponse)
+                    do {
+                        result = try await self.request(Self.makeRequest("token", deviceID: deviceID, body: [
+                            "client_id": PikPakDesktopOAuth.clientID,
+                            "client_secret": PikPakDesktopOAuth.clientSecret,
+                            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                            "device_code": approval.deviceCode,
+                        ]))
+                    } catch let failure as URLError where [.timedOut, .networkConnectionLost, .notConnectedToInternet, .cannotConnectToHost].contains(failure.code) {
+                        try self.checkAttempt(id)
+                        self.status = "Connection interrupted. Waiting to reconnect…"
+                        interval = max(5, interval)
+                        continue
+                    }
+                    try self.checkAttempt(id)
+                    let (tokenData, tokenResponse) = result
+                    let http = tokenResponse as? HTTPURLResponse
+                    if http.map({ (200...299).contains($0.statusCode) }) == true {
+                        let tokens = try JSONDecoder().decode(DesktopTokenResponse.self, from: tokenData)
+                        let token = try PikPakCredentialKind.desktopOAuth.parse(tokens.refreshToken)
+                        self.status = "Browser sign-in complete. Saving this connection…"
+                        self.verificationURL = nil
+                        onSession(.init(refreshToken: token, deviceID: deviceID))
+                        return
+                    }
+                    let failure = try? JSONDecoder().decode(BrowserOAuthFailure.self, from: tokenData)
+                    if failure?.error == "authorization_pending" {
+                        self.status = "Waiting for you to approve the connection in your browser…"
+                        continue
+                    }
+                    if failure?.error == "slow_down" || http?.statusCode == 429 {
+                        interval = min(60, interval + 5)
+                        continue
+                    }
+                    if http.map({ (500...599).contains($0.statusCode) }) == true {
+                        interval = max(5, interval)
+                        self.status = "PikPak is temporarily unavailable. Retrying approval…"
+                        continue
+                    }
+                    try Self.requireSuccess(tokenResponse, data: tokenData)
+                }
+                throw BrowserLoginError.message("This approval expired. Choose Continue in Safari to start again.")
+            } catch {
+                guard self.attempt.accepts(id), !Task.isCancelled else { return }
+                self.verificationURL = nil
+                self.error = (error as? BrowserLoginError)?.localizedDescription
+                    ?? "Could not finish browser sign-in. Check your connection and try again."
+                self.status = "Browser sign-in was not completed."
+            }
+        }
+    }
+
+    func reopen(safari: Bool) {
+        guard let url = verificationURL else { return }
+        let id = attempt.id
+        Task {
+            do { try await openBrowser(url, safari) }
+            catch {
+                guard attempt.accepts(id) else { return }
+                self.error = (error as? BrowserLoginError)?.localizedDescription ?? "Could not reopen your browser."
+            }
+        }
+    }
+
+    func cancel() {
+        attempt.begin(active: false)
+        task?.cancel()
+        task = nil
+        isWorking = false
+        verificationURL = nil
+        error = nil
+    }
+
+    private func checkAttempt(_ id: UUID) throws {
+        guard attempt.accepts(id), !Task.isCancelled else { throw CancellationError() }
+    }
+
+    static func validVerificationURL(_ value: String) -> URL? {
+        guard let url = URL(string: value), url.scheme?.lowercased() == "https",
+              let host = url.host?.lowercased(), host == "mypikpak.com" || host.hasSuffix(".mypikpak.com"),
+              url.user == nil, url.password == nil, url.port == nil || url.port == 443 else { return nil }
+        return url
+    }
+
+    private static func makeRequest(_ path: String, deviceID: String, body: [String: String]) throws -> URLRequest {
+        var components = URLComponents(string: "https://user.mypikpak.com/v1/auth/\(path)")!
+        components.queryItems = [URLQueryItem(name: "client_id", value: PikPakDesktopOAuth.clientID)]
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("", forHTTPHeaderField: "User-Agent")
+        request.setValue(deviceID, forHTTPHeaderField: "X-Device-Id")
+        return request
+    }
+
+    private static func requireSuccess(_ response: URLResponse, data: Data) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw BrowserLoginError.message("PikPak returned an invalid response. Try again.")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let failure = try? JSONDecoder().decode(BrowserOAuthFailure.self, from: data)
+            switch failure?.error {
+            case "access_denied": throw BrowserLoginError.message("The connection was declined in the browser. Try again when ready.")
+            case "expired_token": throw BrowserLoginError.message("This approval expired. Start browser sign-in again.")
+            default: throw BrowserLoginError.message("PikPak could not complete browser sign-in (HTTP \(http.statusCode)). Try again or use Sign in Here.")
+            }
+        }
+    }
+}
+
+private struct BrowserDeviceApproval: Decodable {
+    let deviceCode: String
+    let verificationURI: String
+    let expiresIn: Int
+    let interval: Int
+    enum CodingKeys: String, CodingKey {
+        case deviceCode = "device_code", verificationURI = "verification_uri_complete"
+        case expiresIn = "expires_in", interval
+    }
+}
+
+private struct BrowserOAuthFailure: Decodable { let error: String? }
+private enum BrowserLoginError: LocalizedError {
+    case message(String)
+    var errorDescription: String? { switch self { case .message(let message): return message } }
+}
+
 struct PikPakLoginView: View {
     let reason: String
     let currentDeviceID: String
@@ -86,6 +303,8 @@ struct PikPakLoginView: View {
     @State private var pageErrorDetails: String?
     @State private var reloadRequest = 0
     @State private var credentialKind: PikPakCredentialKind = .desktopOAuth
+    @State private var usesEmbeddedSignIn = false
+    @StateObject private var browserLogin = PikPakBrowserLogin()
 
     init(reason: String, currentDeviceID: String, initialCredentialKind: PikPakCredentialKind = .desktopOAuth,
          onSession: @escaping (PikPakWebSession) -> Void, onCancel: @escaping () -> Void) {
@@ -110,10 +329,59 @@ struct PikPakLoginView: View {
             .padding(.top, 20)
             if credentialKind == .personalAccessToken {
                 PikPakPersonalAccessTokenView(currentDeviceID: currentDeviceID, onSession: onSession, onCancel: onCancel)
+            } else if !usesEmbeddedSignIn {
+                browserLoginBody
             } else {
                 webLoginBody
             }
         }
+        .onChange(of: credentialKind) { _ in browserLogin.cancel() }
+        .onChange(of: usesEmbeddedSignIn) { _ in browserLogin.cancel() }
+        .onDisappear { browserLogin.cancel() }
+    }
+
+    private var browserLoginBody: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Label("Sign in to PikPak", systemImage: "lock.shield")
+                .font(.title2.weight(.semibold))
+            Text(reason).foregroundStyle(.secondary)
+            Text("Use Safari for Sign in with Apple and Touch ID, Passwords, iCloud Keychain or passkeys. Approve the connection on PikPak’s website; this app will continue automatically.")
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                if browserLogin.isWorking { ProgressView().controlSize(.small) }
+                Text(browserLogin.status).font(.callout).foregroundStyle(.secondary)
+            }
+            if let error = browserLogin.error {
+                Text(error).font(.callout).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Button(browserLogin.verificationURL == nil ? "Continue in Safari" : "Open Safari Again") {
+                    continueInBrowser(safari: true)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(browserLogin.isWorking && browserLogin.verificationURL == nil)
+                Button("Use Default Browser") { continueInBrowser(safari: false) }
+                    .disabled(browserLogin.isWorking && browserLogin.verificationURL == nil)
+            }
+            Text("Your browser handles passwords. MyCloudDriver saves a separate connection on this Mac, so you can stay signed in after closing the app.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Divider()
+            HStack {
+                Button("Sign in Here") { usesEmbeddedSignIn = true }
+                    .help("Use the embedded sign-in page if browser approval is unavailable")
+                Spacer()
+                Button("Cancel", role: .cancel, action: onCancel).keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 590)
+    }
+
+    private func continueInBrowser(safari: Bool) {
+        if browserLogin.verificationURL != nil { browserLogin.reopen(safari: safari) }
+        else { browserLogin.start(deviceID: currentDeviceID, safari: safari, onSession: onSession) }
     }
 
     private var webLoginBody: some View {
@@ -139,6 +407,9 @@ struct PikPakLoginView: View {
             )
             .font(.callout)
             .foregroundStyle(.secondary)
+
+            Button("Use Safari for Apple & Touch ID") { usesEmbeddedSignIn = false }
+                .font(.callout)
 
             PikPakLoginWebView(
                 status: $pageStatus,
@@ -175,6 +446,7 @@ struct PikPakLoginView: View {
                     }
                 }
                 Spacer()
+                Button("Use Browser") { usesEmbeddedSignIn = false }
                 if let pageErrorDetails {
                     Button {
                         copyLoginError(pageErrorDetails)
@@ -344,6 +616,7 @@ private struct PikPakLoginWebView: NSViewRepresentable {
         private var desktopAuthorizationAttempted = false
         private var desktopExchangeTask: URLSessionDataTask?
         private var desktopTokenSession: URLSession?
+        private var attemptState = PikPakLoginAttemptState()
 
         init(parent: PikPakLoginWebView) {
             self.parent = parent
@@ -359,6 +632,7 @@ private struct PikPakLoginWebView: NSViewRepresentable {
         }
 
         func stop() {
+            attemptState.begin(active: false)
             tokenTimer?.invalidate()
             tokenTimer = nil
             desktopExchangeTask?.cancel()
@@ -369,6 +643,7 @@ private struct PikPakLoginWebView: NSViewRepresentable {
         }
 
         func loadPikPakDrive() {
+            attemptState.begin(active: webView != nil)
             deliveredSession = false
             desktopAuthorizationInFlight = false
             desktopAuthorizationAttempted = false
@@ -420,6 +695,7 @@ private struct PikPakLoginWebView: NSViewRepresentable {
         }
 
         private func updateStatus(for url: URL?, loading: Bool) {
+            guard attemptState.isActive else { return }
             parent.errorDetails = nil
             guard let host = url?.host?.lowercased(), !host.isEmpty else {
                 parent.status = loading ? "Loading PikPak sign-in…" : "Waiting for PikPak sign-in…"
@@ -430,6 +706,7 @@ private struct PikPakLoginWebView: NSViewRepresentable {
 
         private func inspectForAuthenticatedWebSession() {
             guard
+                attemptState.isActive,
                 !deliveredSession,
                 !desktopAuthorizationInFlight,
                 !desktopAuthorizationAttempted,
@@ -437,9 +714,11 @@ private struct PikPakLoginWebView: NSViewRepresentable {
                 Self.isPikPakHost(webView.url?.host)
             else { return }
 
+            let attempt = attemptState.id
             webView.evaluateJavaScript(Self.authenticationStateScript) { [weak self] result, _ in
                 guard
                     let self,
+                    self.attemptState.accepts(attempt), self.webView === webView,
                     !self.deliveredSession,
                     let values = result as? [String: Any],
                     values["signedIn"] as? Bool == true
@@ -451,6 +730,7 @@ private struct PikPakLoginWebView: NSViewRepresentable {
 
         private func requestDesktopAuthorization(using webView: WKWebView) {
             guard
+                attemptState.isActive,
                 !deliveredSession,
                 !desktopAuthorizationInFlight,
                 !desktopAuthorizationAttempted
@@ -460,6 +740,7 @@ private struct PikPakLoginWebView: NSViewRepresentable {
             desktopAuthorizationAttempted = true
             parent.errorDetails = nil
             parent.status = "Creating an independent desktop session…"
+            let attempt = attemptState.id
 
             webView.callAsyncJavaScript(
                 Self.desktopAuthorizationScript,
@@ -467,7 +748,7 @@ private struct PikPakLoginWebView: NSViewRepresentable {
                 in: nil,
                 in: .page
             ) { [weak self] result in
-                guard let self, !self.deliveredSession else { return }
+                guard let self, self.attemptState.accepts(attempt), self.webView === webView, !self.deliveredSession else { return }
 
                 switch result {
                 case .success(let rawValue):
@@ -509,6 +790,8 @@ private struct PikPakLoginWebView: NSViewRepresentable {
         }
 
         private func exchangeDesktopAuthorizationCode(_ code: String) {
+            guard attemptState.isActive, !deliveredSession else { return }
+            let attempt = attemptState.id
             let deviceID = parent.currentDeviceID.trimmingCharacters(
                 in: .whitespacesAndNewlines
             )
@@ -608,9 +891,10 @@ private struct PikPakLoginWebView: NSViewRepresentable {
                 }
 
                 DispatchQueue.main.async {
-                    guard let self, !self.deliveredSession else { return }
+                    guard let self, self.attemptState.accepts(attempt),
+                          self.desktopTokenSession === session, !self.deliveredSession else { return }
                     self.desktopExchangeTask = nil
-                    self.desktopTokenSession?.finishTasksAndInvalidate()
+                    session.finishTasksAndInvalidate()
                     self.desktopTokenSession = nil
                     self.desktopAuthorizationInFlight = false
 
@@ -651,6 +935,7 @@ private struct PikPakLoginWebView: NSViewRepresentable {
         }
 
         private func reportPageLoadFailure(_ error: Error) {
+            guard attemptState.isActive else { return }
             let nsError = error as NSError
             parent.status = "Page failed to load: \(error.localizedDescription)"
             parent.errorDetails = Self.errorDetailsText(

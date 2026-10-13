@@ -114,7 +114,7 @@ pub(crate) fn validate(bundle: &VectorFile) -> Result<()> {
     let processed = bundle.files.len() as u64;
     if !bundle.summary.elapsed_seconds.is_finite()
         || bundle.summary.elapsed_seconds < 0.0
-        || !(1..=64).contains(&bundle.summary.workers)
+        || !(1..=8192).contains(&bundle.summary.workers)
         || (bundle.summary.cancelled && bundle.complete)
         || counts.files_processed != processed
         || counts.files_ready != ready

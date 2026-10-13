@@ -69,7 +69,7 @@ struct TorrentRelayStorage: Codable, Equatable {
         }
     }
 
-    /// Validate every component again before deleting a torrent-owned file.
+    /// Validate every component before inspecting a torrent-owned file.
     static func file(_ path: String, under root: URL) throws -> URL? {
         let parts = path.split(separator: "/", omittingEmptySubsequences: false)
         guard !parts.isEmpty, !parts.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }),
@@ -86,6 +86,122 @@ struct TorrentRelayStorage: Codable, Equatable {
             guard (info.st_mode & S_IFMT) == expected else { throw CocoaError(.fileReadNoPermission) }
         }
         return url
+    }
+
+    /// Keep the parent directory open until unlinking. A renamed ancestor or a
+    /// replacement symlink cannot redirect cleanup into another directory.
+    final class OwnedFile {
+        private let parent: Int32
+        private let name: String
+        private let device: dev_t, inode: ino_t
+        fileprivate init(parent: Int32, name: String, info: stat) {
+            self.parent = parent; self.name = name; device = info.st_dev; inode = info.st_ino
+        }
+        deinit { close(parent) }
+        func remove() throws {
+            var info = stat()
+            if fstatat(parent, name, &info, AT_SYMLINK_NOFOLLOW) != 0 {
+                if errno == ENOENT { return }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            guard (info.st_mode & S_IFMT) == S_IFREG, info.st_dev == device, info.st_ino == inode else {
+                throw CocoaError(.fileReadNoPermission)
+            }
+            guard unlinkat(parent, name, 0) == 0 || errno == ENOENT else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        }
+    }
+
+    private static func openDirectory(_ url: URL) throws -> Int32 {
+        var parts = url.path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard url.path.hasPrefix("/"), !parts.contains(where: { $0 == "." || $0 == ".." }), !url.path.contains("\0") else {
+            throw CocoaError(.fileReadInvalidFileName)
+        }
+        // Foundation normalizes macOS temporary URLs back to /var even after
+        // resolvingSymlinksInPath(). Accept only the protected system aliases;
+        // mutable directory components below them still use O_NOFOLLOW.
+        if let first = parts.first, ["var", "tmp", "etc"].contains(first) {
+            var target = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+            let count = readlink("/" + first, &target, target.count - 1)
+            if count >= 0, ["private/" + first, "/private/" + first].contains(String(cString: target)) {
+                parts.insert("private", at: 0)
+            }
+        }
+        var descriptor = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        do {
+            for part in parts {
+                let next = openat(descriptor, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                guard next >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                close(descriptor); descriptor = next
+            }
+            return descriptor
+        } catch { close(descriptor); throw error }
+    }
+
+    static func openedFile(_ path: String, under root: URL) throws -> OwnedFile? {
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard !parts.isEmpty, !parts.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }),
+              !path.contains("\\"), !path.contains("\0") else { throw CocoaError(.fileReadInvalidFileName) }
+        var parent = try openDirectory(root)
+        do {
+            for part in parts.dropLast() {
+                let next = openat(parent, String(part), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                if next < 0 && errno == ENOENT { close(parent); return nil }
+                guard next >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                close(parent); parent = next
+            }
+            let name = String(parts.last!)
+            var info = stat()
+            if fstatat(parent, name, &info, AT_SYMLINK_NOFOLLOW) != 0 {
+                if errno == ENOENT { close(parent); return nil }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            guard (info.st_mode & S_IFMT) == S_IFREG else { throw CocoaError(.fileReadNoPermission) }
+            return OwnedFile(parent: parent, name: name, info: info)
+        } catch { close(parent); throw error }
+    }
+
+    static func removeFile(_ path: String, under root: URL) throws {
+        try openedFile(path, under: root)?.remove()
+    }
+
+    /// Empty the directory through held descriptors instead of deleting and
+    /// recreating its pathname. The torrent writer is paused by the caller.
+    static func clearPayload(_ payload: URL) throws {
+        let descriptor = try openDirectory(payload)
+        defer { close(descriptor) }
+        func clearDirectory(_ descriptor: Int32) throws {
+            let listing = dup(descriptor)
+            guard listing >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            guard let directory = fdopendir(listing) else { close(listing); throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            defer { closedir(directory) }
+            while true {
+                errno = 0
+                guard let entry = readdir(directory) else {
+                    if errno != 0 { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                    break
+                }
+                let name = withUnsafePointer(to: &entry.pointee.d_name) {
+                    $0.withMemoryRebound(to: CChar.self, capacity: Int(entry.pointee.d_namlen) + 1) { String(cString: $0) }
+                }
+                if name == "." || name == ".." { continue }
+                var info = stat()
+                guard fstatat(descriptor, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                if (info.st_mode & S_IFMT) == S_IFDIR {
+                    let child = openat(descriptor, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                    guard child >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                    do { try clearDirectory(child); close(child) } catch { close(child); throw error }
+                    guard unlinkat(descriptor, name, AT_REMOVEDIR) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                } else {
+                    guard (info.st_mode & S_IFMT) == S_IFREG else { throw CocoaError(.fileReadNoPermission) }
+                    guard unlinkat(descriptor, name, 0) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                }
+            }
+            guard fsync(descriptor) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        }
+        try clearDirectory(descriptor)
     }
 
     func space() throws -> (free: UInt64, used: UInt64) {
@@ -108,8 +224,7 @@ struct TorrentRelayStorage: Codable, Equatable {
 
     func clear() throws {
         try validate(owner: owner)
-        try FileManager.default.removeItem(at: payload)
-        try LocalTorrentStore.protect(payload)
+        try Self.clearPayload(payload)
     }
 
     func copy(from source: URL, progress: @escaping @Sendable (String) -> Void) async throws {

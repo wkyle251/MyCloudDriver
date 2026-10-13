@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use md5::{Digest, Md5};
 use reqwest::StatusCode;
@@ -19,7 +19,8 @@ use url::Url;
 use crate::auth::DEFAULT_CLIENT_ID;
 use crate::captcha::anonymous_web_captcha_sign;
 use crate::client::{
-    enrich_avi_source_codec, original_download_url, preview_sources, DownloadInfo, MediaResponse, PreviewInfo,
+    enrich_avi_source_codec, original_download_url, preview_sources, DownloadInfo, MediaResponse,
+    PreviewInfo,
 };
 use crate::error::{Error, Result};
 use crate::types::FileInfo;
@@ -106,6 +107,7 @@ pub struct ShareBrowsePage {
 #[derive(Clone)]
 pub struct ShareClient {
     inner: Arc<ShareClientInner>,
+    verification_cache: Option<std::path::PathBuf>,
 }
 
 struct ShareClientInner {
@@ -147,9 +149,13 @@ impl ShareClient {
             .no_proxy()
             .timeout(Duration::from_secs(30))
             .user_agent(WEB_USER_AGENT);
-        let mut download_builder = reqwest::Client::builder().no_proxy().user_agent(WEB_USER_AGENT)
-            .connect_timeout(Duration::from_secs(20)).read_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(32).pool_idle_timeout(Duration::from_secs(30));
+        let mut download_builder = reqwest::Client::builder()
+            .no_proxy()
+            .user_agent(WEB_USER_AGENT)
+            .connect_timeout(Duration::from_secs(20))
+            .read_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(Duration::from_secs(30));
         if let Some(proxy) = proxy.map(str::trim).filter(|value| !value.is_empty()) {
             builder = builder.proxy(reqwest::Proxy::all(proxy)?);
             download_builder = download_builder.proxy(reqwest::Proxy::all(proxy)?);
@@ -169,6 +175,7 @@ impl ShareClient {
                 account: None,
                 user_fallback: None,
             }),
+            verification_cache: None,
         })
     }
 
@@ -199,6 +206,7 @@ impl ShareClient {
                 account: Some(account),
                 user_fallback: None,
             }),
+            verification_cache: None,
         })
     }
 
@@ -206,8 +214,15 @@ impl ShareClient {
         &self.inner.link
     }
 
+    pub(crate) fn with_verification_cache(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.verification_cache = path;
+        self
+    }
+
     pub(crate) fn with_user_fallback(mut self, user: ShareClient) -> Self {
-        Arc::get_mut(&mut self.inner).expect("new share client is not shared yet").user_fallback = Some(user);
+        Arc::get_mut(&mut self.inner)
+            .expect("new share client is not shared yet")
+            .user_fallback = Some(user);
         self
     }
 
@@ -226,7 +241,9 @@ impl ShareClient {
         &self.inner.download_http
     }
 
-    pub fn user_fallback(&self) -> Option<Self> { self.inner.user_fallback.clone() }
+    pub fn user_fallback(&self) -> Option<Self> {
+        self.inner.user_fallback.clone()
+    }
 
     pub async fn pass_code_token(&self) -> String {
         self.inner.pass_code_token.read().await.clone()
@@ -238,16 +255,25 @@ impl ShareClient {
         page_token: Option<&str>,
         limit: usize,
     ) -> Result<ShareBrowsePage> {
-        let result = self.list_folder_page_inner(parent_id, page_token, limit).await;
+        let result = self
+            .list_folder_page_inner(parent_id, page_token, limit)
+            .await;
         if result.is_err() {
             if let Some(user) = &self.inner.user_fallback {
-                return user.list_folder_page_inner(parent_id, page_token, limit).await;
+                return user
+                    .list_folder_page_inner(parent_id, page_token, limit)
+                    .await;
             }
         }
         result
     }
 
-    async fn list_folder_page_inner(&self, parent_id: &str, page_token: Option<&str>, limit: usize) -> Result<ShareBrowsePage> {
+    async fn list_folder_page_inner(
+        &self,
+        parent_id: &str,
+        page_token: Option<&str>,
+        limit: usize,
+    ) -> Result<ShareBrowsePage> {
         self.ensure_pass_code_token_if_supplied().await?;
         let page = self
             .request_share_detail(parent_id, page_token, limit)
@@ -312,9 +338,25 @@ impl ShareClient {
         Ok(files)
     }
 
+    /// Metadata for one selected share item, without resolving a download URL.
+    pub async fn file_info(&self, file_id: &str) -> Result<FileInfo> {
+        match self.get_file_detail(file_id).await {
+            Ok(file) => Ok(file.info),
+            Err(error) => {
+                if let Some(user) = &self.inner.user_fallback {
+                    return user.get_file_detail(file_id).await.map(|file| file.info);
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub async fn get_download_url(&self, file_id: &str) -> Result<DownloadInfo> {
         let result = self.get_download_url_inner(file_id).await;
-        if result.is_err() {
+        if result
+            .as_ref()
+            .is_err_and(|error| !crate::content_mode::guest_lookup_transient(error))
+        {
             if let Some(user) = &self.inner.user_fallback {
                 return user.get_download_url_inner(file_id).await;
             }
@@ -322,14 +364,26 @@ impl ShareClient {
         result
     }
 
+    /// Refresh this route's signed URL without consuming account quota when
+    /// Guest metadata is temporarily unavailable or its URL has expired.
+    pub async fn get_download_url_on_current_route(&self, file_id: &str) -> Result<DownloadInfo> {
+        self.get_download_url_inner(file_id).await
+    }
+
     async fn get_download_url_inner(&self, file_id: &str) -> Result<DownloadInfo> {
+        let _stage = crate::download_waits::Stage::enter(crate::download_waits::Kind::DownloadUrl);
         let detail = self.get_file_detail(file_id).await?;
-        let web_content_link = if self.inner.account.is_none() { original_content_link(&detail) } else { preferred_content_link(&detail) }
+        let web_content_link = original_content_link(&detail)
             .ok_or(Error::InvalidPath("shared file has no content link"))?;
+        let source_revision = crate::client::download_revision(
+            detail.info.hash.as_deref(),
+            detail.info.modified_time.as_deref(),
+        );
         Ok(DownloadInfo {
             web_content_link,
             name: detail.info.name,
             size: detail.info.size,
+            source_revision,
         })
     }
 
@@ -346,7 +400,9 @@ impl ShareClient {
     async fn get_preview_info_inner(&self, file_id: &str) -> Result<PreviewInfo> {
         let detail = self.get_file_detail(file_id).await?;
         if self.inner.account.is_none() {
-            let url = original_content_link(&detail).ok_or(Error::Guest("The public share did not provide an original download URL."))?;
+            let url = original_content_link(&detail).ok_or(Error::Guest(
+                "The public share did not provide an original download URL.",
+            ))?;
             return Ok(original_preview(&detail.info, url));
         }
         let direct = detail.web_content_link.clone();
@@ -379,16 +435,34 @@ impl ShareClient {
 
     /// Verify the source mapping before exposing any URL to the transfer or
     /// preview pipeline. The account's saved filename remains the destination.
-    pub(crate) async fn get_verified_original(&self, original_id: &str, saved: &FileInfo) -> Result<DownloadInfo> {
+    pub(crate) async fn get_verified_original(
+        &self,
+        original_id: &str,
+        saved: &FileInfo,
+    ) -> Result<DownloadInfo> {
         debug_assert!(self.inner.account.is_none());
         let detail = self.get_file_detail(original_id).await?;
-        if detail.info.id != original_id || !detail.info.kind.is_file() || detail.info.size != saved.size
-            || !matching_content_ids(saved.hash.as_deref(), detail.info.hash.as_deref()) {
-            return Err(Error::Guest("The original shared file no longer matches this saved file. Guest access stopped."));
+        if detail.info.id != original_id
+            || !detail.info.kind.is_file()
+            || detail.info.size != saved.size
+            || !matching_content_ids(saved.hash.as_deref(), detail.info.hash.as_deref())
+        {
+            return Err(Error::Guest(
+                "The original shared file no longer matches this saved file. Guest access stopped.",
+            ));
         }
-        let web_content_link = original_content_link(&detail)
-            .ok_or(Error::Guest("The public share did not provide an original download URL."))?;
-        Ok(DownloadInfo { web_content_link, name: saved.name.clone(), size: saved.size })
+        let web_content_link = original_content_link(&detail).ok_or(Error::Guest(
+            "The public share did not provide an original download URL.",
+        ))?;
+        Ok(DownloadInfo {
+            web_content_link,
+            name: saved.name.clone(),
+            size: saved.size,
+            source_revision: crate::client::download_revision(
+                detail.info.hash.as_deref(),
+                detail.info.modified_time.as_deref(),
+            ),
+        })
     }
 
     async fn get_file_detail(&self, file_id: &str) -> Result<ShareFile> {
@@ -495,6 +569,8 @@ impl ShareClient {
     }
 
     async fn request_json(&self, path: &str, query: &[(impl AsRef<str>, String)]) -> Result<Value> {
+        use crate::download_waits::{track, Kind, Stage};
+        let _stage = Stage::enter(Kind::GuestMetadata);
         let action = format!("GET:{path}");
         let url = format!("{}{path}", self.inner.api_base.trim_end_matches('/'));
         if let Some(account) = &self.inner.account {
@@ -516,9 +592,9 @@ impl ShareClient {
         let mut failed_token: Option<String> = None;
         for attempt in 0..2 {
             let captcha = if attempt == 0 {
-                self.captcha_for(&action).await?
+                track(Kind::GuestCaptcha, self.captcha_for(&action)).await?
             } else {
-                self.refresh_captcha(&action, failed_token.as_deref())
+                track(Kind::GuestCaptcha, self.refresh_captcha(&action, failed_token.as_deref()))
                     .await?
             };
             let request = self
@@ -534,15 +610,22 @@ impl ShareClient {
                         .map(|(key, value)| (key.as_ref(), value.as_str()))
                         .collect::<Vec<_>>(),
                 );
-            let response = request.send().await?;
+            let response = track(Kind::GuestHeaders, request.send()).await?;
             let status = response.status();
+            crate::download_waits::response(true, status.as_u16());
             if crate::download_policy::transient_status(status.as_u16()) {
                 if let Some(delay) = crate::download_policy::retry_after(response.headers()) {
-                    return Err(Error::RetryAfter { status: status.as_u16(), delay });
+                    return Err(Error::RetryAfter {
+                        status: status.as_u16(),
+                        delay,
+                    });
                 }
-                return Err(Error::Api { status: status.as_u16(), message: "The shared-file service is temporarily unavailable".into() });
+                return Err(Error::Api {
+                    status: status.as_u16(),
+                    message: "The shared-file service is temporarily unavailable".into(),
+                });
             }
-            let text = response.text().await?;
+            let text = track(Kind::GuestBody, response.text()).await?;
             let value: Value = serde_json::from_str(&text).map_err(|error| {
                 Error::Share(format!(
                     "PikPak returned unreadable share data (HTTP {}): {error}",
@@ -573,16 +656,23 @@ impl ShareClient {
     }
 
     async fn refresh_captcha(&self, action: &str, previous: Option<&str>) -> Result<String> {
-        let _refresh = self.inner.captcha_refresh.lock().await;
+        use crate::download_waits::{track, Kind};
+        let _refresh = track(Kind::GuestRefreshLock, self.inner.captcha_refresh.lock()).await;
         if let Some(cached) = self.inner.captcha_tokens.read().await.get(action) {
             if Instant::now() < cached.refresh_after && previous != Some(cached.token.as_str()) {
                 return Ok(cached.token.clone());
             }
         }
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis().to_string())
-            .unwrap_or_else(|_| "0".to_string());
+        self.inner.captcha_tokens.write().await.remove(action);
+        if let Some(token) = crate::request_verification::verified_token(
+            self.verification_cache.as_deref(), DEFAULT_CLIENT_ID, &self.inner.device_id, action, previous,
+        ) {
+            self.inner.captcha_tokens.write().await.insert(action.into(), CachedCaptcha {
+                token: token.clone(), refresh_after: Instant::now() + Duration::from_secs(30),
+            });
+            return Ok(token);
+        }
+        let timestamp = crate::captcha::anonymous_web_captcha_timestamp();
         let body = serde_json::json!({
             "action": action,
             "captcha_token": previous.unwrap_or(""),
@@ -601,7 +691,7 @@ impl ShareClient {
             "{}/v1/shield/captcha/init",
             self.inner.auth_base.trim_end_matches('/')
         );
-        let response = self
+        let response = track(Kind::GuestRefreshHeaders, self
             .inner
             .http
             .post(url)
@@ -609,10 +699,10 @@ impl ShareClient {
             .header("X-Device-ID", &self.inner.device_id)
             .header("X-Captcha-Token", previous.unwrap_or(""))
             .json(&body)
-            .send()
+            .send())
             .await?;
         let status = response.status();
-        let text = response.text().await?;
+        let text = track(Kind::GuestRefreshBody, response.text()).await?;
         let value: Value = serde_json::from_str(&text).map_err(|error| {
             Error::Share(format!(
                 "PikPak returned unreadable verification data (HTTP {}): {error}",
@@ -622,14 +712,10 @@ impl ShareClient {
         if !status.is_success() || api_error_code(&value) != 0 {
             return Err(api_error(status, &value, &text));
         }
-        if value
-            .get("url")
-            .and_then(Value::as_str)
-            .is_some_and(|url| !url.is_empty())
-        {
-            return Err(Error::Share(
-                "PikPak requires additional verification before opening this link".to_string(),
-            ));
+        if let Some(url) = value.get("url").and_then(Value::as_str).filter(|url| !url.is_empty()) {
+            return Err(Error::VerificationRequired(crate::VerificationChallenge::new(
+                url, DEFAULT_CLIENT_ID, &self.inner.device_id, action,
+            )?));
         }
         let token = value
             .get("captcha_token")
@@ -687,7 +773,9 @@ fn preferred_content_link(file: &ShareFile) -> Option<String> {
 
 fn matching_content_ids(saved: Option<&str>, original: Option<&str>) -> bool {
     match (saved, original) {
-        (Some(saved), Some(original)) => !saved.trim().is_empty() && saved.trim().eq_ignore_ascii_case(original.trim()),
+        (Some(saved), Some(original)) => {
+            !saved.trim().is_empty() && saved.trim().eq_ignore_ascii_case(original.trim())
+        }
         _ => false,
     }
 }
@@ -697,10 +785,21 @@ fn original_content_link(file: &ShareFile) -> Option<String> {
 }
 
 pub(crate) fn original_preview(file: &FileInfo, url: String) -> PreviewInfo {
-    PreviewInfo { name: file.name.clone(), size: file.size, mime_type: file.mime_type.clone(),
-        thumbnail_link: None, icon_link: file.icon_link.clone(), content_link: url.clone(),
-        sources: vec![crate::PreviewSource { url, label: Some("Original · Guest".into()), is_origin: true,
-            video_codec: None, audio_codec: None }] }
+    PreviewInfo {
+        name: file.name.clone(),
+        size: file.size,
+        mime_type: file.mime_type.clone(),
+        thumbnail_link: None,
+        icon_link: file.icon_link.clone(),
+        content_link: url.clone(),
+        sources: vec![crate::PreviewSource {
+            url,
+            label: Some("Original · Guest".into()),
+            is_origin: true,
+            video_codec: None,
+            audio_codec: None,
+        }],
+    }
 }
 
 fn fallback_device_id(share_id: &str) -> String {

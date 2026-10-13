@@ -105,8 +105,8 @@ final class PikPakAccountVerifier {
     private var timedOut = false
     var processIdentifier: Int32? { process.flatMap { $0.isRunning ? $0.processIdentifier : nil } }
 
-    func verify(engineURL: URL, environment: [String: String]) async throws -> PikPakAccountProfile {
-        let data = try await request(engineURL: engineURL, environment: environment, arguments: ["account"])
+    func verify(engineURL: URL, environment: [String: String], checkDrive: Bool = false) async throws -> PikPakAccountProfile {
+        let data = try await request(engineURL: engineURL, environment: environment, arguments: [checkDrive ? "check-connection" : "account"])
         let profile = try JSONDecoder().decode(PikPakAccountProfile.self, from: data)
         guard !profile.sub.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw PikPakAccountError.invalidProfile }
         return profile
@@ -178,6 +178,9 @@ final class PikPakAccountVerifier {
         guard code == 0 else {
             let data = (try? PikPakAccountStore.readPrivateFile(errorURL)) ?? Data()
             let message = String(decoding: data, as: UTF8.self)
+            if let challenge = PikPakVerificationChallenge.fromEngine(message) {
+                throw PikPakRequestVerificationError.required(challenge)
+            }
             if arguments.first == "manage" {
                 throw PikPakManagementError.fromHelper(String(decoding: data, as: UTF8.self))
             }

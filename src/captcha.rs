@@ -19,8 +19,9 @@
 //! in that repo.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use md5::{Digest, Md5};
 use serde::Deserialize;
@@ -33,6 +34,11 @@ use crate::error::{Error, Result};
 const CLIENT_PACKAGE_NAME: &str = "mypikpak.com";
 const WEB_CLIENT_VERSION: &str = "2.0.0";
 const DESKTOP_CLIENT_VERSION: &str = "undefined";
+// These are release metadata, not the request time. The official clients sign
+// their bundled timestamp together with the salt table. Sources verified on
+// 2026-10-12: PikPak Web 5990.5e64572a.js and Windows main.cc72dfeb.js.
+const WEB_PROFILE_TIMESTAMP: &str = "1791533770303";
+const DESKTOP_PROFILE_TIMESTAMP: &str = "1790750014972";
 
 /// Current PikPak Web salt table used to build `captcha_sign`.
 /// Empty strings are meaningful and must remain in sequence.
@@ -75,6 +81,7 @@ struct CaptchaProfile {
     client_version: &'static str,
     package_name: &'static str,
     salts: &'static [&'static str],
+    timestamp: &'static str,
 }
 
 fn captcha_profile(client_id: &str) -> CaptchaProfile {
@@ -83,12 +90,14 @@ fn captcha_profile(client_id: &str) -> CaptchaProfile {
             client_version: DESKTOP_CLIENT_VERSION,
             package_name: CLIENT_PACKAGE_NAME,
             salts: DESKTOP_SALTS,
+            timestamp: DESKTOP_PROFILE_TIMESTAMP,
         }
     } else {
         CaptchaProfile {
             client_version: WEB_CLIENT_VERSION,
             package_name: CLIENT_PACKAGE_NAME,
             salts: WEB_SALTS,
+            timestamp: WEB_PROFILE_TIMESTAMP,
         }
     }
 }
@@ -113,6 +122,7 @@ struct CaptchaManagerInner {
     device_id: String,
     profile: CaptchaProfile,
     tokens: TokenManager,
+    verification_cache: Option<PathBuf>,
     /// Cache of (action -> cached captcha).
     cache: RwLock<HashMap<String, CachedCaptcha>>,
 }
@@ -130,6 +140,7 @@ impl CaptchaManager {
         client_id: impl Into<String>,
         device_id: impl Into<String>,
         tokens: TokenManager,
+        verification_cache: Option<PathBuf>,
     ) -> Self {
         let client_id = client_id.into();
         let profile = captcha_profile(&client_id);
@@ -141,6 +152,7 @@ impl CaptchaManager {
                 device_id: device_id.into(),
                 profile,
                 tokens,
+                verification_cache,
                 cache: RwLock::new(HashMap::new()),
             }),
         }
@@ -163,7 +175,16 @@ impl CaptchaManager {
     /// Force a fresh captcha token for the given action. Optionally pass the
     /// previous token so the server can invalidate it. Returns the new token.
     pub(crate) async fn refresh(&self, action: &str, previous: Option<&str>) -> Result<String> {
-        let mut cache = self.inner.cache.write().await;
+        self.refresh_inner(action, previous, false).await
+    }
+
+    pub(crate) async fn check_for(&self, action: &str) -> Result<String> {
+        self.refresh_inner(action, None, true).await
+    }
+
+    async fn refresh_inner(&self, action: &str, previous: Option<&str>, validate_proof: bool) -> Result<String> {
+        use crate::download_waits::{track, Kind};
+        let mut cache = track(Kind::AccountCaptchaLock, self.inner.cache.write()).await;
 
         // Double-check inside the write lock: another task may have already
         // refreshed while we were waiting. If `previous` is supplied and the
@@ -171,27 +192,36 @@ impl CaptchaManager {
         // refresh instead of returning the known-bad token.
         if let Some(c) = cache.get(action) {
             let already_replaced = previous.is_none_or(|prev| prev != c.token);
-            if already_replaced && Instant::now() < c.refresh_after {
+            if !validate_proof && already_replaced && Instant::now() < c.refresh_after {
                 return Ok(c.token.clone());
             }
         }
+        // The previous token is expired or explicitly rejected. A failed
+        // replacement must not make a later operation reuse that stale token.
+        cache.remove(action);
+
+        let verified = crate::request_verification::verified_token(
+            self.inner.verification_cache.as_deref(), &self.inner.client_id,
+            &self.inner.device_id, action, previous,
+        );
+        if let Some(token) = verified.as_ref().filter(|_| !validate_proof) {
+            cache.insert(action.into(), CachedCaptcha { token: token.clone(), refresh_after: Instant::now() + Duration::from_secs(30) });
+            return Ok(token.clone());
+        }
 
         let user_id = self.inner.tokens.user_id().await?;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis().to_string())
-            .unwrap_or_else(|_| "0".to_string());
+        let timestamp = self.inner.profile.timestamp;
 
         let sign = captcha_sign(
             &self.inner.client_id,
             &self.inner.device_id,
-            &timestamp,
+            timestamp,
             self.inner.profile,
         );
 
         let body = serde_json::json!({
             "action": action,
-            "captcha_token": previous.unwrap_or(""),
+            "captcha_token": previous.or(verified.as_deref()).unwrap_or(""),
             "client_id": self.inner.client_id,
             "device_id": self.inner.device_id,
             "meta": {
@@ -201,7 +231,6 @@ impl CaptchaManager {
                 "client_version": self.inner.profile.client_version,
                 "timestamp": timestamp,
             },
-            "redirect_uri": "xlaccsdk01://xbase.cloud/callback?state=harbor",
         });
 
         let access = self.inner.tokens.access_token().await?;
@@ -211,14 +240,14 @@ impl CaptchaManager {
         );
 
         tracing::debug!(action = %action, "initializing captcha token");
-        let resp = self
+        let resp = track(Kind::AccountCaptchaHeaders, self
             .inner
             .http
             .post(&url)
             .bearer_auth(&access)
             .header("X-Device-Id", &self.inner.device_id)
             .json(&body)
-            .send()
+            .send())
             .await?;
 
         if !resp.status().is_success() {
@@ -230,11 +259,11 @@ impl CaptchaManager {
             });
         }
 
-        let parsed: CaptchaInitResponse = resp.json().await?;
-        if parsed.url.as_deref().is_some_and(|url| !url.is_empty()) {
-            return Err(Error::Auth(
-                "PikPak requires additional verification in the official web app".to_string(),
-            ));
+        let parsed: CaptchaInitResponse = track(Kind::AccountCaptchaBody, resp.json()).await?;
+        if let Some(url) = parsed.url.as_deref().filter(|url| !url.is_empty()) {
+            return Err(Error::VerificationRequired(crate::VerificationChallenge::new(
+                url, &self.inner.client_id, &self.inner.device_id, action,
+            )?));
         }
         if parsed.captcha_token.is_empty() {
             return Err(Error::Auth(
@@ -303,6 +332,8 @@ pub(crate) fn anonymous_web_captcha_sign(device_id: &str, timestamp: &str) -> St
         captcha_profile(crate::auth::DEFAULT_CLIENT_ID),
     )
 }
+
+pub(crate) fn anonymous_web_captcha_timestamp() -> &'static str { WEB_PROFILE_TIMESTAMP }
 
 #[cfg(test)]
 mod tests {

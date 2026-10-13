@@ -78,6 +78,23 @@ the effective filename extension and a fingerprint of FileTwin's format
 recognizer source, so renamed decoder hints and recognition changes are retried.
 Failed or interrupted reads/decoders are not cached as completed results.
 
+## Pruning
+
+The index keeps itself bounded. Every saved source, binary outcome and vector carries a last-used
+time, refreshed when work is reused but at most once a day, so a scan of unchanged files writes
+almost nothing. When a scan opens the cache, at most once a day, it forgets:
+
+- sources and binary outcomes unused for 90 days, which covers files that were deleted and old
+  revisions of files that were edited;
+- vectors unused for 90 days that no remaining source points at (content of deleted files stays
+  that long, so a renamed or moved copy can still reuse it);
+- the least recently used vectors beyond 4 GiB in total, and any source whose vector went with them.
+
+A pass runs in one transaction and leaves the cache untouched if it fails. Nothing is pruned by
+the revision alone, because Apple Photos keeps an original and its preview as two revisions of
+one file. A cache from before pruning is upgraded in place: its entries are dated at the upgrade,
+so nothing is dropped early. Everything pruned is simply analysed again if it is seen again.
+
 Cache creation and completed-record write failures are surfaced before reporting
 the work complete. Pause/Cancel keeps committed entries, including when another
 original is still downloading. A fresh scan after Clear uses the same account's

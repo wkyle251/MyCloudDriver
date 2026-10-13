@@ -23,7 +23,8 @@ struct FinderBookmark: Codable, Hashable, Identifiable {
     var fileBookmark: Data? = nil
     var addedAt: Date = Date()
     var id: String { [provider, scope, itemID].map { "\($0.utf8.count):\($0)" }.joined() }
-    var parentPath: String { parents.last?.path ?? "/" }
+    var kindSortKey: String { isFolder ? "0-folder" : "1-file" }
+    var parentPath: String { url?.deletingLastPathComponent().path ?? parents.last?.path ?? "/" }
     var path: String { url?.path ?? (parentPath == "/" ? "/" + name : parentPath + "/" + name) }
 }
 
@@ -105,71 +106,13 @@ struct FinderBookmark: Codable, Hashable, Identifiable {
     }
 }
 
-struct FinderBookmarksWorkspace: View {
-    @ObservedObject var store: FinderBookmarkStore
-    let provider: String
-    let scope: String?
-    let sourceTitle: String
-    var canOpen = true
-    let open: (FinderBookmark) -> Void
-    let showBrowser: () -> Void
-    @State private var query = ""
-    private var items: [FinderBookmark] {
-        let saved = store.items(provider: provider, scope: scope)
-        let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        return search.isEmpty ? saved : saved.filter { $0.name.localizedCaseInsensitiveContains(search) || $0.path.localizedCaseInsensitiveContains(search) }
-    }
+private struct FinderBookmarkStoreKey: EnvironmentKey {
+    static let defaultValue: FinderBookmarkStore? = nil
+}
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            ViewThatFits(in: .horizontal) {
-                HStack { title; Spacer(minLength: 8); search.frame(width: 230) }
-                VStack(alignment: .leading, spacing: 8) { title; search }
-            }.finderCard(padding: 12)
-            if items.isEmpty {
-                VStack(spacing: 12) {
-                    Image(systemName: "bookmark").font(.system(size: 36)).foregroundStyle(.secondary)
-                    Text(query.isEmpty ? "No bookmarks yet" : "No matching bookmarks").font(.headline)
-                    Text(scope == nil ? "Sign in or connect this drive to view its bookmarks." : query.isEmpty ? "Right-click a file or folder in Browser and choose Add to Bookmarks." : "Try a different name or path.")
-                        .foregroundStyle(.secondary).multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button("Open Browser", action: showBrowser)
-                }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 1) {
-                        ForEach(items) { bookmark in
-                            HStack(spacing: 10) {
-                                Button { open(bookmark) } label: {
-                                    HStack(spacing: 10) {
-                                        Image(systemName: bookmark.isFolder ? "folder.fill" : "doc").font(.system(size: 22)).foregroundStyle(FinderAppearance.accent)
-                                        VStack(alignment: .leading, spacing: 3) {
-                                            Text(bookmark.name).lineLimit(1).truncationMode(.middle)
-                                            Text(bookmark.path).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                                        }.frame(maxWidth: .infinity, alignment: .leading)
-                                    }.contentShape(Rectangle())
-                                }.buttonStyle(.plain).pointingHandCursor().disabled(!canOpen)
-                                    .help(bookmark.isFolder ? "Open this folder in Browser" : "Show this file in Browser")
-                                Button { store.remove(bookmark) } label: { Image(systemName: "bookmark.slash") }
-                                    .buttonStyle(.borderless).pointingHandCursor().help("Remove from Bookmarks")
-                                    .accessibilityLabel("Remove \(bookmark.name) from Bookmarks")
-                            }.padding(12).background(Color.primary.opacity(0.025))
-                                .contextMenu {
-                                    Button(bookmark.isFolder ? "Open Folder" : "Show in Browser") { open(bookmark) }.disabled(!canOpen)
-                                    Divider()
-                                    Button("Remove from Bookmarks") { store.remove(bookmark) }
-                                }
-                        }
-                    }
-                }.background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-            }
-        }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+extension EnvironmentValues {
+    var finderBookmarkStore: FinderBookmarkStore? {
+        get { self[FinderBookmarkStoreKey.self] }
+        set { self[FinderBookmarkStoreKey.self] = newValue }
     }
-    private var title: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Label("Bookmarks", systemImage: "bookmark").font(.headline)
-            Text(sourceTitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-        }
-    }
-    private var search: some View { TextField("Search bookmarks", text: $query).textFieldStyle(.roundedBorder) }
 }

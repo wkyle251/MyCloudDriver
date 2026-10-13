@@ -224,7 +224,12 @@ struct LocalTorrentJob: Codable, Identifiable {
             return note + " A proxy is returning virtual DNS addresses (\(address)). Check whether it supports BitTorrent and UDP; these addresses alone do not show that traffic is blocked."
         }
         switch portMapping {
-        case .mapped(let port, let address):
+        case .mapped(let tcp, let udp, let address, let lease):
+            guard let port = tcp else {
+                return note + (udp.map { " The router accepted UDP port \($0), but an incoming TCP mapping was not confirmed." } ?? " Incoming port mapping was not confirmed.")
+            }
+            if udp == nil { note += " UDP mapping was not confirmed." }
+            if lease == 0 { note += " The router accepted a permanent mapping; it will be removed when torrents stop." }
             // A mapping onto a private or carrier-NAT address is a door onto a
             // network that is itself behind another door. Saying "reachable"
             // there sends the reader hunting for a fault that is not theirs.
@@ -297,6 +302,20 @@ struct LocalTorrentStore {
 
 /// Local torrents belong to this Mac, independently of PikPak account/mode.
 /// Only metadata is fetched until the user selects files and starts a download.
+@MainActor private final class TorrentDNSProbeTarget {
+    weak var model: LocalTorrentModel?
+    init(_ model: LocalTorrentModel) { self.model = model }
+}
+
+@MainActor final class TorrentRelayAccountCandidate {
+    weak var account: DownloaderModel?
+    let identity: ObjectIdentifier
+    init(_ account: DownloaderModel) {
+        self.account = account
+        identity = ObjectIdentifier(account)
+    }
+}
+
 @MainActor final class LocalTorrentModel: ObservableObject {
     static let shared = LocalTorrentModel()
     @Published var jobs: [LocalTorrentJob] = []
@@ -308,13 +327,14 @@ struct LocalTorrentStore {
     /// When the resolver was last questioned. Its answer only changes when a
     /// proxy is switched on or off, and `getaddrinfo` blocks, so this is rare.
     private var dnsProbedAt: Date?
+    private let dnsProbe: @Sendable ([String]) -> TorrentDNSState
     /// The handshaked peers behind each running torrent's two summary rates.
     /// Outside `LocalTorrentJob`: live details never enter the saved queue.
     /// The engine separately caches validated public peer endpoints briefly.
     @Published private(set) var peerDetails: [UUID: [LocalTorrentPeer]] = [:]
     @Published private(set) var networkDetails: [UUID: LocalTorrentNetworkDiagnostics] = [:]
-    /// Connected-peer counts come from `aria2.getPeers`, whose reply carries a
-    /// piece bitfield per peer, so it is polled far less often than status.
+    /// Native peer rates follow each status poll. Legacy aria2 peer replies
+    /// carry piece bitfields, so that engine requests a slower cadence.
     private var censusAt: [UUID: Date] = [:]
     private var networkCensusAt: [UUID: Date] = [:]
     var censusInterval: TimeInterval = 30
@@ -338,7 +358,14 @@ struct LocalTorrentStore {
 
     var ram: TorrentRAMDriving
     var relayUploaderFactory: () -> TorrentRelayUploading = { TorrentRelayUpload() }
-    var relayContextProvider: (() -> PikPakManagementContext?)?
+    var relayAccountCandidates: [TorrentRelayAccountCandidate] = []
+    var relayContextOverride: (() -> PikPakManagementContext?)?
+    /// Synthetic upload fixtures may override credential lookup. Production
+    /// lookup follows all live windows, rather than only the latest window.
+    var relayContextProvider: (() -> PikPakManagementContext?)? {
+        get { relayContextOverride ?? { [weak self] in self?.registeredRelayContexts().first?.1 } }
+        set { relayContextOverride = newValue }
+    }
     var relayFilesChanged: (() -> Void)?
     var relayTasks: [UUID: Task<Void, Never>] = [:]
     var relayUploaders: [UUID: TorrentRelayUploading] = [:]
@@ -356,7 +383,7 @@ struct LocalTorrentStore {
     var relayQueuedSince: [UUID: Date] = [:]
     /// Per-file status is far heavier than the plain poll — a `files:true` reply
     /// for 14,623 files is megabytes — so it runs on the census cadence while
-    /// speeds and peer counts keep refreshing every ten seconds.
+    /// speeds and peer counts refresh together every thirty seconds.
     var relayFileCensusAt: [UUID: Date] = [:]
     var relayFileCensusInterval: TimeInterval = 30
     /// Consecutive status replies lost per job. One dropped reply from the
@@ -367,11 +394,14 @@ struct LocalTorrentStore {
     /// How long a completed file waits for company before it is uploaded alone.
     var relayFlushWait: TimeInterval = TorrentRelayDrain.flushWait
 
-    init(directory: URL? = nil, engine: LocalTorrentDriving? = nil, ram: TorrentRAMDriving? = nil) {
+    init(dnsProbe: @escaping @Sendable ([String]) -> TorrentDNSState = { TorrentFakeIP.probe($0) },
+         directory: URL? = nil, engine: LocalTorrentDriving? = nil, ram: TorrentRAMDriving? = nil) {
+        self.dnsProbe = dnsProbe
         let root = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("MyCloudDriver/LocalTorrents", isDirectory: true)
         store = .init(directory: root)
         self.ram = ram ?? TorrentRAMDisk()
         self.engine = engine ?? LibtorrentEngine(directory: root.appendingPathComponent("Engine", isDirectory: true))
+        censusInterval = self.engine.peerCensusInterval
         do {
             jobs = try store.load()
             restoredResumeIDs = Set(jobs.filter {
@@ -467,7 +497,7 @@ struct LocalTorrentStore {
     }
     private func scheduleMetadataRetry(_ id: UUID) {
         metadataRetryAt[id] = Date().addingTimeInterval(Self.metadataRetryDelay)
-        edit(id) { $0.phase = .metadata; $0.clearTransferStats(); $0.message = "Still waiting for peers. Retrying the file list automatically in 15 seconds…" }
+        edit(id) { $0.phase = .metadata; $0.clearTransferStats(); $0.message = "Still waiting for peers. Retrying the file list automatically…" }
         saveOrReport()
     }
     private func prepare(_ id: UUID, retrying: Bool = false) async {
@@ -640,7 +670,7 @@ struct LocalTorrentStore {
             while !Task.isCancelled {
                 guard let self, !self.closed else { return }
                 await self.refresh()
-                do { try await Task.sleep(nanoseconds: 10_000_000_000) } catch { return }
+                do { try await Task.sleep(nanoseconds: 30_000_000_000) } catch { return }
             }
         }
     }
@@ -651,9 +681,11 @@ struct LocalTorrentStore {
     func pollStatus(_ id: UUID, gid: String, files: Bool) async throws -> LocalTorrentStatus? {
         do {
             let status = try await engine.status(gid, files: files)
+            guard !closed, gids[id] == gid else { return nil }
             statusFailures[id] = nil
             return status
         } catch {
+            guard !closed, gids[id] == gid else { return nil }
             guard engine.running else { throw error }
             let failures = min(statusRetries, (statusFailures[id] ?? 0) + 1)
             statusFailures[id] = failures
@@ -669,7 +701,7 @@ struct LocalTorrentStore {
         }
     }
 
-    /// Updates the connected-peer count on its own slower cadence.
+    /// Refreshes peers on the engine's cadence, alongside native status rates.
     ///
     /// One state escapes that cadence: no peers beside open sockets. Between
     /// censuses the count can only ratchet down, so a single poll that saw no
@@ -682,11 +714,28 @@ struct LocalTorrentStore {
         let now = Date()
         let blankWithSockets = attempted > 0 && job(id)?.peers == 0
         if let last = censusAt[id], now.timeIntervalSince(last) < censusInterval, !blankWithSockets { return }
+        if attempted == 0 {
+            edit(id) { $0.updatePeerCensus(.init()) }
+            peerDetails[id] = nil; censusAt[id] = now
+            await refreshNetworkCensus(id, gid: gid, now: now)
+            return
+        }
+        if censusInterval <= 0 { peerDetails[id] = nil }
+        let census: LocalTorrentPeerCensus
+        do { census = try await engine.peerCensus(gid, attempted: attempted) }
+        catch {
+            guard !closed, gids[id] == gid, job(id)?.phase.active == true, !busy.contains(id) else { return }
+            invalidatePeerRates(id)
+            return
+        }
+        guard !closed, gids[id] == gid, job(id)?.phase.active == true, !busy.contains(id) else { return }
         censusAt[id] = now
-        guard let census = try? await engine.peerCensus(gid, attempted: attempted) else { return }
-        guard !closed, gids[id] == gid, job(id)?.phase.active == true else { return }
         edit(id) { $0.updatePeerCensus(census) }
         peerDetails[id] = census.peers
+        await refreshNetworkCensus(id, gid: gid, now: now)
+    }
+
+    private func refreshNetworkCensus(_ id: UUID, gid: String, now: Date) async {
         if let last = networkCensusAt[id], now.timeIntervalSince(last) < 30 { return }
         networkCensusAt[id] = now
         let network = try? await engine.networkDiagnostics(gid)
@@ -694,10 +743,17 @@ struct LocalTorrentStore {
         networkDetails[id] = network
     }
 
+    /// A lost telemetry reply cannot prove that connected peers disappeared.
+    /// Expire their rates and retry the census at the next status poll.
+    func invalidatePeerRates(_ id: UUID) {
+        peerDetails[id] = nil
+        censusAt[id] = nil
+    }
+
     /// Peers to show for a job. A census is only taken while the torrent is
     /// running, so any other phase would be showing the ghost of the last one.
     func connectedPeers(_ id: UUID) -> [LocalTorrentPeer] {
-        guard let value = job(id), value.checkingPieces != true else { return [] }
+        guard let value = job(id), value.peers > 0, value.checkingPieces != true else { return [] }
         let phase = value.phase
         // `.uploading` beside a live torrent is a drain: finished files are on
         // their way to PikPak while the rest of the batch still downloads.
@@ -716,9 +772,11 @@ struct LocalTorrentStore {
         dnsProbedAt = Date()
         let hosts = Aria2TorrentEngine.fallbackTrackers.compactMap { URL(string: $0)?.host }
         guard !hosts.isEmpty else { return }
-        Task.detached(priority: .utility) { [weak self] in
-            let state = TorrentFakeIP.probe(hosts)
-            await MainActor.run { self?.dnsState = state }
+        let target = TorrentDNSProbeTarget(self)
+        let probe = dnsProbe
+        Task.detached(priority: .utility) {
+            let state = probe(hosts)
+            await MainActor.run { target.model?.dnsState = state }
         }
     }
 
@@ -755,13 +813,16 @@ struct LocalTorrentStore {
             var retryMetadataOnError = value.phase == .metadata && value.magnet != nil
             do {
                 guard let status = try await pollStatus(id, gid: gid, files: false) else {
+                    guard !closed, gids[id] == gid, job(id)?.phase.active == true, !busy.contains(id) else { continue }
                     // The swarm and seed counts stand: nothing said they changed.
+                    invalidatePeerRates(id)
                     edit(id) { $0.downloadSpeed = 0; $0.uploadSpeed = 0
                                if $0.phase != .metadata { $0.message = "Reconnecting to download status…" } }
                     continue
                 }
                 guard !closed, gids[id] == gid, job(id)?.phase.active == true, !busy.contains(id) else { continue }
                 edit(id) { $0.updateTransferStats(status) }
+                if status.state != "active" || status.connections == 0 { invalidatePeerRates(id) }
                 if status.state == "active", !status.checkingPieces { await refreshCensus(id, gid: gid, attempted: status.connections) }
                 guard !closed, gids[id] == gid, job(id)?.phase.active == true, !busy.contains(id) else { continue }
                 if value.phase == .metadata {

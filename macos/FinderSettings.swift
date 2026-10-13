@@ -67,6 +67,21 @@ final class FinderSettings: ObservableObject {
         didSet { defaults.set(contentMode.rawValue, forKey: "pikpakContentMode") }
     }
 
+    @Published var deleteAfterDownload: Bool {
+        didSet { defaults.set(deleteAfterDownload, forKey: "deleteAfterDownload") }
+    }
+
+    @Published var downloadBufferCapMiB: Int {
+        didSet { defaults.set(downloadBufferCapMiB, forKey: "downloadBufferCapMiB") }
+    }
+    var downloadBufferLimit: UInt64 {
+        DownloadBufferPolicy.limitBytes(memory: ProcessInfo.processInfo.physicalMemory,
+            capMiB: downloadBufferCapMiB)
+    }
+    func downloadBufferEnvironment(_ source: [String: String]) -> [String: String] {
+        DownloadBufferPolicy.environment(source, capMiB: downloadBufferCapMiB)
+    }
+
     @Published var autoHideSidebar: Bool {
         didSet { defaults.set(autoHideSidebar, forKey: "finderAutoHideSidebar") }
     }
@@ -85,6 +100,9 @@ final class FinderSettings: ObservableObject {
         playback = MediaPlaybackSettings(defaults: defaults)
         contentMode = PikPakContentMode(rawValue: defaults.string(forKey: "pikpakContentMode") ?? "")
             ?? (defaults.bool(forKey: "pikpakGuestMode") ? .guest : .user)
+        deleteAfterDownload = defaults.bool(forKey: "deleteAfterDownload")
+        let cap = defaults.integer(forKey: "downloadBufferCapMiB")
+        downloadBufferCapMiB = DownloadBufferPolicy.capsMiB.contains(cap) ? cap : 0
         autoHideSidebar = defaults.bool(forKey: "finderAutoHideSidebar")
         showsPreviewPane = defaults.object(forKey: "finderShowsPreviewPane") as? Bool ?? true
         previewPlacement = FinderPreviewPlacement(rawValue: defaults.string(forKey: "finderPreviewPlacement") ?? "") ?? .right
@@ -348,7 +366,8 @@ struct FinderSettingsView: View {
         // Native tab buttons own hover/selection; pane buttons keep our style.
         .buttonStyle(.automatic)
         .padding(12)
-        .frame(width: 580, height: 580)
+        .frame(width: settings.selectedPane == 1 ? 900 : 580,
+               height: settings.selectedPane == 1 ? 760 : 580)
         .onAppear { if let initialPane { settings.selectedPane = initialPane } }
         .task(id: settings.selectedPane) {
             if settings.selectedPane == 2 { model.checkAccountStatus(automatically: true) }
@@ -403,6 +422,14 @@ private struct FinderGeneralSettingsView: View {
                 Text("Uploads and downloads adjust automatically to your connection. You can pause or resume them in Transfers. iCloud Drive and Photos transfers are managed by macOS.")
                     .font(.caption).foregroundStyle(.secondary)
                 LabeledContent("This Mac", value: "\(ProcessInfo.processInfo.activeProcessorCount) cores · \(ProcessInfo.processInfo.physicalMemory / 1_073_741_824) GB memory")
+                Picker("Download RAM buffer maximum", selection: $settings.downloadBufferCapMiB) {
+                    Text("Automatic").tag(0)
+                    ForEach(DownloadBufferPolicy.capsMiB.filter { $0 > 0 }, id: \.self) { cap in
+                        Text(DownloadBufferPolicy.text(UInt64(cap) * 1_048_576)).tag(cap)
+                    }
+                }
+                Text("The buffer grows as needed and shrinks under macOS memory pressure. Selected sizes set a maximum. Changes apply to the next download session.")
+                    .font(.caption).foregroundStyle(.secondary)
                 LabeledContent("Download folder") {
                     Text(model.outputURL.path).lineLimit(2).truncationMode(.middle)
                         .textSelection(.enabled)
@@ -467,9 +494,9 @@ private struct FinderAccountsSettingsView: View {
     let hub: CloudDriveHub?
 
     private var statusColor: Color {
-        switch model.accountLoginStatus {
+        switch model.accountConnectionStatus {
         case .signedIn: return .green
-        case .needsSignIn, .unavailable: return .orange
+        case .needsSignIn, .unavailable, .verificationRequired: return .orange
         default: return .secondary
         }
     }
@@ -489,7 +516,7 @@ private struct FinderAccountsSettingsView: View {
                         HStack(spacing: 6) {
                             if model.isCheckingAccount { ProgressView().controlSize(.mini) }
                             else { Circle().fill(statusColor).frame(width: 7, height: 7) }
-                            Text(model.isChangingAccount ? "Checking account…" : model.accountLoginStatus.title)
+                            Text(model.isChangingAccount ? "Checking account…" : model.accountConnectionStatus.title)
                                 .font(.callout).foregroundStyle(statusColor)
                         }
                     }
@@ -525,6 +552,13 @@ private struct FinderAccountsSettingsView: View {
                 }
                 if model.isCheckingAccount {
                     Button("Cancel Check", action: model.cancelAccountCheck)
+                }
+                if model.requestVerificationChallenge != nil {
+                    HStack {
+                        Button(model.isVerifyingRequest ? "Verifying…" : "Verify Request…", action: model.beginRequestVerification)
+                            .buttonStyle(.borderedProminent).disabled(model.isVerifyingRequest)
+                        if model.isVerifyingRequest { Button("Cancel Verification", action: model.cancelRequestVerification) }
+                    }
                 }
                 if let error = model.accountSettingsError {
                     Label(error, systemImage: "exclamationmark.circle")

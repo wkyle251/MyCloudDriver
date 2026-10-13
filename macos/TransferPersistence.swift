@@ -7,10 +7,10 @@ import Foundation
 struct TransferPersistenceStore {
     let directory: URL
 
-    /// Import old window queues once per account. The receipt and combined
+    /// Import closed window queues once per account. The receipt and combined
     /// queue are one atomic write, so completed work cannot reappear on the
     /// next launch. Keep the old files intact for recovery or an older build.
-    func loadSharedTransfers(accountID: String) throws -> SavedTransfers? {
+    func loadSharedTransfers(accountID: String, excludedWorkspaceSessions: Set<String> = []) throws -> SavedTransfers? {
         let saved = try load(SavedTransfers.self, accountID: accountID)
         if let saved, saved.version != 1 || saved.accountID != accountID { throw CocoaError(.fileReadCorruptFile) }
         let sessions = directory.appendingPathComponent("Sessions", isDirectory: true)
@@ -20,12 +20,29 @@ struct TransferPersistenceStore {
         var downloads = saved?.downloads ?? []
         var uploads = saved?.uploads ?? []
         var cancelled = Set(saved?.cancelledDownloads ?? [])
+        var pausedDownloadIDs = saved?.pausedDownloadIDs ?? []
+        var pausedPendingDownloadIDs = saved?.pausedPendingDownloadIDs ?? []
+        var pausedUploadIDs = saved?.pausedUploadIDs ?? []
+        var downloadDestinations = saved?.downloadDestinations ?? [:]
+        func importDownloadDestination(_ path: String, from checkpoints: [String: DownloadDestinationCheckpoint]?) {
+            // Retried and flattened files can inherit the selected ancestor's
+            // volume identity and bookmark without storing another exact key.
+            guard let anchor = checkpoints?.filter({
+                path == $0.key || path.hasPrefix($0.key + "/")
+            }).max(by: { $0.key.count < $1.key.count }) else { return }
+            if downloadDestinations[anchor.key] == nil {
+                downloadDestinations[anchor.key] = anchor.value
+            }
+        }
+        var cancelledDownloadCleanups = Set(saved?.cancelledDownloadCleanups ?? [])
+        var downloadRetryOrigins = saved?.downloadRetryOrigins ?? [:]
         var downloadKeys = Set(downloads.map(\.deduplicationKey))
         var uploadIDs = Set(uploads.map(\.id))
         var changed = false
         for session in try FileManager.default.contentsOfDirectory(at: sessions, includingPropertiesForKeys: nil).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
             let id = session.lastPathComponent
-            guard id != "primary", PikPakWorkspaceStorage.isValidSessionID(id), !imported.contains(id) else { continue }
+            guard id != "primary", PikPakWorkspaceStorage.isValidSessionID(id),
+                  !excludedWorkspaceSessions.contains(id), !imported.contains(id) else { continue }
             let legacy = TransferPersistenceStore(directory: session)
             guard let queue = try legacy.load(SavedTransfers.self, accountID: accountID) else { continue }
             guard queue.version == 1, queue.accountID == accountID else { throw CocoaError(.fileReadCorruptFile) }
@@ -45,15 +62,36 @@ struct TransferPersistenceStore {
                 }
                 uploads.append(upload)
             }
-            downloads.append(contentsOf: queue.downloads.filter { downloadKeys.insert($0.deduplicationKey).inserted })
+            let additionalDownloads = queue.downloads.filter { downloadKeys.insert($0.deduplicationKey).inserted }
+            downloads.append(contentsOf: additionalDownloads)
+            for request in queue.downloads {
+                let path = request.destinationURL.standardizedFileURL.path
+                importDownloadDestination(path, from: queue.downloadDestinations)
+            }
+            pausedDownloadIDs.formUnion(queue.pausedDownloadIDs ?? [])
+            pausedPendingDownloadIDs.formUnion(queue.pausedPendingDownloadIDs ?? [])
+            downloadRetryOrigins.merge(queue.downloadRetryOrigins ?? [:]) { existing, _ in existing }
+            pausedUploadIDs.formUnion(queue.pausedUploadIDs ?? [])
+            // A pause belonged to this window, not to every restored queue.
+            if queue.downloadsPaused == true {
+                pausedPendingDownloadIDs.formUnion(additionalDownloads.flatMap(\.pendingItems).map(\.id))
+            }
             cancelled.formUnion(queue.cancelledDownloads ?? [])
+            cancelledDownloadCleanups.formUnion(queue.cancelledDownloadCleanups ?? [])
+            for cleanup in queue.cancelledDownloadCleanups ?? [] {
+                let path = URL(fileURLWithPath: cleanup.destinationPath).standardizedFileURL.path
+                importDownloadDestination(path, from: queue.downloadDestinations)
+            }
             imported.insert(id); changed = true
         }
         guard changed else { return saved }
         let result = SavedTransfers(version: 1, accountID: accountID, downloads: downloads, uploads: uploads,
                                     cancelledDownloads: Array(cancelled), importedWorkspaceSessions: imported.sorted(),
-                                    downloadsPaused: saved?.downloadsPaused, pausedDownloadIDs: saved?.pausedDownloadIDs,
-                                    pausedPendingDownloadIDs: saved?.pausedPendingDownloadIDs, pausedUploadIDs: saved?.pausedUploadIDs)
+                                    downloadsPaused: saved?.downloadsPaused, pausedDownloadIDs: pausedDownloadIDs,
+                                    pausedPendingDownloadIDs: pausedPendingDownloadIDs, pausedUploadIDs: pausedUploadIDs,
+                                    downloadDestinations: downloadDestinations,
+                                    cancelledDownloadCleanups: Array(cancelledDownloadCleanups),
+                                    downloadRetryOrigins: downloadRetryOrigins)
         try save(result, accountID: accountID)
         return result
     }

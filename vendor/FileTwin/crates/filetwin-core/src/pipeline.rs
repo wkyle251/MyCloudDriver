@@ -15,6 +15,10 @@ const FETCHING: u8 = 1;
 const READING: u8 = 2;
 const ENCODING: u8 = 3;
 const WAITING: u8 = 4;
+const HASHING: u8 = 5;
+// More simultaneous seeks make external/network disks slower, regardless of
+// the decoder RAM allowance. Reading must also leave analysis workers free.
+const MAX_READERS: usize = 4;
 type Phase = Arc<AtomicU8>;
 type CacheKey = (String, String);
 
@@ -22,6 +26,7 @@ type CacheKey = (String, String);
 struct Bytes {
     read: AtomicU64,
     hashed: AtomicU64,
+    acquired: AtomicU64,
 }
 struct Staging {
     used: Mutex<u64>,
@@ -71,7 +76,7 @@ impl Staging {
         phase: &Phase,
     ) -> Result<Reservation> {
         loop {
-            cancel.check()?;
+            read_checkpoint(cancel)?;
             if bytes > self.limit.load(Ordering::Acquire) {
                 return Err(Error::new(ErrorCode::ResourceBudgetTooSmall, "memory", "The adjusted RAM budget cannot fit this input."));
             }
@@ -102,6 +107,7 @@ struct Input {
     phase: Phase,
     allowance: u64,
     handoff_original: bool,
+    analysis_started: bool,
 }
 impl Input {
     fn visual(&self) -> bool { matches!(self.record.family.as_deref(), Some("image" | "video")) }
@@ -122,10 +128,8 @@ impl Input {
     }
     fn fixed_bytes(&self) -> u64 { self.original_bytes().saturating_add(self.reader_copy_bytes()) }
     fn reservation_bytes(&self) -> u64 {
-        self.allowance.saturating_add(self.fixed_bytes()).saturating_sub(self.transferred_bytes())
-    }
-    fn return_original(&self) {
-        if self.handoff_original { if let Some(memory) = self.memory() { memory.return_to_download(); } }
+        let allowance = if self.record.error.is_some() { 1 << 20 } else { self.allowance };
+        allowance.saturating_add(self.fixed_bytes()).saturating_sub(self.transferred_bytes())
     }
     fn current(&self) -> bool {
         match (&self.file, &self.revision) {
@@ -175,12 +179,22 @@ fn unavailable(record: &mut FileRecord, error: Error) {
 
 enum Work {
     Read(EncodeSource, Phase),
+    Hash(Input),
     Text(Input),
 }
 enum Event {
     Read(Result<Input>, PathBuf),
+    Hash(Input, Result<()>),
     Text(Input, native::Outcome),
     Stopped,
+}
+
+fn read_checkpoint(cancel: &CancellationToken) -> Result<()> {
+    while cancel.is_paused() {
+        cancel.check()?;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cancel.check()
 }
 
 fn prepare(
@@ -190,9 +204,8 @@ fn prepare(
     staging: &Arc<Staging>,
     bytes: &Bytes,
     cancel: &CancellationToken,
-    analysis: &Arc<Staging>,
 ) -> Result<Input> {
-    cancel.check()?;
+    read_checkpoint(cancel)?;
     phase.store(FETCHING, Ordering::Release);
     let source = source.resolve(cancel)?;
     if source.memory.is_none() && !source.path.is_absolute() {
@@ -212,27 +225,30 @@ fn prepare(
     let mut prefix = [0u8; 4096];
     let n = file.read(&mut prefix)?;
     bytes.read.fetch_add(n as u64, Ordering::Relaxed);
+    if source.memory.is_none() { bytes.acquired.fetch_add(n as u64, Ordering::Relaxed); }
     file.seek(SeekFrom::Start(0))?;
     let (family, format) = detect_format(&prefix[..n], &source.path);
-    let excluded = family != "unknown"
-        && source
-            .families
-            .as_ref()
-            .is_some_and(|f| !f.iter().any(|v| v == family));
+    // A container's sniffed family is only a hint. Probe its streams before
+    // deciding whether it is audio or video, and constrain the worker profiles.
+    let excluded = family != "unknown" && source.families.as_ref().is_some_and(|families| {
+        if format == "media" {
+            !families.iter().any(|v| matches!(v.as_str(), "audio" | "video"))
+        } else {
+            !families.iter().any(|v| v == family)
+        }
+    });
     let native = !excluded && format != "utf8" && family != "unknown";
     let required = source_bytes.saturating_add(2 * protocol::MAX_RESPONSE as u64);
-    let needs_copy = native && source.memory.is_none();
+    let needs_copy = source.memory.is_none() && (native
+        || (config.memory_scheduling && !excluded && format == "utf8"));
     let overflow = needs_copy && required > staging.limit.load(Ordering::Acquire);
     let mut reservation = if needs_copy && !overflow {
         Some(staging.reserve(required, cancel, &phase)?)
     } else {
         None
     };
-    // Never hold analysis RAM while waiting for an original's RAM lease:
-    // a queued decoder may need the whole analysis budget to release one.
-    let analysis_reservation = if config.memory_scheduling {
-        Some(analysis.reserve((1 << 20).min(config.memory_bytes), cancel, &phase)?)
-    } else { None };
+    // Acquisition owns only Read RAM. Analysis reserves its allowance after
+    // this snapshot is complete, before the first hash calculation.
     let mut memory_copy = if needs_copy && !overflow && config.memory_staging {
         let mut data = Vec::new();
         data.try_reserve_exact(source_bytes as usize).map_err(|_| Error::new(ErrorCode::ResourceBudgetTooSmall, "memory", "Not enough RAM for the original; no disk copy was created"))?;
@@ -243,11 +259,14 @@ fn prepare(
     } else {
         None
     };
-    let mut hash = Sha256::new();
+    // In RAM scheduling mode acquisition only copies bytes. Hashing is a
+    // separate analysis job, admitted after transferring the original's lease.
+    let mut hash = (!config.memory_scheduling).then(Sha256::new);
     let mut buffer = [0u8; 65536];
     let mut size = 0u64;
-    loop {
-        cancel.check()?;
+    let acquire = !config.memory_scheduling || memory_copy.is_some() || staged.is_some();
+    while acquire {
+        read_checkpoint(cancel)?;
         let n = file.read(&mut buffer)?;
         if n == 0 {
             break;
@@ -256,9 +275,12 @@ fn prepare(
         if size > source_bytes {
             return Err(changed_error());
         }
-        hash.update(&buffer[..n]);
+        if let Some(hash) = &mut hash {
+            hash.update(&buffer[..n]);
+            bytes.hashed.fetch_add(n as u64, Ordering::Relaxed);
+        }
         bytes.read.fetch_add(n as u64, Ordering::Relaxed);
-        bytes.hashed.fetch_add(n as u64, Ordering::Relaxed);
+        if source.memory.is_none() { bytes.acquired.fetch_add(n as u64, Ordering::Relaxed); }
         if let Some(staged) = &mut staged { staged.write_all(&buffer[..n])?; }
         if let Some(copy) = &mut memory_copy {
             if size > source_bytes { return Err(changed_error()); }
@@ -268,9 +290,10 @@ fn prepare(
     if let Some(staged) = &mut staged {
         staged.flush()?;
     }
+    if acquire && size != source_bytes { return Err(changed_error()); }
     let mut record = blank(&source.key);
-    record.file_id = Some(format!("sha256:{:x}", hash.finalize()));
-    record.bytes = Some(size);
+    record.file_id = hash.map(|hash| format!("sha256:{:x}", hash.finalize()));
+    record.bytes = Some(if acquire { size } else { source_bytes });
     record.family = (family != "unknown").then(|| family.into());
     if excluded {
         unavailable(
@@ -313,9 +336,10 @@ fn prepare(
         staged: staged.map(Arc::new),
         memory_copy,
         _reservation: reservation,
-        analysis_reservation,
+        analysis_reservation: None,
         phase,
         handoff_original: config.memory_scheduling,
+        analysis_started: false,
         allowance: if config.memory_scheduling {
             if matches!(family, "image" | "video") || format == "media" { 512 << 20 } else { 128 << 20 }
         } else { config.memory_bytes / native::worker_count(config) as u64 },
@@ -336,11 +360,41 @@ fn prepare(
     Ok(input)
 }
 
+fn hash_input(mut input: Input, bytes: &Bytes, cancel: &CancellationToken) -> (Input, Result<()>) {
+    let result = (|| {
+        // Hash the RAM snapshot, never reread the network original after it
+        // has been acquired. The original and scratch allowance belong to
+        // Analysis RAM for this entire job and the following decoder job.
+        let mut memory = input.memory().cloned().map(Reader::memory);
+        let file = memory.as_mut().unwrap_or(&mut input.file);
+        file.seek(SeekFrom::Start(0))?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; 65536];
+        let mut size = 0u64;
+        loop {
+            cancel.check()?;
+            let n = file.read(&mut buffer)?;
+            if n == 0 { break; }
+            size += n as u64;
+            if size > input.record.bytes.unwrap() { return Err(changed_error()); }
+            hash.update(&buffer[..n]);
+            bytes.read.fetch_add(n as u64, Ordering::Relaxed);
+            bytes.hashed.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        if size != input.record.bytes.unwrap() { return Err(changed_error()); }
+        input.record.file_id = Some(format!("sha256:{:x}", hash.finalize()));
+        Ok(())
+    })();
+    (input, result)
+}
+
 fn text(mut input: Input, bytes: &Bytes, cancel: &CancellationToken) -> (Input, native::Outcome) {
     input.phase.store(ENCODING, Ordering::Release);
     let outcome = (|| -> native::Outcome {
-        input.file.seek(SeekFrom::Start(0))?;
-        match crate::text::encode(&mut input.file, false, &mut || cancel.check()) {
+        let mut memory = input.memory().cloned().map(Reader::memory);
+        let file = memory.as_mut().unwrap_or(&mut input.file);
+        file.seek(SeekFrom::Start(0))?;
+        match crate::text::encode(file, false, &mut || cancel.check()) {
             Ok(encoded) => {
                 bytes.read.fetch_add(encoded.bytes_read, Ordering::Relaxed);
                 Ok(protocol::Encoded {
@@ -368,8 +422,12 @@ struct Pipeline<'a> {
     grow_readers: &'a mut dyn FnMut(usize),
     external_cancel: &'a CancellationToken,
     cancel: CancellationToken,
+    read_cancel: CancellationToken,
+    reads_in_flight: usize,
+    finishing: bool,
     pool: Option<native::Pool>, // Stopped before native input leases are released.
     send: Option<mpsc::Sender<Work>>,
+    send_text: Option<mpsc::Sender<Work>>,
     receive: mpsc::Receiver<Event>,
     jobs: HashMap<PathBuf, Phase>,
     queued: VecDeque<Input>,
@@ -392,7 +450,9 @@ struct Pipeline<'a> {
 impl Drop for Pipeline<'_> {
     fn drop(&mut self) {
         self.cancel.cancel();
+        self.read_cancel.cancel();
         self.send.take();
+        self.send_text.take();
         self.pool.take();
     }
 }
@@ -412,12 +472,14 @@ impl Pipeline<'_> {
             waiting_reuse: self.waiters.values().map(|v| v.len() as u64).sum(),
             ready: self.queued.len() as u64,
             original_memory_bytes: if self.config.memory_staging { *self.staging.used.lock().unwrap() } else { 0 },
+            original_bytes_read: self.bytes.acquired.load(Ordering::Relaxed),
             ..WorkCounts::default()
         };
         for phase in self.jobs.values() {
             match phase.load(Ordering::Acquire) {
                 FETCHING => work.fetching += 1,
                 READING => work.reading += 1,
+                HASHING => work.hashing += 1,
                 ENCODING => work.encoding += 1,
                 WAITING => work.waiting_memory += 1,
                 _ => {}
@@ -430,9 +492,9 @@ impl Pipeline<'_> {
         let available = self.config.memory_bytes.saturating_sub(
             if self.config.memory_scheduling { self.analysis.used() } else { self.pool().memory_in_use() });
         for input in &self.queued {
-            if input.reservation_bytes() > available {
+            if input.analysis_reservation.is_none() && input.reservation_bytes() > available {
                 work.waiting_memory += 1;
-            } else if input.format != "utf8" && self.free_slot(input).is_none() {
+            } else if input.record.file_id.is_some() && input.format != "utf8" && self.free_slot(input).is_none() {
                 if input.visual() && self.config.backend == profile::Backend::Coreml {
                     work.waiting_accelerator += 1;
                 } else {
@@ -463,7 +525,8 @@ impl Pipeline<'_> {
         self.cancel.check()
     }
     fn send(&self, work: Work) -> Result<()> {
-        self.send.as_ref().unwrap().send(work).map_err(|_| {
+        let sender = match &work { Work::Read(..) => &self.send, Work::Hash(..) | Work::Text(..) => &self.send_text };
+        sender.as_ref().unwrap().send(work).map_err(|_| {
             Error::new(
                 ErrorCode::WorkerFailed,
                 "pipeline",
@@ -495,17 +558,16 @@ impl Pipeline<'_> {
                     record.clone(),
                 );
             }
-            FileState::Unsupported | FileState::Skipped => self.counts.files_skipped += 1,
-            FileState::Failed => self.counts.files_failed += 1,
+            FileState::Skipped => self.counts.files_skipped += 1,
+            FileState::Unsupported | FileState::Failed => self.counts.files_failed += 1,
         }
         self.records.push(record);
     }
     fn candidates(&self, input: &Input) -> Vec<String> {
         if input.format == "media" {
-            vec![
-                self.profiles["audio"].clone(),
-                self.profiles["video"].clone(),
-            ]
+            ["audio", "video"].into_iter()
+                .filter(|family| input.source.families.as_ref().is_none_or(|selected| selected.iter().any(|v| v == family)))
+                .map(|family| self.profiles[family].clone()).collect()
         } else {
             vec![self.profiles[input.record.family.as_deref().unwrap()].clone()]
         }
@@ -518,7 +580,7 @@ impl Pipeline<'_> {
     }
     fn adjust_allowance(&self, input: &mut Input) -> Result<()> {
         let available = self.config.memory_bytes.saturating_sub(input.fixed_bytes());
-        let minimum = if input.format == "utf8" { 1 << 20 }
+        let minimum = if input.record.error.is_some() || input.format == "utf8" { 1 << 20 }
             else if input.visual() || input.format == "media" { 512 << 20 }
             else { 128 << 20 };
         if minimum > available {
@@ -545,6 +607,10 @@ impl Pipeline<'_> {
         while let Some(mut input) = self.queued.pop_front() {
             match self.adjust_allowance(&mut input) {
                 Ok(()) => kept.push_back(input),
+                Err(error) if input.record.file_id.is_none() => {
+                    unavailable(&mut input.record, error);
+                    self.record(input.record.clone());
+                }
                 Err(error) => self.finish(input, Err(error)),
             }
         }
@@ -552,9 +618,8 @@ impl Pipeline<'_> {
         self.emit(true);
     }
     fn read(&mut self, mut input: Input) -> Result<()> {
-        // Reading and encoding have different costs. Release the read lease
-        // before queueing for a larger one so waiting files cannot deadlock.
-        input.analysis_reservation.take();
+        // A hashed input keeps its prepaid analysis allowance through decoding.
+        // Its original must never move back into the acquisition budget.
         if !input.current() {
             input.changed();
         }
@@ -589,6 +654,7 @@ impl Pipeline<'_> {
         }
         self.owners.insert(key);
         if input.format == "utf8" && !self.config.memory_scheduling {
+            input.phase.store(ENCODING, Ordering::Release);
             self.send(Work::Text(input))?;
         } else {
             // A reader may finish after a live edit using an older snapshot.
@@ -608,6 +674,11 @@ impl Pipeline<'_> {
             input.changed();
         } else {
             match outcome {
+                Ok(encoded) if input.source.families.as_ref().is_some_and(|selected| !selected.contains(&encoded.family)) => {
+                    let mut error = Error::new(ErrorCode::UnselectedFamily, "selection", "Detected media family was not selected");
+                    error.details = Box::new(serde_json::json!({"family":encoded.family}));
+                    unavailable(&mut input.record, error);
+                }
                 Ok(encoded) => {
                     input.record.state = FileState::Ready;
                     input.record.family = Some(encoded.family.clone());
@@ -639,11 +710,37 @@ impl Pipeline<'_> {
         while let Ok(event) = self.receive.try_recv() {
             self.check()?;
             match event {
-                Event::Read(Ok(input), _) => self.read(input)?,
-                Event::Read(Err(error), key) => {
-                    let mut record = blank(&key);
-                    unavailable(&mut record, error);
-                    self.record(record);
+                Event::Read(result, key) => {
+                    self.reads_in_flight = self.reads_in_flight.saturating_sub(1);
+                    if self.finishing {
+                        self.jobs.remove(&key);
+                        // Discard unfinished acquisitions, without reporting
+                        // cancellation as a failed file. Resume will retry them.
+                        continue;
+                    }
+                    match result {
+                        Ok(mut input) if self.config.memory_scheduling => {
+                            if let Err(error) = self.adjust_allowance(&mut input) {
+                                unavailable(&mut input.record, error);
+                                self.record(input.record.clone());
+                            } else {
+                                input.phase.store(WAITING, Ordering::Release);
+                                self.queued.push_back(input);
+                            }
+                        }
+                        Ok(input) => self.read(input)?,
+                        Err(error) => {
+                            let mut record = blank(&key);
+                            unavailable(&mut record, error);
+                            self.record(record);
+                        }
+                    }
+                }
+                Event::Hash(mut input, result) => {
+                    if let Err(error) = result {
+                        unavailable(&mut input.record, error);
+                        self.record(input.record.clone());
+                    } else { self.read(input)?; }
                 }
                 Event::Text(input, outcome) => self.finish(input, outcome),
                 Event::Stopped => {
@@ -661,12 +758,11 @@ impl Pipeline<'_> {
             // Decoder copies are gone after poll() stops the request's memory
             // server. Keep the original accounted for while waiting to retry.
             input.analysis_reservation.take();
-            input.return_original();
             if let Err(error) = &outcome {
                 // Borrow unused shared memory for readers that need more than
                 // the initial allowance. No other job's reservation is exceeded.
                 let decoder_limit = self.config.memory_bytes.saturating_sub(input.fixed_bytes());
-                if error.code == ErrorCode::ResourceBudgetTooSmall
+                if !self.finishing && error.code == ErrorCode::ResourceBudgetTooSmall
                     && input.allowance < decoder_limit
                     && input.current()
                 {
@@ -707,16 +803,17 @@ impl Pipeline<'_> {
         }
     }
     fn dispatch(&mut self) -> Result<()> {
-        // Return retry buffers when the download queue has room. If it filled
-        // meanwhile, their analysis leases remain alive with the original.
-        for input in &self.queued { input.return_original(); }
         loop {
             let available = self.config.memory_bytes.saturating_sub(if self.config.memory_scheduling { self.analysis.used() } else { self.pool().memory_in_use() });
             // A large original waiting for RAM must not block smaller ready
             // files that fit. Choose the oldest ready input that can run now.
-            let Some(index) = self.queued.iter().position(|input| input.reservation_bytes() <= available && (input.format == "utf8" || self.free_slot(input).is_some())) else { break; };
+            let Some(index) = self.queued.iter().position(|input| {
+                (!self.external_cancel.is_finishing() || input.analysis_started)
+                    && (input.analysis_reservation.is_some() || input.reservation_bytes() <= available)
+                    && (input.record.file_id.is_none() || input.format == "utf8" || self.free_slot(input).is_some())
+            }) else { break; };
             let mut input = self.queued.remove(index).unwrap();
-            if self.config.memory_scheduling {
+            if self.config.memory_scheduling && input.analysis_reservation.is_none() {
                 let Some(mut reservation) = self.analysis.try_reserve(input.reservation_bytes()) else {
                     // A reader may have acquired RAM since the fit check.
                     self.queued.insert(index, input);
@@ -729,13 +826,24 @@ impl Pipeline<'_> {
                 }
                 input.analysis_reservation = Some(reservation);
             }
+            if input.record.file_id.is_none() {
+                input.analysis_started = true;
+                input.phase.store(HASHING, Ordering::Release);
+                self.send(Work::Hash(input))?;
+                continue;
+            }
             if input.format == "utf8" {
                 input.phase.store(ENCODING, Ordering::Release);
                 self.send(Work::Text(input))?;
                 continue;
             }
             let target_slot = self.free_slot(&input).expect("Admitted native slot");
-            let family = input.record.family.as_deref().unwrap();
+            let profiles: BTreeMap<_, _> = self.profiles.iter()
+                .filter(|(family, _)| input.source.families.as_ref().is_none_or(|selected| selected.contains(family)))
+                .map(|(family, id)| (family.clone(), id.clone())).collect();
+            let family = if input.format == "media" {
+                if profiles.contains_key("video") { "video" } else { "audio" }
+            } else { input.record.family.as_deref().unwrap() };
             let mut runtime_config = self.config.clone();
             runtime_config.workers = 1;
             runtime_config.memory_bytes = input.allowance;
@@ -756,13 +864,8 @@ impl Pipeline<'_> {
                 path,
                 memory_input,
                 format: input.format.clone(),
-                profile_id: self.profiles[if input.format == "media" {
-                    "video"
-                } else {
-                    family
-                }]
-                .clone(),
-                profiles: self.profiles.clone(),
+                profile_id: self.profiles[family].clone(),
+                profiles,
                 model_dir: self.config.model_dir.clone(),
                 runtime: self.config.runtime.clone(),
                 memory_bytes: input.allowance,
@@ -785,7 +888,7 @@ impl Pipeline<'_> {
         // grow. If all jobs are waiting and neither pool can accept a retry,
         // report the shortage rather than deadlocking both queues indefinitely.
         if !self.queued.is_empty() && self.pool().active() == 0
-            && !self.jobs.values().any(|p| matches!(p.load(Ordering::Acquire), FETCHING | READING | ENCODING)) {
+            && !self.jobs.values().any(|p| matches!(p.load(Ordering::Acquire), FETCHING | READING | HASHING | ENCODING)) {
             let available = self.config.memory_bytes.saturating_sub(self.analysis.used());
             if !self.queued.iter().any(|input| input.reservation_bytes() <= available) {
                 if let Some(index) = self.queued.iter().rposition(|input| input.transferred_bytes() > 0) {
@@ -803,16 +906,33 @@ impl Pipeline<'_> {
         self.emit(true);
         loop {
             self.check()?;
+            if self.external_cancel.is_finishing() && !self.finishing {
+                self.finishing = true;
+                self.read_cancel.cancel();
+                self.queued.retain(|input| input.analysis_started);
+                self.jobs.retain(|key, phase| matches!(phase.load(Ordering::Acquire), HASHING | ENCODING)
+                    || self.queued.iter().any(|input| &input.source.key == key));
+            }
             self.drain()?;
+            if self.finishing {
+                self.dispatch()?;
+                // Only jobs already admitted to analysis are allowed to finish.
+                // Blocked network reads are abandoned, never joined here.
+                if self.jobs.is_empty() { break; }
+                std::thread::sleep(Duration::from_millis(2));
+                continue;
+            }
             if let Some(resources) = self.external_cancel.take_resources() { self.update_resources(resources); }
+            self.read_cancel.set_paused(self.external_cancel.is_paused());
             if self.external_cancel.is_paused() {
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
             self.dispatch()?;
-            while !complete && self.jobs.len() < self.pool().capacity() {
+            self.read_cancel.set_paused(self.external_cancel.is_paused());
+            while !complete && self.jobs.len() < self.pool().capacity() && self.reads_in_flight < MAX_READERS {
                 self.check()?;
-                if self.external_cancel.is_paused() { break; }
+                if self.external_cancel.is_paused() || self.external_cancel.is_finishing() { break; }
                 let source = match next()? {
                     EncodeSourcePoll::Pending => break,
                     EncodeSourcePoll::Complete => {
@@ -836,6 +956,7 @@ impl Pipeline<'_> {
                 let phase = Arc::new(AtomicU8::new(FETCHING));
                 self.jobs.insert(source.key.clone(), phase.clone());
                 self.counts.files_discovered += 1;
+                self.reads_in_flight += 1;
                 self.send(Work::Read(source, phase))?;
             }
             self.emit(false);
@@ -880,14 +1001,15 @@ pub(super) fn encode(
     if let Some(path) = &request.output_file {
         vector_file::validate_output(&local::resolve_root(path)?)?;
     }
-    let temporary = tempfile::Builder::new()
+    let temporary = Arc::new(tempfile::Builder::new()
         .prefix("filetwin-")
-        .tempdir_in(&config.temp_dir)?;
+        .tempdir_in(&config.temp_dir)?);
     let started = Instant::now();
     let mut config = config.clone();
     config.temp_dir = temporary.path().canonicalize()?;
     let mut final_work = WorkCounts::default();
-    let result = std::thread::scope(|scope| -> Result<VectorFile> {
+    let mut workers = Vec::new();
+    let result = (|| -> Result<VectorFile> {
         let capacity = native::worker_count(&config);
         let bytes = Arc::new(Bytes::default());
         let staging = Arc::new(Staging {
@@ -897,50 +1019,46 @@ pub(super) fn encode(
         let analysis = Arc::new(Staging { used: Mutex::new(0), limit: AtomicU64::new(config.memory_bytes) });
         let reader_config = Arc::new(RwLock::new(config.clone()));
         let cancel = CancellationToken::default();
-        let (send, receive_work) = mpsc::channel::<Work>();
+        let read_cancel = CancellationToken::default();
+        let (send, receive_read) = mpsc::channel::<Work>();
+        let receive_read = Arc::new(Mutex::new(receive_read));
+        let (send_text, receive_work) = mpsc::channel::<Work>();
         let receive_work = Arc::new(Mutex::new(receive_work));
         let (events, receive) = mpsc::channel();
+        let mut spawn_worker = |receive_work: Arc<Mutex<mpsc::Receiver<Work>>>, worker_cancel: CancellationToken| {
+            let events = events.clone();
+            let reader_config = reader_config.clone();
+            let staging = staging.clone();
+            let bytes = bytes.clone(); let temporary = temporary.clone();
+            workers.push(std::thread::spawn(move || {
+                let _temporary = temporary;
+                loop {
+                    let work = { receive_work.lock().unwrap().recv() };
+                    let Ok(work) = work else { break; };
+                    if worker_cancel.is_cancelled() { break; }
+                    let config = reader_config.read().unwrap().clone();
+                    let event = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match work {
+                        Work::Read(source, phase) => {
+                            let key = source.key.clone();
+                            Event::Read(prepare(source, phase, &config, &staging, &bytes, &worker_cancel), key)
+                        }
+                        Work::Hash(input) => {
+                            let (input, result) = hash_input(input, &bytes, &worker_cancel);
+                            Event::Hash(input, result)
+                        }
+                        Work::Text(input) => {
+                            let (input, outcome) = text(input, &bytes, &worker_cancel);
+                            Event::Text(input, outcome)
+                        }
+                    })).unwrap_or(Event::Stopped);
+                    if events.send(event).is_err() { break; }
+                }
+            }));
+        };
+        for _ in 0..MAX_READERS { spawn_worker(receive_read.clone(), read_cancel.clone()); }
         let mut reader_count = 0;
         let mut grow_readers = |wanted: usize| {
-            for _ in reader_count..wanted {
-                let receive_work = receive_work.clone();
-                let events = events.clone();
-                let cancel = cancel.clone();
-                let reader_config = reader_config.clone();
-                let staging = staging.clone();
-                let analysis = analysis.clone();
-                let bytes = bytes.clone();
-                scope.spawn(move || {
-                    loop {
-                        let work = { receive_work.lock().unwrap().recv() };
-                        let Ok(work) = work else {
-                            break;
-                        };
-                        if cancel.is_cancelled() {
-                            break;
-                        }
-                        let config = reader_config.read().unwrap().clone();
-                        let event =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match work {
-                                Work::Read(source, phase) => {
-                                    let key = source.key.clone();
-                                    Event::Read(
-                                        prepare(source, phase, &config, &staging, &bytes, &cancel, &analysis),
-                                        key,
-                                    )
-                                }
-                                Work::Text(input) => {
-                                    let (input, outcome) = text(input, &bytes, &cancel);
-                                    Event::Text(input, outcome)
-                                }
-                            }))
-                            .unwrap_or(Event::Stopped);
-                        if events.send(event).is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
+            for _ in reader_count..wanted { spawn_worker(receive_work.clone(), cancel.clone()); }
             reader_count = reader_count.max(wanted);
         };
         grow_readers(capacity);
@@ -956,8 +1074,10 @@ pub(super) fn encode(
             grow_readers: &mut grow_readers,
             external_cancel,
             cancel: cancel.clone(),
+            read_cancel: read_cancel.clone(), reads_in_flight: 0, finishing: false,
             pool: Some(native::Pool::new(&config)),
             send: Some(send),
+            send_text: Some(send_text),
             receive,
             jobs: HashMap::new(),
             queued: VecDeque::new(),
@@ -988,7 +1108,7 @@ pub(super) fn encode(
             format: VECTOR_FILE_FORMAT.into(),
             schema_version: SCHEMA_VERSION,
             directory: FilePath::from_path(&root),
-            complete: !cancelled,
+            complete: !cancelled && !pipeline.finishing,
             files,
             summary: Summary {
                 counts: pipeline.counts.clone(),
@@ -998,14 +1118,18 @@ pub(super) fn encode(
                 cancelled,
             },
         })
-    });
-    temporary.close().map_err(|e| {
-        Error::new(
-            ErrorCode::IoError,
-            "cleanup",
-            format!("Cannot remove temporary processing data: {e}"),
-        )
-    })?;
+    })();
+    // Cooperative workers normally stop immediately. Never let a kernel read
+    // on an unavailable share hold Finish/Cancel indefinitely. Detached workers
+    // retain their input and private directory until they can exit safely.
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while workers.iter().any(|w| !w.is_finished()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    for worker in workers {
+        if worker.is_finished() { let _ = worker.join(); }
+    }
+    drop(temporary);
     let mut result = result?;
     result.summary.elapsed_seconds = started.elapsed().as_secs_f64();
     progress(&Progress {
@@ -1017,6 +1141,7 @@ pub(super) fn encode(
         counts: result.summary.counts.clone(),
         work: Some(WorkCounts { memory_scheduling: final_work.memory_scheduling,
             worker_limit: final_work.worker_limit, memory_limit: final_work.memory_limit,
+            original_bytes_read: final_work.original_bytes_read,
             accelerator_limit: final_work.accelerator_limit, ..WorkCounts::default() }),
         elapsed_seconds: result.summary.elapsed_seconds,
     });

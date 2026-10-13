@@ -85,6 +85,9 @@ enum MediaBuffering {
     @Published private(set) var phase = Phase.loading
     @Published private(set) var wantsPlayback = false
     @Published private(set) var bufferedRanges: [ClosedRange<Double>] = []
+    /// What a RAM buffer holds, for a file read from an external disk. While set, the seek bar's lighter
+    /// shading shows these ranges instead of AVPlayer's, which only says what the player has asked for.
+    @Published private(set) var memoryBuffer: PreviewResourceCacheSnapshot?
     private var observations: [NSKeyValueObservation] = []
     private var timeObserver: Any?
     private var timeObserverPlayer: AVPlayer?
@@ -114,7 +117,7 @@ enum MediaBuffering {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }; endObserver = nil
         player?.pause()
         seekID = UUID(); pendingSeek = nil
-        player = next; position = 0; duration = 0; bufferedRanges = []; wantsPlayback = false; phase = .loading
+        player = next; position = 0; duration = 0; bufferedRanges = []; memoryBuffer = nil; wantsPlayback = false; phase = .loading
         guard let next, let item = next.currentItem else { return }
         // Inline previews must render here even when another player has left
         // an external video route active on the system.
@@ -143,6 +146,20 @@ enum MediaBuffering {
         refresh()
     }
 
+    /// Byte ranges mapped proportionally onto the track, so they need no known duration; approximate for variable bitrates.
+    func updateMemoryBuffer(_ snapshot: PreviewResourceCacheSnapshot?) {
+        memoryBuffer = snapshot
+        if let snapshot { if snapshot.normalizedRanges != bufferedRanges { bufferedRanges = snapshot.normalizedRanges } }
+        else if player != nil { refresh() }
+        else { bufferedRanges = [] }
+    }
+    var bufferHelp: String? {
+        guard let memoryBuffer else { return nil }
+        let amount = { (bytes: Int64) in ByteCountFormatter.string(fromByteCount: bytes, countStyle: .memory) }
+        let total = memoryBuffer.contentLength.map { " of \(amount($0))" } ?? ""
+        return "In memory: \(amount(memoryBuffer.cachedBytes))\(total)."
+    }
+
     private func apply(_ values: MediaPlaybackSettings.Values) {
         guard let player else { return }
         player.volume = Float(values.volume); player.isMuted = values.muted
@@ -156,7 +173,8 @@ enum MediaBuffering {
         duration = total.isFinite && total > 0 ? total : 0
         let current = pendingSeek ?? player.currentTime().seconds
         position = current.isFinite ? max(0, duration > 0 ? min(current, duration) : current) : 0
-        let loaded = MediaBuffering.normalizedRanges(item.loadedTimeRanges.map(\.timeRangeValue), duration: duration)
+        let loaded = memoryBuffer?.normalizedRanges
+            ?? MediaBuffering.normalizedRanges(item.loadedTimeRanges.map(\.timeRangeValue), duration: duration)
         if loaded != bufferedRanges { bufferedRanges = loaded }
         if item.status == .failed { phase = .failed; wantsPlayback = false }
         else if item.status != .readyToPlay { phase = .loading }

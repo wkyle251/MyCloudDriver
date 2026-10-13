@@ -119,11 +119,15 @@ pub(crate) fn detect_format(bytes: &[u8], path: &Path) -> (&'static str, &'stati
                 | "mp2" | "wma" | "ape" | "wv" | "caf" | "au" | "amr" | "ac3" | "eac3" | "dts"
                 | "aif" | "m4b" | "ra",
             ) => ("audio", "media"),
-            _ if !bytes.contains(&0) && match std::str::from_utf8(bytes) {
-                Ok(_) => true,
-                // The prefix may end part-way through a valid UTF-8 scalar.
-                Err(error) => error.error_len().is_none(),
-            } => ("text", "utf8"),
+            _ if !bytes.contains(&0)
+                && match std::str::from_utf8(bytes) {
+                    Ok(_) => true,
+                    // The prefix may end part-way through a valid UTF-8 scalar.
+                    Err(error) => error.error_len().is_none(),
+                } =>
+            {
+                ("text", "utf8")
+            }
             _ => ("unknown", "binary"),
         }
     }

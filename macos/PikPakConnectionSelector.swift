@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Connection and quota scope stay together; content download routing has its
-/// own existing control below Workspaces.
+/// Connection and quota scope stay together; previews and scans have their own
+/// content-mode control below Workspaces. Downloads always use Dynamic Mode.
 struct PikPakConnectionSelector: View {
     @ObservedObject var model: DownloaderModel
     @ObservedObject var monitor: PikPakTransferQuotaMonitor
@@ -21,8 +21,8 @@ struct PikPakConnectionSelector: View {
                             .foregroundStyle(.secondary)
                     }
                     HStack(spacing: 5) {
-                        Circle().fill(model.hasAccountSession ? FinderAppearance.accent : Color.orange).frame(width: 5, height: 5)
-                        Text(model.isChangingAccount ? "Switching…" : model.hasAccountSession ? model.activeCredentialKind.loginTitle : "Sign-in required")
+                        Circle().fill(model.hasAccountSession && model.accountConnectionStatus != .verificationRequired ? FinderAppearance.accent : Color.orange).frame(width: 5, height: 5)
+                        Text(model.isChangingAccount ? "Switching…" : model.accountConnectionStatus == .verificationRequired ? "Verification required" : model.hasAccountSession ? model.activeCredentialKind.loginTitle : "Sign-in required")
                             .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
                     }
                 }.padding(9).frame(maxWidth: .infinity, alignment: .leading)
@@ -36,6 +36,11 @@ struct PikPakConnectionSelector: View {
                 .popover(isPresented: $isPresented, arrowEdge: .top) { choices }
             if let error = model.accountSettingsError {
                 Text(error).font(.caption2).foregroundStyle(.orange).lineLimit(3).help(error)
+            }
+            if model.requestVerificationChallenge != nil {
+                Button(model.isVerifyingRequest ? "Verifying…" : "Verify Request…", action: model.beginRequestVerification)
+                    .font(.caption).disabled(model.isVerifyingRequest)
+                if model.isVerifyingRequest { Button("Cancel Verification", action: model.cancelRequestVerification).font(.caption) }
             }
         }
     }
@@ -78,7 +83,7 @@ struct PikPakConnectionSelector: View {
             if let reason = model.accountChangeBlockedReason {
                 Text(reason).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
-            Text("Both logins stay saved. The selected connection is used for account requests, downloads, previews and scans; Download Mode controls guest access.")
+            Text("Both logins stay saved. The selected connection handles account access. Downloads always use Dynamic Mode: Guest first, then this connection for the remaining bytes. Preview & Scan Mode controls other content access.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Divider()
             HStack {

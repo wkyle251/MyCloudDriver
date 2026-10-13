@@ -32,6 +32,10 @@ signal-hook = "0.3"
 tempfile = "3"
 zstd = "0.13"
 memmap2 = "0.9"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"

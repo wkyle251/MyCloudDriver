@@ -94,11 +94,10 @@ async fn parallel_ram_pause_retains_pieces_and_releases_connections() {
     let item = item();
     let pause = async {
         tokio::time::timeout(Duration::from_secs(15), async {
-            while fetches.download_progress()["items"][0]["received"]
-                .as_u64()
-                .unwrap_or(0)
-                < 20 << 20
-            {
+            // Fast loopback pieces can all finish within the UI's 250 ms
+            // publication interval, then wait on the held first piece. Wait
+            // for actual received bytes rather than stale presentation state.
+            while fetches.received_bytes.load(Ordering::Acquire) < 20 << 20 {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
@@ -107,7 +106,11 @@ async fn parallel_ram_pause_retains_pieces_and_releases_connections() {
         fetches.control.set_paused(true);
         tokio::time::sleep(Duration::from_millis(100)).await;
         let held = fetches.memory.used();
-        assert_eq!(Network::for_url(&fixture.url).active(), 0, "Paused ranges kept the shared sockets");
+        assert_eq!(
+            Network::for_url(&fixture.url).active(),
+            0,
+            "Paused ranges kept the shared sockets"
+        );
         let progress = fetches.download_progress()["items"][0]["received"]
             .as_u64()
             .unwrap();
@@ -129,8 +132,15 @@ async fn parallel_ram_pause_retains_pieces_and_releases_connections() {
     let input = result.unwrap();
     assert_input(&input, 1);
     assert!(fixture.peak.load(Ordering::Acquire) >= 2);
-    assert!(fixture.requests.lock().unwrap().iter().any(|request| request.start > 0 && request.start < 16 << 20),
-        "Resume did not continue the retained first piece");
+    assert!(
+        fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.start > 0 && request.start < 16 << 20),
+        "Resume did not continue the retained first piece"
+    );
     assert_eq!(
         fixture
             .requests

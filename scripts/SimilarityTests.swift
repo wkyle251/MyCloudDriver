@@ -165,6 +165,8 @@ import Foundation
         cancelled.cancel()
         try await settle()
         precondition(cancelledAttempts == 0, "Cancel Scan must stop a pending automatic resume")
+        precondition(!cancelled.isPaused && !cancelled.interrupted && cancelled.report?.status == "cancelled",
+                     "Cancelling an interrupted scan must open its report even without a live helper")
         print("PASS interrupted scans retry beyond the final backoff, reset on progress and obey user intent")
 
         // Engine status notes must never mask or replace a real failure.
@@ -288,18 +290,24 @@ import Foundation
         let cancelDeadline = Date().addingTimeInterval(20)
         while scan.isRunning && Date() < cancelDeadline { try await Task.sleep(nanoseconds: 50_000_000) }
         precondition(!scan.isRunning && scan.error == nil)
-        if (scan.report?.analysedFiles ?? 0) > 0 {
-            precondition(!(scan.report?.files?.isEmpty ?? true), "Cancelled scans must preserve the analysed file inventory")
-        }
+        precondition(scan.report?.status == "cancelled" && scan.report?.analysedFiles == 1,
+                     "Cancel must open the partial report instead of remaining paused")
+        precondition(scan.report?.files?.contains(where: { $0.id == "streamed-text" }) == true,
+                     "Cancelled scans must preserve the analysed file inventory")
+        precondition(scan.report?.coverage.contains("incomplete") == true)
         precondition(activity.tasks.first(where: { $0.kind == .similarityLocal })?.state == .cancelled)
-        precondition(scan.isPaused && scan.savedSession != nil, "Cancel retains a resumable scan")
-        precondition(scan.retainsOriginalsInRAM && scan.processIdentifier != nil, "Cancel must keep the RAM-owning helper")
+        precondition(!scan.isPaused && scan.savedSession?.state == "cancelled", "Cancel opens results and retains a resumable checkpoint")
+        precondition(!scan.retainsOriginalsInRAM && scan.processIdentifier == nil, "Cancel must finish the helper before opening its report")
+        precondition(scan.autoResumeDeadline == nil && !scan.isAutoResuming)
+        while scan.results.isIndexing { try await Task.sleep(nanoseconds:10_000_000) }
+        precondition(scan.results.index?.files.count == 1, "The partial inventory must be available in the results browser")
+        precondition(SimilaritySessionStore.loadReport(scan.resultConfiguration!,id:scan.savedSession!.id)?.status == "cancelled")
         scan.clearSession()
         for _ in 0..<500 { if scan.processIdentifier == nil { break }; try await Task.sleep(nanoseconds:20_000_000) }
         precondition(scan.processIdentifier == nil)
         let cancelledLeftovers = try manager.contentsOfDirectory(atPath: root.appendingPathComponent("temporary").path)
         precondition(cancelledLeftovers.isEmpty)
-        print("PASS Cancel keeps the helper and progress; Clear stops providers and removes temporary metadata")
+        print("PASS Cancel opens the saved partial report, stops providers and removes temporary copies; Clear removes saved results")
         scan.detachPausedForRecovery()
 
         // Exercise the Photos transport with synthetic bytes, without opening

@@ -334,7 +334,7 @@ impl Connections {
         self.limit = if self.proven_gain || self.limit < INITIAL_CONNECTIONS {
             self.limit.saturating_mul(2)
         } else {
-            self.limit + (self.limit / 4).max(2)
+            self.limit.saturating_add((self.limit / 4).max(2))
         }
         .min(self.ceiling)
         .min(self.resource_limit);

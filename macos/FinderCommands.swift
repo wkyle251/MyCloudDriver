@@ -44,12 +44,16 @@ struct FinderWindowActions {
     var trashTitle = "Move Selected Items to Trash"
     var emptyTitle = "Remove Empty Folders…"
     var mergeTitle = "Merge Selected Folders…"
-    var supportsLinks = true
     var supportsPikPakManagement = false
+    var supportsDiskTrash = false
+    var workspaceSections: [FinderWorkspaceSection] {
+        supportsPikPakManagement ? FinderWorkspaceSection.allCases
+            : supportsDiskTrash ? FinderWorkspaceSection.standard + [.trash] : FinderWorkspaceSection.standard
+    }
     var canToggleFolder = false
     var toggleFolderTitle = "Expand or Collapse Folder"
     var toggleFolder: () -> Void = {}
-    var isFileWorkspace: Bool { section == 0 || section == 3 }
+    var isFileWorkspace: Bool { section == 0 || section == 3 || section == FinderWorkspaceSection.bookmarks.rawValue }
 }
 
 private struct FinderWindowActionsKey: FocusedValueKey {
@@ -141,11 +145,9 @@ struct FinderCommands: Commands {
                 else { sessions?.presentSimilarity() }
             }
                 .disabled(actions == nil && sessions?.canPresentSimilarity != true)
-            Button("Check for Duplicates") { actions?.checkDuplicates() }
+            Button("Check Duplicates Across Drives…") { sessions?.activeHub.presentCrossDriveDuplicates() }
                 .keyboardShortcut("d", modifiers: [.command, .shift])
-                .disabled(actions?.canCheckDuplicates != true)
-            Button("Review Duplicate Results…") { actions?.reviewDuplicates() }
-                .disabled(actions?.canReviewDuplicates != true)
+                .disabled(sessions?.activeHub.pikpak.canCheckCrossDriveDuplicates != true)
             Button(actions?.emptyTitle ?? "Remove Empty Folders…") { actions?.removeEmptyFolders() }
                 .disabled(actions?.canRemoveEmptyFolders != true)
             Button("Remove .DS_Store Files…") { actions?.removeDSStoreFiles() }
@@ -206,10 +208,10 @@ struct FinderCommands: Commands {
                 .keyboardShortcut("[", modifiers: .command)
                 .disabled(actions?.canGoBack != true)
             Divider()
-            ForEach(actions?.supportsPikPakManagement == true ? FinderWorkspaceSection.allCases : FinderWorkspaceSection.standard) { section in
+            ForEach(actions?.workspaceSections ?? FinderWorkspaceSection.standard) { section in
                 Button(section.title) { actions?.selectSection(section.rawValue) }
                     .keyboardShortcut(KeyEquivalent(Character(String(section.shortcut))), modifiers: [.command, .control])
-                    .disabled(actions == nil || (section.rawValue == 3 && actions?.supportsLinks != true))
+                    .disabled(actions == nil)
             }
         }
     }

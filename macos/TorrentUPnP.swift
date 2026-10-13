@@ -32,7 +32,7 @@ enum TorrentIPv4 {
 /// UPnP and no NAT-PMP — so a client speaking only one reports perfectly capable
 /// routers as offering no port mapping at all.
 enum TorrentUPnP {
-    struct Gateway: Equatable {
+    struct Gateway: Equatable, Sendable {
         /// Absolute SOAP endpoint, resolved against the description's own URL.
         let control: URL
         /// The exact serviceType string, which every SOAPAction must echo back.
@@ -54,7 +54,8 @@ enum TorrentUPnP {
         let parser = XMLParser(data: data)
         parser.delegate = reader
         guard parser.parse(), let found = reader.found,
-              let control = URL(string: found.path, relativeTo: location)?.absoluteURL else { return nil }
+              let control = URL(string: found.path, relativeTo: location)?.absoluteURL,
+              ["http", "https"].contains(control.scheme?.lowercased() ?? ""), control.host != nil else { return nil }
         return Gateway(control: control, service: found.service)
     }
 
@@ -64,7 +65,7 @@ enum TorrentUPnP {
         let reader = ValueReader(wanted: name)
         let parser = XMLParser(data: data)
         parser.delegate = reader
-        parser.parse()
+        guard parser.parse() else { return nil }
         return reader.found
     }
 
@@ -137,8 +138,8 @@ enum TorrentUPnP {
     /// Locates the gateway: SSDP for the description URL, then fetch and parse it.
     static func gateway(session: URLSession = .shared) async -> Gateway? {
         guard let location = search() else { return nil }
-        guard let data = try? await session.data(from: location).0 else { return nil }
-        return gateway(describedBy: data, at: location)
+        guard let reply = await boundedReply(URLRequest(url: location), session: session), (200..<300).contains(reply.status) else { return nil }
+        return gateway(describedBy: reply.data, at: location)
     }
 
     /// One SSDP M-SEARCH, returning the first gateway's description URL.
@@ -194,40 +195,99 @@ enum TorrentUPnP {
 
     /// Sends one action. Returns the reply body, or nil on transport failure.
     /// A SOAP fault still returns its body so the caller can read `errorCode`.
+    struct Reply: Sendable {
+        let status: Int
+        let data: Data
+    }
+    private final class SOAPReader: NSObject, XMLParserDelegate {
+        private let action: String, service: String
+        private let soap = "http://schemas.xmlsoap.org/soap/envelope/"
+        private var path: [(String, String?)] = []
+        private var errorDepth: Int?
+        private var error = ""
+        private(set) var responded = false, fault = false
+        var errorCode: String? { fault && !error.isEmpty ? error.trimmingCharacters(in: .whitespacesAndNewlines) : nil }
+        init(action: String, service: String) { self.action = action; self.service = service }
+        func parser(_ parser: XMLParser, didStartElement name: String, namespaceURI: String?, qualifiedName: String?, attributes: [String: String]) {
+            path.append((name, namespaceURI))
+            let body = path.count >= 3 && path[0].0 == "Envelope" && path[0].1 == soap && path[1].0 == "Body" && path[1].1 == soap
+            if body && path.count == 3 {
+                responded = responded || (name == action + "Response" && namespaceURI == service)
+                fault = fault || (name == "Fault" && namespaceURI == soap)
+            }
+            if fault && body && name == "errorCode" { errorDepth = path.count; error = "" }
+        }
+        func parser(_ parser: XMLParser, foundCharacters string: String) { if errorDepth != nil { error += string } }
+        func parser(_ parser: XMLParser, didEndElement name: String, namespaceURI: String?, qualifiedName: String?) {
+            if errorDepth == path.count { errorDepth = nil }
+            path.removeLast()
+        }
+    }
+    private static func parsed(_ reply: Reply, action: String, gateway: Gateway) -> (ok: Bool, code: String?) {
+        let reader = SOAPReader(action: action, service: gateway.service)
+        let parser = XMLParser(data: reply.data)
+        parser.shouldProcessNamespaces = true; parser.delegate = reader
+        guard parser.parse() else { return (false, nil) }
+        return ((200..<300).contains(reply.status) && reader.responded && !reader.fault, reader.errorCode)
+    }
     static func send(_ action: String, to gateway: Gateway, body: String = "",
-                     session: URLSession = .shared) async -> Data? {
+                     session: URLSession = .shared) async -> Reply? {
         var request = URLRequest(url: gateway.control)
         request.httpMethod = "POST"
         request.timeoutInterval = 8
         request.setValue("text/xml; charset=\"utf-8\"", forHTTPHeaderField: "Content-Type")
         request.setValue("\"\(gateway.service)#\(action)\"", forHTTPHeaderField: "SOAPAction")
         request.httpBody = Data(envelope(action: action, service: gateway.service, body: body).utf8)
-        return try? await session.data(for: request).0
+        return await boundedReply(request, session: session)
+    }
+
+    /// Router replies are small. Read incrementally so an endless or excessive
+    /// body cannot hold Stop open or consume unbounded retained memory.
+    private static func boundedReply(_ original: URLRequest, session: URLSession) async -> Reply? {
+        var request = original; request.timeoutInterval = 8
+        let deadline = ProcessInfo.processInfo.systemUptime + 8
+        do {
+            let (bytes, response) = try await session.bytes(for: request)
+            defer { bytes.task.cancel() }
+            guard let http = response as? HTTPURLResponse else { return nil }
+            var data = Data(); data.reserveCapacity(4096)
+            for try await byte in bytes {
+                guard data.count < 512 * 1024, ProcessInfo.processInfo.systemUptime < deadline, !Task.isCancelled else { return nil }
+                data.append(byte)
+            }
+            return Reply(status: http.statusCode, data: data)
+        } catch { return nil }
     }
 
     static func externalAddress(of gateway: Gateway, session: URLSession = .shared) async -> String? {
-        guard let data = await send("GetExternalIPAddress", to: gateway, session: session) else { return nil }
-        return value("NewExternalIPAddress", in: data)
+        guard let reply = await send("GetExternalIPAddress", to: gateway, session: session),
+              parsed(reply, action: "GetExternalIPAddress", gateway: gateway).ok else { return nil }
+        return value("NewExternalIPAddress", in: reply.data)
     }
 
     /// Maps one port. Falls back to a permanent mapping when the gateway refuses
     /// a finite lease — error 725, which some firmware returns for any non-zero value.
     static func addMapping(_ gateway: Gateway, port: UInt16, proto: String, client: String,
                            lease: UInt32, session: URLSession = .shared) async -> Bool {
+        await mappingLease(gateway, port: port, proto: proto, client: client, lease: lease, session: session) != nil
+    }
+
+    /// The accepted lifetime, including zero for firmware's permanent fallback.
+    static func mappingLease(_ gateway: Gateway, port: UInt16, proto: String, client: String,
+                             lease: UInt32, session: URLSession = .shared) async -> UInt32? {
         func attempt(_ duration: UInt32) async -> (ok: Bool, code: String?) {
             let body = "<NewRemoteHost></NewRemoteHost><NewExternalPort>\(port)</NewExternalPort>" +
                        "<NewProtocol>\(proto)</NewProtocol><NewInternalPort>\(port)</NewInternalPort>" +
                        "<NewInternalClient>\(client)</NewInternalClient><NewEnabled>1</NewEnabled>" +
                        "<NewPortMappingDescription>MyCloudDriver</NewPortMappingDescription>" +
                        "<NewLeaseDuration>\(duration)</NewLeaseDuration>"
-            guard let data = await send("AddPortMapping", to: gateway, body: body, session: session) else { return (false, nil) }
-            let code = value("errorCode", in: data)
-            return (code == nil, code)
+            guard let reply = await send("AddPortMapping", to: gateway, body: body, session: session) else { return (false, nil) }
+            return parsed(reply, action: "AddPortMapping", gateway: gateway)
         }
         let first = await attempt(lease)
-        if first.ok { return true }
-        guard first.code == "725" else { return false }
-        return await attempt(0).ok
+        if first.ok { return lease }
+        guard first.code == "725", !Task.isCancelled else { return nil }
+        return await attempt(0).ok ? 0 : nil
     }
 
     static func deleteMapping(_ gateway: Gateway, port: UInt16, proto: String,

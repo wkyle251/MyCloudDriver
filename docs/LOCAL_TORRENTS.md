@@ -6,7 +6,8 @@ metadata. Then select files and choose **This Mac** or **PikPak · RAM only**.
 A separate folder is created for each torrent.
 
 The transfer card and magnet-loading dialog refresh connected peers, seeds and
-download/upload speeds every ten seconds, including while the file list is loading.
+download/upload speeds every 30 seconds, including while the file list is loading.
+Total and per-peer speeds refresh together.
 An idle transfer shows `0 B/s`. Peer counts describe current connections to this
 Mac (including seeds), not the total swarm; zero connected peers does not mean
 the torrent has no peers elsewhere.

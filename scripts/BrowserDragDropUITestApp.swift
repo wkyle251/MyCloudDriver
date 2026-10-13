@@ -8,7 +8,9 @@ struct BrowserDragDropUITestApp: App {
     @StateObject private var model = DownloaderModel.browserDropUIFixture()
     @State private var transferTab = "Browser"
     private let fixtureURL: URL = {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("pikpak-ui-drop-fixture.txt")
+        let directory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("pikpak-ui-drop-\(UUID().uuidString)")
+        try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let url = directory.appendingPathComponent("fixture.txt")
         try? Data("Offline drag and drop fixture. No upload is performed.".utf8).write(to: url)
         return url
     }()
@@ -80,6 +82,9 @@ struct BrowserDragDropUITestApp: App {
                 Text(model.status).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                     .padding(12).background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
             }.padding(24)
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+                    model.stopForWindowClose(); try? FileManager.default.removeItem(at: fixtureURL.deletingLastPathComponent())
+                }
         }.defaultSize(width: 980, height: 620)
     }
 }

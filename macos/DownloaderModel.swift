@@ -549,6 +549,8 @@ private struct ShareSaveResult: Codable {
     let restoreTaskId: String?
     let savedCount: Int
     let cacheParentIds: [String]?
+    let skippedDuplicateCount: Int?
+    let duplicateCacheRefreshNeeded: Bool?
 }
 
 struct ShareDownloadRoot: Codable {
@@ -576,6 +578,7 @@ struct PendingDownloadItem: Identifiable, Equatable {
     let destinationPath: String
     let kind: BrowserItemKind
     let isShared: Bool
+    let knownSize: UInt64?
 
     var isFolder: Bool { kind == .folder }
 }
@@ -670,6 +673,9 @@ struct SavedTransfers: Codable {
     var pausedDownloadIDs: Set<String>? = nil
     var pausedPendingDownloadIDs: Set<UUID>? = nil
     var pausedUploadIDs: Set<String>? = nil
+    var downloadDestinations: [String: DownloadDestinationCheckpoint]? = nil
+    var cancelledDownloadCleanups: [SavedDownloadPartialCleanup]? = nil
+    var downloadRetryOrigins: [UUID: UUID]? = nil
 }
 
 private struct ShareDownloadInput: Codable {
@@ -982,6 +988,10 @@ struct DuplicateFile: Codable, Hashable, Identifiable {
     let path: String
     let size: UInt64
     let modifiedTime: String?
+    var source: String? = nil
+    var folderCreatedTime: String? = nil
+    var localIdentity: DuplicateLocalIdentity? = nil
+    var isLocal: Bool { source == "local" || localIdentity != nil }
 }
 
 struct DuplicateGroup: Codable, Identifiable {
@@ -1149,13 +1159,65 @@ struct DownloadTransfer: Identifiable, Equatable {
     /// complete parent selection.
     var remotePath: String? = nil
     var outputDirectoryPath: String? = nil
+    /// A recovered publication can have a different local name. Keep its
+    /// actual location separate from the source name and retry destination.
+    var outputFilePath: String? = nil
     var isShared: Bool = false
     var bytesPerSecond: Double = 0
     var error: String? = nil
+    var sourceCleanupMessage: String? = nil
+    var sourceCleanupFailed = false
+    /// Why the helper judged this file can never be fetched (deleted, moved or replaced in the cloud), and how
+    /// many consecutive attempts reported it. One report is only a suspicion; see `finalFailureReason`.
+    var permanentReason: String? = nil
+    var permanentReports = 0
+
+    /// Consecutive reports of the same permanent cause before a file stops retrying and moves to Failed.
+    static let permanentConfirmations = 3
+    static let missingSourceReason = "Older failure without source details; download its folder again"
+
+    /// Rows from before the app saved a file's source and destination cannot be retried one by one.
+    var lacksSourceDetails: Bool {
+        (remotePath ?? "").isEmpty || (outputDirectoryPath ?? "").isEmpty
+    }
+
+    /// The only reasons a failed file leaves Retry for Failed; everything else keeps retrying.
+    var finalFailureReason: String? {
+        guard state == .failed else { return nil }
+        if permanentReports >= Self.permanentConfirmations, let permanentReason { return permanentReason }
+        return lacksSourceDetails ? Self.missingSourceReason : nil
+    }
 
     var fraction: Double? {
         guard totalBytes > 0 else { return nil }
         return min(Double(downloadedBytes) / Double(totalBytes), 1)
+    }
+
+    static func validatedOutputFilePath(_ path: String?) -> String? {
+        guard let path, path.hasPrefix("/"), !path.utf8.contains(0) else { return nil }
+        let url = URL(fileURLWithPath: path, isDirectory: false).standardizedFileURL
+        guard url.path != "/" else { return nil }
+        return url.path
+    }
+
+    private var originalOutputFileURL: URL? {
+        guard let directory = outputDirectoryPath, directory.hasPrefix("/"), !directory.utf8.contains(0) else { return nil }
+        return URL(fileURLWithPath: directory, isDirectory: true)
+            .appendingPathComponent((name as NSString).lastPathComponent, isDirectory: false)
+            .standardizedFileURL
+    }
+
+    var completedFileURL: URL? {
+        guard state == .completed || state == .skipped else { return nil }
+        if let path = Self.validatedOutputFilePath(outputFilePath) { return URL(fileURLWithPath: path, isDirectory: false) }
+        return originalOutputFileURL
+    }
+
+    var recoveredCopyNotice: String? {
+        guard let actual = Self.validatedOutputFilePath(outputFilePath),
+              let original = originalOutputFileURL, actual != original.path,
+              state == .completed || state == .skipped else { return nil }
+        return "Saved a recovered copy. The original file was kept."
     }
 }
 
@@ -1181,24 +1243,58 @@ private struct DownloadQueueEntry: Decodable {
     let sourceFileId: String?
 }
 
+/// A best guess at the whole size of a download that is still being discovered. See `downloadEstimatedTotal`.
+struct DownloadSizeEstimate: Equatable {
+    let totalBytes: UInt64
+    /// Selections with no known size, which can only make the real total larger.
+    let unmeasuredRoots: Int
+}
+
+private struct DownloadProgressIdentity: Hashable {
+    let sourceID: String
+    let outputPath: String
+    let shareURL: String?
+}
+
 private struct DownloadProgressEvent: Decodable {
     let requestId: UUID?
     let success: Bool?
+    /// A drained traversal can still have omitted unavailable folders.
+    let discoveryComplete: Bool?
     let event: String
     let totalFiles: Int?
     let totalBytes: UInt64?
     let fileId: String?
+    let sourceFileId: String?
     let name: String?
+    let outputPath: String?
     let downloadedBytes: UInt64?
     /// Bytes received from the network during this run. Unlike
     /// `downloadedBytes`, this excludes an existing resumable `.part` prefix
     /// and includes bytes that had to be fetched again after a restart.
     let transferredBytes: UInt64?
+    /// Bytes of an existing finished file read so far to prove it is the original (`file_verifying`).
+    let verifiedBytes: UInt64?
     let attempt: Int?
     let retryInMillis: UInt64?
     let files: [DownloadQueueEntry]?
     let retryable: Bool?
+    let destinationUnavailable: Bool?
     let error: String?
+    /// Set on `file_failed` when the failure proves the file can never be fetched (deleted, moved or replaced).
+    let permanent: String?
+    /// Independent helper diagnostics; no names, paths or response text.
+    let receivedBytes: UInt64?
+    let diagnostics: [String: DownloadDiagnosticMetric]?
+    let receiveDiagnostics: [String: UInt64]?
+    let bufferedBytes: UInt64?
+    let bufferReservedBytes: UInt64?
+    let bufferPeakBytes: UInt64?
+    let bufferLimitBytes: UInt64?
+    let bufferConfiguredBytes: UInt64?
+    let bufferReserveBytes: UInt64?
+    let bufferMemoryPressure: UInt64?
+    let diskTraffic: DownloadDiskTraffic?
 }
 
 enum UploadRunState: Equatable {
@@ -1522,10 +1618,14 @@ private struct BrowserMoveRequest {
 private struct LiveDownloadInbox: Encodable {
     let version = 1
     let requests: [LiveDownloadInput]
-    var contentMode: PikPakContentMode = .user
+    let retryOrigins: [String: String]
+    let contentMode: PikPakContentMode = .dynamic
+    var deleteAfterDownload: Bool
     enum CodingKeys: String, CodingKey {
         case version, requests
+        case retryOrigins = "retry_origins"
         case contentMode = "content_mode"
+        case deleteAfterDownload = "delete_after_download"
     }
 }
 private struct LiveDownloadInput: Encodable {
@@ -1536,10 +1636,12 @@ private struct LiveDownloadInput: Encodable {
     let relativeParent: [String]
     let proxyURL: String
     let access: ShareAccessInput?
+    var destinationKind: String? = nil
     enum CodingKeys: String, CodingKey {
         case id, path, file, destination, access
         case relativeParent = "relative_parent"
         case proxyURL = "proxy_url"
+        case destinationKind = "destination_kind"
     }
 }
 
@@ -1559,7 +1661,52 @@ enum PendingDownloadRequest: Codable {
     )
 
     var individualRequests: [PendingDownloadRequest] {
-        pendingItems.compactMap { keepingPendingItems([$0.id]) }
+        switch self {
+        case .account(let roots, let destination, let jobs, let proxy):
+            return roots.map { .account(roots: [$0], destination: destination, jobs: jobs, proxyURL: proxy) }
+        case .shared(let roots, let access, let destination, let jobs, let proxy):
+            return roots.map { .shared(roots: [$0], access: access, destination: destination, jobs: jobs, proxyURL: proxy) }
+        }
+    }
+
+    fileprivate func renewingQueueIDs() -> (request: Self, origins: [UUID: UUID]) {
+        var origins: [UUID: UUID] = [:]
+        switch self {
+        case .account(let roots, let destination, let jobs, let proxy):
+            let fresh = roots.map { root -> AccountDownloadRoot in
+                let id = UUID(); origins[id] = root.queueID
+                return .init(queueID: id, path: root.path, name: root.name, kind: root.kind, file: root.file, relativeParent: root.relativeParent)
+            }
+            return (.account(roots: fresh, destination: destination, jobs: jobs, proxyURL: proxy), origins)
+        case .shared(let roots, let access, let destination, let jobs, let proxy):
+            let fresh = roots.map { root -> SharedPendingDownloadRoot in
+                let id = UUID(); origins[id] = root.queueID
+                return .init(queueID: id, item: root.item, root: root.root)
+            }
+            return (.shared(roots: fresh, access: access, destination: destination, jobs: jobs, proxyURL: proxy), origins)
+        }
+    }
+
+    var destinationURL: URL {
+        switch self {
+        case .account(_, let destination, _, _), .shared(_, _, let destination, _, _): return destination
+        }
+    }
+
+    /// Where each queued selection's own progress files would be, if its unfinished download was restored.
+    fileprivate var restoredProgressProbes: [DownloadRestoredProgress.Probe] {
+        switch self {
+        case .account(let roots, let destination, _, _):
+            return roots.map { root in
+                .init(directory: root.relativeParent.reduce(destination) { $0.appendingPathComponent($1, isDirectory: true) },
+                      name: root.name, isFolder: root.kind == .folder)
+            }
+        case .shared(let roots, _, let destination, _, _):
+            return roots.map { root in
+                .init(directory: (root.root.relativeParent ?? []).reduce(destination) { $0.appendingPathComponent($1, isDirectory: true) },
+                      name: root.item.name, isFolder: root.item.kind == .folder)
+            }
+        }
     }
 
     fileprivate var liveInputs: [LiveDownloadInput] {
@@ -1575,7 +1722,7 @@ enum PendingDownloadRequest: Codable {
     }
 
     func withWorkerLimit(_ limit: Int) -> PendingDownloadRequest {
-        let count = min(max(limit, 1), 64)
+        let count = max(limit, 1)
         switch self {
         case .account(let roots, let destination, _, let proxy):
             return .account(roots: roots, destination: destination, jobs: count, proxyURL: proxy)
@@ -1596,25 +1743,29 @@ enum PendingDownloadRequest: Codable {
     var pendingItems: [PendingDownloadItem] {
         switch self {
         case .account(let roots, let destination, _, _):
+            let destinationPath = destination.path
             return roots.map { root in
                 PendingDownloadItem(
                     id: root.queueID,
                     name: root.name,
                     remotePath: root.path,
-                    destinationPath: destination.path,
+                    destinationPath: destinationPath,
                     kind: root.kind,
-                    isShared: false
+                    isShared: false,
+                    knownSize: root.kind == .folder ? nil : root.file.flatMap { UInt64($0.size) }
                 )
             }
         case .shared(let roots, _, let destination, _, _):
+            let destinationPath = destination.path
             return roots.map { root in
                 PendingDownloadItem(
                     id: root.queueID,
                     name: root.item.name,
                     remotePath: root.root.path,
-                    destinationPath: destination.path,
+                    destinationPath: destinationPath,
                     kind: root.item.kind,
-                    isShared: true
+                    isShared: true,
+                    knownSize: root.item.kind == .folder ? nil : root.root.size
                 )
             }
         }
@@ -1721,11 +1872,11 @@ enum PendingDownloadRequest: Codable {
         case .account(let roots, let destination, _, _):
             guard let root = roots.first(where: { $0.queueID == itemID && $0.kind == .file }) else { return nil }
             return root.relativeParent.reduce(destination) { $0.appendingPathComponent(($1 as NSString).lastPathComponent, isDirectory: true) }
-                .appendingPathComponent((root.name as NSString).lastPathComponent + ".part")
+                .appendingPathComponent((root.name as NSString).lastPathComponent + ".part", isDirectory: false)
         case .shared(let roots, _, let destination, _, _):
             guard let root = roots.first(where: { $0.queueID == itemID && !$0.item.isFolder }) else { return nil }
             return (root.root.relativeParent ?? []).reduce(destination) { $0.appendingPathComponent(($1 as NSString).lastPathComponent, isDirectory: true) }
-                .appendingPathComponent((root.item.name as NSString).lastPathComponent + ".part")
+                .appendingPathComponent((root.item.name as NSString).lastPathComponent + ".part", isDirectory: false)
         }
     }
 
@@ -1776,234 +1927,6 @@ private struct PendingSharedSaveRequest {
 
     var deduplicationKey: String {
         "\(linkID.uuidString)|\(request.fileIds.sorted().joined(separator: "\u{1F}"))"
-    }
-}
-
-/// A small synchronized accumulator used by Process pipe callbacks. Keeping
-/// structured JSON here means signed preview links never enter the UI log.
-private final class ProcessOutputBuffer: @unchecked Sendable {
-    private let lock = NSLock()
-    private var data = Data()
-
-    func append(_ newData: Data) {
-        guard !newData.isEmpty else { return }
-        lock.lock()
-        data.append(newData)
-        lock.unlock()
-    }
-
-    func string() -> String {
-        lock.lock()
-        let snapshot = data
-        lock.unlock()
-        return String(data: snapshot, encoding: .utf8) ?? ""
-    }
-}
-
-/// Converts arbitrary pipe chunks into complete UTF-8 lines. Progress JSON can
-/// be split across reads, so decoding each FileHandle callback independently
-/// would occasionally lose an update.
-private final class ProcessLineBuffer: @unchecked Sendable {
-    private let lock = NSLock()
-    private var pending = Data()
-
-    func append(_ data: Data) -> [String] {
-        guard !data.isEmpty else { return [] }
-        lock.lock()
-        pending.append(data)
-        let lines = extractCompleteLines()
-        lock.unlock()
-        return lines
-    }
-
-    func drain() -> [String] {
-        lock.lock()
-        let lines = extractCompleteLines()
-        var result = lines
-        if !pending.isEmpty {
-            result.append(String(decoding: pending, as: UTF8.self))
-            pending.removeAll(keepingCapacity: false)
-        }
-        lock.unlock()
-        return result
-    }
-
-    private func extractCompleteLines() -> [String] {
-        var lines: [String] = []
-        while let newline = pending.firstIndex(of: 0x0A) {
-            let lineData = pending[pending.startIndex..<newline]
-            lines.append(String(decoding: lineData, as: UTF8.self))
-            pending.removeSubrange(pending.startIndex...newline)
-        }
-        return lines
-    }
-}
-
-private struct CloudDownloadPromisePayload {
-    let promisedName: String
-    let remotePaths: [String]
-    let wrapsSelectionInFolder: Bool
-    let engineURL: URL
-    let environment: [String: String]
-    let jobs: Int
-    let onStart: () -> Void
-    let onFinish: (Result<Void, Error>) -> Void
-}
-
-/// Finder asks an NSItemProvider for its file representation only after the
-/// user drops it. The coordinator materializes the selected cloud data in a
-/// private temporary directory, then Finder copies that file or folder to the
-/// exact drop location. This avoids exposing incomplete placeholder files.
-private final class CloudDownloadPromiseCoordinator {
-    private let queue: OperationQueue = {
-        let queue = OperationQueue()
-        queue.name = "com.wky.PikPakDownloader.file-promises"
-        queue.qualityOfService = .userInitiated
-        queue.maxConcurrentOperationCount = 2
-        return queue
-    }()
-
-    func makeProvider(
-        fileType: String,
-        payload: CloudDownloadPromisePayload
-    ) -> NSItemProvider {
-        let provider = NSItemProvider()
-        provider.suggestedName = payload.promisedName
-        provider.registerFileRepresentation(
-            forTypeIdentifier: fileType,
-            fileOptions: [],
-            visibility: .all
-        ) { [weak self] completion in
-            guard let self else {
-                completion(
-                    nil,
-                    false,
-                    NSError(
-                        domain: "PikPakFilePromise",
-                        code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "The PikPak drag session expired."]
-                    )
-                )
-                return nil
-            }
-
-            let progress = Progress(totalUnitCount: -1)
-            self.queue.addOperation {
-                self.materialize(payload: payload, progress: progress, completion: completion)
-            }
-            return progress
-        }
-        return provider
-    }
-
-    private func materialize(
-        payload: CloudDownloadPromisePayload,
-        progress: Progress,
-        completion: @escaping (URL?, Bool, Error?) -> Void
-    ) {
-        payload.onStart()
-        let temporaryRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("PikPakDownloader-Drag-\(UUID().uuidString)", isDirectory: true)
-        let outputDirectory = payload.wrapsSelectionInFolder
-            ? temporaryRoot.appendingPathComponent(payload.promisedName, isDirectory: true)
-            : temporaryRoot
-
-        do {
-            try FileManager.default.createDirectory(
-                at: outputDirectory,
-                withIntermediateDirectories: true
-            )
-
-            let process = Process()
-            let stderr = Pipe()
-            let stderrBuffer = ProcessOutputBuffer()
-            process.executableURL = payload.engineURL
-            var arguments = ["download"]
-            for path in payload.remotePaths {
-                arguments.append(contentsOf: ["--path", path])
-            }
-            arguments.append(contentsOf: [
-                "--output", outputDirectory.path,
-                "--jobs", String(payload.jobs),
-            ])
-            process.arguments = arguments
-            process.environment = payload.environment
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = stderr
-            progress.cancellationHandler = {
-                if process.isRunning {
-                    process.terminate()
-                }
-            }
-            stderr.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                if !data.isEmpty {
-                    stderrBuffer.append(data)
-                }
-            }
-
-            try process.run()
-            process.waitUntilExit()
-            stderr.fileHandleForReading.readabilityHandler = nil
-            let trailing = stderr.fileHandleForReading.readDataToEndOfFile()
-            if !trailing.isEmpty {
-                stderrBuffer.append(trailing)
-            }
-
-            guard process.terminationStatus == 0 else {
-                let detail = FileSearchIndex.withoutStatusNotes(stderrBuffer.string())
-                    .split(whereSeparator: \.isNewline)
-                    .last
-                    .map(String.init)
-                    ?? "The PikPak download engine stopped."
-                throw NSError(
-                    domain: "PikPakFilePromise",
-                    code: Int(process.terminationStatus),
-                    userInfo: [
-                        NSLocalizedDescriptionKey:
-                            "PikPak could not complete the Finder download (exit \(process.terminationStatus)): \(detail)"
-                    ]
-                )
-            }
-
-            let resultURL: URL
-            if payload.wrapsSelectionInFolder {
-                resultURL = outputDirectory
-            } else {
-                let preferred = temporaryRoot.appendingPathComponent(payload.promisedName)
-                if FileManager.default.fileExists(atPath: preferred.path) {
-                    resultURL = preferred
-                } else {
-                    let children = try FileManager.default.contentsOfDirectory(
-                        at: temporaryRoot,
-                        includingPropertiesForKeys: nil,
-                        options: []
-                    )
-                    guard let downloaded = children.first else {
-                        throw NSError(
-                            domain: "PikPakFilePromise",
-                            code: 2,
-                            userInfo: [NSLocalizedDescriptionKey: "The downloader returned no local item."]
-                        )
-                    }
-                    resultURL = downloaded
-                }
-            }
-
-            payload.onFinish(.success(()))
-            completion(resultURL, false, nil)
-            Self.scheduleCleanup(of: temporaryRoot)
-        } catch {
-            payload.onFinish(.failure(error))
-            completion(nil, false, error)
-            try? FileManager.default.removeItem(at: temporaryRoot)
-        }
-    }
-
-    private static func scheduleCleanup(of directory: URL) {
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3_600) {
-            try? FileManager.default.removeItem(at: directory)
-        }
     }
 }
 
@@ -2163,13 +2086,24 @@ private final class BoundedTextPreviewLoader: NSObject, URLSessionDataDelegate, 
 
 @MainActor
 final class DownloaderModel: ObservableObject {
+    private var preferences = UserDefaults.standard
+    private var isolatedPreferencesSuite: String?
+
     private(set) var workspaceSessionID = "primary"
+    var transferWorkspaceSessionsToExclude: (() -> Set<String>)?
     @Published private(set) var accountProfile: PikPakAccountProfile?
     var accountDisplayName: String? { accountProfile?.displayName ?? activeSavedAccount?.profile?.displayName }
     @Published private(set) var savedAccounts: [SavedPikPakAccount] = []
     @Published private(set) var activeAccountID: UUID?
     @Published private(set) var accountLoginStatus: PikPakLoginStatus = .signedOut
     @Published private(set) var accountSettingsError: String?
+    @Published private(set) var requestVerificationChallenge: PikPakVerificationChallenge?
+    @Published private(set) var isVerifyingRequest = false
+    private let requestVerifier = PikPakRequestVerifier()
+    var accountConnectionStatus: PikPakLoginStatus {
+        requestVerificationChallenge != nil && accountLoginStatus != .checking
+            ? .verificationRequired : accountLoginStatus
+    }
     @Published private(set) var isChangingAccount = false
     @Published private(set) var isCheckingAccount = false
     @Published private(set) var loginFromSettings = false
@@ -2212,6 +2146,7 @@ final class DownloaderModel: ObservableObject {
     #if FINDER_WORKSPACE_TESTS
     private var accountProfileLoader: ((PikPakAccountSessionFiles) async throws -> PikPakAccountProfile)?
     private var accountFixtureTransferDirectory: URL?
+    private var accountLoginWebsiteDataClearer: ((@escaping () -> Void) -> Void)?
     #endif
     private var fileOpenContext = UUID()
     lazy var fileOpener: FinderFileOpener = {
@@ -2223,6 +2158,7 @@ final class DownloaderModel: ObservableObject {
         return opener
     }()
     private var contentModeObservation: AnyCancellable?
+    private var downloadCleanupObservation: AnyCancellable?
     private var previewRequestContentMode: PikPakContentMode = .user
     private(set) var finderSettings = FinderSettings() {
         didSet { observeContentMode() }
@@ -2230,6 +2166,14 @@ final class DownloaderModel: ObservableObject {
     private func observeContentMode() {
         contentModeObservation = finderSettings.$contentMode.dropFirst().removeDuplicates().sink { [weak self] _ in
             self?.contentModeChanged()
+        }
+        downloadCleanupObservation = finderSettings.$deleteAfterDownload.dropFirst().removeDuplicates().sink { [weak self] enabled in
+            guard let self else { return }
+            do { try self.publishLiveDownloads(deleteAfterDownload: enabled) }
+            catch {
+                if !enabled, self.isDownloading { self.stop(automatic: true) }
+                self.setError("Could not update the download cleanup option. Resume downloads to apply it.")
+            }
         }
     }
 
@@ -2294,8 +2238,11 @@ final class DownloaderModel: ObservableObject {
     private var fileUndoFixtureTrashed: Set<String> = []
     private var sharedSaveFixtureRequests: [PendingSharedSaveRequest] = []
     private var sharedLinkLoadFixture: ((UUID, ShareBrowseInput, Process) -> Void)?
+    private var trashConfirmationFixture: (([String]) -> Void)?
     private var downloadEngineFixture: (([String], Operation, AccountDownloadInput?) -> Void)?
     private init(finderFixture: Bool, defaults: UserDefaults) {
+        self.preferences = defaults
+        hidesEmptyFolders = BrowserEmptyFolders.preference(in: defaults)
         outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("Offline Downloads")
         isFinderWorkspaceFixture = finderFixture
         finderSettings = FinderSettings(defaults: defaults)
@@ -2335,7 +2282,7 @@ final class DownloaderModel: ObservableObject {
         isFileSearchFixture = fileSearchFixture
     }
     #endif
-    var effectiveDownloadConcurrentJobs: Int { TransferConcurrency.automaticLimit }
+    var effectiveDownloadConcurrentJobs: Int { TransferConcurrency.downloadAutomaticLimit }
     var effectiveUploadConcurrentJobs: Int { TransferConcurrency.automaticLimit }
 
     /// Describe work from the owning task's state, never command lines, tokens
@@ -2361,7 +2308,9 @@ final class DownloaderModel: ObservableObject {
         record(mergeProcess, .init(name: "Merging folders",
             detail: "\(mergeDestination?.name ?? "My PikPak")\n\(mergeMovedItems.formatted()) items moved · \(mergeCompletedSourceCount.formatted()) folders merged",
             symbol: "folder"))
-        record(folderMeasurementProcess, resourceActivity(for: folderMeasurementOperation))
+        for run in folderMeasurementRuns.values {
+            record(run.process, resourceActivity(for: run.operation))
+        }
         for (id, child) in archiveProcesses {
             let task = archiveTasks.first { $0.id == id }
             record(child, .init(name: task?.isInspecting == true ? "Reading cloud archive" : "Extracting in PikPak",
@@ -2497,7 +2446,7 @@ final class DownloaderModel: ObservableObject {
     /// folder. Coalescing it prevents thousands of main-actor publications
     /// from starving Finder-style navigation and selection.
     private static let downloadOutputBatchSize = 192
-    private static let downloadOutputBatchDelay: TimeInterval = 0.04
+    private static let downloadOutputBatchDelay: TimeInterval = 0.25
     private static let scanProgressBatchSize = 128
     private static let scanProgressBatchDelay: TimeInterval = 0.06
 
@@ -2581,22 +2530,32 @@ final class DownloaderModel: ObservableObject {
 
     }
 
-    /// Folder-size requests are serialized through one utility process to keep
-    /// recursive scans service-conscious, but every request retains its own
-    /// account/link namespace. This lets another link be queued without making
-    /// every Calculate control look busy or sharing an empty root id.
-    private struct PendingFolderMeasurementRequest {
-        let arguments: [String]
+    /// Each calculation owns its process, request file and cache namespace.
+    /// Completion/cancellation of one folder cannot clear another folder's work.
+    private final class FolderMeasurementRun {
+        let process = Process()
         let operation: Operation
         let folderID: String
         let cacheKey: String
+        let revision: UInt64
+        let accountID: String?
+        let usesCachedSubfolders: Bool
+        var inputURL: URL?
+        var wasCancelled = false
+
+        init(operation: Operation, folderID: String, cacheKey: String,
+             revision: UInt64, accountID: String?, usesCachedSubfolders: Bool) {
+            self.operation = operation; self.folderID = folderID; self.cacheKey = cacheKey
+            self.revision = revision; self.accountID = accountID
+            self.usesCachedSubfolders = usesCachedSubfolders
+        }
     }
 
     @Published private(set) var refreshToken: String = ""
     @Published var outputURL: URL
     @Published var proxyURL: String = "" {
         didSet {
-            UserDefaults.standard.set(proxyURL, forKey: "proxyURL")
+            preferences.set(proxyURL, forKey: "proxyURL")
         }
     }
     @Published var status: String = "Ready"
@@ -2605,8 +2564,22 @@ final class DownloaderModel: ObservableObject {
     @Published var isRunning = false
     @Published var isBrowserLoading = false
     @Published private(set) var isPreviewLoading = false
-    @Published var isDownloading = false
-    @Published private(set) var downloadRunState: DownloadRunState = .ready
+    @Published var isDownloading = false {
+        didSet {
+            if oldValue != isDownloading {
+                downloadDiscoveryPresentationIsDirty = true
+                recordDownloadSpeedHistory(at: Date())
+            }
+        }
+    }
+    @Published private(set) var downloadRunState: DownloadRunState = .ready {
+        didSet {
+            if oldValue != downloadRunState {
+                downloadRetryRowsDirty = true
+                downloadDiscoveryPresentationIsDirty = true
+            }
+        }
+    }
     @Published private(set) var downloadTotalFiles = 0
     @Published private(set) var downloadTotalBytes: UInt64 = 0
     @Published private(set) var downloadDownloadedBytes: UInt64 = 0
@@ -2614,13 +2587,19 @@ final class DownloaderModel: ObservableObject {
     @Published private(set) var downloadSkippedFiles = 0
     @Published private(set) var downloadFailedFiles = 0
     @Published private(set) var downloadBytesPerSecond: Double = 0
+    @Published private(set) var downloadSpeedHistory = DownloadSpeedSnapshot()
+    private var downloadSpeedTracker = DownloadSpeedHistory()
     @Published private(set) var downloadQueueTransfers: [DownloadTransfer] = []
     @Published private(set) var downloadQueueOffset = 0
     @Published private(set) var downloadingTransfers: [DownloadTransfer] = []
+    @Published private(set) var retryingDownloadTransfers: [DownloadTransfer] = []
+    @Published private(set) var visibleFailedDownloadTransfers: [DownloadTransfer] = []
     @Published private(set) var completedDownloadTransfers: [DownloadTransfer] = []
     /// A separate failure history survives progress resets and transcript
     /// replay, so retrying one row does not make the other failures disappear.
-    @Published private(set) var failedDownloadTransfers: [DownloadTransfer] = []
+    @Published private(set) var failedDownloadTransfers: [DownloadTransfer] = [] {
+        didSet { downloadRetryRowsDirty = true }
+    }
     @Published private(set) var pendingDownloadItems: [PendingDownloadItem] = []
     @Published private(set) var restoredDownloadQueue = false
     @Published private(set) var savedUploadBatches: [SavedUploadBatch] = []
@@ -2647,7 +2626,14 @@ final class DownloaderModel: ObservableObject {
     @Published private(set) var uploadingTransfers: [UploadTransfer] = []
     @Published private(set) var completedUploadTransfers: [UploadTransfer] = []
     @Published private(set) var failedUploadTransfers: [UploadTransfer] = []
-    @Published var log = ""
+    @Published private(set) var activityLog = ActivityLogBuffer()
+    var log: String {
+        get { activityLog.text }
+        set {
+            activityLog.clear()
+            activityLog.append(newValue)
+        }
+    }
     @Published var isLoginPresented = false
     @Published private(set) var loginReason = "Sign in to connect this app to your PikPak account."
     @Published private(set) var requiresDedicatedSignIn = false
@@ -2680,16 +2666,24 @@ final class DownloaderModel: ObservableObject {
     @Published var browserFileFilter: BrowserFileFilter = .all {
         didSet {
             guard oldValue != browserFileFilter else { return }
-            filteredBrowserEntriesCache = nil
-            filteredBrowserItemsCache = nil
-            if !isBrowsingSharedLink { clearBrowserSelectionFromCanvas() }
+            invalidateBrowserFilterCaches()
+            if !isBrowsingSharedLink { reconcileBrowserFilterSelection() }
+        }
+    }
+    /// Hide folders a type filter has left with nothing to show. Only folders already known to be empty go.
+    @Published var hidesEmptyFolders = BrowserEmptyFolders.preference() {
+        didSet {
+            guard oldValue != hidesEmptyFolders else { return }
+            BrowserEmptyFolders.setPreference(hidesEmptyFolders, in: preferences)
+            invalidateBrowserFilterCaches()
+            reconcileBrowserFilterSelection()
         }
     }
     @Published private(set) var browserSortColumn: BrowserSortColumn = .name {
-        didSet { browserSortRevision = UUID() }
+        didSet { browserSortRevision = UUID(); deletedBrowserSelection = nil }
     }
     @Published private(set) var browserSortDirection: BrowserSortDirection = .ascending {
-        didSet { browserSortRevision = UUID() }
+        didSet { browserSortRevision = UUID(); deletedBrowserSelection = nil }
     }
     @Published private(set) var browserStack: [BrowserLocation] = [.root]
     private var bookmarkNavigationTask: Task<Void, Never>?
@@ -2734,9 +2728,13 @@ final class DownloaderModel: ObservableObject {
     @Published private(set) var browserTreeChildren: [String: [BrowserItem]] = [:] {
         didSet { invalidateBrowserPresentation(itemsChanged: true) }
     }
-    @Published private(set) var browserTreeLoadingFolderIDs = Set<String>()
+    @Published private(set) var browserTreeLoadingFolderIDs = Set<String>() {
+        didSet { invalidateBrowserFilterCaches() }
+    }
     @Published private(set) var browserFolderExpansionProgress: BrowserFolderExpansionProgress?
-    @Published private(set) var browserTreeLoadErrors: [String: String] = [:]
+    @Published private(set) var browserTreeLoadErrors: [String: String] = [:] {
+        didSet { invalidateBrowserFilterCaches() }
+    }
     @Published private(set) var selectedBrowserItemID: String?
     @Published private(set) var selectedBrowserItemIDs = Set<String>()
     @Published private(set) var previewInfo: PreviewInfo?
@@ -2747,7 +2745,9 @@ final class DownloaderModel: ObservableObject {
     @Published private(set) var previewPlaybackError: String?
     @Published private(set) var previewErrorDiagnostic: AppErrorDiagnostic?
     @Published private(set) var previewSourceLabel: String?
-    @Published private(set) var previewPreparationFraction: Double?
+    @Published private(set) var previewPreparationProgress: CloudDriveProgress?
+    @Published private(set) var previewPreparationBytesPerSecond: Double?
+    var previewPreparationFraction: Double? { previewPreparationProgress?.fraction }
     @Published private(set) var previewText: String?
     @Published private(set) var previewTextEncodingName: String?
     @Published private(set) var previewTextLoadedBytes: UInt64 = 0
@@ -2810,10 +2810,11 @@ final class DownloaderModel: ObservableObject {
     @Published private(set) var measuringFolderID: String?
     @Published private(set) var folderMeasurements: [String: FolderMeasurement] = [:] {
         didSet {
+            downloadDiscoveryPresentationIsDirty = true
             if browserSortColumn == .size { browserSortRevision = UUID() }
         }
     }
-    @Published private var queuedFolderMeasurementCacheKeys = Set<String>()
+    @Published private var activeFolderMeasurementCacheKeys = Set<String>()
     let taskActivity = FinderTaskActivityStore()
     @Published private(set) var duplicateScan: DuplicateScan? {
         didSet {
@@ -2833,6 +2834,12 @@ final class DownloaderModel: ObservableObject {
     private(set) var duplicateCurrentPath = ""
     private(set) var duplicateScanRootPath = ""
     @Published private(set) var selectedDuplicateFileIDs = Set<String>()
+    @Published var showsCrossDriveDuplicateScope = false
+    @Published var duplicateScopeCloudFolders: [BrowserLocation] = []
+    @Published var duplicateScopeLocalFolders: [URL] = []
+    @Published var duplicateScopePicker: SimilarityScopePicker?
+    private var duplicateScanCloudFolders: [BrowserLocation] = []
+    private var duplicateScanLocalFolders: [URL] = []
     @Published private(set) var isRemovingEmptyFolders = false
     @Published private(set) var isRemovingDSStoreFiles = false
     @Published private(set) var isCreatingFolder = false
@@ -2872,19 +2879,93 @@ final class DownloaderModel: ObservableObject {
     /// Downloads own a utility-priority process instead of the foreground
     /// Browser process. The shared token file still serializes refresh-token
     /// rotation, while folder navigation and previews remain responsive.
-    @Published private(set) var pausedDownloadIDs = Set<String>()
-    @Published private(set) var cancelledDownloadIDs = Set<String>()
+    @Published private(set) var pausedDownloadIDs = Set<String>() {
+        didSet {
+            downloadRetryRowsDirty = true
+            downloadPausedFileRootsAreDirty = true
+            downloadRetryLookupIsDirty = true
+            if oldValue != pausedDownloadIDs { recordDownloadSpeedHistory(at: Date()) }
+        }
+    }
+    @Published private(set) var cancelledDownloadIDs = Set<String>() {
+        didSet { downloadRetryRowsDirty = true }
+    }
     @Published private(set) var pausedUploadIDs = Set<String>()
     @Published private(set) var cancelledUploadIDs = Set<String>()
-    @Published private(set) var pausedPendingDownloadIDs = Set<UUID>()
-    @Published private(set) var downloadsPaused = false
+    @Published private(set) var pausedPendingDownloadIDs = Set<UUID>() {
+        didSet { downloadRetryRowsDirty = true; downloadRetryLookupIsDirty = true }
+    }
+    @Published private(set) var downloadsPaused = false {
+        didSet {
+            downloadRetryRowsDirty = true
+            // Record the moment of the pause or resume, so the monitor stops and restarts exactly then.
+            if oldValue != downloadsPaused { recordDownloadSpeedHistory(at: Date()) }
+        }
+    }
     private var downloadControlURL: URL?
     private var uploadControlURL: URL?
-    private var cancelAllDownloadsRequested = false
+    private var cancelAllDownloadsRequested = false {
+        didSet { downloadDiscoveryPresentationIsDirty = true }
+    }
+    private var cancelledDownloadRequestIDs = Set<UUID>() {
+        didSet { downloadDiscoveryPresentationIsDirty = true }
+    }
+    private var cancelledDownloadCleanups = Set<SavedDownloadPartialCleanup>()
+    private var downloadCleanupTask: Task<Void, Never>?
+    private let downloadCleanupFence = DownloadCleanupFence()
     private var cancelAllUploadsRequested = false
-    private var automaticDownloadRetry: Task<Void, Never>?
+    private var automaticDownloadRetry: Task<Void, Never>? {
+        didSet {
+            downloadRetryRowsDirty = true
+            publishDownloadTransferRows()
+        }
+    }
+    @Published private(set) var downloadDestinationStatus: String?
+    @Published private(set) var downloadPreparationStatus: String?
+    /// Finished files being read in full to prove they are the originals, for example after a backup was
+    /// restored. Nothing is transferred meanwhile, so the speed column says so instead of "Starting…".
+    @Published private(set) var downloadVerification: DownloadVerification?
+    private var verifyingDownloads: [String: (verified: UInt64, total: UInt64)] = [:]
+    struct DownloadVerification: Equatable {
+        let files: Int
+        let verifiedBytes: UInt64
+        let totalBytes: UInt64
+    }
+    /// Queued folders now on a different disk (replaced or reformatted), until the user accepts it or restored
+    /// progress files prove it. While one waits, the downloads panel offers Use This Disk.
+    private var replacedDownloadDestinations = Set<String>()
+    private var acceptedDownloadReplacements = Set<String>()
+    private var replacementProofCheckedAt: [String: Date] = [:]
+    var downloadDestinationReplacement: String? {
+        downloadDestinationStatus == nil ? nil : replacedDownloadDestinations.sorted().first
+    }
+    private var downloadDestinations: [String: DownloadDestinationCheckpoint] = [:]
+    private var downloadDestinationLeases: [String: LocalFileAccessLease] = [:]
+    private var downloadVolumeObservers: [NSObjectProtocol] = []
+    private var downloadDestinationPoll: Task<Void, Never>?
+    private var downloadDestinationRestartPending = false
+    private var downloadDestinationRecoveryAttempts: [String: Int] = [:]
+    private var downloadDestinationRetryUntil: [String: Date] = [:]
+    private var unavailableDownloadDestinations = Set<String>()
+    private var downloadProgressHighWater: [DownloadProgressIdentity: UInt64] = [:]
+    #if FINDER_WORKSPACE_TESTS
+    private var downloadDestinationValidator: ((URL, DownloadDestinationCheckpoint?) throws -> DownloadDestinationCheckpoint)?
+    private var downloadCleanupPathResolver: (@Sendable (String) -> [String])?
+    private var downloadFileRevealFixture: ((URL) -> Void)?
+    #endif
     private var automaticUploadRetry: Task<Void, Never>?
     private var downloadRetryAttempt = 0
+    /// Consecutive attempts that reported a permanent cause for each source file and destination. Any other
+    /// outcome, a completion, a manual retry or a new run starts the count again.
+    private var permanentFailureReports: [DownloadProgressIdentity: Int] = [:]
+    /// The batch being downloaded, reported in the status bar once the queue has fully drained.
+    private var downloadBatch: DownloadBatch?
+    /// Bytes of each selection's files discovered so far, so a cached size for the whole selection can be
+    /// counted without counting what discovery has already added. Reset with each run's totals.
+    private var discoveredBytesByRoot: [UUID: UInt64] = [:]
+    /// Failed files in this run that are final, so the processed count can include exactly them.
+    private var permanentFailedDownloadIDs = Set<String>()
+    @Published private(set) var downloadPermanentFailedFiles = 0
     private var downloadFailureRetryable = false
     private var downloadFailureRetryDelay: UInt64 = 0
     private var uploadRetryAttempt = 0
@@ -2893,19 +2974,37 @@ final class DownloaderModel: ObservableObject {
     private var savedDownloadCancellations = Set<SavedDownloadCancellation>()
     private var importedTransferSessions: [String] = []
     private var downloadProcess: Process?
+    private var downloadSleepPrevention = DownloadSleepPrevention()
+    private var downloadDrainingForQuit = false {
+        didSet { updateDownloadSleepPrevention() }
+    }
     private var downloadInputURL: URL?
-    private var downloadRequestedStop = false
+    private var downloadRequestedStop = false {
+        didSet { downloadRetryRowsDirty = true }
+    }
     private var downloadOperation: Operation?
     private var pendingDownloadOutputLines: [String] = []
     private var downloadOutputFlushScheduled = false
-    private var pendingDownloadRequests: [PendingDownloadRequest] = []
-    private var activeDownloadRequests: [PendingDownloadRequest] = []
+    private var downloadOutputBatchDepth = 0
+    private var downloadProgressPublicationDeferred = false
+    private var pendingDownloadRequests: [PendingDownloadRequest] = [] {
+        didSet { downloadRetryRowsDirty = true; downloadDiscoveryPresentationIsDirty = true; downloadRetryLookupIsDirty = true }
+    }
+    private var activeDownloadRequests: [PendingDownloadRequest] = [] {
+        didSet { downloadRetryRowsDirty = true; downloadDiscoveryPresentationIsDirty = true; downloadRetryLookupIsDirty = true }
+    }
     private var submittedDownloadRequests: [UUID: PendingDownloadRequest] = [:]
-    private var discoveringDownloadRequestIDs: Set<UUID> = []
-    private var downloadRequestIDsByFileID: [String: UUID] = [:]
+    private var discoveringDownloadRequestIDs: Set<UUID> = [] {
+        didSet { downloadDiscoveryPresentationIsDirty = true }
+    }
+    private var downloadRequestIDsByFileID: [String: UUID] = [:] {
+        didSet { downloadRetryRowsDirty = true; downloadPausedFileRootsAreDirty = true; downloadRetryLookupIsDirty = true }
+    }
     private var downloadSourceFileIDs: [String: String] = [:]
     private var downloadProxyByFileID: [String: String] = [:]
-    private var liveDownloadRun = false
+    private var liveDownloadRun = false {
+        didSet { downloadDiscoveryPresentationIsDirty = true }
+    }
 
     #if FINDER_WORKSPACE_TESTS || TRANSFER_PERSISTENCE_TESTS
     // Fixture convenience for legacy single-selection protocol tests.
@@ -2914,7 +3013,9 @@ final class DownloaderModel: ObservableObject {
         set { activeDownloadRequests = newValue.map { [$0] } ?? [] }
     }
     #endif
-    private var interruptedDownloadRequests: [PendingDownloadRequest] = []
+    private var interruptedDownloadRequests: [PendingDownloadRequest] = [] {
+        didSet { downloadRetryRowsDirty = true; downloadDiscoveryPresentationIsDirty = true; downloadRetryLookupIsDirty = true }
+    }
     private var activeUploadBatchID: UUID?
     private var uploadFileAccess: [UUID: LocalFileAccessLease] = [:]
     private var uploadVolumeObserver: NSObjectProtocol?
@@ -2922,10 +3023,20 @@ final class DownloaderModel: ObservableObject {
     private var uploadRemountObserver: NSObjectProtocol?
     private var uploadBatchAwaitingVolume: UUID?
     private var uploadSourceError: String?
-    private var transferAccountID: String?
-    private var transferStateReady = false
+    private var transferAccountID: String? {
+        didSet { downloadDiscoveryPresentationIsDirty = true }
+    }
+    private var transferStateReady = false {
+        didSet { downloadRetryRowsDirty = true }
+    }
     private var transferPersistenceScheduled = false
-    private var isClosingWindow = false
+    #if FINDER_WORKSPACE_TESTS
+    private var transferPersistenceFixtureWrites = 0
+    private var downloadControlFixtureWrites = 0
+    #endif
+    private var isClosingWindow = false {
+        didSet { downloadRetryRowsDirty = true; updateDownloadSleepPrevention() }
+    }
     private let transferPersistenceQueue = DispatchQueue(label: "com.wky.PikPakDownloader.transfer-state", qos: .utility)
     #if TRANSFER_PERSISTENCE_TESTS
     private var transferTestDirectory: URL?
@@ -2934,6 +3045,7 @@ final class DownloaderModel: ObservableObject {
         didSet { if activeDownloadRequestKey == nil { activeDownloadSelectionKeys.removeAll() } }
     }
     private var activeDownloadSelectionKeys = Set<String>()
+    private var activeDownloadSelectionRoots: [String: Set<UUID>] = [:]
     /// Uploads own a process independent from short-lived browser/preview
     /// requests. This keeps Finder-style navigation responsive throughout a
     /// long transfer while the shared token store serializes any refresh.
@@ -2978,6 +3090,11 @@ final class DownloaderModel: ObservableObject {
         selectedBrowserItemID = items.first(where: { selectedIDs.contains($0.id) })?.id
     }
 
+    func setArchiveTestConnections(_ accounts: [SavedPikPakAccount], activeID: UUID) {
+        savedAccounts = accounts
+        activeAccountID = activeID
+    }
+
     init(archiveTestEngineURL: URL, directory: URL) {
         self.archiveTestEngineURL = archiveTestEngineURL
         self.archiveTestDirectory = directory
@@ -3000,17 +3117,17 @@ final class DownloaderModel: ObservableObject {
     #endif
     /// Recursive folder measurements are read-only but can take minutes. Keep
     /// them independent from the short foreground Browser/Links request slot.
-    private var folderMeasurementProcess: Process?
-    private var folderMeasurementInputURL: URL?
-    private var folderMeasurementOperation: Operation?
-    private var folderMeasurementWasCancelled = false
-    private var measuringFolderCacheKey: String?
-    private var pendingFolderMeasurementRequests: [PendingFolderMeasurementRequest] = []
+    private var folderMeasurementRuns: [String: FolderMeasurementRun] = [:]
+    #if FINDER_WORKSPACE_TESTS
+    private var folderMeasurementTestEngineURL: URL?
+    #endif
     private var deferredLoginReason: String?
     private var deferredLoginRequiresCleanStart = false
     private var quotaRefreshPending = false
     private var deviceID = ""
-    private var folderMeasurementAccountID: String?
+    private var folderMeasurementAccountID: String? {
+        didSet { downloadDiscoveryPresentationIsDirty = true }
+    }
     private var folderSizeIndex = FolderSizeIndex()
     private var folderSizeRevision: UInt64 = 0
     private var folderSizeChanges: [String: UInt64] = [:]
@@ -3018,9 +3135,6 @@ final class DownloaderModel: ObservableObject {
     private var forceFullSizeRepairIDs = Set<String>()
     private var foregroundSizeRevision: UInt64 = 0
     private var sizeListingRevisions: [String: UInt64] = [:]
-    private var folderMeasurementStartRevision: UInt64 = 0
-    private var folderMeasurementStartAccountID: String?
-    private var folderMeasurementUsesCachedSubfolders = false
     private var automaticSizeRepairIDs = Set<String>()
     private var folderSizeRepairTask: Task<Void, Never>?
     private var folderSizePersistTask: Task<Void, Never>?
@@ -3153,8 +3267,11 @@ final class DownloaderModel: ObservableObject {
         qos: .utility
     )
     private var browserSelectionAnchorID: String?
+    private var deletedBrowserSelection: DeletedBrowserSelection<String>?
     private var browserFolderSnapshots: [String: BrowserFolderSnapshot] = [:]
-    private var browserTreeNextPageTokens: [String: String] = [:]
+    private var browserTreeNextPageTokens: [String: String] = [:] {
+        didSet { invalidateBrowserFilterCaches() }
+    }
     private var browserItemPaths: [String: String] = [:]
     private var browserItemParentIDs: [String: String] = [:]
     private var browserDragToken: String?
@@ -3197,12 +3314,18 @@ final class DownloaderModel: ObservableObject {
     private var pendingSharedLinkOpenAfterLogin = false
     private var accountBrowserWorkspace: BrowserWorkspaceSnapshot?
     private var sharedBrowserWorkspace: BrowserWorkspaceSnapshot?
-    private var sharedLinkSessions: [UUID: SharedLinkSession] = [:]
+    private var sharedLinkSessions: [UUID: SharedLinkSession] = [:] {
+        didSet { downloadDiscoveryPresentationIsDirty = true }
+    }
     private var browserSortRevision = UUID()
     private var activeBrowserSortRevision: UUID?
     private var browserTreeEntriesCache: [BrowserTreeEntry]?
     private var filteredBrowserEntriesCache: [BrowserTreeEntry]?
     private var filteredBrowserItemsCache: [BrowserItem]?
+    /// Folders the current type filter has left empty, and how many rows each displayed list lost to them.
+    private var hiddenBrowserFolderIDsCache: Set<String>?
+    private var hiddenBrowserEntryFolderCount = 0
+    private var hiddenBrowserItemFolderCount = 0
     private var browserFileExtensionsCache: [Bool: [String]] = [:]
     /// Items per Browser page. PikPak accepts up to 500 for account and shared
     /// listings (folder-tree loads already use it); each page costs one engine
@@ -3211,13 +3334,19 @@ final class DownloaderModel: ObservableObject {
     private var browserFilterIncludesExpandedRows = true
     private static let browserFolderLoadStopped = "Loading stopped before this folder's contents arrived."
 
-    private func invalidateBrowserPresentation(itemsChanged: Bool) {
-        browserTreeEntriesCache = nil
+    private func invalidateBrowserFilterCaches() {
         filteredBrowserEntriesCache = nil
         filteredBrowserItemsCache = nil
+        hiddenBrowserFolderIDsCache = nil
+    }
+
+    private func invalidateBrowserPresentation(itemsChanged: Bool) {
+        browserTreeEntriesCache = nil
+        invalidateBrowserFilterCaches()
         browserFileExtensionsCache.removeAll()
         if itemsChanged { browserItemIndexCache = nil; activeBrowserSortRevision = nil }
     }
+    private var sharedLinkPersistenceTask: Task<Void, Never>?
     private let sharedLinkStateQueue = DispatchQueue(
         label: "com.wky.PikPakDownloader.shared-links-state",
         qos: .utility
@@ -3228,6 +3357,8 @@ final class DownloaderModel: ObservableObject {
     private var previewSources: [PreviewSource] = []
     private var compatiblePreviewTask: Task<Void, Never>?
     private var compatiblePreviewCopy: VideoPreviewCopy?
+    private var previewPreparationReadActivity = FilePreviewReadActivity()
+    private var previewPreparationRateTask: Task<Void, Never>?
     private var previewFreshCacheRetries = Set<String>()
     private var previewResumeRetries = Set<String>()
     private var previewResumeSeconds: Double?
@@ -3280,8 +3411,45 @@ final class DownloaderModel: ObservableObject {
     private let quickLookPreviewCoordinator = QuickLookPreviewCoordinator()
     private let cloudDownloadPromiseCoordinator = CloudDownloadPromiseCoordinator()
     private var activeDownloadTransfers: [String: DownloadTransfer] = [:]
+    /// Retry eligibility depends on requests and controls, not byte progress.
+    /// Keep terminal classification cached while workers publish progress.
+    private var downloadRetryRowsDirty = true
+    private var downloadRetryRowsHadSession = false
+    private var automaticRetryDownloadRows: [DownloadTransfer] = []
+    private var automaticRetryDownloadCount = 0
+    #if FINDER_WORKSPACE_TESTS
+    private var downloadRetryProjectionFixtureRefreshes = 0
+    #endif
     private var queuedDownloadIDs = Set<String>()
     private var settledDownloadIDs = Set<String>()
+    private var downloadSettledStates: [String: DownloadTransferState] = [:]
+    private var downloadSettledBytesByID: [String: UInt64] = [:]
+    private var downloadRetryTargets: [UUID: [DownloadProgressIdentity: String]] = [:] {
+        didSet { downloadRetryRowsDirty = true; downloadPausedFileRootsAreDirty = true; downloadRetryLookupIsDirty = true }
+    }
+    private var downloadPausedFileRootsAreDirty = true
+    private var downloadPausedFileRoots = Set<UUID>()
+    private var downloadRetryLookupIsDirty = true
+    private var downloadRetryActiveRoots = Set<UUID>()
+    private var downloadRetryPausedRequestRoots = Set<UUID>()
+    private var downloadRetryQueuedRootsByFileID: [String: Set<UUID>] = [:]
+    private var automaticDownloadRetryOrigins: [UUID: UUID] = [:] {
+        didSet { downloadRetryRowsDirty = true; downloadDiscoveryPresentationIsDirty = true; downloadRetryLookupIsDirty = true }
+    }
+    private var individuallyRetriedDownloadRequestIDs = Set<UUID>() {
+        didSet { downloadRetryRowsDirty = true }
+    }
+    private var fullyDiscoveredDownloadRequestIDs = Set<UUID>() {
+        didSet { downloadRetryRowsDirty = true; downloadDiscoveryPresentationIsDirty = true }
+    }
+    private var downloadDiscoveryPresentationIsDirty = true
+    private var cachedDownloadTotalsAreIncomplete = false
+    private var cachedDownloadDiscoveryFolderEstimateSummary: String?
+    private var cachedDownloadDiscoveryRoots: [DownloadDiscoveryRoot] = []
+    #if FINDER_WORKSPACE_TESTS
+    private var downloadDiscoveryPresentationFixtureRefreshes = 0
+    #endif
+    private var excludedDownloadPlanIDs = Set<String>()
     private var settledDownloadBytes: UInt64 = 0
     private var settledDownloadNetworkBytes: UInt64 = 0
     private var downloadNetworkBaselines: [String: UInt64] = [:]
@@ -3289,9 +3457,17 @@ final class DownloaderModel: ObservableObject {
     private var downloadFileTotalsByID: [String: UInt64] = [:]
     private var downloadFileRates: [String: DownloadFileRate] = [:]
     private var downloadNetworkTransferredBytes: UInt64 = 0
-    private var lastDownloadSpeedSampleDate: Date?
-    private var lastDownloadSpeedSampleBytes: UInt64 = 0
-    private var lastDownloadNetworkProgressDate: Date?
+    private var downloadHelperReceivedBytes: UInt64?
+    @Published private(set) var downloadBufferUsage: DownloadBufferUsage? {
+        didSet { updateDownloadSleepPrevention() }
+    }
+    private var downloadDiagnosticRates = DownloadDiagnosticRates()
+    private var downloadDiagnosticMetrics: [String: DownloadDiagnosticMetric] = [:]
+    private var downloadDiagnosticSessionStarted = false
+    private var downloadDiagnosticHandoverHelperPID: Int32 = 0
+    private var downloadDiagnosticHandoverSequence: UInt64 = 0
+    private var downloadDiagnosticLogFailuresSeen: UInt64 = 0
+    private var downloadRate = RollingRate()
     private var lastAccountDownloadPaths: [String] = []
     private var lastSharedDownloadItems: [BrowserItem] = []
     private var lastSharedDownloadAccess: ShareAccessInput?
@@ -3299,7 +3475,9 @@ final class DownloaderModel: ObservableObject {
     /// Shared links have independent access contexts. Associate each emitted
     /// file id with the context that produced it so a later row-level retry is
     /// not accidentally sent through whichever link is currently selected.
-    private var downloadSharedAccessByFileID: [String: ShareAccessInput] = [:]
+    private var downloadSharedAccessByFileID: [String: ShareAccessInput] = [:] {
+        didSet { downloadRetryRowsDirty = true }
+    }
     private var activeUploadTransfers: [String: UploadTransfer] = [:]
     private var queuedUploadIDs = Set<String>()
     private var settledUploadIDs = Set<String>()
@@ -3390,7 +3568,9 @@ final class DownloaderModel: ObservableObject {
     }
 
     deinit {
+        if let isolatedPreferencesSuite { preferences.removePersistentDomain(forName: isolatedPreferencesSuite) }
         compatiblePreviewTask?.cancel()
+        previewPreparationRateTask?.cancel()
         if let accountStoreObservation { NotificationCenter.default.removeObserver(accountStoreObservation) }
     }
 
@@ -3453,17 +3633,9 @@ final class DownloaderModel: ObservableObject {
     /// Extraction runs on PikPak and never occupies this local work lane.
     /// Source-specific checks protect an archive while unrelated work continues.
     private var hasExclusiveBackgroundTask: Bool {
-        isScanningDuplicates || isMaintenanceScanRunning || isMeasuringFolder || isMergingFolders
+        isScanningDuplicates || isMaintenanceScanRunning || isMergingFolders
     }
 
-    /// A running folder measurement may accept more independently keyed scans
-    /// into its own queue. Other transfer/maintenance work still prevents a
-    /// new recursive scan from being scheduled.
-    private var hasNonMeasurementBackgroundTask: Bool {
-        isScanningDuplicates
-            || isMaintenanceScanRunning
-            || isMergingFolders
-    }
     var canOpenShareLink: Bool {
         !isRunning
             && !shareURLInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -3837,15 +4009,17 @@ final class DownloaderModel: ObservableObject {
 
     func canMeasureFolder(_ item: BrowserItem, in linkID: UUID? = nil) -> Bool {
         guard
-            !isRunning,
-            !hasNonMeasurementBackgroundTask,
-            hasActiveBrowserAccess,
+            !isClosingWindow, !isLoginPresented, deferredLoginReason == nil,
+            hasUsableSession,
             item.isFolder
         else { return false }
         let effectiveLinkID = linkID ?? (isBrowsingSharedLink ? activeSharedLinkID : nil)
+        if let effectiveLinkID {
+            guard sharedLinkSessions[effectiveLinkID] != nil,
+                  sharedLinks.first(where: { $0.id == effectiveLinkID })?.state == .ready else { return false }
+        }
         let key = folderMeasurementCacheKey(for: item.id, linkID: effectiveLinkID)
-        return measuringFolderCacheKey != key
-            && !queuedFolderMeasurementCacheKeys.contains(key)
+        return !activeFolderMeasurementCacheKeys.contains(key)
     }
 
     /// Shared roots can legitimately use the same opaque folder id (including
@@ -3876,18 +4050,13 @@ final class DownloaderModel: ObservableObject {
 
     func isMeasuringFolder(_ folderID: String, in linkID: UUID? = nil) -> Bool {
         let effectiveLinkID = linkID ?? (isBrowsingSharedLink ? activeSharedLinkID : nil)
-        return isMeasuringFolder
-            && measuringFolderCacheKey == folderMeasurementCacheKey(
-                for: folderID,
-                linkID: effectiveLinkID
-            )
+        return activeFolderMeasurementCacheKeys.contains(
+            folderMeasurementCacheKey(for: folderID, linkID: effectiveLinkID)
+        )
     }
 
     func isFolderMeasurementQueued(_ folderID: String, in linkID: UUID? = nil) -> Bool {
-        let effectiveLinkID = linkID ?? (isBrowsingSharedLink ? activeSharedLinkID : nil)
-        return queuedFolderMeasurementCacheKeys.contains(
-            folderMeasurementCacheKey(for: folderID, linkID: effectiveLinkID)
-        )
+        false // Independent read-only calculations start immediately.
     }
 
     func sharedLinkRootLocation(for linkID: UUID) -> BrowserLocation? {
@@ -3916,21 +4085,19 @@ final class DownloaderModel: ObservableObject {
     /// work can block it.
     func canDisconnectSharedLink(_ linkID: UUID) -> Bool {
         sharedSaveProcesses[linkID]?.isRunning != true
-            && measuringFolderCacheKey?.hasPrefix(sharedLinkMeasurementPrefix(linkID)) != true
+            && !activeFolderMeasurementCacheKeys.contains { $0.hasPrefix(sharedLinkMeasurementPrefix(linkID)) }
     }
 
     func canMeasureSharedLink(_ linkID: UUID) -> Bool {
         guard
-            !isRunning,
-            !hasNonMeasurementBackgroundTask,
+            !isClosingWindow, !isLoginPresented, deferredLoginReason == nil,
             hasUsableSession,
             let root = sharedLinkRootLocation(for: linkID),
             let entry = sharedLinks.first(where: { $0.id == linkID }),
             entry.state == .ready
         else { return false }
         let key = folderMeasurementCacheKey(for: root.id, linkID: linkID)
-        return measuringFolderCacheKey != key
-            && !queuedFolderMeasurementCacheKeys.contains(key)
+        return !activeFolderMeasurementCacheKeys.contains(key)
     }
 
     var canTrashSelectedBrowserItem: Bool {
@@ -4049,6 +4216,10 @@ final class DownloaderModel: ObservableObject {
             && browserStack.last != nil
     }
 
+    var canCheckCrossDriveDuplicates: Bool {
+        !isClosingWindow && !isLoginPresented && !isRunning && !hasExclusiveBackgroundTask && hasUsableSession
+    }
+
     var selectedDuplicateFiles: [DuplicateFile] {
         guard let duplicateScan else { return [] }
         return duplicateScan.groups
@@ -4086,16 +4257,17 @@ final class DownloaderModel: ObservableObject {
         return min(max(previewBufferedSeconds / previewDurationSeconds, 0), 1)
     }
 
+    /// Files that are finished one way or another. A failed file still waiting to retry is not finished.
     var downloadProcessedFiles: Int {
-        downloadCompletedFiles + downloadSkippedFiles + downloadFailedFiles
+        downloadCompletedFiles + downloadSkippedFiles + downloadPermanentFailedFiles
     }
 
     var activeDownloadCount: Int {
         activeDownloadTransfers.values.filter { transfer in
             switch transfer.state {
-            case .preparing, .downloading, .retrying:
+            case .preparing, .downloading:
                 return true
-            case .queued, .completed, .skipped, .failed, .stopped:
+            case .queued, .retrying, .completed, .skipped, .failed, .stopped:
                 return false
             }
         }.count
@@ -4117,15 +4289,19 @@ final class DownloaderModel: ObservableObject {
 
     var preparingDownloadItems: [PendingDownloadItem] {
         guard isDownloading else { return [] }
-        return activeDownloadRequests.flatMap(\.pendingItems).filter {
-            liveDownloadRun ? discoveringDownloadRequestIDs.contains($0.id) : downloadRunState == .scanning
+        let held = interruptedDownloadRequests.filter { request in
+            request.pendingItems.contains { pendingDownloadIsPaused($0) }
+        }
+        return (activeDownloadRequests + held).flatMap(\.pendingItems).filter {
+            pendingDownloadIsPaused($0)
+                || (liveDownloadRun ? discoveringDownloadRequestIDs.contains($0.id) : downloadRunState == .scanning)
         }
     }
 
     var canStartPendingDownloads: Bool {
-        (!pendingDownloadRequests.isEmpty || !interruptedDownloadRequests.isEmpty)
-            && downloadProcess?.isRunning != true
-            && !isDownloading
+        ((downloadsPaused && isDownloading && downloadProcess?.isRunning == true)
+            || ((!pendingDownloadRequests.isEmpty || !interruptedDownloadRequests.isEmpty)
+                && downloadProcess?.isRunning != true && !isDownloading))
             && hasUsableSession
             && transferStateReady && !isClosingWindow
     }
@@ -4140,7 +4316,151 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
+    var downloadTotalsAreIncomplete: Bool {
+        refreshDownloadDiscoveryPresentationIfNeeded()
+        return cachedDownloadTotalsAreIncomplete
+    }
+
+    var downloadDiscoveryFolderEstimateSummary: String? {
+        refreshDownloadDiscoveryPresentationIfNeeded()
+        return cachedDownloadDiscoveryFolderEstimateSummary
+    }
+
+    private struct DownloadDiscoveryFolderKey: Hashable {
+        let shareURL: String?
+        let remotePath: String
+        let destinationPath: String
+        let relativeParent: [String]
+    }
+
+    /// One selection still being discovered, with its whole-selection size when that is already known (a file's
+    /// own size, or a folder's cached measurement). Duplicates of one selection share an entry.
+    private struct DownloadDiscoveryRoot {
+        let ids: [UUID]
+        let estimate: UInt64?
+    }
+
+    /// The cached recursive size of a folder, only for the account (or shared link) the transfer belongs to.
+    private func cachedFolderMeasurement(sourceID: String, shareURL: String?) -> FolderMeasurement? {
+        guard let account = transferAccountID, folderMeasurementAccountID == account else { return nil }
+        let cacheKey: String
+        if let shareURL {
+            let links = sharedLinkSessions.filter { $0.value.access.url == shareURL }
+            guard links.count == 1, let linkID = links.first?.key else { return nil }
+            cacheKey = folderMeasurementCacheKey(for: sourceID, linkID: linkID)
+        } else {
+            cacheKey = folderMeasurementCacheKey(for: sourceID, linkID: nil)
+        }
+        guard let measurement = folderMeasurements[cacheKey], measurement.totalBytes <= UInt64(Int64.max) else { return nil }
+        return measurement
+    }
+
+    /// The live queue reports only leaves admitted so far. Cache this root
+    /// projection independently from byte progress and never use folder-size
+    /// cache estimates as the denominator of those exact discovered counters.
+    private func refreshDownloadDiscoveryPresentationIfNeeded() {
+        guard downloadDiscoveryPresentationIsDirty else { return }
+        downloadDiscoveryPresentationIsDirty = false
+        cachedDownloadTotalsAreIncomplete = false
+        cachedDownloadDiscoveryFolderEstimateSummary = nil
+        cachedDownloadDiscoveryRoots = []
+        #if FINDER_WORKSPACE_TESTS
+        downloadDiscoveryPresentationFixtureRefreshes += 1
+        #endif
+        guard !cancelAllDownloadsRequested else { return }
+        func cancelled(_ id: UUID) -> Bool {
+            cancelledDownloadRequestIDs.contains { downloadRoot(id, belongsTo: $0) }
+        }
+        let ongoing = liveDownloadRun && discoveringDownloadRequestIDs.contains { !cancelled($0) }
+        var folders: [DownloadDiscoveryFolderKey: Set<String>] = [:]
+        var groups: [DownloadDiscoveryFolderKey: (ids: [UUID], kind: BrowserItemKind, sourceIDs: Set<String>, size: UInt64?)] = [:]
+        var unresolved = false
+        func include(_ id: UUID, kind: BrowserItemKind, path: String, sourceID: String?, shareURL: String?,
+                     destination: URL, relativeParent: [String], size: UInt64?) {
+            guard !fullyDiscoveredDownloadRequestIDs.contains(id), !cancelled(id) else { return }
+            unresolved = true
+            let key = DownloadDiscoveryFolderKey(shareURL: shareURL, remotePath: path,
+                destinationPath: destination.path, relativeParent: relativeParent)
+            // A live leaf retry replaces a row already counted in this run.
+            // Restored retries have no such row yet and still add their known size.
+            let alreadyCounted = (downloadRetryTargets[id] ?? [:]).values.contains { downloadFileTotalsByID[$0] != nil }
+            if kind == .folder || !alreadyCounted {
+                var group = groups[key] ?? (ids: [], kind: kind, sourceIDs: [], size: size)
+                group.ids.append(id)
+                if let sourceID { group.sourceIDs.insert(sourceID) }
+                groups[key] = group
+            }
+            guard kind == .folder else { return }
+            var sources = folders[key] ?? []
+            if let sourceID { sources.insert(sourceID) }
+            folders[key] = sources
+        }
+        for request in activeDownloadRequests + pendingDownloadRequests + interruptedDownloadRequests {
+            switch request {
+            case .account(let roots, let destination, _, _):
+                for root in roots {
+                    include(root.queueID, kind: root.kind, path: root.path, sourceID: root.file?.id, shareURL: nil,
+                        destination: destination, relativeParent: root.relativeParent,
+                        size: root.kind == .folder ? nil : root.file.flatMap { UInt64($0.size) })
+                }
+            case .shared(let roots, let access, let destination, _, _):
+                for root in roots {
+                    include(root.queueID, kind: root.root.kind, path: root.root.path, sourceID: root.root.id, shareURL: access.url,
+                        destination: destination, relativeParent: root.root.relativeParent ?? [],
+                        size: root.root.kind == .folder ? nil : root.root.size)
+                }
+            }
+        }
+        cachedDownloadTotalsAreIncomplete = ongoing || unresolved
+            || (!liveDownloadRun && isDownloading && downloadRunState == .scanning)
+        guard cachedDownloadTotalsAreIncomplete else { return }
+        cachedDownloadDiscoveryRoots = groups.map { key, group in
+            let estimate = group.kind == .folder
+                ? (group.sourceIDs.count == 1 ? cachedFolderMeasurement(sourceID: group.sourceIDs.first!, shareURL: key.shareURL)?.totalBytes : nil)
+                : group.size
+            return DownloadDiscoveryRoot(ids: group.ids, estimate: estimate)
+        }
+        guard folders.count == 1, let (key, sources) = folders.first, sources.count == 1, let sourceID = sources.first,
+              let measurement = cachedFolderMeasurement(sourceID: sourceID, shareURL: key.shareURL) else { return }
+        let bytes = ByteCountFormatter.string(fromByteCount: Int64(measurement.totalBytes), countStyle: .binary)
+        cachedDownloadDiscoveryFolderEstimateSummary = "Cached folder estimate: \(bytes) • \(measurement.fileCount.formatted()) files • \(measurement.folderCount.formatted()) folders"
+    }
+
+    /// While selections are still being discovered, the discovered total plus whatever is already known about
+    /// their undiscovered part: a file's size, or a folder's cached size less what discovery has already added.
+    /// It feeds size, Remaining and approximate progress, keeping exact counters separate. Nil when
+    /// nothing adds to the discovered total (no sizes known, or a cached size that discovery has already passed).
+    var downloadEstimatedTotal: DownloadSizeEstimate? {
+        refreshDownloadDiscoveryPresentationIfNeeded()
+        guard cachedDownloadTotalsAreIncomplete else { return nil }
+        var extra: UInt64 = 0, unmeasured = 0
+        for root in cachedDownloadDiscoveryRoots {
+            guard let estimate = root.estimate else { unmeasured += 1; continue }
+            // Duplicates of one selection rediscover the same files, so the most advanced one is what is known.
+            let discovered = root.ids.map { discoveredBytesByRoot[$0] ?? 0 }.max() ?? 0
+            if estimate > discovered { extra = addingWithoutOverflow(extra, estimate - discovered) }
+        }
+        guard extra > 0 else { return nil }
+        return DownloadSizeEstimate(totalBytes: addingWithoutOverflow(downloadTotalBytes, extra), unmeasuredRoots: unmeasured)
+    }
+
+    var downloadEstimatedFraction: Double? {
+        guard let estimate = downloadEstimatedTotal, estimate.totalBytes > 0 else { return nil }
+        return min(Double(downloadDownloadedBytes) / Double(estimate.totalBytes), 1)
+    }
+
+    /// Approximate bytes (and time) left while discovery is still running. `lowerBound` means some selection has no
+    /// known size yet, so the real remainder can only be larger.
+    var downloadDiscoveryEstimatedRemaining: (bytes: UInt64, seconds: TimeInterval?, lowerBound: Bool)? {
+        guard let estimate = downloadEstimatedTotal, estimate.totalBytes > downloadDownloadedBytes else { return nil }
+        let remaining = estimate.totalBytes - downloadDownloadedBytes
+        let seconds = downloadRunState == .downloading && downloadBytesPerSecond > 1
+            ? Double(remaining) / downloadBytesPerSecond : nil
+        return (remaining, seconds, estimate.unmeasuredRoots > 0)
+    }
+
     var downloadOverallFraction: Double? {
+        guard !downloadTotalsAreIncomplete else { return nil }
         if downloadRunState == .completed,
            downloadTotalFiles > 0 || downloadTotalBytes > 0 {
             return 1
@@ -4160,8 +4480,17 @@ final class DownloaderModel: ObservableObject {
             : 0
     }
 
+    var downloadSpeedChartRemaining: (bytes: UInt64, estimated: Bool, lowerBound: Bool)? {
+        if let estimate = downloadEstimatedTotal {
+            return (estimate.totalBytes > downloadDownloadedBytes ? estimate.totalBytes - downloadDownloadedBytes : 0,
+                true, estimate.unmeasuredRoots > 0)
+        }
+        guard downloadTotalBytes > 0 || downloadRunState == .completed else { return nil }
+        return (downloadRemainingBytes, downloadTotalsAreIncomplete, downloadTotalsAreIncomplete)
+    }
+
     var downloadEstimatedSecondsRemaining: TimeInterval? {
-        guard downloadBytesPerSecond > 1, downloadRemainingBytes > 0 else { return nil }
+        guard !downloadTotalsAreIncomplete, downloadBytesPerSecond > 1, downloadRemainingBytes > 0 else { return nil }
         return Double(downloadRemainingBytes) / downloadBytesPerSecond
     }
 
@@ -4255,20 +4584,53 @@ final class DownloaderModel: ObservableObject {
 
     var activeBrowserFileFilter: BrowserFileFilter { isBrowsingSharedLink ? .all : browserFileFilter }
 
+    /// A folder's complete listing from what has already been read, or nil while it is not fully known: never
+    /// opened, loading, failed to load, or with more pages to come. Nothing is fetched to answer.
+    private func knownBrowserChildren(of folderID: String) -> [BrowserItem]? {
+        guard let children = browserTreeChildren[folderID], !browserTreeLoadingFolderIDs.contains(folderID),
+              browserTreeLoadErrors[folderID] == nil, browserTreeNextPageTokens[folderID]?.isEmpty != false else { return nil }
+        return children
+    }
+
+    private var hiddenBrowserFolderIDs: Set<String> {
+        guard !isBrowsingSharedLink, hidesEmptyFolders else { return [] }
+        if let hiddenBrowserFolderIDsCache { return hiddenBrowserFolderIDsCache }
+        let filter = browserFileFilter
+        let empty = BrowserEmptyFolders.emptyFolderIDs(among: Set(browserTreeEntries.lazy.filter { $0.item.isFolder }.map(\.id)),
+            children: { [unowned self] in self.knownBrowserChildren(of: $0) }, id: \.id, isFolder: \.isFolder,
+            matches: { filter.matches($0) })
+        hiddenBrowserFolderIDsCache = empty
+        return empty
+    }
+
     var displayedBrowserTreeEntries: [BrowserTreeEntry] {
-        guard activeBrowserFileFilter.isActive else { return browserTreeEntries }
+        guard activeBrowserFileFilter.isActive || (!isBrowsingSharedLink && hidesEmptyFolders) else { return browserTreeEntries }
         if let filteredBrowserEntriesCache { return filteredBrowserEntriesCache }
-        let entries = browserTreeEntries.filter { browserFileFilter.matches($0.item) }
+        let matched = browserTreeEntries.filter { browserFileFilter.matches($0.item) }
+        let hidden = hiddenBrowserFolderIDs
+        let entries = hidden.isEmpty ? matched : matched.filter { !($0.item.isFolder && hidden.contains($0.id)) }
+        hiddenBrowserEntryFolderCount = matched.count - entries.count
         filteredBrowserEntriesCache = entries
         return entries
     }
 
     var displayedBrowserItems: [BrowserItem] {
-        guard activeBrowserFileFilter.isActive else { return browserItems }
+        guard activeBrowserFileFilter.isActive || (!isBrowsingSharedLink && hidesEmptyFolders) else { return browserItems }
         if let filteredBrowserItemsCache { return filteredBrowserItemsCache }
-        let items = browserItems.filter { browserFileFilter.matches($0) }
+        let matched = browserItems.filter { browserFileFilter.matches($0) }
+        let hidden = hiddenBrowserFolderIDs
+        let items = hidden.isEmpty ? matched : matched.filter { !($0.isFolder && hidden.contains($0.id)) }
+        hiddenBrowserItemFolderCount = matched.count - items.count
         filteredBrowserItemsCache = items
         return items
+    }
+
+    /// How many folders the type filter and "Hide Empty Folders" removed from the list on screen.
+    func displayedBrowserHiddenFolderCount(includingExpanded: Bool) -> Int {
+        guard activeBrowserFileFilter.isActive || (!isBrowsingSharedLink && hidesEmptyFolders) else { return 0 }
+        if includingExpanded { _ = displayedBrowserTreeEntries; return hiddenBrowserEntryFolderCount }
+        _ = displayedBrowserItems
+        return hiddenBrowserItemFolderCount
     }
 
     /// The filter bar asks on every Browser render. Recompute only when the
@@ -4297,14 +4659,41 @@ final class DownloaderModel: ObservableObject {
     }
 
     private var browserFilterSelectionItems: [BrowserItem] {
-        activeBrowserFileFilter.isActive && !browserFilterIncludesExpandedRows
+        !browserFilterIncludesExpandedRows
             ? displayedBrowserItems : displayedBrowserTreeEntries.map(\.item)
     }
 
     private func isBrowserFilterSelectionVisible(_ item: BrowserItem) -> Bool {
-        guard activeBrowserFileFilter.isActive else { return true }
+        guard !isBrowsingSharedLink, activeBrowserFileFilter.isActive || hidesEmptyFolders else { return true }
         return browserFileFilter.matches(item)
+            && !(item.isFolder && hiddenBrowserFolderIDs.contains(item.id))
             && (browserFilterIncludesExpandedRows || browserItems.contains { $0.id == item.id })
+    }
+
+    /// Keep matching selections and the active preview when the user changes
+    /// the presentation filter. Only selections the filter actually hides go.
+    private func reconcileBrowserFilterSelection(resetsNavigation: Bool = true) {
+        if resetsNavigation {
+            deletedBrowserSelection = nil
+            collapsedBrowserFolderFocus = nil
+        }
+        guard selectedBrowserItemID != nil || !selectedBrowserItemIDs.isEmpty else { return }
+        let retained = Set(selectedBrowserItemIDs.filter { id in
+            browserItem(withID: id).map(isBrowserFilterSelectionVisible) == true
+        })
+        if retained != selectedBrowserItemIDs { selectedBrowserItemIDs = retained }
+        if let selectedBrowserItemID, let item = browserItem(withID: selectedBrowserItemID),
+           isBrowserFilterSelectionVisible(item) {
+            if browserSelectionAnchorID.flatMap({ browserItem(withID: $0) }).map(isBrowserFilterSelectionVisible) != true {
+                browserSelectionAnchorID = selectedBrowserItemID
+            }
+            return
+        }
+        if !retained.isEmpty, let replacement = browserFilterSelectionItems.first(where: { retained.contains($0.id) }) {
+            updateBrowserSelection(to: replacement, replacingSelection: false)
+        } else if selectedBrowserItemID != nil || !retained.isEmpty {
+            clearBrowserSelectionFromCanvas()
+        }
     }
 
     var selectedBrowserItem: BrowserItem? {
@@ -4337,7 +4726,9 @@ final class DownloaderModel: ObservableObject {
     var browserItemActionRoots: [BrowserItem] {
         selectedBrowserItems.filter { item in
             var parentID = browserItemParentIDs[item.id]
+            var visited = Set([item.id])
             while let candidate = parentID {
+                guard visited.insert(candidate).inserted else { return false }
                 if selectedBrowserItemIDs.contains(candidate),
                    browserItem(withID: candidate)?.isFolder == true {
                     return false
@@ -4617,8 +5008,8 @@ final class DownloaderModel: ObservableObject {
             browserSortColumn = column
             browserSortDirection = .ascending
         }
-        UserDefaults.standard.set(browserSortColumn.rawValue, forKey: "browserSortColumn")
-        UserDefaults.standard.set(browserSortDirection.rawValue, forKey: "browserSortDirection")
+        preferences.set(browserSortColumn.rawValue, forKey: "browserSortColumn")
+        preferences.set(browserSortDirection.rawValue, forKey: "browserSortDirection")
         applyBrowserSortToCachedItems()
         setStatus("Sorted by \(browserSortColumn.title), \(browserSortDirection.title)")
     }
@@ -4632,6 +5023,7 @@ final class DownloaderModel: ObservableObject {
         visibleItems: [BrowserItem]? = nil
     ) {
         guard canChangeBrowserSelection, isBrowserFilterSelectionVisible(item) else { return }
+        deletedBrowserSelection = nil
         prefetchFolderThumbnails(for: item)
         if extending {
             if showsSharedLinkOverview { extendSharedBrowserSelection(to: item) }
@@ -4648,6 +5040,7 @@ final class DownloaderModel: ObservableObject {
     /// subtree, including descendants that have not been loaded into the UI.
     func toggleBrowserCheckbox(_ item: BrowserItem) {
         guard canChangeBrowserSelection, isBrowserFilterSelectionVisible(item) else { return }
+        deletedBrowserSelection = nil
         prefetchFolderThumbnails(for: item)
         if let containingSelectionID = selectionRootID(containing: item.id) {
             // A folder is one recursive selection root. Remove the complete
@@ -5009,6 +5402,7 @@ final class DownloaderModel: ObservableObject {
         }
     }
     var hasAccountSession: Bool { hasToken && !requiresDedicatedSignIn }
+    var canProvidePikPakRelayContext: Bool { !isClosingWindow && hasUsableSession }
     var canChangeAccount: Bool { accountStore != nil && !isClosingWindow && !accountWorkIsActive && !isCheckingAccount && !isChangingAccount && !isLoginPresented }
     var canCheckAccountStatus: Bool { hasAccountSession && !isClosingWindow && !isCheckingAccount && !isChangingAccount && !isLoginPresented }
     var accountChangeBlockedReason: String? {
@@ -5029,7 +5423,41 @@ final class DownloaderModel: ObservableObject {
             || fileSearch.isScanning || fileSearch.isResolving || fileSimilarity.cloud.isRunning
     }
 
+    /// Closing one browser must not stop its transfers while other workspace
+    /// windows remain open. Retain its owner until app shutdown or a reveal.
+    var keepsWorkspaceAlive: Bool {
+        accountWorkIsActive || !pendingDownloadRequests.isEmpty || !interruptedDownloadRequests.isEmpty
+            || !savedUploadBatches.isEmpty || fileSimilarity.local.isRunning || fileSimilarity.local.isPaused
+    }
+
+    func inheritWindowAccount(from source: DownloaderModel) {
+        guard let accountStore, let sourceStore = source.accountStore,
+              accountStore.directory == sourceStore.directory else { return }
+        do {
+            applyAccounts(try accountStore.selectWorkspaceAccount(source.activeAccountID, workspaceSessionID: workspaceSessionID))
+            if let account = activeSavedAccount, !account.needsSignIn {
+                let session = try accountStore.files(for: account.id).load()
+                refreshToken = session.token; deviceID = session.deviceID
+                accountProfile = account.profile
+                requiresDedicatedSignIn = false
+                accountLoginStatus = source.accountLoginStatus == .signedIn ? .signedIn : .unverified
+            } else {
+                refreshToken = ""; accountProfile = nil
+                requiresDedicatedSignIn = activeSavedAccount?.needsSignIn == true
+                accountLoginStatus = requiresDedicatedSignIn ? .needsSignIn : .signedOut
+            }
+        } catch {
+            refreshToken = ""; accountProfile = nil; requiresDedicatedSignIn = true
+            accountLoginStatus = .needsSignIn
+            accountSettingsError = "Could not load this window’s PikPak account. Sign in or choose a saved account."
+        }
+    }
+
     private func applyAccounts(_ document: PikPakAccountsDocument) {
+        if document.activeID(for: workspaceSessionID) != activeAccountID {
+            cancelRequestVerification()
+            requestVerificationChallenge = nil
+        }
         savedAccounts = document.accounts
         activeAccountID = document.activeID(for: workspaceSessionID)
     }
@@ -5099,7 +5527,7 @@ final class DownloaderModel: ObservableObject {
         }
         accountProfile = profile
         requiresDedicatedSignIn = false
-        accountLoginStatus = .signedIn
+        accountLoginStatus = requestVerificationChallenge == nil ? .signedIn : .verificationRequired
     }
 
     func checkAccountStatus(automatically: Bool = false) {
@@ -5119,14 +5547,24 @@ final class DownloaderModel: ObservableObject {
             guard let self else { return }
             defer { if self.accountCheckGeneration == generation { self.isCheckingAccount = false; self.accountCheckTask = nil } }
             do {
-                let profile = try await self.verifyAccount(store.files(for: account.id))
+                let profile = try await self.verifyAccount(store.files(for: account.id), checkDrive: true)
                 try Task.checkCancellation()
                 guard self.accountCheckGeneration == generation, self.activeAccountID == account.id, !self.isClosingWindow else { return }
                 if let expected = account.profile?.sub, expected != profile.sub { throw PikPakAccountError.accountMismatch }
+                // This check now includes the browser's shield action, without
+                // requesting or enumerating the user's files.
+                if self.requestVerificationChallenge?.action == "GET:/drive/v1/files" {
+                    self.requestVerificationChallenge = nil
+                }
                 self.rememberVerifiedAccount(profile)
                 self.synchronizeSharedSessionFromDisk()
             } catch {
-                guard !Task.isCancelled, self.accountCheckGeneration == generation, !self.isClosingWindow else { return }
+                guard !Task.isCancelled, self.accountCheckGeneration == generation,
+                      self.activeAccountID == account.id, !self.isClosingWindow else { return }
+                if case let PikPakRequestVerificationError.required(challenge) = error {
+                    self.receiveRequestVerification(challenge)
+                    return
+                }
                 self.accountSettingsError = error.localizedDescription
                 if let error = error as? PikPakAccountError,
                    error == .needsSignIn || error == .missingSession || error == .accountMismatch {
@@ -5135,6 +5573,17 @@ final class DownloaderModel: ObservableObject {
                 } else { self.accountLoginStatus = .unavailable }
             }
         }
+    }
+
+    private func clearAccountLoginWebsiteData(completion: @escaping () -> Void) {
+        #if FINDER_WORKSPACE_TESTS
+        if isFinderWorkspaceFixture {
+            if let accountLoginWebsiteDataClearer { accountLoginWebsiteDataClearer(completion) }
+            else { completion() }
+            return
+        }
+        #endif
+        PikPakLoginDataStore.clearPikPakWebsiteData(completion: completion)
     }
 
     func beginAccountLogin(accountID: UUID? = nil, credentialKind: PikPakCredentialKind? = nil, fromSettings: Bool = true) {
@@ -5149,10 +5598,13 @@ final class DownloaderModel: ObservableObject {
             presentLogin(reason: "Connect with a token you create in PikPak’s Connected Apps page.", fromSettings: fromSettings, preserveConnectionChoice: true)
             return
         }
+        // Login preparation belongs to this authorization attempt, independently
+        // of file previews and Download Mode changes in any workspace.
         let loginDevice = accountLoginDeviceID
         isChangingAccount = true
-        PikPakLoginDataStore.clearPikPakWebsiteData { [weak self] in
-            guard let self, !self.isClosingWindow, self.accountLoginDeviceID == loginDevice else { return }
+        clearAccountLoginWebsiteData { [weak self] in
+            guard let self, !self.isClosingWindow, self.isChangingAccount,
+                  self.accountLoginDeviceID == loginDevice else { return }
             self.isChangingAccount = false
             self.presentLogin(reason: accountID == nil ? "Sign in to add a PikPak account to this Mac." : "Sign in to connect normal login for this PikPak account. Your saved token is kept.", fromSettings: fromSettings, preserveConnectionChoice: true)
         }
@@ -5218,7 +5670,7 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
-    private func verifyAccount(_ files: PikPakAccountSessionFiles, using verifier: PikPakAccountVerifier? = nil) async throws -> PikPakAccountProfile {
+    private func verifyAccount(_ files: PikPakAccountSessionFiles, using verifier: PikPakAccountVerifier? = nil, checkDrive: Bool = false) async throws -> PikPakAccountProfile {
         #if FINDER_WORKSPACE_TESTS
         if let accountProfileLoader { return try await accountProfileLoader(files) }
         #endif
@@ -5227,10 +5679,12 @@ final class DownloaderModel: ObservableObject {
         var environment = desktopEngineEnvironment(tokenURL: files.tokenURL, lockURL: files.lockURL, deviceID: session.deviceID, credentialKind: session.credentialKind)
         let proxy = proxyURL.trimmingCharacters(in: .whitespacesAndNewlines)
         environment["PIKPAK_PROXY"] = proxy.isEmpty ? nil : proxy
-        return try await (verifier ?? accountVerifier).verify(engineURL: engine, environment: environment)
+        return try await (verifier ?? accountVerifier).verify(engineURL: engine, environment: environment, checkDrive: checkDrive)
     }
 
     private func clearAccountWorkspace() {
+        cancelRequestVerification()
+        requestVerificationChallenge = nil
         pikpakManagement.clear()
         pendingSharedLinkLoads = []
         cancelAutomaticSharedLinkRetry(resettingAttempts: true)
@@ -5239,6 +5693,8 @@ final class DownloaderModel: ObservableObject {
         sharedBrowserSelectionAnchor = nil
         clearTransferAccountContext()
         resetDownloadProgress(); downloadRunState = .ready
+        permanentFailureReports = [:]
+        downloadBatch = nil
         failedDownloadTransfers = []
         lastAccountDownloadPaths = []; lastSharedDownloadItems = []
         lastSharedDownloadAccess = nil; lastDownloadUsedSharedLink = false
@@ -5289,6 +5745,9 @@ final class DownloaderModel: ObservableObject {
         storageQuota = nil; storageQuotaError = nil; isQuotaLoading = false; quotaRefreshPending = false
         transferQuotaMonitor.clear()
         duplicateScan = nil; selectedDuplicateFileIDs = []
+        showsCrossDriveDuplicateScope = false; duplicateScopeCloudFolders = []; duplicateScopeLocalFolders = []
+        duplicateScanCloudFolders = []; duplicateScanLocalFolders = []
+        duplicateScopePicker?.close(); duplicateScopePicker = nil
         attemptedInitialBrowse = false
     }
 
@@ -5350,15 +5809,47 @@ final class DownloaderModel: ObservableObject {
         panel.directoryURL = outputURL
         guard panel.runModal() == .OK, let url = panel.url else { return }
         outputURL = url
-        UserDefaults.standard.set(url.path, forKey: "outputPath")
+        let key = url.standardizedFileURL.path
+        // A fresh picker grant can restore access without changing queued
+        // selections or silently substituting a different disk.
+        if let bookmark = try? url.bookmarkData(options: .withSecurityScope,
+            includingResourceValuesForKeys: [.volumeUUIDStringKey], relativeTo: nil) {
+            if var checkpoint = downloadDestinations[key] {
+                checkpoint.bookmark = bookmark; downloadDestinations[key] = checkpoint
+            }
+            downloadDestinationLeases[key] = LocalFileAccessLease([url], bookmarks: [key: bookmark])
+        }
+        _ = downloadDestinationIsReady(url)
+        _ = persistTransfersSynchronously()
+        checkDownloadDestinations()
+        preferences.set(url.path, forKey: "outputPath")
     }
 
     func openOutputFolder() {
-        try? FileManager.default.createDirectory(
-            at: outputURL,
-            withIntermediateDirectories: true
-        )
-        NSWorkspace.shared.open(outputURL)
+        guard downloadDestinationIsReady(outputURL) else {
+            if let downloadDestinationStatus { setError(downloadDestinationStatus) }
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
+            NSWorkspace.shared.open(outputURL)
+        } catch { setError("Could not open the download folder: \(error.localizedDescription)") }
+    }
+
+    func revealDownloadedFile(_ transfer: DownloadTransfer) {
+        guard let url = transfer.completedFileURL else { return }
+        guard downloadDestinationIsReady(url.deletingLastPathComponent()) else {
+            if let downloadDestinationStatus { setError(downloadDestinationStatus) }
+            return
+        }
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            setError("The downloaded file is no longer at its saved location.")
+            return
+        }
+        #if FINDER_WORKSPACE_TESTS
+        if let downloadFileRevealFixture { downloadFileRevealFixture(url); return }
+        #endif
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     /// Ask for local files and folders and immediately upload them into the
@@ -5483,7 +5974,7 @@ final class DownloaderModel: ObservableObject {
             destination: destination,
             preservingFailedHistory: preservingFailedHistory
         )
-        UserDefaults.standard.set(proxyURL, forKey: "proxyURL")
+        preferences.set(proxyURL, forKey: "proxyURL")
         runUploadEngine(
             arguments: [
                 "upload",
@@ -5707,7 +6198,7 @@ final class DownloaderModel: ObservableObject {
         }
         let passcode = sharePasscodeInput.trimmingCharacters(in: .whitespacesAndNewlines)
         if let existing = sharedLinks.first(where: { entry in
-            entry.url.caseInsensitiveCompare(rawURL) == .orderedSame
+            SharedLinkIdentity.equivalent(entry.url, rawURL)
         }) {
             if case .failed = existing.state,
                !passcode.isEmpty,
@@ -5731,6 +6222,10 @@ final class DownloaderModel: ObservableObject {
             return
         }
 
+        guard sharedLinks.count < SharedLinksStateStore.maximumLinks else {
+            setShareLinkFeedback("Links holds up to \(SharedLinksStateStore.maximumLinks) saved links. Remove a link before adding another.", tone: .error)
+            return
+        }
         guard activateSharedLinkBrowser() else { return }
         if isBrowsingSharedLink {
             saveActiveBrowserWorkspace()
@@ -5763,7 +6258,7 @@ final class DownloaderModel: ObservableObject {
         pendingSharedLinkOpenAfterLogin = false
         isOpeningShareLink = true
         setShareLinkFeedback("Opening this link with your private app session…", tone: .progress)
-        UserDefaults.standard.set(rawURL, forKey: "lastShareURL")
+        preferences.set(rawURL, forKey: "lastShareURL")
         resetBrowserWorkspace(root: .sharedRoot)
         sharedBrowserWorkspace = nil
         shareURLInput = ""
@@ -5981,7 +6476,7 @@ final class DownloaderModel: ObservableObject {
             return
         }
         guard !sharedLinks.contains(where: { other in
-            other.id != linkID && other.url.caseInsensitiveCompare(url) == .orderedSame
+            other.id != linkID && SharedLinkIdentity.equivalent(other.url, url)
         }) else {
             setShareLinkFeedback(
                 "Another link in this list already uses that URL.",
@@ -5990,7 +6485,7 @@ final class DownloaderModel: ObservableObject {
             return
         }
 
-        let urlChanged = sharedLinks[index].url.caseInsensitiveCompare(url) != .orderedSame
+        let urlChanged = !SharedLinkIdentity.equivalent(sharedLinks[index].url, url)
         let passCodeChanged = session.access.passCode != passCode
         guard urlChanged || passCodeChanged else {
             setShareLinkFeedback("That link is already up to date.", tone: .info)
@@ -6114,7 +6609,7 @@ final class DownloaderModel: ObservableObject {
             for record in document.records.prefix(SharedLinksStateStore.maximumLinks) {
                 let normalizedURL = record.entry.url
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                let urlKey = normalizedURL.lowercased()
+                let urlKey = SharedLinkIdentity.key(normalizedURL)
                 guard
                     isSupportedPersistedSharedLinkURL(normalizedURL),
                     seenIDs.insert(record.entry.id).inserted,
@@ -6182,7 +6677,7 @@ final class DownloaderModel: ObservableObject {
     /// current list while replacing the running app.
     private func restorePendingSharedLinkURLMigration() {
         let key = "pendingSharedLinkURLMigrationV1"
-        let defaults = UserDefaults.standard
+        let defaults = preferences
         guard
             let encoded = defaults.string(forKey: key),
             let data = Data(base64Encoded: encoded),
@@ -6199,7 +6694,7 @@ final class DownloaderModel: ObservableObject {
             let url = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
             guard
                 isSupportedPersistedSharedLinkURL(url),
-                seenURLs.insert(url.lowercased()).inserted
+                seenURLs.insert(SharedLinkIdentity.key(url)).inserted
             else { continue }
             let id = UUID()
             entries.append(
@@ -6268,22 +6763,26 @@ final class DownloaderModel: ObservableObject {
         #if FILE_SEARCH_TESTS
         if isFileSearchFixture { return }
         #endif
-        let document = persistedSharedLinksDocument()
-        let workspaceSessionID = self.workspaceSessionID
-        sharedLinkStateQueue.async { [weak self] in
-            do {
-                try SharedLinksStateStore.save(document, workspaceSessionID: workspaceSessionID)
-            } catch {
-                Task { @MainActor [weak self] in
-                    self?.appendOutput(
-                        "Warning: shared links could not be saved locally: \(error.localizedDescription)\n"
-                    )
+        sharedLinkPersistenceTask?.cancel()
+        sharedLinkPersistenceTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 300_000_000) } catch { return }
+            guard let self, !self.isClosingWindow else { return }
+            self.sharedLinkPersistenceTask = nil
+            let document = self.persistedSharedLinksDocument()
+            let workspaceSessionID = self.workspaceSessionID
+            self.sharedLinkStateQueue.async { [weak self] in
+                do { try SharedLinksStateStore.save(document, workspaceSessionID: workspaceSessionID) }
+                catch {
+                    Task { @MainActor [weak self] in
+                        self?.appendOutput("Warning: shared links could not be saved locally: \(error.localizedDescription)\n")
+                    }
                 }
             }
         }
     }
 
     private func persistSharedLinkStateSynchronously() {
+        sharedLinkPersistenceTask?.cancel(); sharedLinkPersistenceTask = nil
         #if FINDER_WORKSPACE_TESTS
         if isFinderWorkspaceFixture { return }
         #endif
@@ -6417,6 +6916,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func restoreBrowserWorkspace(_ snapshot: BrowserWorkspaceSnapshot) {
+        deletedBrowserSelection = nil
         collapsedBrowserFolderFocus = nil
         cancelBrowserTreeLoads()
         browserItems = snapshot.items
@@ -6501,10 +7001,14 @@ final class DownloaderModel: ObservableObject {
     }
 
     func completeWebLogin(with session: PikPakWebSession) {
-        guard !isClosingWindow, !isCheckingAccount, !isChangingAccount, let store = accountStore else { return }
+        guard !isClosingWindow, !isCheckingAccount, !isChangingAccount, isLoginPresented,
+              let expectedDevice = accountLoginDeviceID,
+              session.deviceID == expectedDevice,
+              session.credentialKind == loginCredentialKind,
+              let store = accountStore else { return }
         do {
             let parsed = try session.credentialKind.parse(session.refreshToken)
-            let newDeviceID = session.deviceID.isEmpty ? loginDeviceID : session.deviceID
+            let newDeviceID = expectedDevice
             let files = try store.stage(token: parsed, deviceID: newDeviceID, credentialKind: session.credentialKind)
             let expected = savedAccounts.first { $0.id == accountLoginTargetID }?.profile?.sub
             let generation = UUID()
@@ -6533,7 +7037,11 @@ final class DownloaderModel: ObservableObject {
                     let document = try store.commit(files, profile: profile, checkedAt: Date(), workspaceSessionID: self.workspaceSessionID)
                     committed = true
                     self.finishAccountChange(document, session: freshSession, profile: profile)
+                    #if FINDER_WORKSPACE_TESTS
+                    if !self.isFinderWorkspaceFixture { PikPakLoginDataStore.clearPikPakWebsiteData() }
+                    #else
                     PikPakLoginDataStore.clearPikPakWebsiteData()
+                    #endif
                 } catch {
                     guard !Task.isCancelled, !self.isClosingWindow else { return }
                     self.accountSettingsError = error.localizedDescription
@@ -6593,7 +7101,7 @@ final class DownloaderModel: ObservableObject {
             fileSearch.present(scope: .expanded,
                 expandedItems: currentExpandedSearchItems(
                     includesExpandedChildren: showsSharedLinkOverview
-                        || UserDefaults.standard.integer(forKey: isBrowsingSharedLink ? "linksViewMode" : "browserViewMode") != 1),
+                        || preferences.integer(forKey: isBrowsingSharedLink ? "linksViewMode" : "browserViewMode") != 1),
                 contextName: showsSharedLinkOverview ? "Links" : "\(isBrowsingSharedLink ? "Links" : "Browser") · \(currentBrowserPath)")
             return
         }
@@ -6848,6 +7356,12 @@ final class DownloaderModel: ObservableObject {
 
         let visibleItems = suppliedVisibleItems ?? browserFilterSelectionItems
         guard !visibleItems.isEmpty else { return nil }
+        if selectedBrowserItemID == nil, let deletedBrowserSelection {
+            guard let index = deletedBrowserSelection.targetIndex(in: visibleItems.map(\.id), offset: offset) else { return nil }
+            let item = visibleItems[index]
+            updateBrowserSelection(to: item)
+            return item.id
+        }
         let startIndex: Int
         if let selectedBrowserItemID,
            let selectedIndex = visibleItems.firstIndex(where: { $0.id == selectedBrowserItemID }) {
@@ -7059,16 +7573,7 @@ final class DownloaderModel: ObservableObject {
             let playlistURL = try makePrivateCompatibilityPlaylist(for: sourceURL)
             let player = Process()
             player.executableURL = executableURL
-            var arguments = [
-                "--no-stdin",
-                "--separate-windows",
-                "--mpv-user-agent=\(Self.previewUserAgent)",
-                "--mpv-save-position-on-quit=no",
-                "--mpv-resume-playback=no",
-            ]
-            arguments.append("--mpv-referrer=https://mypikpak.com/")
-            arguments.append(playlistURL.path)
-            player.arguments = arguments
+            player.arguments = Self.compatibilityPlayerArguments(playlistURL: playlistURL)
             player.standardOutput = FileHandle.nullDevice
             player.standardError = FileHandle.nullDevice
             do {
@@ -7229,36 +7734,38 @@ final class DownloaderModel: ObservableObject {
     }
 
     func measureSharedLink(_ linkID: UUID) {
-        guard canMeasureSharedLink(linkID) else { return }
-        if activeSharedLinkID != linkID {
-            activateSharedLink(linkID)
-        }
         guard
-            activeSharedLinkID == linkID,
+            canMeasureSharedLink(linkID),
             let root = sharedLinkRootLocation(for: linkID),
-            let shareAccess,
-            shareLinkIsOpen
+            let access = sharedLinkSessions[linkID]?.access
         else { return }
 
-        measuredFolderID = root.id
-        folderMeasurement = cachedFolderMeasurement(for: root.id, in: linkID)
-        let request = ShareMeasureInput(access: shareAccess, folderId: root.id)
+        if isBrowsingSharedLink, activeSharedLinkID == linkID {
+            measuredFolderID = root.id
+            folderMeasurement = cachedFolderMeasurement(for: root.id, in: linkID)
+        }
+        let request = ShareMeasureInput(access: access, folderId: root.id)
+        cancelOperationRetries(prefix: "measure:\(linkID):\(root.id)")
         runFolderMeasurementEngine(
             arguments: ["share-measure"],
             operation: .shareMeasure(request: request, folderID: root.id, linkID: linkID)
         )
     }
 
-    func measureFolder(_ item: BrowserItem) {
-        guard canMeasureFolder(item), isBrowsingSharedLink || validateConfiguration() else { return }
+    func measureFolder(_ item: BrowserItem, in linkID: UUID? = nil) {
+        let effectiveLinkID = linkID ?? (isBrowsingSharedLink ? activeSharedLinkID : nil)
+        guard canMeasureFolder(item, in: effectiveLinkID), effectiveLinkID != nil || validateConfiguration() else { return }
 
-        measuredFolderID = item.id
-        folderMeasurement = cachedFolderMeasurement(for: item.id)
-        if isBrowsingSharedLink {
-            guard let shareAccess,
-                  let linkID = activeSharedLinkID,
-                  shareLinkIsOpen else { return }
-            let request = ShareMeasureInput(access: shareAccess, folderId: item.id)
+        if effectiveLinkID == (isBrowsingSharedLink ? activeSharedLinkID : nil) {
+            measuredFolderID = item.id
+            folderMeasurement = cachedFolderMeasurement(for: item.id, in: effectiveLinkID)
+        }
+        if let linkID = effectiveLinkID {
+            cancelOperationRetries(prefix: "measure:\(linkID):\(item.id)")
+        } else { cancelOperationRetries(prefix: "measure:\(item.id)") }
+        if let linkID = effectiveLinkID {
+            guard let access = sharedLinkSessions[linkID]?.access else { return }
+            let request = ShareMeasureInput(access: access, folderId: item.id)
             runFolderMeasurementEngine(
                 arguments: ["share-measure"],
                 operation: .shareMeasure(
@@ -7279,14 +7786,28 @@ final class DownloaderModel: ObservableObject {
     }
 
     func cancelFolderMeasurement() {
-        cancelOperationRetries(prefix: "measure:")
-        guard isMeasuringFolder,
-              let folderMeasurementProcess,
-              folderMeasurementProcess.isRunning
-        else { return }
-        folderMeasurementWasCancelled = true
+        let linkID = isBrowsingSharedLink ? activeSharedLinkID : nil
+        let folderID = selectedBrowserItem?.id ?? browserStack.last?.id ?? ""
+        let key = folderMeasurementCacheKey(for: folderID, linkID: linkID)
+        guard let run = folderMeasurementRuns[key] else { return }
+        if let retryKey = operationRetryKey(run.operation) { cancelOperationRetries(prefix: retryKey) }
+        run.wasCancelled = true
         setStatus("Cancelling folder size calculation…")
-        folderMeasurementProcess.terminate()
+        if run.process.isRunning { run.process.terminate() }
+    }
+
+    private func stopFolderMeasurements() {
+        cancelOperationRetries(prefix: "measure:")
+        for run in folderMeasurementRuns.values {
+            run.wasCancelled = true
+            if run.process.isRunning { run.process.terminate() }
+        }
+    }
+
+    private func updateFolderMeasurementActivity() {
+        activeFolderMeasurementCacheKeys = Set(folderMeasurementRuns.keys)
+        isMeasuringFolder = !folderMeasurementRuns.isEmpty
+        measuringFolderID = folderMeasurementRuns.values.first?.folderID
     }
 
     func scanCurrentFolderForDuplicates() {
@@ -7295,6 +7816,13 @@ final class DownloaderModel: ObservableObject {
             let scope = browserStack.last,
             validateConfiguration()
         else { return }
+
+        duplicateScanCloudFolders = [scope]
+        duplicateScanLocalFolders = []
+        prepareDuplicateScan(scope: scope)
+    }
+
+    private func prepareDuplicateScan(scope: BrowserLocation) {
 
         duplicateScan = nil
         selectedDuplicateFileIDs = []
@@ -7315,6 +7843,48 @@ final class DownloaderModel: ObservableObject {
         }
         #endif
         runDuplicateScan(scope: scope)
+    }
+
+    func presentCrossDriveDuplicateScope(localFolders: [URL] = [], reusingScan: Bool = false) {
+        guard canCheckCrossDriveDuplicates else { return }
+        let accountFolder = isBrowsingSharedLink ? accountBrowserWorkspace?.stack.last : browserStack.last
+        duplicateScopeCloudFolders = reusingScan && !duplicateScanCloudFolders.isEmpty
+            ? duplicateScanCloudFolders : [accountFolder ?? .root]
+        duplicateScopeLocalFolders = reusingScan ? duplicateScanLocalFolders : localFolders
+        taskActivity.showsDuplicateResults = false
+        showsCrossDriveDuplicateScope = true
+    }
+
+    func startCrossDriveDuplicateScan() {
+        guard canCheckCrossDriveDuplicates, validateConfiguration(),
+              !duplicateScopeCloudFolders.isEmpty || !duplicateScopeLocalFolders.isEmpty else { return }
+        duplicateScanCloudFolders = duplicateScopeCloudFolders
+        duplicateScanLocalFolders = duplicateScopeLocalFolders
+        showsCrossDriveDuplicateScope = false
+        prepareDuplicateScan(scope: duplicateScanCloudFolders.first ?? .root)
+    }
+
+    func chooseDuplicateCloudFolder() {
+        guard canCheckCrossDriveDuplicates else { return }
+        do {
+            let account = activeAccountID
+            let configuration = try similarityConfiguration(.cloud)
+            duplicateScopePicker = SimilarityScopePicker(title: "Add a PikPak Folder", prompt: "Add Folder",
+                root: .init(id: "", title: "PikPak"), load: { [weak self] folder, token in
+                    guard let self, self.activeAccountID == account else { throw CancellationError() }
+                    var arguments = ["--parent-id", folder.id, "--limit", "500"]
+                    if let token { arguments += ["--page-token", token] }
+                    let data = try await SimilarityHelper.request(configuration: configuration, command: "browse", input: Data(), arguments: arguments)
+                    let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+                    let page = try decoder.decode(BrowserPage.self, from: data)
+                    return .init(folders: page.files.filter(\.isFolder).map { .init(id: $0.id, title: $0.name) }, nextPage: page.nextPageToken)
+                }, accept: { [weak self] route in
+                    guard let self, self.activeAccountID == account, let folder = route.last else { return }
+                    let item = BrowserLocation(id: folder.id, name: folder.title,
+                        path: route.count == 1 ? "/" : "/" + route.dropFirst().map(\.title).joined(separator: "/"))
+                    if !self.duplicateScopeCloudFolders.contains(where: { $0.id == item.id }) { self.duplicateScopeCloudFolders.append(item) }
+                })
+        } catch { setError(error.localizedDescription) }
     }
 
     func cancelDuplicateScan() {
@@ -7338,7 +7908,7 @@ final class DownloaderModel: ObservableObject {
     func setDuplicateFileSelected(_ fileID: String, selected: Bool) {
         guard let duplicateScan,
               let group = duplicateScan.groups.first(where: { group in
-                  group.files.contains(where: { $0.id == fileID })
+                  group.files.contains(where: { $0.id == fileID && !$0.isLocal })
               })
         else { return }
 
@@ -7361,9 +7931,9 @@ final class DownloaderModel: ObservableObject {
         selectedDuplicateFileIDs = Set(
             duplicateScan.groups
                 .filter { $0.matchKind == .exactContent }
-                .flatMap { $0.files.dropFirst().map(\.id) }
+                .flatMap { CrossDriveDuplicatePolicy.recommendedIDs($0.files) }
         )
-        setStatus("Selected redundant exact-content copies while keeping one copy per group")
+        setStatus("Selected redundant PikPak copies, preferring newer folders and keeping disk copies")
     }
 
     func clearDuplicateSelection() {
@@ -7372,6 +7942,8 @@ final class DownloaderModel: ObservableObject {
 
     func deleteSelectedDuplicates() {
         guard canDeleteSelectedDuplicates else { return }
+        do { try CrossDriveDuplicatePolicy.validateKeepers(duplicateScan, selected: selectedDuplicateFileIDs) }
+        catch { setError(error.localizedDescription); return }
         let ids = selectedDuplicateFileIDs.sorted()
         runEngine(
             arguments: ["trash", "--yes"],
@@ -7445,6 +8017,7 @@ final class DownloaderModel: ObservableObject {
 
     func performFileUndo(redo: Bool) {
         guard redo ? canRedoFileAction : canUndoFileAction else { return }
+        deletedBrowserSelection = nil
         let title = redo ? fileUndoHistory.redoTitle : fileUndoHistory.undoTitle
         if !redo, let batch = fileUndoHistory.undoEntries.last?.uploadBatchID,
            savedUploadBatches.contains(where: { $0.id == batch }) { discardSavedUpload(batch) }
@@ -7510,11 +8083,25 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
+    var browserActionContext: UUID { fileOpenContext }
+
     func trashSelectedBrowserItems() {
         guard canTrashSelectedBrowserItem else { return }
-        let ids = browserItemsSelectedForTrash.map(\.id)
+        trashBrowserItems(browserItemsSelectedForTrash, expectedContext: browserActionContext)
+    }
+
+    /// Confirmation owns immutable IDs and the account generation, so moving
+    /// selection in another panel cannot change the destructive target.
+    func trashBrowserItems(_ items: [BrowserItem], expectedContext: UUID) {
+        guard expectedContext == fileOpenContext, !isClosingWindow, !isChangingAccount,
+              !isRunning, !hasExclusiveBackgroundTask, !isBrowsingSharedLink, hasUsableSession,
+              !items.contains(where: isExtractionSourceInUse) else { return }
+        let ids = Array(Set(items.map(\.id))).sorted()
         guard !ids.isEmpty else { return }
         cancelAutomaticPreviewNavigation()
+        #if FINDER_WORKSPACE_TESTS
+        if let trashConfirmationFixture { trashConfirmationFixture(ids); return }
+        #endif
         runEngine(
             arguments: ["trash", "--yes"],
             operation: .trashBrowserItems(ids: ids)
@@ -7988,6 +8575,7 @@ final class DownloaderModel: ObservableObject {
     private func scheduleAutomaticArchiveRetry(_ id: UUID) {
         guard !isClosingWindow, automaticArchiveRetries[id] == nil,
               let task = archiveTasks.first(where: { $0.id == id }),
+              task.error?.code.contains("HTTP 403") != true,
               task.error != nil, !task.isBusy, !task.needsPassword, !task.isComplete else { return }
         let attempt = archiveRetryAttempts[id] ?? 0
         archiveRetryAttempts[id] = AutomaticRecovery.nextAttempt(attempt)
@@ -7998,6 +8586,7 @@ final class DownloaderModel: ObservableObject {
             self.automaticArchiveRetries[id] = nil
             guard !self.isClosingWindow,
                   let current = self.archiveTasks.first(where: { $0.id == id }),
+                  current.error?.code.contains("HTTP 403") != true,
                   current.error != nil, !current.isBusy, !current.needsPassword, !current.isComplete else { return }
             guard self.hasUsableSession else { self.scheduleAutomaticArchiveRetry(id); return }
             self.retryArchiveTask(id, automatic: true)
@@ -8020,11 +8609,13 @@ final class DownloaderModel: ObservableObject {
         else {
             taskID = UUID()
             archiveTasks.append(CloudExtractionTask(id: taskID, item: item,
-                parentFolderID: browserItemParentIDs[item.id] ?? item.parentId ?? browserStack.last?.id))
+                parentFolderID: browserItemParentIDs[item.id] ?? item.parentId ?? browserStack.last?.id,
+                accountID: activeAccountID))
         }
         if activate { selectArchiveTask(taskID) }
         updateArchiveTask(taskID) {
             $0.inspection = nil; $0.result = nil; $0.error = nil
+            $0.needsNormalLogin = false
             $0.password = password; $0.selectedIndices = []
             $0.passwordWasAttempted = !password.isEmpty
             $0.queuedAction = .inspect
@@ -8111,7 +8702,7 @@ final class DownloaderModel: ObservableObject {
                 let id = UUID()
                 archiveTasks.append(CloudExtractionTask(id: id, item: item,
                     parentFolderID: browserItemParentIDs[item.id] ?? item.parentId ?? browserStack.last?.id,
-                    extractWhenReady: true))
+                    extractWhenReady: true, accountID: activeAccountID))
                 inspectArchive(item, activate: false)
             }
         }
@@ -8153,6 +8744,29 @@ final class DownloaderModel: ObservableObject {
         // again. Never blindly resubmit an extraction with a cleared password.
         updateArchiveTask(id) { $0.extractWhenReady = true }
         inspectArchive(task.item, activate: false)
+    }
+
+    func canRetryArchiveWithNormalLogin(_ task: CloudExtractionTask) -> Bool {
+        task.needsNormalLogin && !task.isBusy && normalArchiveConnection(for: task, in: savedAccounts) != nil
+    }
+
+    /// Permission to use the broader connection is explicit and limited to
+    /// this archive. The window and other workers keep their selected login.
+    func retryArchiveWithNormalLogin(_ id: UUID) {
+        guard let task = archiveTasks.first(where: { $0.id == id }),
+              canRetryArchiveWithNormalLogin(task),
+              let normal = normalArchiveConnection(for: task, in: savedAccounts) else { return }
+        updateArchiveTask(id) { $0.connectionAccountID = normal.id }
+        retryArchiveTask(id)
+    }
+
+    private func normalArchiveConnection(for task: CloudExtractionTask, in accounts: [SavedPikPakAccount]) -> SavedPikPakAccount? {
+        guard let accountID = task.accountID,
+              let original = accounts.first(where: { $0.id == accountID }),
+              let owner = original.profile?.sub, !owner.isEmpty else { return nil }
+        return accounts.first {
+            $0.connectionKind == .desktopOAuth && !$0.needsSignIn && $0.profile?.sub == owner
+        }
     }
 
     /// Clear a completed/error task so the Extractions workspace can return to
@@ -8300,7 +8914,7 @@ final class DownloaderModel: ObservableObject {
 
         var seenPaths = Set<String>()
         let paths = requestedPaths.compactMap { requestedPath -> String? in
-            var path = requestedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            var path = requestedPath
             guard !path.isEmpty else { return nil }
             if !path.hasPrefix("/") {
                 path = "/" + path
@@ -8314,9 +8928,9 @@ final class DownloaderModel: ObservableObject {
         }
 
         let resolvedConcurrentJobs = effectiveDownloadConcurrentJobs
-        UserDefaults.standard.set(proxyURL, forKey: "proxyURL")
+        preferences.set(proxyURL, forKey: "proxyURL")
         let destination = destinationOverride ?? outputURL
-        UserDefaults.standard.set(outputURL.path, forKey: "outputPath")
+        preferences.set(outputURL.path, forKey: "outputPath")
         var itemsByPath: [String: BrowserItem] = [:]
         for item in requestedItems {
             itemsByPath[browserPath(for: item)] = item
@@ -8359,8 +8973,8 @@ final class DownloaderModel: ObservableObject {
         guard let downloadAccess = accessOverride ?? shareAccess,
               !items.isEmpty else { return }
         let resolvedConcurrentJobs = effectiveDownloadConcurrentJobs
-        UserDefaults.standard.set(proxyURL, forKey: "proxyURL")
-        UserDefaults.standard.set(outputURL.path, forKey: "outputPath")
+        preferences.set(proxyURL, forKey: "proxyURL")
+        preferences.set(outputURL.path, forKey: "outputPath")
         let paths = items.map { pathOverrides[$0.id] ?? browserPath(for: $0) }
         let relativeParents = DownloadDestinationLayout.relativeParents(for: paths)
         let roots = items.enumerated().map { index, item in
@@ -8398,6 +9012,7 @@ final class DownloaderModel: ObservableObject {
             setError("Open Browser to verify your account and restore saved transfers before adding downloads.")
             return
         }
+        refreshActiveDownloadSelectionKeys()
         let key = request.deduplicationKey
         guard activeDownloadRequestKey != key,
               !activeDownloadRequests.contains(where: { $0.deduplicationKey == key }),
@@ -8408,6 +9023,22 @@ final class DownloaderModel: ObservableObject {
             setStatus("That download selection is already queued or running")
             return
         }
+        downloadCleanupFence.invalidate()
+        let newPaths = request.pendingItems.compactMap { item in
+            request.partialTreeURL(for: item.id)?.path ?? request.partialURL(for: item.id)?.path
+        }
+        let newOutputPaths = request.pendingItems.compactMap { item in
+            request.partialTreeURL(for: item.id)?.path ?? request.partialURL(for: item.id)?.deletingPathExtension().path
+        }
+        downloadProgressHighWater = downloadProgressHighWater.filter { identity, _ in
+            !newOutputPaths.contains { identity.outputPath == $0 || identity.outputPath.hasPrefix($0 + "/") }
+        }
+        cancelledDownloadCleanups = cancelledDownloadCleanups.filter { cleanup in
+            !newPaths.contains { path in
+                cleanup.path == path || cleanup.path.hasPrefix(path + "/") || path.hasPrefix(cleanup.path + "/")
+            }
+        }
+        _ = downloadDestinationIsReady(request.destinationURL)
         // Explicitly adding the selection again is a new user request. Automatic
         // resume bypasses this entry point and retains its cancellation exclusions.
         savedDownloadCancellations = savedDownloadCancellations.filter { record in
@@ -8416,10 +9047,14 @@ final class DownloaderModel: ObservableObject {
             }
         }
         pendingDownloadRequests.append(request)
+        watchDownloadDestinations()
         synchronizePendingDownloadQueue()
         guard persistTransfersSynchronously() else { return }
         let noun = request.itemCount == 1 ? "item" : "items"
         setStatus("Added \(request.itemCount.formatted()) \(noun) to downloads" + (downloadsPaused ? " • paused" : ""))
+        // New selections survive cancellation of the previous helper, but
+        // cannot be published to that helper while it is stopping.
+        if cancelAllDownloadsRequested { return }
         // Explicit selections auto-start; a user pause and restored queues
         // remain under the user's Resume control.
         if startImmediately || (!downloadsPaused && !restoredDownloadQueue) || isDownloading {
@@ -8428,25 +9063,276 @@ final class DownloaderModel: ObservableObject {
     }
 
     private var liveDownloadInbox: LiveDownloadInbox {
-        LiveDownloadInbox(requests: submittedDownloadRequests.values.flatMap(\.liveInputs).sorted { $0.id < $1.id },
-                          contentMode: finderSettings.contentMode)
+        let requests = Array(submittedDownloadRequests.values)
+        // UUID dictionary keys otherwise encode as an alternating JSON array.
+        // Keep the entire chain so a restored leaf retry can recover a copy
+        // originally owned by a folder that is still being discovered.
+        let origins = retainedDownloadRetryOrigins(for: requests).reduce(into: [String: String]()) {
+            $0[$1.key.uuidString] = $1.value.uuidString
+        }
+        let inputs = requests.flatMap { request -> [LiveDownloadInput] in
+            let path = request.destinationURL.standardizedFileURL.path
+            let checkpoint = downloadDestinations[path] ?? downloadDestinations.filter {
+                path.hasPrefix($0.key + "/")
+            }.max { $0.key.count < $1.key.count }?.value
+            // Reuse the volume flags collected during destination validation.
+            // Encoding a live inbox must not probe a network disk on the UI thread.
+            return request.liveInputs.map { input in
+                var input = input
+                input.destinationKind = checkpoint?.destinationKind
+                return input
+            }
+        }
+        return LiveDownloadInbox(requests: inputs.sorted { $0.id < $1.id }, retryOrigins: origins,
+            deleteAfterDownload: finderSettings.deleteAfterDownload)
     }
 
-    private func publishLiveDownloads() throws {
-        guard let url = downloadInputURL else { return }
+    @discardableResult
+    private func downloadDestinationIsReady(_ url: URL, reportStatus: Bool = true) -> Bool {
+        let key = url.standardizedFileURL.path
+        let recoveryKey = downloadDestinationRecoveryKey(url)
+        let saved = downloadDestinations[key].map { (key: key, value: $0) } ?? downloadDestinations.filter {
+            key.hasPrefix($0.key + "/")
+        }.max { $0.key.count < $1.key.count }.map { (key: $0.key, value: $0.value) }
+        let checkpoint = saved?.value
+        if downloadDestinationLeases[key] == nil {
+            let bookmarks = checkpoint?.bookmark.map { [key: $0] } ?? [:]
+            downloadDestinationLeases[key] = LocalFileAccessLease([url], bookmarks: bookmarks)
+        }
+        func validated(_ checkpoint: DownloadDestinationCheckpoint?) throws -> DownloadDestinationCheckpoint {
+            #if FINDER_WORKSPACE_TESTS
+            if let downloadDestinationValidator { return try downloadDestinationValidator(url, checkpoint) }
+            #endif
+            return try DownloadDestinationAccess.validate(url, checkpoint: checkpoint)
+        }
+        do {
+            let verified: DownloadDestinationCheckpoint
+            var adopted = false
+            do { verified = try validated(checkpoint) }
+            catch let replaced as DownloadDestinationReplaced {
+                // Another disk, or this one reformatted. Continue only when the user said so, or when this app's own
+                // progress files for the queued items were restored onto it: nothing else shows it is the same job.
+                guard acceptedDownloadReplacements.contains(key) || restoredProgressExists(at: url) else {
+                    replacedDownloadDestinations.insert(key)
+                    throw replaced
+                }
+                verified = try validated(nil)
+                adopted = true
+            }
+            if adopted, let saved {
+                adoptReplacementDisk(verified, previous: saved.value, savedKey: saved.key, url: url)
+            } else if downloadDestinations[key] != nil || checkpoint == nil {
+                downloadDestinations[key] = verified
+            } else if let saved {
+                downloadDestinations[saved.key]?.destinationKind = verified.destinationKind
+            }
+            if replacedDownloadDestinations.remove(key) != nil { replacementProofCheckedAt[key] = nil }
+            if unavailableDownloadDestinations.remove(recoveryKey) != nil {
+                downloadDestinationRecoveryAttempts[recoveryKey] = nil
+                downloadDestinationRetryUntil[recoveryKey] = nil
+            }
+            if let until = downloadDestinationRetryUntil[recoveryKey], until > Date() {
+                if reportStatus {
+                    downloadDestinationStatus = "Waiting for the download destination to recover. Retrying in \(Int(ceil(until.timeIntervalSinceNow)))s; partial files are kept."
+                }
+                return false
+            }
+            return true
+        } catch {
+            unavailableDownloadDestinations.insert(recoveryKey)
+            if reportStatus { downloadDestinationStatus = error.localizedDescription }
+            return false
+        }
+    }
+
+    /// This app's own restored progress for the queued items at `destination`. A negative answer is reused for a few
+    /// seconds, so polling a waiting disk does not rescan a large folder every time.
+    private func restoredProgressExists(at destination: URL) -> Bool {
+        let path = destination.standardizedFileURL.path
+        if let checked = replacementProofCheckedAt[path], Date().timeIntervalSince(checked) < 10 { return false }
+        let probes = (activeDownloadRequests + pendingDownloadRequests + interruptedDownloadRequests)
+            .filter { $0.destinationURL.standardizedFileURL.path == path }.flatMap(\.restoredProgressProbes)
+        if DownloadRestoredProgress.found(probes) { return true }
+        replacementProofCheckedAt[path] = Date()
+        return false
+    }
+
+    /// Moves the saved identity of every queued folder on the old disk to the one mounted now, and keeps it.
+    private func adoptReplacementDisk(_ verified: DownloadDestinationCheckpoint, previous: DownloadDestinationCheckpoint,
+                                      savedKey: String, url: URL) {
+        let key = url.standardizedFileURL.path
+        downloadDestinations[savedKey] = verified
+        // One disk was reformatted: other queued folders saved against it follow, and take a fresh bookmark when next checked.
+        let components = url.standardizedFileURL.pathComponents
+        let mount = components.count >= 3 && components[1] == "Volumes" ? "/Volumes/\(components[2])" : nil
+        if let mount, let old = previous.volumeID {
+            for (other, value) in downloadDestinations where other != savedKey && value.volumeID == old
+                && (other == mount || other.hasPrefix(mount + "/")) {
+                downloadDestinations[other] = .init(volumeID: verified.volumeID)
+            }
+        }
+        acceptedDownloadReplacements.remove(key)
+        downloadDestinationLeases[key] = LocalFileAccessLease([url], bookmarks: verified.bookmark.map { [key: $0] } ?? [:])
+        _ = persistTransfersSynchronously()
+    }
+
+    /// The user's choice to continue the unfinished downloads on the disk now mounted where a queued folder is.
+    func acceptReplacementDisk() {
+        guard !replacedDownloadDestinations.isEmpty else { return }
+        acceptedDownloadReplacements.formUnion(replacedDownloadDestinations)
+        checkDownloadDestinations()
+    }
+
+    private func downloadDestinationRecoveryKey(_ url: URL) -> String {
+        let path = url.standardizedFileURL.path
+        return downloadDestinations.keys.filter { path == $0 || path.hasPrefix($0 + "/") }
+            .max { $0.count < $1.count } ?? path
+    }
+
+    private func downloadRecoveryKeys(_ event: DownloadProgressEvent) -> Set<String> {
+        if let requestID = event.requestId,
+           let request = submittedDownloadRequests[requestID] ?? activeDownloadRequests.first(where: {
+               $0.pendingItems.contains { $0.id == requestID }
+           }) {
+            return [downloadDestinationRecoveryKey(request.destinationURL)]
+        }
+        if let fileID = event.fileId,
+           let directory = activeDownloadTransfers[fileID]?.outputDirectoryPath
+                ?? downloadQueueTransfers.first(where: { $0.id == fileID })?.outputDirectoryPath {
+            return [downloadDestinationRecoveryKey(URL(fileURLWithPath: directory, isDirectory: true))]
+        }
+        return Set(activeDownloadRequests.map { downloadDestinationRecoveryKey($0.destinationURL) })
+    }
+
+    private func refreshActiveDownloadSelectionKeys() {
+        let activeIDs = Set(activeDownloadRequests.flatMap(\.pendingItems).map(\.id))
+        activeDownloadSelectionRoots = activeDownloadSelectionRoots.compactMapValues { ids in
+            let remaining = ids.intersection(activeIDs)
+            return remaining.isEmpty ? nil : remaining
+        }
+        activeDownloadSelectionKeys = Set(activeDownloadRequests.map(\.deduplicationKey))
+            .union(activeDownloadSelectionRoots.keys)
+        if let activeDownloadRequestKey { activeDownloadSelectionKeys.insert(activeDownloadRequestKey) }
+    }
+
+    private func watchDownloadDestinations() {
+        guard !isClosingWindow else { return }
+        if downloadVolumeObservers.isEmpty {
+            for notification in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification, NSWorkspace.didRenameVolumeNotification] {
+                downloadVolumeObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
+                    forName: notification, object: nil, queue: .main
+                ) { [weak self] notification in
+                    let unmounted = notification.name == NSWorkspace.didUnmountNotification
+                        ? notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL : nil
+                    Task { @MainActor in self?.checkDownloadDestinations(unmounted: unmounted) }
+                })
+            }
+        }
+        guard downloadDestinationPoll == nil else { return }
+        downloadDestinationPoll = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
+                guard let self, !self.isClosingWindow else { return }
+                self.checkDownloadDestinations()
+            }
+        }
+    }
+
+    private func stopWatchingDownloadDestinations() {
+        downloadVolumeObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
+        downloadVolumeObservers.removeAll()
+        downloadDestinationPoll?.cancel(); downloadDestinationPoll = nil
+    }
+
+    /// Resume only against the remembered volume, including when another disk
+    /// appears at the same path. Manual Pause and Cancel remain authoritative.
+    private func checkDownloadDestinations(unmounted: URL? = nil) {
+        guard !isClosingWindow, transferStateReady else { return }
+        let requests = activeDownloadRequests + pendingDownloadRequests + interruptedDownloadRequests
+        cleanCancelledDownloadPartialsIfPossible()
+        guard !requests.isEmpty else {
+            downloadDestinationStatus = nil
+            if cancelledDownloadCleanups.isEmpty { stopWatchingDownloadDestinations() }
+            return
+        }
+        let wasWaiting = downloadDestinationStatus != nil
+        downloadDestinationStatus = nil
+        let activeDestinations = Set(activeDownloadRequests.map { $0.destinationURL.standardizedFileURL })
+        if let unmounted {
+            for destination in activeDestinations where destination.path == unmounted.path || destination.path.hasPrefix(unmounted.path + "/") {
+                let key = downloadDestinationRecoveryKey(destination)
+                downloadDestinationRecoveryAttempts[key] = nil
+                downloadDestinationRetryUntil[key] = nil
+            }
+        }
+        let unavailableActiveDestination = activeDestinations.reduce(false) { unavailable, url in
+            !downloadDestinationIsReady(url) || unavailable
+        }
+        let lostActiveDestination = unavailableActiveDestination || unmounted.map { volume in
+            activeDestinations.contains { $0.path == volume.path || $0.path.hasPrefix(volume.path + "/") }
+        } == true
+        if isDownloading && lostActiveDestination {
+            guard !downloadDestinationRestartPending else { return }
+            downloadDestinationRestartPending = true
+            stop(automatic: true)
+            if let downloadDestinationStatus { setError(downloadDestinationStatus) }
+            return
+        }
+        guard wasWaiting, !downloadDestinationRestartPending, !downloadsPaused, !cancelAllDownloadsRequested else { return }
+        if !isDownloading && !interruptedDownloadRequests.isEmpty { requeueInterruptedDownloads() }
+        _ = startNextPendingDownloadIfNeeded()
+    }
+
+    private func publishLiveDownloads(deleteAfterDownload: Bool? = nil) throws {
+        guard liveDownloadRun, let url = downloadInputURL else { return }
         let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
-        try encoder.encode(liveDownloadInbox).write(to: url, options: .atomic)
+        var inbox = liveDownloadInbox
+        if let deleteAfterDownload { inbox.deleteAfterDownload = deleteAfterDownload }
+        try encoder.encode(inbox).write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
     @discardableResult
     private func startNextPendingDownloadIfNeeded() -> Bool {
         guard hasUsableSession, transferStateReady, !isClosingWindow,
-              !downloadRequestedStop, !downloadsPaused, !pendingDownloadRequests.isEmpty else { return false }
+              !downloadDrainingForQuit,
+              !downloadRequestedStop, !downloadsPaused, !cancelAllDownloadsRequested,
+              !downloadDestinationRestartPending,
+              !pendingDownloadRequests.isEmpty else { return false }
         let waiting = pendingDownloadRequests
-        let available = waiting.compactMap { $0.removingPendingItems(pausedPendingDownloadIDs) }
-            .flatMap(\.individualRequests).map { $0.withWorkerLimit(effectiveDownloadConcurrentJobs) }
-        guard !available.isEmpty else { return false }
+        var heldIDs = pausedPendingDownloadIDs
+        let candidates = waiting.compactMap { $0.removingPendingItems(pausedPendingDownloadIDs) }
+            .flatMap(\.individualRequests).filter { request in
+                if downloadRequestIsPaused(request, includingFolderChildren: false) { heldIDs.formUnion(request.pendingItems.map(\.id)); return false }
+                return true
+            }.map { $0.withWorkerLimit(effectiveDownloadConcurrentJobs) }
+        if downloadCleanupTask != nil, !candidates.isEmpty {
+            // Stop old cancellation work between files before starting a new
+            // writer. A large ownership history on SMB must not drain first.
+            downloadCleanupFence.invalidate()
+            let message = "Preparing downloads. Waiting for the current cancelled-file cleanup check to finish…"
+            downloadPreparationStatus = message
+            setStatus(message)
+            return false
+        }
+        downloadPreparationStatus = nil
+        downloadDestinationStatus = nil
+        var readyDestinations: [String: Bool] = [:]
+        let available = candidates.filter { request in
+            let key = request.destinationURL.standardizedFileURL.path
+            let ready = readyDestinations[key] ?? downloadDestinationIsReady(request.destinationURL)
+            readyDestinations[key] = ready
+            if !ready { heldIDs.formUnion(request.pendingItems.map(\.id)) }
+            return ready
+        }
+        guard !available.isEmpty else {
+            if let downloadDestinationStatus {
+                watchDownloadDestinations()
+                if !isDownloading { setError(downloadDestinationStatus) }
+            }
+            return false
+        }
+        watchDownloadDestinations()
         let starting = !isDownloading
         if starting {
             resetDownloadProgress()
@@ -8456,8 +9342,10 @@ final class DownloaderModel: ObservableObject {
             discoveringDownloadRequestIDs = []
             liveDownloadRun = true
         }
-        pendingDownloadRequests = waiting.compactMap { $0.keepingPendingItems(pausedPendingDownloadIDs) }
+        pendingDownloadRequests = waiting.compactMap { $0.keepingPendingItems(heldIDs) }
         activeDownloadRequests.append(contentsOf: available)
+        if downloadBatch == nil { downloadBatch = DownloadBatch(startedAt: Date()) }
+        for request in available { downloadBatch?.note(destination: request.destinationURL.standardizedFileURL.path) }
         for request in available {
             for item in request.pendingItems {
                 submittedDownloadRequests[item.id] = request
@@ -8473,8 +9361,12 @@ final class DownloaderModel: ObservableObject {
             synchronizePendingDownloadQueue()
             return false
         }
-        activeDownloadSelectionKeys.formUnion(available.map(\.deduplicationKey))
-        activeDownloadSelectionKeys.formUnion(waiting.map(\.deduplicationKey))
+        let admittedIDs = Set(available.flatMap(\.pendingItems).map(\.id))
+        for request in waiting {
+            let ids = Set(request.pendingItems.map(\.id)).intersection(admittedIDs)
+            if !ids.isEmpty { activeDownloadSelectionRoots[request.deduplicationKey, default: []].formUnion(ids) }
+        }
+        refreshActiveDownloadSelectionKeys()
         if starting {
             runDownloadEngine(arguments: ["download-queue"], operation: .download, liveQueue: true)
             if !isDownloading { retainInterruptedDownload() }
@@ -8491,9 +9383,11 @@ final class DownloaderModel: ObservableObject {
     }
 
     func startPendingDownloads() {
+        let resuming = downloadsPaused && downloadProcess?.isRunning == true
         downloadsPaused = false
         if !interruptedDownloadRequests.isEmpty { requeueInterruptedDownloads() }
         writeDownloadControls()
+        if resuming { setStatus("Cloud reception resumed; the RAM buffer and disk work continue.") }
         if !startNextPendingDownloadIfNeeded() && !isDownloading && pendingDownloadRequests.isEmpty {
             setStatus("The download queue is empty")
         }
@@ -8529,6 +9423,7 @@ final class DownloaderModel: ObservableObject {
     private func synchronizePendingDownloadQueue() {
         pendingDownloadItems = pendingDownloadRequests.flatMap(\.pendingItems)
         if pendingDownloadRequests.isEmpty { restoredDownloadQueue = false }
+        publishDownloadTransferRows()
     }
 
     // MARK: Durable transfers
@@ -8554,8 +9449,11 @@ final class DownloaderModel: ObservableObject {
         transferAccountID = accountID
         do {
             let store = try transferStore()
+            let storageSession = workspaceSessionID
+            let excludedSessions = transferWorkspaceSessionsToExclude?() ?? []
             let saved = try transferPersistenceQueue.sync {
-                try workspaceSessionID == "primary" ? store.loadSharedTransfers(accountID: accountID)
+                try storageSession == "primary" ? store.loadSharedTransfers(accountID: accountID,
+                    excludedWorkspaceSessions: excludedSessions)
                     : store.load(SavedTransfers.self, accountID: accountID)
             }
             if let saved {
@@ -8574,13 +9472,17 @@ final class DownloaderModel: ObservableObject {
                 downloadsPaused = saved.downloadsPaused ?? false
                 pausedDownloadIDs = saved.pausedDownloadIDs ?? []
                 pausedPendingDownloadIDs = saved.pausedPendingDownloadIDs ?? []
+                automaticDownloadRetryOrigins = saved.downloadRetryOrigins ?? [:]
                 pausedUploadIDs = saved.pausedUploadIDs ?? []
+                downloadDestinations = saved.downloadDestinations ?? [:]
+                cancelledDownloadCleanups = Set(saved.cancelledDownloadCleanups ?? [])
                 synchronizePendingDownloadQueue()
                 if !saved.downloads.isEmpty || !saved.uploads.isEmpty {
                     appendOutput("Restored unfinished transfers. They continue automatically; use Pause in Status → Transfers to hold them.\n")
                 }
             }
             transferStateReady = true
+            if !cancelledDownloadCleanups.isEmpty { watchDownloadDestinations(); cleanCancelledDownloadPartialsIfPossible() }
             resumeRestoredTransfers()
         } catch {
             // Keep the unreadable file intact instead of silently replacing a
@@ -8596,6 +9498,10 @@ final class DownloaderModel: ObservableObject {
         automaticUploadRetry?.cancel(); automaticUploadRetry = nil
         automaticUploadBatchIDs.removeAll()
         stopWatchingUploadRemount()
+        stopWatchingDownloadDestinations()
+        downloadCleanupFence.invalidate()
+        downloadCleanupTask?.cancel(); downloadCleanupTask = nil
+        downloadPreparationStatus = nil
         fileUndoRefreshFeedback = nil; undoMoveOrigins.removeAll()
         fileUndoHistory.reset()
         uploadUndoMutations.removeAll()
@@ -8609,6 +9515,15 @@ final class DownloaderModel: ObservableObject {
         transferAccountID = nil
         transferStateReady = false
         pendingDownloadRequests = []
+        downloadDestinations = [:]; downloadDestinationLeases = [:]
+        replacedDownloadDestinations = []; acceptedDownloadReplacements = []; replacementProofCheckedAt = [:]
+        downloadDestinationStatus = nil; downloadDestinationRestartPending = false
+        downloadDestinationRecoveryAttempts = [:]; downloadDestinationRetryUntil = [:]
+        unavailableDownloadDestinations = []
+        downloadProgressHighWater = [:]
+        individuallyRetriedDownloadRequestIDs = []; fullyDiscoveredDownloadRequestIDs = []
+        automaticDownloadRetryOrigins = [:]
+        cancelledDownloadRequestIDs = []; cancelledDownloadCleanups = []
         savedDownloadCancellations = []
         importedTransferSessions = []
         interruptedDownloadRequests = []
@@ -8619,6 +9534,7 @@ final class DownloaderModel: ObservableObject {
         downloadsPaused = false
         pausedDownloadIDs.removeAll(); pausedPendingDownloadIDs.removeAll(); pausedUploadIDs.removeAll()
         activeDownloadSelectionKeys = []
+        activeDownloadSelectionRoots = [:]
         activeUploadBatchID = nil
         savedUploadBatches = []
         uploadFileAccess.removeAll()
@@ -8637,7 +9553,33 @@ final class DownloaderModel: ObservableObject {
                              downloads: downloads, uploads: savedUploadBatches,
                              cancelledDownloads: Array(savedDownloadCancellations), importedWorkspaceSessions: importedTransferSessions,
                              downloadsPaused: downloadsPaused, pausedDownloadIDs: pausedDownloadIDs,
-                             pausedPendingDownloadIDs: pausedPendingDownloadIDs, pausedUploadIDs: pausedUploadIDs)
+                             pausedPendingDownloadIDs: pausedPendingDownloadIDs, pausedUploadIDs: pausedUploadIDs,
+                             downloadDestinations: downloadDestinations,
+                             cancelledDownloadCleanups: Array(cancelledDownloadCleanups),
+                             downloadRetryOrigins: retainedDownloadRetryOrigins(for: downloads))
+    }
+
+    private func retainedDownloadRetryOrigins(for requests: [PendingDownloadRequest]) -> [UUID: UUID] {
+        var result: [UUID: UUID] = [:]
+        var validated = Set<UUID>(), rejected = Set<UUID>()
+        for root in requests.flatMap(\.pendingItems).map(\.id).sorted(by: { $0.uuidString < $1.uuidString }) {
+            var current = root, seen = Set<UUID>()
+            var chain: [(UUID, UUID)] = [], valid = true
+            while !validated.contains(current) {
+                guard !rejected.contains(current), seen.insert(current).inserted else { valid = false; break }
+                guard let previous = automaticDownloadRetryOrigins[current] else { break }
+                chain.append((current, previous)); current = previous
+            }
+            if valid {
+                for (retry, origin) in chain { result[retry] = origin }
+                validated.formUnion(seen)
+            } else {
+                // Trimming only the cycle's back-edge would turn damaged
+                // provenance into an apparently valid ownership relationship.
+                rejected.formUnion(seen)
+            }
+        }
+        return result
     }
 
     @discardableResult
@@ -8647,6 +9589,9 @@ final class DownloaderModel: ObservableObject {
         do {
             let store = try transferStore()
             try transferPersistenceQueue.sync { try store.save(snapshot, accountID: snapshot.accountID) }
+            #if FINDER_WORKSPACE_TESTS
+            transferPersistenceFixtureWrites += 1
+            #endif
             transferSaveRetry?.cancel(); transferSaveRetry = nil
             return true
         } catch {
@@ -8694,12 +9639,16 @@ final class DownloaderModel: ObservableObject {
     private func retainInterruptedDownload() {
         if !activeDownloadRequests.isEmpty {
             var unfinishedRequests = activeDownloadRequests
+            let activeRootIDs = Set(activeDownloadRequests.flatMap(\.pendingItems).map(\.id))
+            let knownFileIDs = Set(queuedDownloadTransfers.map(\.id)).union(activeDownloadTransfers.keys)
+            let hasPausedPlan = !pausedPendingDownloadIDs.isDisjoint(with: activeRootIDs)
+                || !pausedDownloadIDs.isDisjoint(with: knownFileIDs)
             // A complete, bounded plan lets a stopped folder resume the exact
             // remaining files, including those still waiting for a worker.
             // Before planning finishes, retain the original roots instead.
-            if isDownloading, (!liveDownloadRun || discoveringDownloadRequestIDs.isEmpty), downloadTotalFiles > 0, downloadTotalFiles <= 2_000,
+            if isDownloading, !hasPausedPlan, (!liveDownloadRun || discoveringDownloadRequestIDs.isEmpty), downloadTotalFiles > 0, downloadTotalFiles <= 2_000,
                downloadQueueTransfers.count == downloadTotalFiles,
-               queuedDownloadCount + activeDownloadTransfers.count + completedDownloadTransfers.count == downloadTotalFiles {
+               queuedDownloadCount + activeDownloadTransfers.count + settledDownloadIDs.count == downloadTotalFiles {
                 let activeIDs = Set(activeDownloadRequests.flatMap(\.pendingItems).map(\.id))
                 let unfinished = (Array(queuedDownloadTransfers) + Array(activeDownloadTransfers.values)
                     + completedDownloadTransfers.filter { ($0.state == .failed || $0.state == .stopped) && !cancelledDownloadIDs.contains($0.id) })
@@ -8711,6 +9660,7 @@ final class DownloaderModel: ObservableObject {
             interruptedDownloadRequests.append(contentsOf: unfinishedRequests.filter { existing.insert($0.deduplicationKey).inserted })
         }
         activeDownloadRequests = []
+        refreshActiveDownloadSelectionKeys()
         interruptedDownloadCount = interruptedDownloadRequests.reduce(0) { $0 + $1.itemCount }
         _ = persistTransfersSynchronously()
     }
@@ -8729,6 +9679,263 @@ final class DownloaderModel: ObservableObject {
         setStatus(downloadsPaused
             ? "Interrupted downloads returned to the queue. Press Resume Downloads when ready."
             : "Interrupted downloads returned to the queue.")
+    }
+
+    func pendingDownloadIsPaused(_ item: PendingDownloadItem) -> Bool {
+        // Use the admission rule, including restored per-file controls. A
+        // folder with only one paused descendant can still discover siblings.
+        downloadSelectionIsPaused(item, includingFolderChildren: false)
+    }
+
+    private func downloadRequestIsPaused(_ request: PendingDownloadRequest, includingFolderChildren: Bool = true) -> Bool {
+        request.pendingItems.contains { downloadSelectionIsPaused($0, includingFolderChildren: includingFolderChildren) }
+    }
+
+    private func downloadSelectionIsPaused(_ item: PendingDownloadItem, includingFolderChildren: Bool) -> Bool {
+        if !pausedPendingDownloadIDs.isEmpty {
+            var current = item.id, seen = Set<UUID>()
+            while seen.insert(current).inserted {
+                if pausedPendingDownloadIDs.contains(current) { return true }
+                guard let parent = automaticDownloadRetryOrigins[current] else { break }
+                current = parent
+            }
+        }
+        // A held descendant keeps its original plan for retry, but must not
+        // block discovery or other descendants of an admitted folder.
+        guard (includingFolderChildren || !item.isFolder), !pausedDownloadIDs.isEmpty else { return false }
+        if downloadPausedFileRootsAreDirty {
+            // Rendering each row must not scan every request and reconstruct
+            // its paths. Build the reverse pause lookup once per control or
+            // discovery change, then share it across preparation and rows.
+            var roots = Set<UUID>()
+            for id in pausedDownloadIDs {
+                if let root = downloadRequestIDsByFileID[id] { roots.insert(root) }
+                let prefix = id.prefix(37)
+                if prefix.last == ":", let root = UUID(uuidString: String(prefix.dropLast())),
+                   id.hasPrefix(root.uuidString + ":") { roots.insert(root) }
+            }
+            for (root, targets) in downloadRetryTargets where targets.values.contains(where: pausedDownloadIDs.contains) {
+                roots.insert(root)
+            }
+            downloadPausedFileRoots = roots
+            downloadPausedFileRootsAreDirty = false
+        }
+        return downloadPausedFileRoots.contains(item.id)
+    }
+
+    private func downloadRoot(_ root: UUID, belongsTo parent: UUID) -> Bool {
+        var current = root, seen = Set<UUID>()
+        while seen.insert(current).inserted {
+            if current == parent { return true }
+            guard let previous = automaticDownloadRetryOrigins[current] else { break }
+            current = previous
+        }
+        return false
+    }
+
+    private func downloadRetryIsQueued(_ transfer: DownloadTransfer) -> Bool {
+        refreshDownloadRetryLookupIfNeeded()
+        let original = downloadRequestIDsByFileID[transfer.id]
+        return (downloadRetryQueuedRootsByFileID[transfer.id] ?? []).contains { root in
+            original != root && (original.map { downloadRoot(root, belongsTo: $0) } ?? true)
+        }
+    }
+
+    /// Retry rows and the retry timer share one queue projection. Scanning all
+    /// roots for every failed file stalls a restored queue before it can resume.
+    private func refreshDownloadRetryLookupIfNeeded() {
+        guard downloadRetryLookupIsDirty else { return }
+        downloadRetryLookupIsDirty = false
+        downloadRetryActiveRoots = Set(activeDownloadRequests.flatMap(\.pendingItems).map(\.id))
+        var seen = Set<UUID>(), paused = Set<UUID>(), queued: [String: Set<UUID>] = [:]
+        for request in pendingDownloadRequests + activeDownloadRequests + interruptedDownloadRequests {
+            let items = request.pendingItems
+            let requestPaused = items.contains { downloadSelectionIsPaused($0, includingFolderChildren: true) }
+            for item in items {
+                if seen.insert(item.id).inserted, requestPaused { paused.insert(item.id) }
+                for fileID in (downloadRetryTargets[item.id] ?? [:]).values {
+                    queued[fileID, default: []].insert(item.id)
+                }
+            }
+        }
+        downloadRetryPausedRequestRoots = paused
+        downloadRetryQueuedRootsByFileID = queued
+    }
+
+    private func downloadRootHasPausedAncestor(_ root: UUID) -> Bool {
+        guard !pausedPendingDownloadIDs.isEmpty else { return false }
+        var current = root, seen = Set<UUID>()
+        while seen.insert(current).inserted {
+            if pausedPendingDownloadIDs.contains(current) { return true }
+            guard let parent = automaticDownloadRetryOrigins[current] else { break }
+            current = parent
+        }
+        return false
+    }
+
+    private func automaticDownloadRetryCandidates() -> [DownloadTransfer] {
+        guard !downloadsPaused, !cancelAllDownloadsRequested, !downloadRequestedStop else { return [] }
+        refreshDownloadRetryLookupIfNeeded()
+        let activeIDs = downloadRetryActiveRoots
+        return failedDownloadTransfers.filter { transfer in
+            guard canRetryFailedDownload(transfer), transfer.finalFailureReason == nil,
+                  !pausedDownloadIDs.contains(transfer.id), !downloadRetryIsQueued(transfer) else { return false }
+            guard let root = downloadRequestIDsByFileID[transfer.id] else { return true }
+            if downloadRootHasPausedAncestor(root) { return false }
+            if !activeIDs.contains(root), !fullyDiscoveredDownloadRequestIDs.contains(root),
+               downloadRetryPausedRequestRoots.contains(root) { return false }
+            return activeIDs.contains(root) || individuallyRetriedDownloadRequestIDs.contains(root) || fullyDiscoveredDownloadRequestIDs.contains(root)
+        }
+    }
+
+    func automaticDownloadRetryStatus(_ transfer: DownloadTransfer) -> String? {
+        guard transfer.state == .failed || transfer.state == .stopped, transfer.finalFailureReason == nil,
+              !cancelledDownloadIDs.contains(transfer.id), !downloadsPaused,
+              !pausedDownloadIDs.contains(transfer.id), !isClosingWindow else { return nil }
+        let root = downloadRequestIDsByFileID[transfer.id]
+        refreshDownloadRetryLookupIfNeeded()
+        if let root, downloadRootHasPausedAncestor(root) { return nil }
+        let rootIsActive = root.map(downloadRetryActiveRoots.contains) == true
+        if !rootIsActive, root.map(fullyDiscoveredDownloadRequestIDs.contains) != true,
+           root.map(downloadRetryPausedRequestRoots.contains) == true { return nil }
+        if downloadRetryIsQueued(transfer) { return "Retry queued" }
+        guard canRetryFailedDownload(transfer) else { return nil }
+        if automaticDownloadRetry != nil || root == nil
+            || root.map(individuallyRetriedDownloadRequestIDs.contains) == true
+            || rootIsActive {
+            return "Retrying automatically"
+        }
+        return nil
+    }
+
+    var hasAutomaticDownloadRetries: Bool {
+        automaticRetryDownloadCount > 0
+    }
+
+    /// A failed row leaves Retry only for a confirmed permanent cause or missing source details.
+    func downloadFailureIsFinal(_ transfer: DownloadTransfer) -> Bool {
+        transfer.finalFailureReason != nil
+    }
+
+    /// Why a file in Retry is not (yet) downloading, in plain words, or nil when its row already says it.
+    func downloadRetryDetail(_ transfer: DownloadTransfer) -> String? {
+        guard transfer.state == .failed || transfer.state == .stopped, transfer.finalFailureReason == nil,
+              !cancelledDownloadIDs.contains(transfer.id) else { return nil }
+        if let reason = transfer.permanentReason, transfer.permanentReports > 0 {
+            return "\(reason). Checking again before giving up (\(transfer.permanentReports) of \(DownloadTransfer.permanentConfirmations))."
+        }
+        if automaticDownloadRetryStatus(transfer) != nil { return nil }
+        if downloadsPaused || pausedDownloadIDs.contains(transfer.id) || pausedDownloadSelection(containing: transfer) != nil {
+            return "Paused. It retries when you resume."
+        }
+        if !hasUsableSession { return "Waiting for sign-in." }
+        if !transferStateReady { return "Waiting for saved transfers to load." }
+        return "Waiting for the next automatic retry."
+    }
+
+    private func downloadRetryIdentity(_ transfer: DownloadTransfer) -> DownloadProgressIdentity? {
+        guard let directory = transfer.outputDirectoryPath else { return nil }
+        let output = URL(fileURLWithPath: directory, isDirectory: true)
+            .appendingPathComponent((transfer.name as NSString).lastPathComponent, isDirectory: false).standardizedFileURL.path
+        return .init(sourceID: downloadSourceFileIDs[transfer.id] ?? transfer.id, outputPath: output,
+            shareURL: transfer.isShared ? downloadSharedAccessByFileID[transfer.id]?.url : nil)
+    }
+
+    private func replaceAutomaticDownloadRetryRow(_ id: String) {
+        guard let state = downloadSettledStates.removeValue(forKey: id),
+              let total = downloadFileTotalsByID.removeValue(forKey: id) else { return }
+        downloadTotalFiles = max(0, downloadTotalFiles - 1)
+        downloadTotalBytes = downloadTotalBytes >= total ? downloadTotalBytes - total : 0
+        let bytes = downloadSettledBytesByID.removeValue(forKey: id) ?? 0
+        settledDownloadBytes = settledDownloadBytes >= bytes ? settledDownloadBytes - bytes : 0
+        switch state {
+        case .completed: downloadCompletedFiles = max(0, downloadCompletedFiles - 1)
+        case .skipped: downloadSkippedFiles = max(0, downloadSkippedFiles - 1)
+        case .failed: downloadFailedFiles = max(0, downloadFailedFiles - 1); releaseFinalFailure(id)
+        default: break
+        }
+        // Preserve cumulative network traffic while the new attempt replaces
+        // the old logical row. Late events for the old attempt stay settled.
+        excludedDownloadPlanIDs.insert(id)
+        completedDownloadTransfers.removeAll { $0.id == id }
+        failedDownloadTransfers.removeAll { $0.id == id }
+    }
+
+    @discardableResult
+    private func prepareAutomaticDownloadRetry() -> Bool {
+        guard !downloadsPaused, !cancelAllDownloadsRequested, !downloadRequestedStop else { return true }
+        let candidates = automaticDownloadRetryCandidates()
+        if !(isDownloading && liveDownloadRun), candidates.isEmpty { requeueInterruptedDownloads(); return true }
+        let previousPending = pendingDownloadRequests, previousInterrupted = interruptedDownloadRequests
+        let previousOrigins = automaticDownloadRetryOrigins
+        let previousTargets = downloadRetryTargets
+        let previousIndividualRoots = individuallyRetriedDownloadRequestIDs
+        var acceptedFiles: [DownloadTransfer] = []
+        var renewedIDs: [UUID: UUID] = [:]
+        var existing = Set((pendingDownloadRequests + activeDownloadRequests).map(\.deduplicationKey))
+        // A failed file need not wait for every unrelated descendant of its
+        // folder. Retry its exact source/output while those workers continue.
+        for transfer in candidates {
+            guard let request = downloadRequestForKnownFile(transfer), let identity = downloadRetryIdentity(transfer),
+                  existing.insert(request.deduplicationKey).inserted, let fresh = request.pendingItems.first?.id else { continue }
+            pendingDownloadRequests.append(request)
+            downloadRetryTargets[fresh] = [identity: transfer.id]
+            if let original = downloadRequestIDsByFileID[transfer.id] {
+                automaticDownloadRetryOrigins[fresh] = original
+                individuallyRetriedDownloadRequestIDs.insert(original)
+            }
+            acceptedFiles.append(transfer)
+        }
+        // After complete discovery, the individually queued failures are the
+        // whole remaining plan. Keep a discovery failure's original folder.
+        interruptedDownloadRequests = interruptedDownloadRequests.filter { request in
+            let roots = Set(request.pendingItems.map(\.id))
+            guard roots.isSubset(of: individuallyRetriedDownloadRequestIDs), roots.isSubset(of: fullyDiscoveredDownloadRequestIDs),
+                  !downloadRequestIsPaused(request) else { return true }
+            return failedDownloadTransfers.contains { transfer in
+                downloadRequestIDsByFileID[transfer.id].map(roots.contains) == true
+                    && !cancelledDownloadIDs.contains(transfer.id) && !excludedDownloadPlanIDs.contains(transfer.id)
+                    && !downloadRetryIsQueued(transfer)
+            }
+        }
+        let remaining = pendingDownloadRequests + activeDownloadRequests + interruptedDownloadRequests
+        let retrying = interruptedDownloadRequests.filter { request in
+            !downloadRequestIsPaused(request) && !request.pendingItems.contains { original in
+                remaining.flatMap(\.pendingItems).contains { child in child.id != original.id && downloadRoot(child.id, belongsTo: original.id) }
+            }
+        }
+        for request in retrying where existing.insert(request.deduplicationKey).inserted {
+            if isDownloading && liveDownloadRun {
+                let fresh = request.renewingQueueIDs()
+                pendingDownloadRequests.append(fresh.request)
+                automaticDownloadRetryOrigins.merge(fresh.origins) { _, new in new }
+                renewedIDs.merge(fresh.origins) { _, new in new }
+            } else { pendingDownloadRequests.append(request) }
+        }
+        let keys = Set(retrying.map(\.deduplicationKey))
+        interruptedDownloadRequests.removeAll { keys.contains($0.deduplicationKey) }
+        interruptedDownloadCount = interruptedDownloadRequests.reduce(0) { $0 + $1.itemCount }
+        synchronizePendingDownloadQueue()
+        guard persistTransfersSynchronously() else {
+            pendingDownloadRequests = previousPending; interruptedDownloadRequests = previousInterrupted
+            automaticDownloadRetryOrigins = previousOrigins
+            downloadRetryTargets = previousTargets
+            individuallyRetriedDownloadRequestIDs = previousIndividualRoots
+            interruptedDownloadCount = interruptedDownloadRequests.reduce(0) { $0 + $1.itemCount }
+            synchronizePendingDownloadQueue()
+            return false
+        }
+        for (fresh, previous) in renewedIDs {
+            // Discovery may fail again before announcing any new rows. Carry
+            // the prior logical targets forward so eventual rows replace them.
+            downloadRetryTargets[fresh] = downloadRetryTargets[previous]
+        }
+        let retired = Set(renewedIDs.values)
+        let accepted = Set(acceptedFiles.map(\.id))
+        failedDownloadTransfers.removeAll { transfer in
+            accepted.contains(transfer.id) || downloadRequestIDsByFileID[transfer.id].map(retired.contains) == true
+        }
+        return true
     }
 
     /// Transfers that were under way when the app last closed did not stop by
@@ -8882,6 +10089,1307 @@ final class DownloaderModel: ObservableObject {
         applyDownloadProgressEvent(event)
     }
 
+    static func testDownloadCleanupOptionAndOutcomes() throws {
+        let suite = "DownloadCleanup-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        precondition(!model.finderSettings.deleteAfterDownload, "Cloud cleanup defaults to off")
+        model.liveDownloadRun = true
+        model.downloadInputURL = directory.appendingPathComponent("inbox.json")
+        try model.publishLiveDownloads()
+        func cleanupOption() throws -> Bool {
+            let json = try JSONSerialization.jsonObject(with: Data(contentsOf: model.downloadInputURL!)) as! [String: Any]
+            return json["delete_after_download"] as! Bool
+        }
+        let initial = try cleanupOption()
+        precondition(!initial)
+        model.finderSettings.deleteAfterDownload = true
+        let enabled = try cleanupOption()
+        precondition(enabled)
+        precondition(FinderSettings(defaults: defaults).deleteAfterDownload, "Cleanup choice survives relaunch")
+        model.finderSettings.deleteAfterDownload = false
+        let disabled = try cleanupOption()
+        precondition(!disabled, "Turning cleanup off updates the active helper inbox immediately")
+
+        func finish(_ id: String, shared: Bool = false, state: String = "file_completed") {
+            model.lastDownloadUsedSharedLink = shared
+            model.downloadFixtureEvent(["event":"queue_append", "files":[[
+                "file_id":id, "name":"Generated.bin", "total_bytes":8,
+                "remote_path":"/Generated.bin", "output_directory":directory.path]]])
+            model.downloadFixtureEvent(["event":state, "file_id":id, "name":"Generated.bin", "total_bytes":8])
+        }
+        finish("removed")
+        model.downloadFixtureEvent(["event":"file_source_trashed", "file_id":"removed", "name":"Generated.bin", "source_file_id":"owned-id"])
+        let removed = model.successfulDownloadTransfers.first { $0.id == "removed" }!
+        precondition(removed.state == .completed && removed.sourceCleanupMessage == "Moved to PikPak Trash" && !removed.sourceCleanupFailed)
+        finish("cleanup-failed", state: "file_skipped")
+        model.downloadFixtureEvent(["event":"file_source_cleanup_failed", "file_id":"cleanup-failed", "name":"Generated.bin", "error":"Synthetic cleanup denied"])
+        let failed = model.successfulDownloadTransfers.first { $0.id == "cleanup-failed" }!
+        precondition(failed.state == .skipped && failed.sourceCleanupFailed && failed.sourceCleanupMessage == "Synthetic cleanup denied")
+        precondition(model.failedDownloadTransfers.isEmpty && model.retryingDownloadTransfers.isEmpty,
+            "A cleanup error must never retry or fail the completed download")
+        finish("shared", shared: true)
+        model.downloadFixtureEvent(["event":"file_source_trashed", "file_id":"shared", "name":"Generated.bin", "source_file_id":"shared-id"])
+        precondition(model.successfulDownloadTransfers.first { $0.id == "shared" }!.sourceCleanupMessage == nil)
+        model.downloadFixtureEvent(["event":"file_source_trashed", "file_id":"unknown", "name":"Generated.bin", "source_file_id":"unknown-id"])
+        precondition(model.downloadCompletedFiles == 2 && model.downloadSkippedFiles == 1 && model.downloadFailedFiles == 0)
+        print("PASS download cleanup: default off, persistence, active inbox changes, successful deletion notices, cleanup failures retain completed/skipped downloads and shared originals stay separate")
+    }
+
+    static func testRestoredDownloadRetryLineage() throws {
+        let suite = "DownloadRetryLineage-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        model.downloadsPaused = true
+        let accountOriginal = UUID(), accountMiddle = UUID(), accountCurrent = UUID()
+        let sharedOriginal = UUID(), sharedMiddle = UUID(), sharedCurrent = UUID()
+        func accountRoot(_ id: UUID, path: String, kind: BrowserItemKind) -> AccountDownloadRoot {
+            .init(queueID: id, path: path, name: URL(fileURLWithPath: path).lastPathComponent, kind: kind,
+                file: .init(id: "account-\(id)", name: URL(fileURLWithPath: path).lastPathComponent,
+                            size: kind == .file ? "100" : "0", kind: kind),
+                relativeParent: kind == .file ? ["Account"] : [])
+        }
+        func sharedRoot(_ id: UUID, path: String, kind: BrowserItemKind) -> SharedPendingDownloadRoot {
+            let name = URL(fileURLWithPath: path).lastPathComponent
+            let item = BrowserItem(id: "shared-\(id)", name: name, size: kind == .file ? 100 : 0, kind: kind,
+                parentId: nil, mimeType: nil, createdTime: nil, modifiedTime: nil, fileExtension: nil,
+                iconLink: nil, thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+            return .init(queueID: id, item: item, root: .init(id: item.id, name: name, size: item.size, kind: kind,
+                path: path, relativeParent: kind == .file ? ["Shared"] : []))
+        }
+        let account = PendingDownloadRequest.account(roots: [
+            accountRoot(accountOriginal, path: "/Account", kind: .folder),
+            accountRoot(accountCurrent, path: "/Account/retry.bin", kind: .file)
+        ], destination: model.outputURL, jobs: 1, proxyURL: "")
+        let shared = PendingDownloadRequest.shared(roots: [
+            sharedRoot(sharedOriginal, path: "/Shared", kind: .folder),
+            sharedRoot(sharedCurrent, path: "/Shared/retry.bin", kind: .file)
+        ], access: .init(url: "https://mypikpak.com/s/synthetic", passCode: "", passCodeToken: ""),
+            destination: model.outputURL, jobs: 1, proxyURL: "")
+        let expected = [accountCurrent: accountMiddle, accountMiddle: accountOriginal,
+                        sharedCurrent: sharedMiddle, sharedMiddle: sharedOriginal]
+        model.automaticDownloadRetryOrigins = expected
+        model.automaticDownloadRetryOrigins[UUID()] = UUID()
+
+        // A damaged cycle must not hang persistence or produce a wire cycle,
+        // even when both of its nodes are present as separate selections.
+        let cycleA = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        let cycleB = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+        let cycleSelf = UUID(uuidString: "00000000-0000-0000-0000-000000000003")!
+        let cycleChild = UUID(uuidString: "00000000-0000-0000-0000-000000000004")!
+        model.automaticDownloadRetryOrigins[cycleA] = cycleB
+        model.automaticDownloadRetryOrigins[cycleB] = cycleA
+        model.automaticDownloadRetryOrigins[cycleSelf] = cycleSelf
+        model.automaticDownloadRetryOrigins[cycleChild] = cycleA
+        let cycles = PendingDownloadRequest.account(roots: [
+            accountRoot(cycleB, path: "/B.bin", kind: .file),
+            accountRoot(cycleA, path: "/A.bin", kind: .file),
+            accountRoot(cycleSelf, path: "/Self.bin", kind: .file),
+            accountRoot(cycleChild, path: "/Child.bin", kind: .file)
+        ], destination: model.outputURL, jobs: 1, proxyURL: "")
+        precondition(model.retainedDownloadRetryOrigins(for: [cycles]).isEmpty,
+                     "invalid ancestry must not become a valid ownership relationship by trimming a cycle")
+        model.queueDownload(account); model.queueDownload(shared)
+        let saved = try model.transferStore().load(SavedTransfers.self, accountID: "synthetic-download-account")!
+        precondition(saved.downloads.count == 2 && saved.downloadRetryOrigins == expected,
+                     "saved retries retain both invisible intermediate ancestors and original live folder owners")
+
+        let restored = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { restored.stopForWindowClose() }
+        restored.failedDownloadTransfers = []
+        restored.transferStateReady = false
+        restored.adoptTransferAccount("synthetic-download-account")
+        precondition(restored.downloadsPaused && !restored.isDownloading && restored.pendingDownloadItems.count == 4)
+        precondition(restored.automaticDownloadRetryOrigins == expected)
+        restored.startPendingDownloads()
+        precondition(restored.isDownloading && restored.activeDownloadRequests.count == 4)
+        let expectedWire = Dictionary(uniqueKeysWithValues: expected.map { ($0.key.uuidString, $0.value.uuidString) })
+        func checkInbox(_ url: URL) throws {
+            let json = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+            precondition(json["retry_origins"] as? [String: String] == expectedWire,
+                         "Rust receives an object of full retry ancestry rather than UUID's alternating array encoding")
+            let requests = json["requests"] as! [[String: Any]]
+            precondition(Set(requests.compactMap { $0["id"] as? String }) ==
+                         Set([accountOriginal, accountCurrent, sharedOriginal, sharedCurrent].map(\.uuidString)))
+        }
+        let initial = try restored.writePrivateRequest(restored.liveDownloadInbox, named: "initial", in: directory)
+        try checkInbox(initial)
+        restored.downloadInputURL = directory.appendingPathComponent("live-inbox.json")
+        try restored.publishLiveDownloads()
+        try checkInbox(restored.downloadInputURL!)
+
+        restored.downloadControlURL = directory.appendingPathComponent("controls.json")
+        let originalItem = account.pendingItems.first { $0.id == accountOriginal }!
+        let retry = account.keepingPendingItems([accountCurrent])!
+        restored.pausePendingDownload(originalItem)
+        precondition(restored.downloadRequestIsPaused(retry), "an original folder Pause continues to hold its restored leaf retry")
+        let controls = try JSONSerialization.jsonObject(with: Data(contentsOf: restored.downloadControlURL!)) as! [String: Any]
+        let actions = controls["actions"] as! [String: String]
+        precondition(actions["root:" + accountOriginal.uuidString] == "pause" &&
+                     actions["root:" + accountCurrent.uuidString] == "pause" &&
+                     actions["root:" + sharedCurrent.uuidString] == nil)
+        restored.resumePendingDownload(originalItem)
+        precondition(!restored.downloadRequestIsPaused(retry))
+        try restored.publishLiveDownloads()
+        try checkInbox(restored.downloadInputURL!)
+        print("PASS restored retry lineage: account/shared full ancestry, live folder owners, object wire encoding, cycles and Pause ownership")
+    }
+
+    static func testDownloadCompletedOutputPath() throws {
+        let suite = "DownloadCompletedOutput-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        model.downloadDestinationValidator = { _, _ in .init(volumeID: "synthetic-output-volume") }
+        model.downloadsPaused = true
+        try FileManager.default.createDirectory(at: model.outputURL, withIntermediateDirectories: true)
+        let name = "Original \"sample\".bin"
+        let original = model.outputURL.appendingPathComponent(name)
+        let recovered = model.outputURL.appendingPathComponent("Original \"sample\" (recovered).bin")
+        let originalBytes = Data("generated original stays untouched".utf8)
+        try originalBytes.write(to: original)
+        try Data(repeating: 42, count: 100).write(to: recovered)
+        let rootID = UUID()
+        let request = PendingDownloadRequest.account(roots: [.init(queueID: rootID, path: "/\(name)", name: name,
+            kind: .file, file: .init(id: "synthetic-output-source", name: name, size: "100", kind: .file), relativeParent: [])],
+            destination: model.outputURL, jobs: 1, proxyURL: "")
+        model.queueDownload(request); model.startPendingDownloads()
+        func enqueue(_ model: DownloaderModel, _ transferID: String) {
+            model.downloadFixtureEvent(["event": "queue_append", "files": [[
+                "file_id": transferID, "source_file_id": "synthetic-output-source", "request_id": rootID.uuidString,
+                "name": name, "total_bytes": 100, "remote_path": "/\(name)", "output_directory": model.outputURL.path
+            ]]])
+        }
+        enqueue(model, "first-output")
+        model.downloadFixtureEvent(["event": "file_started", "file_id": "first-output", "name": name,
+            "total_bytes": 100, "downloaded_bytes": 95, "transferred_bytes": 0])
+        model.downloadFixtureEvent(["event": "file_progress", "file_id": "first-output", "name": name,
+            "total_bytes": 100, "downloaded_bytes": 100, "transferred_bytes": 0])
+        precondition(model.activeDownloadTransfers["first-output"]?.fraction == 1 &&
+                     model.activeDownloadTransfers["first-output"]?.completedFileURL == nil,
+                     "100 percent of bytes is not yet a committed local file")
+        model.downloadFixtureEvent(["event": "file_completed", "file_id": "first-output", "name": name,
+            "total_bytes": 100, "output_path": recovered.path, "transferred_bytes": 0])
+        let completed = model.completedDownloadTransfers.last!
+        precondition(completed.name == name && completed.remotePath == "/\(name)" &&
+                     completed.outputDirectoryPath == model.outputURL.path && completed.outputFilePath == recovered.path)
+        precondition(completed.completedFileURL == recovered && completed.recoveredCopyNotice != nil &&
+                     model.downloadCompletedFiles == 1 && model.downloadNetworkTransferredBytes == 0)
+        let logical = DownloadTransfer(id: completed.id, name: name, downloadedBytes: 0, totalBytes: 100, state: .failed,
+            remotePath: "/\(name)", outputDirectoryPath: model.outputURL.path)
+        precondition(model.sameDownloadRetryTarget(completed, logical) &&
+                     model.downloadRetryIdentity(completed) == model.downloadRetryIdentity(logical),
+                     "actual publication location must not change the original retry destination or source matching")
+        var revealed: [URL] = []
+        model.downloadFileRevealFixture = { revealed.append($0) }
+        model.revealDownloadedFile(completed)
+        precondition(revealed == [recovered])
+
+        // The unfinished saved request can be restored before its final root
+        // acknowledgement. Its durable helper route reports the same file as
+        // already saved, including when no new download body is started.
+        let restored = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { restored.stopForWindowClose() }
+        restored.failedDownloadTransfers = []
+        restored.downloadDestinationValidator = { _, _ in .init(volumeID: "synthetic-output-volume") }
+        restored.transferStateReady = false
+        restored.adoptTransferAccount("synthetic-download-account")
+        precondition(restored.isDownloading && restored.activeDownloadRequests.count == 1)
+        enqueue(restored, "restored-output")
+        restored.downloadFixtureEvent(["event": "file_skipped", "file_id": "restored-output", "name": name,
+            "total_bytes": 100, "output_path": recovered.path])
+        let skipped = restored.completedDownloadTransfers.last!
+        precondition(skipped.state == .skipped && skipped.name == name && skipped.completedFileURL == recovered &&
+                     skipped.outputDirectoryPath == restored.outputURL.path && skipped.recoveredCopyNotice != nil &&
+                     restored.queuedDownloadTransfers.isEmpty && restored.downloadNetworkTransferredBytes == 0)
+        restored.downloadFileRevealFixture = { revealed.append($0) }
+        restored.revealDownloadedFile(skipped)
+        precondition(revealed == [recovered, recovered])
+        let preservedBytes = try Data(contentsOf: original)
+        precondition(preservedBytes == originalBytes, "Reveal must preserve the generated original destination")
+
+        for (index, path) in [nil, "relative.bin", "file:///tmp/other.bin", "/", "/invalid\0name"].enumerated() {
+            let id = "legacy-output-\(index)"
+            enqueue(restored, id)
+            var event: [String: Any] = ["event": "file_completed", "file_id": id, "name": name, "total_bytes": 100]
+            if let path { event["output_path"] = path }
+            restored.downloadFixtureEvent(event)
+            let legacy = restored.completedDownloadTransfers.last!
+            precondition(legacy.outputFilePath == nil && legacy.completedFileURL == original && legacy.recoveredCopyNotice == nil,
+                         "missing or invalid helper paths keep the original directory/name fallback")
+        }
+        enqueue(restored, "canonical-output")
+        restored.downloadFixtureEvent(["event": "file_completed", "file_id": "canonical-output", "name": name,
+            "total_bytes": 100, "output_path": original.path])
+        precondition(restored.completedDownloadTransfers.last?.completedFileURL == original &&
+                     restored.completedDownloadTransfers.last?.recoveredCopyNotice == nil)
+        print("PASS completed output paths: actual recovered location, committed-only Reveal, restored skipped route, logical names and legacy fallback")
+    }
+
+    static func testDownloadRetryWaitingPresentation() throws {
+        let suite = "DownloadRetryPresentation-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        func fixture(_ name: String) -> (DownloaderModel, PendingDownloadRequest) {
+            let model = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent(name, isDirectory: true))
+            model.failedDownloadTransfers = []
+            let request = PendingDownloadRequest.account(roots: [.init(queueID: UUID(), path: "/Generated", name: "Generated",
+                kind: .folder, file: nil, relativeParent: [])], destination: model.outputURL, jobs: 2, proxyURL: "")
+            let root = request.pendingItems[0].id
+            model.activeDownloadRequests = [request]
+            model.submittedDownloadRequests[root] = request
+            model.liveDownloadRun = true; model.isDownloading = true
+            model.downloadRunState = .downloading
+            model.downloadFixtureEvent(["event":"request_discovered", "request_id":root.uuidString])
+            model.downloadFixtureEvent(["event":"queue_append", "files":[
+                ["file_id":"retry-body", "source_file_id":"generated-source", "request_id":root.uuidString,
+                 "name":"Retained.bin", "total_bytes":100, "remote_path":"/Generated/Retained.bin", "output_directory":model.outputURL.path],
+                ["file_id":"queued-body", "source_file_id":"generated-queued", "request_id":root.uuidString,
+                 "name":"Queued.bin", "total_bytes":100, "remote_path":"/Generated/Queued.bin", "output_directory":model.outputURL.path]
+            ]])
+            return (model, request)
+        }
+        let (model, request) = fixture("worker")
+        defer { model.stopForWindowClose() }
+        let root = request.pendingItems[0]
+        model.downloadFixtureEvent(["event":"file_dequeued", "file_id":"retry-body", "name":"Retained.bin"])
+        model.downloadFixtureEvent(["event":"file_started", "file_id":"retry-body", "name":"Retained.bin", "total_bytes":100,
+            "downloaded_bytes":40, "transferred_bytes":0])
+        model.downloadFixtureEvent(["event":"file_progress", "file_id":"retry-body", "name":"Retained.bin", "total_bytes":100,
+            "downloaded_bytes":60, "transferred_bytes":20])
+        let actualPath = model.outputURL.appendingPathComponent("Retained (Recovered 0123456789abcdef0123456789abcdef).bin", isDirectory: false).path
+        model.activeDownloadTransfers["retry-body"]?.outputFilePath = actualPath
+        model.downloadBytesPerSecond = 512
+        let queueStorageCount = model.downloadQueueTransfers.count
+        let queueOffset = model.downloadQueueOffset
+        let classifications = model.downloadRetryProjectionFixtureRefreshes
+        for attempt in 1...100 {
+            model.downloadFixtureEvent(["event":"file_retrying", "file_id":"retry-body", "name":"Retained.bin",
+                "attempt":attempt, "retry_in_millis":30_000])
+        }
+        let waiting = model.retryingDownloadTransfers.first!
+        precondition(model.retryingDownloadTransfers.count == 1 && model.downloadingTransfers.isEmpty && model.activeDownloadCount == 0,
+            "Backoff has one Retry row and occupies no Downloading slot")
+        precondition(waiting.downloadedBytes == 60 && waiting.totalBytes == 100 && waiting.bytesPerSecond == 0
+            && waiting.remotePath == "/Generated/Retained.bin" && waiting.outputFilePath == actualPath
+            && model.downloadRequestIDsByFileID[waiting.id] == root.id && model.downloadSourceFileIDs[waiting.id] == "generated-source",
+            "Retry rows retain their checkpoint, source, root and actual publication destination")
+        precondition(model.downloadDownloadedBytes == 60 && model.downloadNetworkTransferredBytes == 20 && model.downloadBytesPerSecond == 0
+            && model.downloadTotalFiles == 2 && model.downloadTotalBytes == 200,
+            "Waiting keeps logical and network totals while showing zero download speed")
+        precondition(model.downloadQueueTransfers.count == queueStorageCount && model.downloadQueueOffset == queueOffset
+            && model.queuedDownloadCount == 1 && model.downloadRetryProjectionFixtureRefreshes == classifications,
+            "Repeated worker backoff neither grows Queue nor reclassifies terminal failures")
+        model.pausePendingDownload(root)
+        precondition(model.pausedDownloadIDs.contains(waiting.id) && model.pausedDownloadSelection(containing: waiting)?.id == root.id,
+            "Folder Pause controls waiting bodies even though they are absent from Downloading")
+        let snapshot = try model.transferStore().load(SavedTransfers.self, accountID: "synthetic-download-account")!
+        precondition(snapshot.pausedPendingDownloadIDs?.contains(root.id) == true && snapshot.pausedDownloadIDs?.contains(waiting.id) == true)
+        let restored = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent("worker", isDirectory: true))
+        defer { restored.stopForWindowClose() }
+        restored.failedDownloadTransfers = []; restored.transferStateReady = false
+        restored.adoptTransferAccount("synthetic-download-account")
+        precondition(!restored.isDownloading && restored.pendingDownloadRequests.contains { $0.pendingItems.contains { $0.id == root.id } }
+            && restored.pausedPendingDownloadIDs.contains(root.id) && restored.pausedDownloadIDs.contains(waiting.id),
+            "Relaunch restores the retained source plan and durable holds without starting a waiting body")
+        model.resumePendingDownload(root)
+        precondition(!model.pausedDownloadIDs.contains(waiting.id) && model.retryingDownloadTransfers.count == 1)
+        model.downloadFixtureEvent(["event":"file_dequeued", "file_id":"retry-body", "name":"Retained.bin"])
+        precondition(model.retryingDownloadTransfers.isEmpty && model.downloadingTransfers.count == 1 && model.activeDownloadCount == 1
+            && model.downloadingTransfers[0].state == .preparing && model.downloadingTransfers[0].downloadedBytes == 60
+            && model.queuedDownloadCount == 1 && model.downloadNetworkTransferredBytes == 20,
+            "The next admitted attempt moves the retained row to Downloading without a duplicate dequeue")
+        model.downloadFixtureEvent(["event":"file_started", "file_id":"retry-body", "name":"Retained.bin", "total_bytes":100,
+            "downloaded_bytes":60, "transferred_bytes":20])
+        model.downloadFixtureEvent(["event":"file_retrying", "file_id":"retry-body", "name":"Retained.bin", "attempt":101])
+        model.downloadFixtureEvent(["event":"file_progress", "file_id":"retry-body", "name":"Retained.bin", "total_bytes":100,
+            "downloaded_bytes":70, "transferred_bytes":30])
+        precondition(model.retryingDownloadTransfers.isEmpty && model.downloadingTransfers[0].state == .downloading
+            && model.downloadDownloadedBytes == 70 && model.downloadNetworkTransferredBytes == 30,
+            "Progress also admits a retry, with no double-counting of the retained prefix")
+        model.downloadFixtureEvent(["event":"file_retrying", "file_id":"retry-body", "name":"Retained.bin", "attempt":102])
+        model.downloadFixtureEvent(["event":"file_completed", "file_id":"retry-body", "name":"Retained.bin", "total_bytes":100,
+            "downloaded_bytes":100, "transferred_bytes":30, "output_path":actualPath])
+        precondition(model.retryingDownloadTransfers.isEmpty && model.downloadingTransfers.isEmpty && model.downloadCompletedFiles == 1
+            && model.completedDownloadTransfers.last?.outputFilePath == actualPath && model.downloadNetworkTransferredBytes == 30,
+            "Completion during backoff settles exactly once and keeps the actual saved path")
+
+        let (failed, parent) = fixture("terminal")
+        defer { failed.stopForWindowClose() }
+        failed.downloadFixtureEvent(["event":"file_started", "file_id":"retry-body", "name":"Retained.bin", "total_bytes":100,
+            "downloaded_bytes":100, "transferred_bytes":0])
+        failed.downloadFixtureEvent(["event":"file_failed", "file_id":"retry-body", "name":"Retained.bin", "total_bytes":100,
+            "downloaded_bytes":100, "transferred_bytes":0, "error":"Generated publication interruption"])
+        precondition(failed.retryingDownloadTransfers.count == 1 && failed.visibleFailedDownloadTransfers.isEmpty
+            && failed.failedDownloadTransfers.count == 1 && failed.downloadFailedFiles == 1 && failed.hasAutomaticDownloadRetries,
+            "Automatic terminal retries appear in Retry while retaining the failure ledger and full checkpoint")
+        failed.pauseDownloadFile(failed.retryingDownloadTransfers[0])
+        precondition(failed.retryingDownloadTransfers.count == 1 && failed.visibleFailedDownloadTransfers.isEmpty
+            && !failed.hasAutomaticDownloadRetries
+            && failed.downloadRetryDetail(failed.retryingDownloadTransfers[0])?.hasPrefix("Paused") == true,
+            "A held failure stays in Retry and says it is paused; a pause is not a permanent failure")
+        failed.pausedDownloadIDs.remove("retry-body"); failed.writeDownloadControls()
+        precondition(failed.retryingDownloadTransfers.count == 1 && failed.visibleFailedDownloadTransfers.isEmpty && failed.hasAutomaticDownloadRetries)
+        failed.stop()
+        precondition(failed.retryingDownloadTransfers.count == 1 && failed.visibleFailedDownloadTransfers.isEmpty
+            && !failed.hasAutomaticDownloadRetries && failed.downloadsPaused
+            && failed.downloadRetryDetail(failed.retryingDownloadTransfers[0])?.hasPrefix("Paused") == true,
+            "Pause All refreshes terminal retry presentation even with no running process")
+        failed.downloadsPaused = false; failed.writeDownloadControls()
+        precondition(failed.retryingDownloadTransfers.count == 1)
+        failed.cancelPendingDownload(parent.pendingItems[0])
+        precondition(failed.retryingDownloadTransfers.isEmpty && failed.visibleFailedDownloadTransfers.isEmpty
+            && failed.failedDownloadTransfers.isEmpty && failed.queuedDownloadCount == 0 && failed.activeDownloadCount == 0)
+        failed.downloadFixtureEvent(["event":"file_retrying", "file_id":"retry-body", "name":"Retained.bin", "attempt":2])
+        precondition(failed.retryingDownloadTransfers.isEmpty, "Late retry events cannot restore a cancelled body")
+
+        let (cancelled, cancelParent) = fixture("cancel-worker")
+        defer { cancelled.stopForWindowClose() }
+        cancelled.downloadFixtureEvent(["event":"file_started", "file_id":"retry-body", "name":"Retained.bin",
+            "total_bytes":100, "downloaded_bytes":60, "transferred_bytes":0])
+        cancelled.downloadFixtureEvent(["event":"file_retrying", "file_id":"retry-body", "name":"Retained.bin", "attempt":1])
+        cancelled.cancelPendingDownload(cancelParent.pendingItems[0])
+        precondition(cancelled.retryingDownloadTransfers.isEmpty && cancelled.downloadingTransfers.isEmpty
+            && cancelled.queuedDownloadCount == 0 && cancelled.cancelledDownloadIDs.contains("retry-body"),
+            "Folder Cancel removes bodies waiting in Retry as well as undispatched queue rows")
+        print("PASS download Retry presentation: retained progress, attempts, zero slots/speed, cached failures, Pause/Resume/relaunch, completion paths and Cancel")
+    }
+
+    static func testDownloadDiscoveryProgressTotals() throws {
+        let suite = "DownloadDiscoveryTotals-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        func fixture(_ name: String) -> DownloaderModel {
+            let model = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent(name, isDirectory: true))
+            model.failedDownloadTransfers = []
+            model.folderMeasurementAccountID = model.transferAccountID
+            return model
+        }
+        let model = fixture("account")
+        defer { model.stopForWindowClose() }
+        let root = AccountDownloadRoot(queueID: UUID(), path: "/Generated", name: "Generated", kind: .folder,
+            file: .init(id: "generated-folder", name: "Generated", size: "0", kind: .folder), relativeParent: [])
+        let request = PendingDownloadRequest.account(roots: [root], destination: model.outputURL, jobs: 2, proxyURL: "")
+        model.activeDownloadRequests = [request]; model.submittedDownloadRequests[root.queueID] = request
+        model.isDownloading = true; model.liveDownloadRun = true; model.downloadRunState = .downloading
+        model.discoveringDownloadRequestIDs.insert(root.queueID)
+        model.folderMeasurements[root.file!.id] = .init(totalBytes: 10_000, fileCount: 77, folderCount: 7)
+        model.downloadFixtureEvent(["event":"queue_append", "files":[
+            ["file_id":"known-skip", "name":"Skipped.bin", "total_bytes":100, "request_id":root.queueID.uuidString,
+             "source_file_id":"skip-source", "remote_path":"/Generated/Skipped.bin", "output_directory":model.outputURL.path],
+            ["file_id":"known-body", "name":"Body.bin", "total_bytes":300, "request_id":root.queueID.uuidString,
+             "source_file_id":"body-source", "remote_path":"/Generated/Body.bin", "output_directory":model.outputURL.path]
+        ]])
+        model.downloadFixtureEvent(["event":"file_skipped", "file_id":"known-skip", "name":"Skipped.bin", "total_bytes":100])
+        model.downloadFixtureEvent(["event":"file_started", "file_id":"known-body", "name":"Body.bin",
+            "total_bytes":300, "downloaded_bytes":100, "transferred_bytes":0])
+        model.downloadBytesPerSecond = 50
+        precondition(model.downloadTotalsAreIncomplete && model.downloadOverallFraction == nil && model.downloadEstimatedSecondsRemaining == nil
+            && model.downloadTotalFiles == 2 && model.downloadTotalBytes == 400 && model.downloadDownloadedBytes == 200
+            && model.downloadSkippedFiles == 1 && model.downloadNetworkTransferredBytes == 0,
+            "A bounded live discovery queue keeps exact discovered/skipped counters without claiming a whole-folder percentage or ETA")
+        precondition(model.downloadDiscoveryFolderEstimateSummary?.hasPrefix("Cached folder estimate:") == true
+            && model.downloadDiscoveryFolderEstimateSummary?.contains("77 files") == true,
+            "A recursive cache estimate is shown separately from the 400 discovered bytes")
+        let refreshes = model.downloadDiscoveryPresentationFixtureRefreshes
+        for _ in 0..<100 {
+            _ = model.downloadTotalsAreIncomplete; _ = model.downloadDiscoveryFolderEstimateSummary
+            _ = model.downloadOverallFraction; _ = model.downloadEstimatedSecondsRemaining
+        }
+        model.downloadFixtureEvent(["event":"file_progress", "file_id":"known-body", "name":"Body.bin",
+            "total_bytes":300, "downloaded_bytes":150, "transferred_bytes":50])
+        precondition(model.downloadTotalsAreIncomplete && model.downloadDiscoveryPresentationFixtureRefreshes == refreshes
+            && model.downloadDownloadedBytes == 250 && model.downloadTotalBytes == 400,
+            "Dashboard queries and leaf progress reuse the root projection without substituting cached folder bytes")
+        let estimated = model.downloadDiscoveryEstimatedRemaining
+        precondition(estimated?.bytes == 9_750 && estimated?.seconds == 195 && model.downloadEstimatedSecondsRemaining == nil
+            && model.downloadOverallFraction == nil && model.downloadTotalBytes == 400,
+            "Remaining is the cached 10,000 bytes less the 250 downloaded, with its own ETA; exact totals and the percentage stay unknown")
+        model.folderMeasurements[root.file!.id] = .init(totalBytes: 250, fileCount: 77, folderCount: 7)
+        precondition(model.downloadTotalsAreIncomplete && model.downloadDiscoveryEstimatedRemaining == nil,
+            "A cached size no larger than the bytes already downloaded is stale and gives no estimate")
+        model.folderMeasurements[root.file!.id] = .init(totalBytes: 10_000, fileCount: 77, folderCount: 7)
+        model.downloadBytesPerSecond = 0
+        precondition(model.downloadDiscoveryEstimatedRemaining?.bytes == 9_750 && model.downloadDiscoveryEstimatedRemaining?.seconds == nil,
+            "Without a transfer rate the estimate keeps its bytes and omits the time")
+        model.downloadBytesPerSecond = 50
+        model.pausePendingDownload(request.pendingItems[0])
+        model.downloadFixtureEvent(["event":"request_discovered", "request_id":root.queueID.uuidString, "discovery_complete":false])
+        model.downloadFixtureEvent(["event":"request_finished", "request_id":root.queueID.uuidString, "success":false,
+            "error":"Generated unavailable folder listing"])
+        precondition(model.discoveringDownloadRequestIDs.isEmpty && !model.fullyDiscoveredDownloadRequestIDs.contains(root.queueID)
+            && model.interruptedDownloadCount == 1 && model.downloadTotalsAreIncomplete && model.downloadOverallFraction == nil,
+            "A failed traversal remains incomplete after active discovery ends, including while its selection is paused")
+        let renewed = request.renewingQueueIDs(), retryRoot = renewed.request.pendingItems[0].id
+        model.automaticDownloadRetryOrigins.merge(renewed.origins) { _, new in new }
+        model.activeDownloadRequests = [renewed.request]
+        precondition(model.downloadTotalsAreIncomplete && model.downloadDiscoveryFolderEstimateSummary?.contains("77 files") == true,
+            "A retry and its interrupted parent represent one cached folder estimate")
+        model.cancelledDownloadRequestIDs.insert(root.queueID)
+        precondition(!model.downloadTotalsAreIncomplete && model.downloadDiscoveryFolderEstimateSummary == nil,
+            "Cancelled ancestry excludes both the original discovery and its retry")
+        model.cancelledDownloadRequestIDs = []; model.pausedPendingDownloadIDs = []; model.pausedDownloadIDs = []
+        model.interruptedDownloadRequests = []
+        model.submittedDownloadRequests[retryRoot] = renewed.request
+        model.downloadFixtureEvent(["event":"request_started", "request_id":retryRoot.uuidString])
+        _ = model.downloadTotalsAreIncomplete
+        let beforeBytes = model.downloadDownloadedBytes, beforeTotal = model.downloadTotalBytes
+        var phaseInvalidations = 0
+        let phaseObservation = model.objectWillChange.sink { phaseInvalidations += 1 }
+        model.downloadFixtureEvent(["event":"request_discovered", "request_id":retryRoot.uuidString, "discovery_complete":true])
+        phaseObservation.cancel()
+        precondition(phaseInvalidations > 0 && !model.downloadTotalsAreIncomplete && model.downloadDiscoveryFolderEstimateSummary == nil
+            && model.downloadDownloadedBytes == beforeBytes && model.downloadTotalBytes == beforeTotal
+            && model.downloadOverallFraction == 0.625,
+            "The final successful discovery invalidates the UI without byte advancement and exposes the exact discovered denominator")
+        model.downloadBytesPerSecond = 50
+        precondition(model.downloadEstimatedSecondsRemaining == 3)
+        model.downloadFixtureEvent(["event":"request_finished", "request_id":retryRoot.uuidString, "success":false,
+            "error":"Generated body-only publication failure"])
+        precondition(!model.downloadTotalsAreIncomplete && model.fullyDiscoveredDownloadRequestIDs.contains(retryRoot),
+            "Body-only failures retain a successfully discovered inventory")
+        model.automaticDownloadRetry?.cancel(); model.automaticDownloadRetry = nil
+        model.activeDownloadRequests = [renewed.request]; model.submittedDownloadRequests[retryRoot] = renewed.request
+        model.downloadFixtureEvent(["event":"request_started", "request_id":retryRoot.uuidString])
+        model.downloadFixtureEvent(["event":"request_discovered", "request_id":retryRoot.uuidString, "discovery_complete":false])
+        precondition(model.downloadTotalsAreIncomplete && !model.fullyDiscoveredDownloadRequestIDs.contains(retryRoot),
+            "A repeated root cannot retain stale full-discovery status after a failed walk")
+        model.downloadFixtureEvent(["event":"request_discovered", "request_id":retryRoot.uuidString])
+        precondition(!model.downloadTotalsAreIncomplete, "Older engines without discovery_complete keep their completed-discovery contract")
+        model.activeDownloadRequests = []; model.interruptedDownloadRequests = []; model.downloadRunState = .completed
+        let waitingFile = PendingDownloadRequest.account(roots: [.init(queueID: UUID(), path: "/Extra.bin", name: "Extra.bin", kind: .file,
+            file: .init(id: "extra-file", name: "Extra.bin", size: "100", kind: .file), relativeParent: [])],
+            destination: model.outputURL, jobs: 1, proxyURL: "")
+        model.pendingDownloadRequests = [waitingFile]
+        model.pausedPendingDownloadIDs.insert(waitingFile.pendingItems[0].id)
+        precondition(model.downloadTotalsAreIncomplete && model.downloadOverallFraction == nil,
+            "A held file selection outside the admitted inventory prevents a misleading whole-selection completion percentage")
+        model.pendingDownloadRequests = []
+        precondition(!model.downloadTotalsAreIncomplete && model.downloadOverallFraction == 1)
+        model.pendingDownloadRequests = [request]
+        model.folderMeasurements[root.file!.id] = nil
+        precondition(model.downloadTotalsAreIncomplete && model.downloadDiscoveryFolderEstimateSummary == nil,
+            "Unknown cache data leaves only the discovered subtotal")
+
+        let shared = fixture("shared")
+        defer { shared.stopForWindowClose() }
+        let access = ShareAccessInput(url: "https://mypikpak.com/s/generated-original", passCode: "", passCodeToken: "")
+        let link = UUID(), unrelated = UUID()
+        shared.sharedLinkSessions[link] = .init(access: access, workspace: nil, savedItemIDs: [])
+        shared.sharedLinkSessions[unrelated] = .init(access: .init(url: "https://mypikpak.com/s/generated-other", passCode: "", passCodeToken: ""),
+            workspace: nil, savedItemIDs: [])
+        let item = BrowserItem(id: "generated-folder", name: "Shared", size: 0, kind: .folder, parentId: nil,
+            mimeType: nil, createdTime: nil, modifiedTime: nil, fileExtension: nil, iconLink: nil, thumbnailLink: nil,
+            fileCategory: nil, hash: nil, md5Checksum: nil)
+        let sharedRequest = PendingDownloadRequest.shared(roots: [.init(queueID: UUID(), item: item,
+            root: .init(id: item.id, name: item.name, size: 0, kind: .folder, path: "/Shared"))], access: access,
+            destination: shared.outputURL, jobs: 1, proxyURL: "")
+        shared.pendingDownloadRequests = [sharedRequest]
+        shared.folderMeasurements[item.id] = .init(totalBytes: 80_000, fileCount: 88, folderCount: 8)
+        shared.folderMeasurements[shared.folderMeasurementCacheKey(for: item.id, linkID: link)] = .init(totalBytes: 30_000, fileCount: 31, folderCount: 3)
+        shared.folderMeasurements[shared.folderMeasurementCacheKey(for: item.id, linkID: unrelated)] = .init(totalBytes: 90_000, fileCount: 99, folderCount: 9)
+        shared.activeSharedLinkID = unrelated; shared.browserSource = .sharedLink
+        precondition(shared.downloadTotalsAreIncomplete && shared.downloadDiscoveryFolderEstimateSummary?.contains("31 files") == true,
+            "Shared estimates use the original request URL namespace, independent of the currently browsed link or matching account IDs")
+        precondition(shared.downloadDiscoveryEstimatedRemaining?.bytes == 30_000,
+            "The shared link's own cached size is the estimate, with nothing downloaded yet")
+        shared.folderMeasurementAccountID = "different-account"
+        precondition(shared.downloadDiscoveryFolderEstimateSummary == nil && shared.downloadDiscoveryEstimatedRemaining == nil,
+            "Another account's cache cannot estimate this transfer")
+        shared.folderMeasurementAccountID = shared.transferAccountID
+        shared.pendingDownloadRequests.append(request)
+        precondition(shared.downloadDiscoveryFolderEstimateSummary == nil && shared.downloadDiscoveryEstimatedRemaining?.bytes == 110_000
+            && shared.downloadDiscoveryEstimatedRemaining?.lowerBound == false,
+            "With several unresolved folders each known size counts once (the shared link's cache and the account's are separate) and the single-folder summary stays hidden")
+
+        let legacy = fixture("legacy")
+        defer { legacy.stopForWindowClose() }
+        legacy.activeDownloadRequests = [request]; legacy.isDownloading = true; legacy.downloadRunState = .scanning
+        precondition(legacy.downloadTotalsAreIncomplete)
+        legacy.downloadFixtureEvent(["event":"plan", "total_files":2, "total_bytes":400])
+        precondition(!legacy.downloadTotalsAreIncomplete && legacy.downloadOverallFraction == 0,
+            "A legacy account/shared Plan proves its complete traversal before publishing exact totals")
+        legacy.finishDownloadProgress(as: .failed)
+        precondition(!legacy.downloadTotalsAreIncomplete, "Legacy body interruption retains the complete planned inventory")
+        print("PASS discovery totals: bounded subtotal, skipped bytes, cached account/link isolation, successful/failed traversal, retry lineage, controls and legacy plans")
+    }
+
+    static func testDownloadSpeedWaitsForPayload() throws {
+        let suite = "DownloadSpeedPreparation-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.isDownloading = true
+        model.downloadRunState = .scanning
+        model.downloadDownloadedBytes = 9_000_000
+        model.downloadNetworkTransferredBytes = 0
+        let start = Date()
+        model.restartDownloadSpeedCounter(at: start)
+        func tick(_ second: Double, bytes: UInt64) {
+            model.downloadNetworkTransferredBytes = bytes
+            model.sampleTransferRates(at: start.addingTimeInterval(second))
+        }
+        for second in 1...30 { tick(Double(second), bytes: 0) }
+        precondition(model.downloadSpeedHistory.samples.isEmpty && model.downloadSpeedHistory.startedAt == nil
+            && model.downloadSpeedHistory.activeSeconds == 0 && model.downloadSpeedHistory.transferredBytes == 0,
+            "Queue restoration and saved prefixes must not start the speed chart")
+        precondition(!model.downloadSpeedChartIsRunning && model.downloadSpeedChartWaitingMessage == "Preparing downloads…")
+        model.downloadVerification = .init(files: 1, verifiedBytes: 1_000, totalBytes: 9_000_000)
+        precondition(model.downloadSpeedChartWaitingMessage == "Checking saved download progress…")
+        model.downloadVerification = nil
+        model.downloadRunState = .downloading
+        model.activeDownloadTransfers["generated"] = .init(id: "generated", name: "Generated.bin", downloadedBytes: 0,
+            totalBytes: 1_000_000, state: .downloading, remotePath: "/Generated.bin", outputDirectoryPath: directory.path)
+        tick(31, bytes: 0)
+        precondition(model.downloadSpeedHistory.samples.isEmpty && !model.downloadSpeedChartIsRunning,
+            "A ready download without payload still waits")
+        tick(32, bytes: 1_000)
+        tick(33, bytes: 2_000)
+        precondition(model.downloadSpeedChartIsRunning && model.downloadSpeedChartWaitingMessage == nil)
+        precondition(model.downloadSpeedHistory.startedAt == start.addingTimeInterval(31)
+            && model.downloadSpeedHistory.activeSeconds == 2 && model.downloadSpeedHistory.transferredBytes == 2_000
+            && model.downloadSpeedHistory.averageBytesPerSecond == 1_000,
+            "First payload is retained without diluting the average with preparation")
+        tick(34, bytes: 2_000)
+        precondition(model.downloadSpeedHistory.activeSeconds == 3, "Stalls after reception starts still count")
+        model.downloadNetworkTransferredBytes = 0
+        model.restartDownloadSpeedCounter(at: start.addingTimeInterval(34))
+        let held = model.downloadSpeedHistory
+        for second in 35...60 { tick(Double(second), bytes: 0) }
+        precondition(model.downloadSpeedHistory == held && model.downloadSpeedChartWaitingMessage != nil,
+            "Preparing a replacement helper holds existing history and average still")
+        tick(61, bytes: 1_000)
+        precondition(model.downloadSpeedHistory.activeSeconds == 4 && model.downloadSpeedHistory.transferredBytes == 3_000
+            && model.downloadSpeedHistory.averageBytesPerSecond == 750,
+            "Replacement helper's first payload resumes history without counting its preparation")
+        print("PASS download startup: preparation message, saved-prefix exclusion, frozen chart/average until payload, first bytes retained, stalls and helper restart")
+    }
+
+    /// While downloads are paused the speed monitor holds still: it records nothing, and the pause is not counted as
+    /// time spent downloading, which would drag the average down and stretch the time remaining.
+    static func testDownloadSpeedMonitorPausesWithDownloads() throws {
+        let suite = "DownloadSpeedPause-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        model.isDownloading = true
+        model.downloadRunState = .downloading
+        model.activeDownloadTransfers["running"] = .init(id: "running", name: "Generated.bin", downloadedBytes: 0, totalBytes: 1_000_000,
+            state: .downloading, remotePath: "/Generated.bin", outputDirectoryPath: directory.path)
+        let start = Date()
+        model.downloadNetworkTransferredBytes = 0
+        model.restartDownloadSpeedCounter(at: start)
+        func tick(_ second: Double, bytes: UInt64) {
+            model.downloadNetworkTransferredBytes = bytes
+            model.sampleTransferRates(at: start.addingTimeInterval(second))
+        }
+        for second in 1...10 { tick(Double(second), bytes: UInt64(second) * 1_000) }
+        let running = model.downloadSpeedHistory
+        precondition(abs(running.activeSeconds - 10) < 0.01 && abs(running.averageBytesPerSecond - 1_000) < 1, "\(running.activeSeconds) s at \(running.averageBytesPerSecond)")
+
+        // The app records the moment of the pause itself; the simulated clock does so here.
+        model.downloadsPaused = true
+        tick(10, bytes: 10_000)
+        for second in 11...39 { tick(Double(second), bytes: 10_000) }
+        let paused = model.downloadSpeedHistory
+        precondition(abs(paused.activeSeconds - 10) < 0.01, "Paused time is not download time: \(paused.activeSeconds) s")
+        precondition(abs(paused.averageBytesPerSecond - 1_000) < 1, "The average is not diluted by the pause: \(paused.averageBytesPerSecond)")
+        precondition(paused.samples.count <= running.samples.count + 1, "No samples are recorded while paused: \(paused.samples.count) vs \(running.samples.count)")
+        precondition(model.downloadBytesPerSecond == 0, "The headline speed reads zero while paused")
+        precondition(paused.estimatedSeconds(remainingBytes: 5_000) == running.estimatedSeconds(remainingBytes: 5_000), "The time remaining does not stretch while paused")
+
+        model.downloadsPaused = false
+        tick(40, bytes: 10_000)
+        tick(41, bytes: 11_000)
+        let resumed = model.downloadSpeedHistory
+        precondition(abs(resumed.activeSeconds - 11) < 0.01 && abs(resumed.averageBytesPerSecond - 1_000) < 1,
+            "Resuming continues the average: \(resumed.activeSeconds) s at \(resumed.averageBytesPerSecond)")
+        precondition(zip(resumed.samples, resumed.samples.dropFirst()).contains { $1.time.timeIntervalSince($0.time) >= 29 && $1.bytesPerSecond == 0 },
+            "The pause stays visible on the chart as one flat gap")
+
+        // Every file paused one by one is a paused download too, while another that is still running is not.
+        model.activeDownloadTransfers["second"] = .init(id: "second", name: "Second.bin", downloadedBytes: 0, totalBytes: 1_000_000,
+            state: .stopped, remotePath: "/Second.bin", outputDirectoryPath: directory.path)
+        model.pausedDownloadIDs = ["second"]
+        for second in 42...50 { tick(Double(second), bytes: 11_000 + UInt64(second - 41) * 1_000) }
+        precondition(model.downloadSpeedHistory.activeSeconds > resumed.activeSeconds + 8, "A file paused while another runs does not pause the monitor")
+        model.activeDownloadTransfers["running"]?.state = .stopped
+        model.pausedDownloadIDs = ["second", "running"]
+        let beforeAllPaused = model.downloadSpeedHistory.activeSeconds
+        for second in 51...70 { tick(Double(second), bytes: 20_000) }
+        precondition(model.downloadSpeedHistory.activeSeconds <= beforeAllPaused + 1.01, "With every file paused the monitor holds still")
+        print("PASS download speed monitor: Pause All and all-files-paused hold it still, the average and time remaining are not diluted, and resuming records the pause as one gap")
+    }
+
+    static func testDownloadRAMProgressAndSettings() throws {
+        let suite = "DownloadRAM-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.isDownloading = true
+        model.downloadRunState = .downloading
+        model.downloadFixtureEvent(["event":"plan", "total_files":1, "total_bytes":8_000_000])
+        model.downloadFixtureEvent(["event":"file_started", "file_id":"generated-buffer", "name":"Generated.bin", "downloaded_bytes":0, "total_bytes":8_000_000])
+        model.downloadFixtureEvent(["event":"network_sample", "received_bytes":2_000_000,
+            "buffered_bytes":1_500_000, "buffer_limit_bytes":4_000_000,
+            "disk_traffic":["pending_read_bytes":1_024, "reading_bytes":0,
+                "pending_read_tasks":2, "reading_tasks":0, "read_drives":0, "write_drives":1,
+                "batch_remaining_bytes":0, "read_turn_idle_handoffs":1, "last_read_handover_reason":6,
+                "last_read_turn_ms":5_750, "last_read_remaining_bytes":1_024]])
+        precondition(model.downloadBufferUsage?.traffic?.readTurnIdleHandoffs == 1
+            && model.downloadBufferUsage?.traffic?.lastReadHandoverSummary == "Last read turn: 5s, receiving idle; draining waiting writes, 0 MiB unfinished",
+            "Idle receiving handovers retain unfinished checks and expose their recovery reason")
+        model.downloadFixtureEvent(["event":"network_sample", "received_bytes":2_000_000, "buffered_bytes":1_500_000,
+            "buffer_peak_bytes":1_600_000, "buffer_limit_bytes":4_000_000, "buffer_configured_bytes":8_000_000,
+            "buffer_reserve_bytes":8_000_000, "buffer_memory_pressure":2])
+        precondition(model.downloadNetworkTransferredBytes == 2_000_000 && model.downloadDownloadedBytes == 0,
+            "Received RAM bytes affect network speed, never durable progress")
+        precondition(model.downloadBufferUsage?.used == 1_500_000 && model.downloadBufferUsage?.pressure == 2)
+        precondition(model.downloadBufferUsage?.traffic == nil, "An older helper without queue-age fields remains compatible")
+        model.downloadFixtureEvent(["event":"network_sample", "received_bytes":2_000_000,
+            "buffered_bytes":1_500_000, "buffer_limit_bytes":4_000_000,
+            "disk_traffic":["pending_read_bytes":1_024, "reading_bytes":0,
+                "pending_read_tasks":2, "reading_tasks":0, "read_drives":0, "write_drives":1,
+                "batch_remaining_bytes":0, "read_turn_idle_handoffs":1, "last_read_handover_reason":6,
+                "last_read_turn_ms":5_750, "last_read_remaining_bytes":1_024]])
+        precondition(model.downloadBufferUsage?.traffic?.readTurnIdleHandoffs == 1
+            && model.downloadBufferUsage?.traffic?.lastReadHandoverSummary == "Last read turn: 5s, receiving idle; draining waiting writes, 0 MiB unfinished",
+            "Idle receiving handovers retain unfinished checks and expose their recovery reason")
+        model.downloadFixtureEvent(["event":"network_sample", "received_bytes":2_000_000, "buffered_bytes":1_500_000,
+            "buffer_limit_bytes":4_000_000, "disk_traffic":["pending_read_bytes":1_024, "reading_bytes":512,
+                "pending_read_tasks":2, "reading_tasks":1, "read_drives":1, "write_drives":0,
+                "batch_remaining_bytes":512, "oldest_pending_ms":2_500, "read_tasks_started":7, "read_tasks_finished":6]])
+        precondition(model.downloadBufferUsage?.traffic?.oldestPendingMs == 2_500
+            && model.downloadBufferUsage?.traffic?.readTasksStarted == 7
+            && model.downloadBufferUsage?.traffic?.readTasksFinished == 6, "Numeric queue progress reaches the buffer dashboard")
+        precondition(model.downloadBufferUsage?.traffic?.receivingTasks == nil, "Older helpers need not supply receiving phases")
+        model.downloadFixtureEvent(["event":"network_sample", "received_bytes":2_000_000,
+            "buffered_bytes":1_500_000, "buffer_limit_bytes":4_000_000,
+            "disk_traffic":["pending_read_bytes":1_024, "reading_bytes":0,
+                "pending_read_tasks":2, "reading_tasks":0, "read_drives":0, "write_drives":1,
+                "batch_remaining_bytes":0, "read_turn_idle_handoffs":1, "last_read_handover_reason":6,
+                "last_read_turn_ms":5_750, "last_read_remaining_bytes":1_024]])
+        precondition(model.downloadBufferUsage?.traffic?.readTurnIdleHandoffs == 1
+            && model.downloadBufferUsage?.traffic?.lastReadHandoverSummary == "Last read turn: 5s, receiving idle; draining waiting writes, 0 MiB unfinished",
+            "Idle receiving handovers retain unfinished checks and expose their recovery reason")
+        model.downloadFixtureEvent(["event":"network_sample", "received_bytes":2_000_000, "buffered_bytes":1_500_000,
+            "buffer_limit_bytes":4_000_000, "disk_traffic":["pending_read_bytes":1_024, "reading_bytes":512,
+                "pending_read_tasks":2, "reading_tasks":1, "read_drives":1, "write_drives":0,
+                "batch_remaining_bytes":0, "receiving_tasks":3, "ram_draining_tasks":4, "disk_only_tasks":5,
+                "pending_write_bytes":1_000_000, "writing_bytes":500_000, "writing_tasks":1, "waiting_writers":3,
+                "write_dispatch_polls":17, "eligible_waiting_writers":2,
+                "turn_elapsed_ms":1_250, "turn_target_ms":10_000, "ready_read_tasks":2, "ready_read_bytes":1_024,
+                "switch_wait_ms":0, "read_turns":9, "write_turns":8, "backlog_drives":1,
+                "file_worker_limit":12, "file_network_workers":11, "queued_downloads":100, "download_has_ready":true,
+                "receiving_admission_waiters":9,
+                "read_turn_timeouts":4, "read_turn_finishes":2, "read_turn_pressure_handoffs":1, "read_turn_control_handoffs":0,
+                "last_read_handover_sequence":7, "last_read_handover_reason":1, "last_read_turn_ms":10_004, "last_read_remaining_bytes":1_024,
+                "ram_waiting_receivers":2, "ram_wait_count":7, "ram_wait_total_ms":500, "ram_wait_max_ms":200,
+                "checkpoint_batches":3, "checkpoint_batched_files":64, "checkpoint_barriers":6,
+                "checkpoint_batch_total_ms":120, "checkpoint_batch_pending":2]])
+        precondition(model.downloadBufferUsage?.traffic?.receivingTasks == 3
+            && model.downloadBufferUsage?.traffic?.ramDrainingTasks == 4
+            && model.downloadBufferUsage?.traffic?.diskOnlyTasks == 5, "Anonymous producer and disk phases survive heartbeat decoding")
+        precondition(model.downloadBufferUsage?.traffic?.pendingWriteBytes == 1_000_000
+            && model.downloadBufferUsage?.traffic?.writingBytes == 500_000
+            && model.downloadBufferUsage?.traffic?.writingTasks == 1
+            && model.downloadBufferUsage?.traffic?.writeDispatchPolls == 17
+            && model.downloadBufferUsage?.traffic?.eligibleWaitingWriters == 2
+            && model.downloadBufferUsage?.traffic?.turnElapsedMs == 1_250
+            && model.downloadBufferUsage?.traffic?.turnTargetMs == 10_000
+            && model.downloadBufferUsage?.traffic?.turnSummary == "Turn 1s • target 10s"
+            && model.downloadBufferUsage?.traffic?.readyReadTasks == 2
+            && model.downloadBufferUsage?.traffic?.readTurns == 9,
+            "Timed turns and disjoint pending/writing RAM counters reach the dashboard")
+        precondition(model.downloadBufferUsage?.traffic?.fileWorkerLimit == 12
+            && model.downloadBufferUsage?.traffic?.fileNetworkWorkers == 11
+            && model.downloadBufferUsage?.traffic?.receivingAdmissionWaiters == 9
+            && model.downloadBufferUsage?.traffic?.queuedDownloads == 100
+            && model.downloadBufferUsage?.traffic?.downloadHasReady == true
+            && model.downloadBufferUsage?.traffic?.ramWaitingReceivers == 2
+            && model.downloadBufferUsage?.traffic?.ramWaitCount == 7,
+            "Admission and actual suspended RAM receivers survive anonymous heartbeat decoding")
+        precondition(model.downloadBufferUsage?.traffic?.checkpointBatches == 3
+            && model.downloadBufferUsage?.traffic?.checkpointBatchedFiles == 64
+            && model.downloadBufferUsage?.traffic?.checkpointBarriers == 6
+            && model.downloadBufferUsage?.traffic?.checkpointBatchTotalMs == 120
+            && model.downloadBufferUsage?.traffic?.checkpointBatchPending == 2,
+            "Anonymous group-commit and cache-flush counters survive heartbeat decoding")
+        precondition(model.downloadBufferUsage?.traffic?.readTurnTimeouts == 4
+            && model.downloadBufferUsage?.traffic?.readTurnFinishes == 2
+            && model.downloadBufferUsage?.traffic?.readTurnPressureHandoffs == 1
+            && model.downloadBufferUsage?.traffic?.lastReadHandoverSequence == 7
+            && model.downloadBufferUsage?.traffic?.lastReadHandoverSummary == "Last read turn: 10s, 10s limit reached, 0 MiB unfinished",
+            "Read handover reasons, durations and retained bytes survive decoding with integer seconds")
+        model.downloadFixtureEvent(["event":"network_sample", "received_bytes":2_000_000, "buffered_bytes":3_200_001,
+            "buffer_limit_bytes":4_000_000, "disk_traffic":["pending_read_bytes":1_024, "reading_bytes":512,
+                "pending_read_tasks":2, "reading_tasks":1, "read_drives":1, "write_drives":0,
+                "batch_remaining_bytes":0, "pending_write_bytes":3_200_001, "writing_bytes":0,
+                "turn_elapsed_ms":75_750, "turn_target_ms":0,
+                "read_write_threshold_percent":80, "read_write_threshold_bytes":3_200_000,
+                "read_turn_write_handoffs":3, "last_read_handover_reason":5,
+                "last_read_turn_ms":75_750, "last_read_pending_write_bytes":3_200_001,
+                "last_read_buffer_limit_bytes":4_000_000, "last_read_remaining_bytes":1_024]])
+        precondition(model.downloadBufferUsage?.traffic?.turnSummary == "Turn 75s • writes above 80% RAM"
+            && model.downloadBufferUsage?.traffic?.readWriteThresholdBytes == 3_200_000
+            && model.downloadBufferUsage?.traffic?.lastReadPendingWriteBytes == 3_200_001
+            && model.downloadBufferUsage?.traffic?.lastReadBufferLimitBytes == 4_000_000
+            && model.downloadBufferUsage?.traffic?.readTurnWriteHandoffs == 3
+            && model.downloadBufferUsage?.traffic?.lastReadHandoverSummary == "Last read turn: 75s, pending writes exceeded 80% RAM, 0 MiB unfinished",
+            "Threshold read turns have no deadline and expose their exact RAM handover using integer seconds")
+        model.downloadFixtureEvent(["event":"network_sample", "received_bytes":2_000_000,
+            "buffered_bytes":1_500_000, "buffer_limit_bytes":4_000_000,
+            "disk_traffic":["pending_read_bytes":1_024, "reading_bytes":0,
+                "pending_read_tasks":2, "reading_tasks":0, "read_drives":0, "write_drives":1,
+                "batch_remaining_bytes":0, "read_turn_idle_handoffs":1, "last_read_handover_reason":6,
+                "last_read_turn_ms":5_750, "last_read_remaining_bytes":1_024]])
+        precondition(model.downloadBufferUsage?.traffic?.readTurnIdleHandoffs == 1
+            && model.downloadBufferUsage?.traffic?.lastReadHandoverSummary == "Last read turn: 5s, receiving idle; draining waiting writes, 0 MiB unfinished",
+            "Idle receiving handovers retain unfinished checks and expose their recovery reason")
+        model.downloadFixtureEvent(["event":"network_sample", "received_bytes":2_000_000, "buffered_bytes":1_500_000,
+            "buffer_limit_bytes":4_000_000, "disk_traffic":["pending_read_bytes":1_024, "reading_bytes":0,
+                "pending_read_tasks":2, "reading_tasks":0, "read_drives":0, "write_drives":1,
+                "batch_remaining_bytes":0, "pending_write_bytes":500_000, "writing_bytes":1_000_000,
+                "turn_elapsed_ms":25_750, "turn_target_ms":0]])
+        precondition(model.downloadBufferUsage?.traffic?.turnSummary == "Turn 25s • until written",
+            "An unlimited write batch shows integer elapsed seconds and no ten-second target")
+        model.downloadFixtureEvent(["event":"file_progress", "file_id":"generated-buffer", "name":"Generated.bin", "downloaded_bytes":500_000,
+            "transferred_bytes":2_000_000, "total_bytes":8_000_000])
+        model.publishDownloadProgress()
+        precondition(model.downloadNetworkTransferredBytes == 2_000_000 && model.downloadDownloadedBytes == 500_000,
+            "Heartbeat and file progress must not double count receive-ahead")
+        model.downloadFixtureEvent(["event":"plan", "total_files":1, "total_bytes":8_000_000])
+        model.publishDownloadProgress()
+        precondition(model.downloadNetworkTransferredBytes == 0, "A new legacy plan resets the previous helper counter")
+        let settings = model.finderSettings
+        precondition(settings.downloadBufferCapMiB == 0)
+        defaults.set(8, forKey: "downloadBufferReserveGiB")
+        settings.downloadBufferCapMiB = 4_096
+        let restored = FinderSettings(defaults: defaults)
+        precondition(restored.downloadBufferCapMiB == 4_096)
+        let environment = restored.downloadBufferEnvironment(["MYCLOUDDRIVER_DOWNLOAD_RAM_LIMIT_BYTES":"wrong",
+            "MYCLOUDDRIVER_DOWNLOAD_RAM_RESERVE_BYTES":String(8 * DownloadBufferPolicy.gib)])
+        precondition(environment["MYCLOUDDRIVER_DOWNLOAD_RAM_LIMIT_BYTES"] == String(4 * DownloadBufferPolicy.gib))
+        precondition(environment["MYCLOUDDRIVER_DOWNLOAD_RAM_RESERVE_BYTES"] == nil, "A saved or inherited fixed reserve cannot restrict automatic buffering")
+        restored.downloadBufferCapMiB = 0
+        let automatic = restored.downloadBufferEnvironment(environment)
+        precondition(automatic["MYCLOUDDRIVER_DOWNLOAD_RAM_LIMIT_BYTES"] == nil && automatic["MYCLOUDDRIVER_DOWNLOAD_RAM_RESERVE_BYTES"] == nil)
+        precondition(DownloadBufferPolicy.limitBytes(memory: 16 * DownloadBufferPolicy.gib, capMiB: 0) == 16 * DownloadBufferPolicy.gib)
+        precondition(DownloadBufferPolicy.limitBytes(memory: 8 * DownloadBufferPolicy.gib, capMiB: 16_384) == 8 * DownloadBufferPolicy.gib)
+        print("PASS download RAM: independent receive/durable counters, no double counting, pressure usage, helper restart and persisted adaptive settings")
+    }
+
+    static func testDownloadSleepPreventionLifecycle() throws {
+        let suite = "DownloadSleepPrevention-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        var begins = 0, ends = 0
+        model.downloadSleepPrevention = DownloadSleepPrevention(begin: { begins += 1; return NSObject() }, end: { _ in ends += 1 })
+        defer { model.stopForWindowClose() }
+        model.isClosingWindow = false
+        model.isDownloading = true
+        precondition(model.downloadSleepPrevention.isActive && begins == 1 && ends == 0)
+        for _ in 0..<20 { model.recordDownloadSpeedHistory(at: Date()) }
+        precondition(begins == 1, "Heartbeats must retain one sleep activity, not leak new assertions")
+        model.downloadsPaused = true
+        precondition(!model.downloadSleepPrevention.isActive && ends == 1, "A drained paused download allows sleep")
+        model.downloadBufferUsage = .init(used: 1, peak: 1, limit: 1_024, configured: 1_024, reserve: 0, pressure: 1, receivedAt: Date())
+        precondition(model.downloadSleepPrevention.isActive, "Pause must keep the Mac awake while accepted RAM data drains")
+        model.downloadBufferUsage?.used = 0
+        precondition(!model.downloadSleepPrevention.isActive)
+        let pending = DownloadDiskTraffic(pendingReadBytes: 1_024, readingBytes: 0, pendingReadTasks: 1,
+            readingTasks: 0, readDrives: 1, writeDrives: 0, batchRemainingBytes: 0)
+        model.downloadBufferUsage?.traffic = pending
+        precondition(model.downloadSleepPrevention.isActive, "Pending verification must keep running while reception is paused")
+        var traffic = DownloadDiskTraffic(pendingReadBytes: 0, readingBytes: 0, pendingReadTasks: 0,
+            readingTasks: 0, readDrives: 0, writeDrives: 1, batchRemainingBytes: 0)
+        traffic.checkpointBatchPending = 1
+        model.downloadBufferUsage?.traffic = traffic
+        precondition(model.downloadSleepPrevention.isActive, "Checkpoint commits must retain sleep protection")
+        traffic.checkpointBatchPending = 0
+        model.downloadBufferUsage?.traffic = traffic
+        precondition(!model.downloadSleepPrevention.isActive)
+        model.downloadsPaused = false
+        precondition(model.downloadSleepPrevention.isActive, "Resume reacquires sleep protection")
+        model.activeDownloadTransfers = ["generated": .init(id: "generated", name: "Generated.bin", downloadedBytes: 0,
+            totalBytes: 1_024, state: .downloading, remotePath: "/Generated.bin", outputDirectoryPath: directory.path)]
+        model.pausedDownloadIDs = ["generated"]
+        precondition(!model.downloadSleepPrevention.isActive, "Individually pausing every file also permits idle sleep")
+        model.downloadDrainingForQuit = true
+        precondition(model.downloadSleepPrevention.isActive, "Normal Quit must stay awake until the helper acknowledges its save")
+        model.isDownloading = false
+        precondition(!model.downloadSleepPrevention.isActive, "Completion or helper failure releases the activity despite stale metrics")
+        model.pausedDownloadIDs = []; model.isDownloading = true
+        precondition(model.downloadSleepPrevention.isActive)
+        model.stopForWindowClose()
+        precondition(!model.downloadSleepPrevention.isActive && begins == ends, "Workspace closure must not leave a sleep assertion behind")
+        var first: DownloadSleepPrevention? = DownloadSleepPrevention(begin: { begins += 1; return NSObject() }, end: { _ in ends += 1 })
+        let second = DownloadSleepPrevention(begin: { begins += 1; return NSObject() }, end: { _ in ends += 1 })
+        first?.setActive(true); second.setActive(true)
+        first = nil
+        precondition(second.isActive && begins == ends + 1, "Closing one workspace must retain another workspace's sleep protection")
+        second.setActive(false)
+        precondition(begins == ends, "Deallocation and completion both release their owned activity")
+        print("PASS download sleep prevention: active reception, idempotent heartbeats, Pause with RAM/verification/checkpoints, Resume, individual pauses, safe Quit and close")
+    }
+
+    static func testDownloadPauseKeepsHelperAndQuitRestoresPausedQueue() async throws {
+        let suite = "DownloadReceptionPause-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.isClosingWindow = false; model.failedDownloadTransfers = []
+        model.pendingDownloadRequests = []; model.interruptedDownloadRequests = []
+        let root = AccountDownloadRoot(queueID: UUID(), path: "/Generated", name: "Generated", kind: .folder, file: nil, relativeParent: [])
+        model.activeDownloadRequests = [.account(roots: [root], destination: model.outputURL, jobs: 1, proxyURL: "")]
+        model.isDownloading = true; model.downloadRunState = .downloading; model.liveDownloadRun = true
+        model.pausedDownloadIDs = ["generated-paused-child"]
+        model.downloadControlURL = directory.appendingPathComponent("control.json")
+        model.writeDownloadControls()
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        helper.arguments = ["-c", "import json,sys,time\np=sys.argv[1]\nwhile not json.load(open(p)).get('drain'): time.sleep(.01)\ntime.sleep(.2)\n", model.downloadControlURL!.path]
+        helper.terminationHandler = { [weak model] child in
+            DispatchQueue.main.async { model?.finishDownloadProcess(exitCode: child.terminationStatus, errorOutput: "", operation: .download) }
+        }
+        model.downloadProcess = helper
+        try helper.run()
+        let pid = helper.processIdentifier
+        model.stop()
+        try await Task.sleep(nanoseconds: 150_000_000)
+        let paused = try JSONDecoder().decode(TransferControlsDocument.self, from: Data(contentsOf: model.downloadControlURL!))
+        precondition(helper.isRunning && model.downloadProcess === helper && model.isDownloading,
+            "Pause must preserve the helper and its RAM consumers")
+        precondition(model.downloadsPaused && model.canStartPendingDownloads && model.downloadRunState == .downloading)
+        precondition(paused.receive_only_pause && !paused.drain && paused.actions["*"] == "pause")
+        model.startPendingDownloads()
+        let resumed = try JSONDecoder().decode(TransferControlsDocument.self, from: Data(contentsOf: model.downloadControlURL!))
+        precondition(helper.isRunning && helper.processIdentifier == pid && model.downloadProcess === helper,
+            "Resume continues the same helper rather than discarding its buffers")
+        precondition(!model.downloadsPaused && resumed.actions["*"] == nil && resumed.actions["generated-paused-child"] == "pause")
+        model.stop()
+        let started = Date()
+        let saved = await model.prepareDownloadsForApplicationTermination()
+        precondition(saved && !helper.isRunning && model.downloadProcess == nil)
+        precondition(Date().timeIntervalSince(started) >= 0.19, "Quit while paused must still wait for the disk drain")
+        let restored = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { restored.stopForWindowClose() }
+        restored.failedDownloadTransfers = []; restored.transferStateReady = false
+        restored.adoptTransferAccount("synthetic-download-account")
+        precondition(restored.downloadsPaused && restored.pausedDownloadIDs.contains("generated-paused-child"))
+        precondition((restored.pendingDownloadRequests + restored.interruptedDownloadRequests + restored.activeDownloadRequests)
+            .contains { $0.pendingItems.contains { $0.id == root.queueID } }, "Restart retains the original pending check's selection")
+        print("PASS reception Pause: helper stays alive, same-process Resume, drain on paused Quit, paused queue and individual controls restored")
+    }
+
+    static func testDownloadQuitWaitsForDrainAndPreservesResumeIntent() async throws {
+        let suite = "DownloadQuitDrain-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.isClosingWindow = false
+        model.transferStateReady = false
+        let emptySessionCanQuit = await model.prepareDownloadsForApplicationTermination()
+        precondition(emptySessionCanQuit, "A signed-out session without a RAM writer must still be able to quit")
+        model.transferStateReady = true
+        model.failedDownloadTransfers = []
+        let root = AccountDownloadRoot(queueID: UUID(), path: "/Generated", name: "Generated", kind: .folder, file: nil, relativeParent: [])
+        model.activeDownloadRequests = [.account(roots: [root], destination: model.outputURL, jobs: 1, proxyURL: "")]
+        model.isDownloading = true; model.liveDownloadRun = true
+        model.pausedDownloadIDs = ["generated-paused-child"]
+        model.downloadControlURL = directory.appendingPathComponent("control.json")
+        model.writeDownloadControls()
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        helper.arguments = ["-c", "import json,sys,time\np=sys.argv[1]\nwhile not json.load(open(p)).get('drain'): time.sleep(.01)\ntime.sleep(.2)\n", model.downloadControlURL!.path]
+        helper.terminationHandler = { [weak model] child in
+            DispatchQueue.main.async { model?.finishDownloadProcess(exitCode: child.terminationStatus, errorOutput: "", operation: .download) }
+        }
+        model.downloadProcess = helper
+        try helper.run()
+        let started = Date()
+        let saved = await model.prepareDownloadsForApplicationTermination()
+        precondition(saved && !helper.isRunning && model.downloadProcess == nil)
+        precondition(Date().timeIntervalSince(started) >= 0.19, "Quit must wait for the helper's drain and termination callback")
+        precondition(!model.downloadsPaused && model.pausedDownloadIDs.contains("generated-paused-child"), "Quit preserves automatic resume and individual pause intent")
+        let restored = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { restored.stopForWindowClose() }
+        restored.failedDownloadTransfers = []
+        restored.transferStateReady = false
+        restored.adoptTransferAccount("synthetic-download-account")
+        precondition((restored.pendingDownloadRequests + restored.interruptedDownloadRequests + restored.activeDownloadRequests).contains { $0.pendingItems.contains { $0.id == root.queueID } }, "A pending verification's original selection must survive Quit and restart")
+        precondition(!restored.downloadsPaused, "The restored queue retains its automatic-resume intent")
+        print("PASS normal Quit: drain request, helper acknowledgement, durable selection restored, automatic resume and individual pauses preserved")
+    }
+
+    static func testDownloadProgressBatchResponsiveness() throws {
+        let suite = "DownloadProgressBatch-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        model.isDownloading = true
+        model.downloadRunState = .downloading
+        let absentDirectory = "/Volumes/Disconnected-Generated-\(UUID())/downloads"
+        for index in 0..<48 {
+            let id = "batch-\(index)"
+            model.activeDownloadTransfers[id] = .init(id: id, name: "Generated-\(index).bin", downloadedBytes: 0,
+                totalBytes: 100, state: .downloading, remotePath: "/Generated-\(index).bin", outputDirectoryPath: absentDirectory)
+            model.downloadFileTotalsByID[id] = 100
+        }
+        model.downloadTotalBytes = 4_800
+        var publications = 0
+        let observation = model.$downloadingTransfers.dropFirst().sink { _ in publications += 1 }
+        defer { observation.cancel() }
+        func line(_ event: [String: Any]) throws -> String {
+            "@pikpak-progress:" + String(data: try JSONSerialization.data(withJSONObject: event), encoding: .utf8)!
+        }
+        var lines: [String] = []
+        for _ in 0..<4 {
+            for index in 0..<48 {
+                lines.append(try line(["event":"file_progress", "file_id":"batch-\(index)", "name":"Generated-\(index).bin",
+                    "downloaded_bytes":60, "transferred_bytes":20, "total_bytes":100]))
+            }
+        }
+        model.pendingDownloadOutputLines = lines
+        model.flushDownloadOutputBatch()
+        precondition(model.pendingDownloadOutputLines.isEmpty && publications == 1,
+            "A helper progress burst publishes one coherent UI snapshot, without dropping any events")
+        precondition(model.downloadingTransfers.count == 48 && model.downloadDownloadedBytes == 2_880 &&
+            model.downloadNetworkTransferredBytes == 960 && model.downloadProgressHighWater.count == 48)
+        let completedPath = absentDirectory + "/Generated-0 (Recovered 00000000000000000000000000000000).bin"
+        model.pendingDownloadOutputLines = [
+            try line(["event":"file_progress", "file_id":"batch-0", "name":"Generated-0.bin", "downloaded_bytes":100, "total_bytes":100]),
+            try line(["event":"file_completed", "file_id":"batch-0", "name":"Generated-0.bin", "downloaded_bytes":100,
+                "transferred_bytes":20, "total_bytes":100, "output_path":completedPath]),
+            try line(["event":"file_progress", "file_id":"batch-0", "name":"Generated-0.bin", "downloaded_bytes":60, "total_bytes":100])
+        ]
+        model.flushDownloadOutputBatch()
+        precondition(publications == 2 && model.activeDownloadTransfers["batch-0"] == nil &&
+            model.completedDownloadTransfers.last?.completedFileURL?.path == completedPath && model.downloadCompletedFiles == 1,
+            "Batching preserves completion ordering, actual recovery paths, and rejection of late progress")
+        precondition(URL(fileURLWithPath: absentDirectory, isDirectory: true).hasDirectoryPath &&
+            !model.completedDownloadTransfers.last!.completedFileURL!.hasDirectoryPath,
+            "Known directory and file hints must avoid filesystem probing during progress and rendering")
+        let sampleDate = Date()
+        model.downloadRate.restart(bytes: model.downloadNetworkTransferredBytes, at: sampleDate)
+        var invalidations = 0, downloadRatePublications = 0, uploadRatePublications = 0
+        var hashRatePublications = 0, runStatePublications = 0, bytePublications = 0, historyPublications = 0
+        let metricObservations = [
+            model.objectWillChange.sink { invalidations += 1 },
+            model.$downloadBytesPerSecond.dropFirst().sink { _ in downloadRatePublications += 1 },
+            model.$uploadBytesPerSecond.dropFirst().sink { _ in uploadRatePublications += 1 },
+            model.$uploadHashBytesPerSecond.dropFirst().sink { _ in hashRatePublications += 1 },
+            model.$downloadSpeedHistory.dropFirst().sink { _ in historyPublications += 1 },
+            model.$downloadRunState.dropFirst().sink { _ in runStatePublications += 1 },
+            model.$downloadDownloadedBytes.dropFirst().sink { _ in bytePublications += 1 }
+        ]
+        defer { metricObservations.forEach { $0.cancel() } }
+        for tick in 1...20 {
+            model.sampleTransferRates(at: sampleDate.addingTimeInterval(Double(tick) / 2))
+        }
+        precondition(invalidations == historyPublications && historyPublications > 0
+            && uploadRatePublications == 0 && hashRatePublications == 0
+            && downloadRatePublications == 0 && model.lastUploadSpeedSampleDate == sampleDate.addingTimeInterval(10)
+            && model.lastUploadHashSpeedSampleDate == sampleDate.addingTimeInterval(10),
+            "Idle download-only samples advance the speed chart, while baselines update without publishing unchanged rates or unrelated upload views")
+        invalidations = 0
+        for _ in 0..<100 {
+            model.downloadFixtureEvent(["event":"file_progress", "file_id":"batch-1", "name":"Generated-1.bin",
+                "downloaded_bytes":60, "transferred_bytes":20, "total_bytes":100])
+        }
+        precondition(invalidations == 0 && runStatePublications == 0 && bytePublications == 0,
+            "Repeated unchanged progress does not republish run state, retained totals or row snapshots")
+        model.downloadRunState = .scanning
+        runStatePublications = 0
+        model.downloadFixtureEvent(["event":"file_dequeued", "file_id":"batch-1", "name":"Generated-1.bin", "total_bytes":100])
+        model.downloadFixtureEvent(["event":"file_started", "file_id":"batch-1", "name":"Generated-1.bin",
+            "downloaded_bytes":60, "transferred_bytes":20, "total_bytes":100])
+        precondition(runStatePublications == 1 && model.downloadRunState == .downloading,
+            "A genuine worker admission still publishes the transition from Scanning to Downloading once")
+
+        // The fixture events above sampled at the real clock, behind the simulated one. Replay five idle
+        // seconds on the simulated clock so the burst below is measured against a full window.
+        let idleBytes = model.downloadNetworkTransferredBytes
+        model.downloadRate.restart(bytes: idleBytes, at: sampleDate.addingTimeInterval(5))
+        for second in 6...10 { model.downloadRate.sample(bytes: idleBytes, at: sampleDate.addingTimeInterval(Double(second))) }
+        model.isUploading = true; model.uploadRunState = .uploading
+        model.downloadNetworkTransferredBytes += 120
+        model.downloadNetworkBytesByID["batch-1", default: 0] += 120
+        model.uploadNetworkTransferredBytes = 400; model.uploadHashedBytes = 800
+        let progressedAt = sampleDate.addingTimeInterval(11)
+        model.lastUploadNetworkProgressDate = progressedAt; model.lastUploadHashProgressDate = progressedAt
+        model.sampleTransferRates(at: progressedAt)
+        precondition(downloadRatePublications == 1 && uploadRatePublications == 1 && hashRatePublications == 1
+            && model.uploadBytesPerSecond == 400 && model.uploadHashBytesPerSecond == 800
+            && model.downloadBytesPerSecond == 120.0 / 5,
+            "New network and hashing bytes still publish their measured speeds; the download speed averages them over five seconds")
+        model.sampleTransferRates(at: sampleDate.addingTimeInterval(13))
+        precondition(downloadRatePublications == 1 && uploadRatePublications == 2 && hashRatePublications == 2
+            && model.downloadBytesPerSecond == 120.0 / 5 && model.uploadBytesPerSecond == 0 && model.uploadHashBytesPerSecond == 0,
+            "Upload stall deadlines clear each nonzero speed exactly once, while the download average still covers its recent burst")
+        model.sampleTransferRates(at: sampleDate.addingTimeInterval(17))
+        precondition(downloadRatePublications == 2 && uploadRatePublications == 2 && hashRatePublications == 2
+            && model.downloadBytesPerSecond == 0,
+            "Once the burst leaves the five-second window the download speed reaches zero, published exactly once")
+        invalidations = 0; historyPublications = 0
+        model.sampleTransferRates(at: sampleDate.addingTimeInterval(18))
+        precondition(invalidations == historyPublications && downloadRatePublications == 2
+            && uploadRatePublications == 2 && hashRatePublications == 2,
+            "Stalled samples can advance the chart without reannouncing already-cleared rates")
+        model.downloadNetworkTransferredBytes += 120
+        model.downloadNetworkBytesByID["batch-1", default: 0] += 120
+        model.uploadNetworkTransferredBytes += 400; model.uploadHashedBytes += 800
+        model.sampleTransferRates(at: sampleDate.addingTimeInterval(19))
+        precondition(model.downloadBytesPerSecond > 0 && model.uploadBytesPerSecond > 0 && model.uploadHashBytesPerSecond > 0)
+        model.downloadRunState = .stopped; model.isUploadPaused = true
+        model.sampleTransferRates(at: sampleDate.addingTimeInterval(19.1))
+        precondition(downloadRatePublications == 4 && uploadRatePublications == 4 && hashRatePublications == 4
+            && model.downloadBytesPerSecond == 0 && model.uploadBytesPerSecond == 0 && model.uploadHashBytesPerSecond == 0,
+            "Stop and Pause still clear rates immediately, before another sampling interval elapses")
+        invalidations = 0; historyPublications = 0
+        model.sampleTransferRates(at: sampleDate.addingTimeInterval(20))
+        precondition(invalidations == historyPublications && downloadRatePublications == 4
+            && uploadRatePublications == 4 && hashRatePublications == 4)
+        print("PASS progress responsiveness: disconnected paths, batched ordering, retained totals, idle publication suppression and genuine speed/state/stall transitions")
+    }
+
+    static func testLargeDownloadPausePresentation() throws {
+        let suite = "DownloadPausePresentation-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        let roots: [AccountDownloadRoot] = (0..<12_000).map { index in
+            let id = UUID(), name = id.uuidString
+            let kind: BrowserItemKind = index.isMultiple(of: 5) ? .folder : .file
+            return .init(queueID: id, path: "/" + name, name: name, kind: kind,
+                file: kind == .folder ? nil : .init(id: name, name: name, size: "100", kind: kind), relativeParent: [])
+        }
+        let plan = PendingDownloadRequest.account(roots: roots, destination: model.outputURL, jobs: 8, proxyURL: "")
+        let splitStarted = ProcessInfo.processInfo.systemUptime
+        model.activeDownloadRequests = plan.individualRequests
+        precondition(ProcessInfo.processInfo.systemUptime - splitStarted < 2,
+            "Splitting a large restored selection must not rescan every root for each individual request")
+        model.isDownloading = true
+        model.liveDownloadRun = true
+        model.discoveringDownloadRequestIDs = Set(roots.map(\.queueID))
+        let pausedFiles = Set(roots.enumerated().filter { $0.offset.isMultiple(of: 7) && $0.element.kind == .file }.map(\.element.queueID))
+        model.pausedDownloadIDs = Set(pausedFiles.map { $0.uuidString + ":body" })
+        let pausedSelections = Set(roots.enumerated().filter { $0.offset.isMultiple(of: 29) }.map(\.element.queueID))
+        model.pausedPendingDownloadIDs = pausedSelections
+        let items = plan.pendingItems
+        let started = ProcessInfo.processInfo.systemUptime
+        for _ in 0..<4 {
+            precondition(model.preparingDownloadItems.count == roots.count)
+            for item in items {
+                let expected = pausedSelections.contains(item.id) || pausedFiles.contains(item.id)
+                precondition(model.pendingDownloadIsPaused(item) == expected)
+            }
+        }
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        precondition(elapsed < 3, "Four large queue renders must leave the main actor available for progress and controls")
+
+        let first = items[1], second = items[2], folder = items[5]
+        model.pausedPendingDownloadIDs = []
+        model.pausedDownloadIDs = ["saved-control"]
+        model.downloadRequestIDsByFileID = ["saved-control": first.id]
+        precondition(model.pendingDownloadIsPaused(first) && !model.pendingDownloadIsPaused(second))
+        model.downloadRequestIDsByFileID["saved-control"] = second.id
+        precondition(!model.pendingDownloadIsPaused(first) && model.pendingDownloadIsPaused(second),
+            "A discovered file's changed root must invalidate the pause lookup")
+        model.downloadRequestIDsByFileID = [:]
+        let identity = DownloadProgressIdentity(sourceID: "generated-source", outputPath: first.destinationPath + "/" + first.name, shareURL: nil)
+        model.downloadRetryTargets = [first.id: [identity: "saved-control"]]
+        precondition(model.pendingDownloadIsPaused(first) && !model.pendingDownloadIsPaused(second))
+        model.downloadRetryTargets = [second.id: [identity: "saved-control"]]
+        precondition(!model.pendingDownloadIsPaused(first) && model.pendingDownloadIsPaused(second),
+            "A restored retry's target must update pause state without rebuilding all requests")
+        model.pausedDownloadIDs = []
+        precondition(!model.pendingDownloadIsPaused(second), "Resume must immediately clear the indexed file pause")
+        model.pausedDownloadIDs = [folder.id.uuidString + ":child"]
+        precondition(!model.pendingDownloadIsPaused(folder)
+            && model.downloadRequestIsPaused(model.activeDownloadRequests[5])
+            && !model.downloadRequestIsPaused(model.activeDownloadRequests[5], includingFolderChildren: false),
+            "Pausing one discovered child must keep its folder available for sibling discovery")
+        let ancestor = UUID(), intermediate = UUID()
+        model.automaticDownloadRetryOrigins = [first.id: intermediate, intermediate: ancestor]
+        model.pausedPendingDownloadIDs = [ancestor]
+        precondition(model.pendingDownloadIsPaused(first), "A paused selection must hold every generation of its file retries")
+        model.pausedPendingDownloadIDs = []
+        model.automaticDownloadRetryOrigins[ancestor] = first.id
+        precondition(!model.pendingDownloadIsPaused(first), "A malformed retry cycle must remain bounded")
+        model.isDownloading = false
+        precondition(model.preparingDownloadItems.isEmpty)
+        print("PASS large queue pause presentation: 12,000 generated selections, indexed restored controls, file/root Resume, folder siblings and retry lineage; four snapshots=\(elapsed.formatted(.number.precision(.fractionLength(3))))s")
+    }
+
+    static func testLargeDownloadRetryPresentation() throws {
+        let suite = "DownloadRetryPresentation-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        let roots: [AccountDownloadRoot] = (0..<12_000).map { _ in
+            let id = UUID(), name = id.uuidString
+            return .init(queueID: id, path: "/" + name, name: name, kind: .file,
+                file: .init(id: name, name: name, size: "100", kind: .file), relativeParent: [])
+        }
+        let plan = PendingDownloadRequest.account(roots: roots, destination: model.outputURL, jobs: 8, proxyURL: "")
+        let failures = roots.map { root in
+            DownloadTransfer(id: root.queueID.uuidString + ":body", name: root.name, downloadedBytes: 0, totalBytes: 100,
+                state: .failed, remotePath: root.path, outputDirectoryPath: model.outputURL.path)
+        }
+        model.failedDownloadTransfers = failures
+        model.activeDownloadRequests = [plan]
+        model.downloadRequestIDsByFileID = Dictionary(uniqueKeysWithValues: zip(failures, roots).map { ($0.id, $1.queueID) })
+        model.isDownloading = true
+        let started = ProcessInfo.processInfo.systemUptime
+        for _ in 0..<4 {
+            model.downloadRetryRowsDirty = true
+            model.publishDownloadTransferRows()
+            precondition(model.automaticRetryDownloadCount == failures.count)
+            precondition(model.automaticDownloadRetryCandidates().count == failures.count)
+        }
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        precondition(elapsed < 3, "Large retry lists and retry timers must not repeatedly reconstruct every queued selection")
+        model.pausedPendingDownloadIDs = [roots[0].queueID]
+        model.pausedDownloadIDs = [failures[1].id]
+        precondition(model.automaticDownloadRetryStatus(failures[0]) == nil && model.automaticDownloadRetryStatus(failures[1]) == nil)
+        precondition(model.automaticDownloadRetryCandidates().count == failures.count - 2)
+        let retryRoot = UUID(), target = roots[2], transfer = failures[2]
+        let retry = PendingDownloadRequest.account(roots: [.init(queueID: retryRoot, path: target.path, name: target.name, kind: .file,
+            file: target.file, relativeParent: [])], destination: model.outputURL, jobs: 8, proxyURL: "")
+        let identity = DownloadProgressIdentity(sourceID: target.name, outputPath: model.outputURL.path + "/" + target.name, shareURL: nil)
+        model.pendingDownloadRequests = [retry]
+        model.downloadRetryTargets = [retryRoot: [identity: transfer.id]]
+        model.automaticDownloadRetryOrigins = [retryRoot: target.queueID]
+        precondition(model.downloadRetryIsQueued(transfer) && model.automaticDownloadRetryStatus(transfer) == "Retry queued")
+        precondition(model.automaticDownloadRetryCandidates().count == failures.count - 3)
+        model.automaticDownloadRetryOrigins[retryRoot] = roots[3].queueID
+        precondition(!model.downloadRetryIsQueued(transfer), "An unrelated root cannot suppress a file's retry")
+        model.automaticDownloadRetryOrigins[retryRoot] = target.queueID
+        model.pendingDownloadRequests = []
+        precondition(!model.downloadRetryIsQueued(transfer), "Removed retry requests must immediately leave the reverse lookup")
+        model.activeDownloadRequests = []
+        model.pendingDownloadRequests = [plan]
+        precondition(model.automaticDownloadRetryStatus(transfer) == nil,
+            "A grouped pending request retains the original pause behavior for all of its members")
+        model.pausedPendingDownloadIDs = []; model.pausedDownloadIDs = []
+        model.fullyDiscoveredDownloadRequestIDs = Set(roots.map(\.queueID))
+        precondition(model.automaticDownloadRetryCandidates().count == failures.count,
+            "Resume and discovery completion must immediately refresh retry eligibility")
+        print("PASS large retry presentation: 12,000 generated failures, indexed queue/status/candidates, pauses, retry ancestry and request removal; four snapshots=\(elapsed.formatted(.number.precision(.fractionLength(3))))s")
+    }
+
+    static func testLargeDownloadRestoreProgress() throws {
+        let suite = "LargeDownloadRestore-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        let requests: [PendingDownloadRequest] = (0..<2_000).map { index in
+            .account(roots: [.init(queueID: UUID(), path: "/Generated/Folder-\(index)", name: "Folder-\(index)",
+                kind: .folder, file: nil, relativeParent: [])], destination: model.outputURL, jobs: 8, proxyURL: "")
+        }
+        let saved = SavedTransfers(version: 1, accountID: "synthetic-download-account", downloads: requests, uploads: [])
+        try model.transferStore().save(saved, accountID: saved.accountID)
+        let restoreStarted = Date()
+        model.transferStateReady = false; model.adoptTransferAccount(saved.accountID)
+        let restoreElapsed = Date().timeIntervalSince(restoreStarted)
+        precondition(model.activeDownloadRequests.count == 2_000 && model.isDownloading,
+            "Every generated restored root must be admitted without changing its source or identity")
+        model.downloadControlURL = directory.appendingPathComponent("controls.json")
+        model.writeDownloadControls()
+        // Measure the old unconditional per-append work against the same
+        // generated restored queue, without accessing a real transfer store.
+        let legacyStarted = Date()
+        for _ in 0..<10 { model.writeDownloadControls() }
+        let legacyPerAppend = Date().timeIntervalSince(legacyStarted) / 10
+        let writes = model.transferPersistenceFixtureWrites, controlWrites = model.downloadControlFixtureWrites
+        let root = requests[0].pendingItems[0].id
+        func append(_ index: Int) {
+            model.downloadFixtureEvent(["event":"queue_append", "files":[[
+                "file_id":"generated-\(index)", "source_file_id":"source-\(index)", "request_id":root.uuidString,
+                "name":"File-\(index).bin", "total_bytes":100, "remote_path":"/Generated/Folder-0/File-\(index).bin",
+                "output_directory":model.outputURL.path]]])
+        }
+        let appendStarted = Date()
+        for index in 0..<2_000 { append(index) }
+        let appendElapsed = Date().timeIntervalSince(appendStarted)
+        precondition(model.transferPersistenceFixtureWrites == writes && model.downloadControlFixtureWrites == controlWrites,
+            "Discovery-only appends must not re-encode or rewrite the unchanged saved request plan and controls")
+        precondition(model.downloadTotalFiles == 2_000 && model.downloadTotalBytes == 200_000 && model.queuedDownloadCount == 2_000)
+        let first = model.queuedDownloadTransfers.first!
+        model.pauseDownloadFile(first)
+        precondition(model.transferPersistenceFixtureWrites == writes + 1 && model.downloadControlFixtureWrites == controlWrites + 1,
+            "An explicit Pause must still be durable and visible to the helper immediately")
+        let persisted = try model.transferStore().load(SavedTransfers.self, accountID: saved.accountID)!
+        precondition(persisted.pausedDownloadIDs?.contains(first.id) == true)
+        let beforeHeldAppend = model.transferPersistenceFixtureWrites
+        model.pendingRootActions[root.uuidString + ":/Generated/Folder-0"] = "pause"
+        append(2_000)
+        precondition(model.transferPersistenceFixtureWrites == beforeHeldAppend + 1 && model.pausedDownloadIDs.contains("generated-2000"),
+            "A newly inherited body Pause must be written and persisted before later events")
+        model.pendingRootActions[root.uuidString + ":/Generated/Folder-0"] = "cancel"
+        model.writeDownloadControls()
+        let beforeLateCancel = model.downloadTotalFiles
+        append(2_001)
+        let controls = try JSONDecoder().decode(TransferControlsDocument.self, from: Data(contentsOf: model.downloadControlURL!))
+        precondition(model.downloadTotalFiles == beforeLateCancel && model.cancelledDownloadIDs.contains("generated-2001")
+            && controls.actions["path:" + root.uuidString + ":/Generated/Folder-0"] == "cancel",
+            "Late discovery must keep its existing immediate ancestor Cancel and never recreate a queued row")
+        print("PASS large restore/discovery: 2,000 preserved roots, 2,000 appends without saved-plan rewrites, immediate explicit/inherited Pause; restore=\(restoreElapsed.formatted(.number.precision(.fractionLength(3))))s, old writer/append=\((legacyPerAppend * 1_000).formatted(.number.precision(.fractionLength(3))))ms, new append/row=\((appendElapsed / 2_000 * 1_000).formatted(.number.precision(.fractionLength(3))))ms")
+    }
+
     func showDownloadRetryFixtureProgress() {
         guard case .account(let roots, let destination, _, _) = activePersistentDownload else { return }
         resetDownloadProgress()
@@ -8922,17 +11430,17 @@ final class DownloaderModel: ObservableObject {
         let file = DownloadTransfer(id: "file-A", name: "A.bin", downloadedBytes: 10, totalBytes: 100,
             state: .downloading, remotePath: "/A.bin", outputDirectoryPath: directory.path)
         model.pauseDownloadFile(file)
-        let paused = try JSONSerialization.jsonObject(with: Data(contentsOf: control)) as! [String: [String: String]]
-        precondition(paused["actions"]?[file.id] == "pause")
+        let paused = try JSONDecoder().decode(TransferControlsDocument.self, from: Data(contentsOf: control))
+        precondition(paused.actions[file.id] == "pause")
         model.resumeDownloadFile(file)
-        let resumed = try JSONSerialization.jsonObject(with: Data(contentsOf: control)) as! [String: [String: String]]
-        precondition(resumed["actions"]?[file.id] == nil)
+        let resumed = try JSONDecoder().decode(TransferControlsDocument.self, from: Data(contentsOf: control))
+        precondition(resumed.actions[file.id] == nil)
         let partial = directory.appendingPathComponent("A.bin.part")
         try Data("unfinished".utf8).write(to: partial)
         model.cancelDownloadFile(file)
         precondition(FileManager.default.fileExists(atPath: partial.path), "UI must never delete while helper may still write")
-        let cancelled = try JSONSerialization.jsonObject(with: Data(contentsOf: control)) as! [String: [String: String]]
-        precondition(cancelled["actions"]?[file.id] == "cancel" && !model.canRetryFailedDownload(file))
+        let cancelled = try JSONDecoder().decode(TransferControlsDocument.self, from: Data(contentsOf: control))
+        precondition(cancelled.actions[file.id] == "cancel" && !model.canRetryFailedDownload(file))
         precondition(model.canBrowse && model.canUploadFiles, "downloads must not block unrelated browser/uploads")
         // A large original folder root must not resurrect a cancelled child on
         // restart, even when the plan is too large to flatten into saved files.
@@ -8959,6 +11467,36 @@ final class DownloaderModel: ObservableObject {
         print("PASS per-file controls: atomic pause/resume/cancel messages, no UI deletion of active writers, unrelated work stays enabled")
     }
 
+    /// Every queue event rewrites the control file, which restores the saved
+    /// cancellations of each active request on the main thread. Normalizing the
+    /// request destination once per saved record made a large cancelled folder
+    /// saturate the main thread, so restoring must scale with plain string work.
+    static func testRestoredDownloadControlsStayCheapForLargeCancelledFolders() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("Restored-Controls-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let defaults = UserDefaults(suiteName: "Restored-Controls-\(UUID().uuidString)")!
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        let folder = PendingDownloadRequest.account(roots: [.init(queueID: UUID(), path: "/Large", name: "Large", kind: .folder, file: nil, relativeParent: [])], destination: directory, jobs: 4, proxyURL: "")
+        let foreign = PendingDownloadRequest.account(roots: [], destination: directory.appendingPathComponent("other"), jobs: 4, proxyURL: "")
+        model.activePersistentDownload = folder
+        let childCount = 50_000
+        var records = Set<SavedDownloadCancellation>()
+        for index in 0..<childCount {
+            records.insert(.init(scope: folder.cancellationScope, controlID: "child-\(index)", remotePath: "/Large/child-\(index).bin"))
+            records.insert(.init(scope: foreign.cancellationScope, controlID: "foreign-\(index)", remotePath: "/Large/foreign-\(index).bin"))
+        }
+        model.savedDownloadCancellations = records
+        var restored: [String: String] = [:]
+        let elapsed = ContinuousClock().measure { restored = model.restoredDownloadControls() }
+        precondition(restored.count == childCount && restored["child-0"] == "cancel" && restored["child-\(childCount - 1)"] == "cancel",
+            "every cancelled child of the active destination must be restored (got \(restored.count))")
+        precondition(restored["foreign-0"] == nil, "cancellations saved for another destination must not be restored")
+        precondition(elapsed < .milliseconds(250), "restoring \(records.count) saved cancellations took \(elapsed); per-record work must not normalize URLs")
+        model.isClosingWindow = true
+        print("PASS restored download controls: \(childCount) cancelled children restored in \(elapsed), other destinations untouched")
+    }
+
     static func testGuestMode() throws {
         let suite = "ContentMode-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -8973,7 +11511,7 @@ final class DownloaderModel: ObservableObject {
         defaults.set(false, forKey: "pikpakGuestMode")
         let model = finderWorkspaceFixture(defaults: defaults)
         defer { model.stopForWindowClose() }
-        precondition(model.finderSettings.contentMode == .user && model.liveDownloadInbox.contentMode == .user)
+        precondition(model.finderSettings.contentMode == .user && model.liveDownloadInbox.contentMode == .dynamic)
         let token = URL(fileURLWithPath: "/tmp/content-mode-unused-token")
         func environment() -> [String: String] {
             model.desktopEngineEnvironment(tokenURL: token, lockURL: token, deviceID: "fixture-device")
@@ -8984,11 +11522,13 @@ final class DownloaderModel: ObservableObject {
             model.finderSettings.contentMode = mode
             precondition(model.previewFileID == nil, "every mode change invalidates issued preview URLs")
             precondition(FinderSettings(defaults: defaults).contentMode == mode, "each mode survives relaunch")
-            precondition(environment()["PIKPAK_CONTENT_MODE"] == mode.rawValue, "downloads, previews, Open, Quick Look and scans share the engine policy")
+            precondition(environment()["PIKPAK_CONTENT_MODE"] == mode.rawValue, "previews, Open, Quick Look and scans retain the selected content mode")
+            precondition(Self.transferDownloadEnvironment(environment())["PIKPAK_CONTENT_MODE"] == "dynamic",
+                         "PikPak transfer downloads always try Guest before the account")
             precondition(environment()["PIKPAK_GUEST_MODE"] == nil, "legacy shell preferences cannot override the selected mode")
             let inbox = try JSONSerialization.jsonObject(with: JSONEncoder().encode(model.liveDownloadInbox)) as! [String: Any]
-            precondition(inbox["content_mode"] as? String == mode.rawValue && inbox["guest_mode"] == nil,
-                         "new and retried requests in an existing queue use the current mode")
+            precondition(inbox["content_mode"] as? String == "dynamic" && inbox["guest_mode"] == nil,
+                         "new and retried requests in an existing queue always use Dynamic")
         }
         precondition(runningHelperEnvironment["PIKPAK_CONTENT_MODE"] == "user", "running scans keep their captured mode")
         let file = AccountDownloadCachedFile(id: "id", name: "Saved", size: "8", kind: .file, parentId: "folder")
@@ -9004,6 +11544,1477 @@ final class DownloaderModel: ObservableObject {
         model.finderSettings.resetLayout()
         precondition(model.finderSettings.contentMode == .dynamic, "layout reset preserves the content preference")
         print("PASS User/Guest/Dynamic: legacy migration, persistence, helper environments, live inbox, preview invalidation, running-helper snapshots, legacy queues and layout isolation")
+    }
+
+    static func testTransferDownloadDynamicMode() throws {
+        let suite = "TransferDynamic-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        for mode in PikPakContentMode.allCases {
+            model.finderSettings.contentMode = mode
+            for credential in [PikPakCredentialKind.desktopOAuth, .personalAccessToken] {
+                let token = directory.appendingPathComponent("unused-token")
+                let general = model.desktopEngineEnvironment(tokenURL: token, lockURL: token,
+                    deviceID: "synthetic-device", credentialKind: credential)
+                var source = general
+                source["PIKPAK_GUEST_MODE"] = "1"
+                source["PIKPAK_PROXY"] = "http://127.0.0.1:12345"
+                let download = Self.transferDownloadEnvironment(source)
+                precondition(download["PIKPAK_CONTENT_MODE"] == "dynamic" && download["PIKPAK_GUEST_MODE"] == nil)
+                precondition(general["PIKPAK_CONTENT_MODE"] == mode.rawValue,
+                             "transfer policy must preserve the preview/scan preference")
+                for (key, value) in source where key != "PIKPAK_CONTENT_MODE" && key != "PIKPAK_GUEST_MODE" {
+                    precondition(download[key] == value, "download policy must preserve account credentials, proxy and limits")
+                }
+            }
+        }
+        model.finderSettings.contentMode = .user
+        model.downloadsPaused = true
+        let account = PendingDownloadRequest.account(roots: [.init(queueID: UUID(), path: "/large.bin", name: "large.bin",
+            kind: .file, file: .init(id: "large-account-source", name: "large.bin", size: "1073741824", kind: .file), relativeParent: [])],
+            destination: model.outputURL, jobs: 1, proxyURL: "")
+        let sharedItem = BrowserItem(id: "large-shared-source", name: "shared.bin", size: 1 << 30, kind: .file,
+            parentId: nil, mimeType: nil, createdTime: nil, modifiedTime: nil, fileExtension: nil, iconLink: nil,
+            thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+        let shared = PendingDownloadRequest.shared(roots: [.init(queueID: UUID(), item: sharedItem,
+            root: .init(id: sharedItem.id, name: sharedItem.name, size: sharedItem.size, kind: .file, path: "/shared.bin", relativeParent: []))],
+            access: .init(url: "https://mypikpak.com/s/synthetic", passCode: "", passCodeToken: ""),
+            destination: model.outputURL, jobs: 1, proxyURL: "")
+        model.queueDownload(account); model.queueDownload(shared)
+        let saved = try model.transferStore().load(SavedTransfers.self, accountID: "synthetic-download-account")!
+        precondition(saved.downloads.count == 2 && saved.downloadsPaused == true)
+
+        let restored = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { restored.stopForWindowClose() }
+        restored.transferStateReady = false
+        restored.finderSettings.contentMode = .guest
+        restored.adoptTransferAccount("synthetic-download-account")
+        precondition(restored.pendingDownloadRequests.count == 2 && restored.downloadsPaused && !restored.isDownloading)
+        restored.startPendingDownloads()
+        func checkInbox(_ expectedRequests: Int) throws {
+            let json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(restored.liveDownloadInbox)) as! [String: Any]
+            precondition(json["content_mode"] as? String == "dynamic" && json["guest_mode"] == nil)
+            precondition((json["requests"] as? [[String: Any]])?.count == expectedRequests)
+        }
+        precondition(restored.isDownloading && restored.finderSettings.contentMode == .guest)
+        try checkInbox(2)
+        // A new request joins a running helper even after the preview mode changes.
+        restored.finderSettings.contentMode = .user
+        let failed = DownloadTransfer(id: "retry-source", name: "retry.bin", downloadedBytes: 3, totalBytes: 1 << 30,
+            state: .failed, remotePath: "/retry.bin", outputDirectoryPath: restored.outputURL.path)
+        restored.failedDownloadTransfers = [failed]
+        restored.retryFailedDownload(failed)
+        try checkInbox(3)
+        precondition(restored.failedDownloadTransfers.isEmpty)
+        print("PASS Dynamic transfer downloads: account/PAT environments, proxy preservation, paused restore/Resume, shared sources and live retry ignore preview/scan mode")
+    }
+
+    static func testLiveDownloadCheckpointPolicy() throws {
+        let suite = "LiveCheckpoint-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        let internalURL = directory.appendingPathComponent("internal")
+        let externalURL = directory.appendingPathComponent("external")
+        let networkURL = directory.appendingPathComponent("network")
+        model.downloadDestinationValidator = { url, _ in
+            let kind = url.path.hasPrefix(externalURL.path) ? "external"
+                : url.path.hasPrefix(networkURL.path) ? "network" : "internal"
+            return .init(volumeID: "synthetic-volume", destinationKind: kind)
+        }
+        let legacy = try JSONDecoder().decode(DownloadDestinationCheckpoint.self,
+            from: Data(#"{"volumeID":"synthetic-volume"}"#.utf8))
+        precondition(legacy.destinationKind == nil)
+        model.downloadDestinations[externalURL.path] = legacy
+        let nested = externalURL.appendingPathComponent("nested")
+        precondition(model.downloadDestinationIsReady(nested))
+        precondition(model.downloadDestinations[externalURL.path]?.destinationKind == "external",
+            "Validation refreshes a legacy ancestor without doing disk I/O during inbox encoding")
+        func submit(_ url: URL) {
+            let id = UUID()
+            model.submittedDownloadRequests[id] = .account(roots: [.init(queueID: id, path: "/generated.bin",
+                name: "generated.bin", kind: .file, file: nil, relativeParent: [])], destination: url, jobs: 1, proxyURL: "")
+        }
+        precondition(model.downloadDestinationIsReady(internalURL))
+        submit(internalURL); submit(nested)
+        func check(_ expected: [String: String]) throws {
+            let json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(model.liveDownloadInbox)) as! [String: Any]
+            let rows = json["requests"] as! [[String: Any]]
+            precondition(rows.count == expected.count)
+            for row in rows {
+                precondition(row["destination_kind"] as? String == expected[row["destination"] as! String],
+                    "Each live request carries its own checkpoint policy")
+            }
+        }
+        try check([internalURL.path: "internal", nested.path: "external"])
+        precondition(model.downloadDestinationIsReady(networkURL))
+        submit(networkURL)
+        try check([internalURL.path: "internal", nested.path: "external", networkURL.path: "network"])
+        let localCheckpoint = try DownloadDestinationAccess.validate(directory)
+        precondition(localCheckpoint.destinationKind == "internal")
+        precondition(DownloadDestinationPolicy.destinationKind(.externalDisk) == "external"
+            && DownloadDestinationPolicy.destinationKind(.networkShare) == "network"
+            && DownloadDestinationPolicy.destinationKind(nil) == "internal")
+        print("PASS continuous download checkpoints: validated volume flags, legacy records, inherited roots, mixed disks and late network roots; inbox encoding does no volume probing")
+    }
+
+    static func testDownloadDestinationRecovery() throws {
+        let suite = "DownloadDestination-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        var connected = true, writable = true, volume = "original-volume"
+        model.downloadDestinationValidator = { url, checkpoint in
+            guard connected else { throw CloudDriveError.waiting("Synthetic disk disconnected") }
+            guard writable else { throw CloudDriveError.waiting("Synthetic write access denied") }
+            guard checkpoint?.volumeID == nil || checkpoint?.volumeID == volume else {
+                throw DownloadDestinationReplaced(path: url.path)
+            }
+            return .init(volumeID: volume)
+        }
+        let destination = directory.appendingPathComponent("external", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let partial = destination.appendingPathComponent("large.bin.part")
+        let prefix = Data("generated-prefix".utf8)
+        try prefix.write(to: partial)
+        let request = PendingDownloadRequest.account(roots: [.init(queueID: UUID(), path: "/large.bin", name: "large.bin",
+            kind: .file, file: .init(id: "large-source", name: "large.bin", size: "1073741824", kind: .file), relativeParent: [])],
+            destination: destination, jobs: 1, proxyURL: "")
+        model.queueDownload(request)
+        precondition(model.isDownloading)
+        let saved = try model.transferStore().load(SavedTransfers.self, accountID: "synthetic-download-account")!
+        precondition(saved.downloadDestinations?[destination.path]?.volumeID == "original-volume")
+        connected = false
+        model.checkDownloadDestinations(unmounted: destination)
+        precondition(model.downloadDestinationRestartPending)
+        model.finishDownloadProcess(exitCode: 15, errorOutput: "Synthetic destination lost", operation: .download)
+        precondition(!model.isDownloading && model.pendingDownloadRequests.count == 1 && model.downloadDestinationStatus != nil)
+        let retainedPrefix = try Data(contentsOf: partial)
+        precondition(retainedPrefix == prefix, "Disconnect must preserve the generated partial")
+        connected = true; writable = false
+        model.checkDownloadDestinations()
+        precondition(!model.isDownloading, "Permission denial must wait without launching another helper")
+        writable = true; volume = "replacement-volume"
+        // A different disk has none of the queued file's progress files; restored ones would prove it is the same job.
+        let awayFromReplacement = destination.appendingPathComponent("large.bin.part.away")
+        try FileManager.default.moveItem(at: partial, to: awayFromReplacement)
+        model.checkDownloadDestinations()
+        precondition(!model.isDownloading, "Another disk at the same path must never receive the download")
+        try FileManager.default.moveItem(at: awayFromReplacement, to: partial)
+        volume = "original-volume"
+        model.checkDownloadDestinations()
+        precondition(model.isDownloading && model.downloadDestinationStatus == nil)
+        model.stop()
+        connected = false
+        model.checkDownloadDestinations(unmounted: destination)
+        precondition(model.downloadsPaused, "Losing an active disk must preserve a user Pause")
+        model.finishDownloadProcess(exitCode: 15, errorOutput: "Synthetic paused disconnect", operation: .download)
+        connected = true
+        model.checkDownloadDestinations()
+        precondition(!model.isDownloading && model.downloadsPaused)
+        model.startPendingDownloads()
+        precondition(model.isDownloading)
+        // A helper can observe an old mount identity even after the destination
+        // path is already available. Its typed event must restart that helper.
+        model.downloadFixtureEvent(["event":"file_retrying", "file_id":"large-source", "name":"large.bin",
+            "destination_unavailable":true, "retry_in_millis":1000])
+        precondition(model.downloadDestinationRestartPending)
+        model.stop()
+        model.finishDownloadProcess(exitCode: 15, errorOutput: "Synthetic remount", operation: .download)
+        model.checkDownloadDestinations()
+        precondition(!model.isDownloading && model.downloadsPaused, "Manual Pause must defeat automatic remount recovery")
+        model.startPendingDownloads()
+        precondition(model.isDownloading)
+        model.finishDownloadProcess(exitCode: 9, errorOutput: "Synthetic network failure", operation: .download)
+        precondition(model.automaticDownloadRetry != nil)
+        model.checkDownloadDestinations()
+        precondition(!model.isDownloading, "Destination polling must preserve normal network cooldowns")
+        let missingMount = URL(fileURLWithPath: "/Volumes/MyCloudDriver-Missing-Fixture-\(UUID())/downloads")
+        do {
+            _ = try DownloadDestinationAccess.validate(missingMount)
+            preconditionFailure("A missing external disk must never be accepted as an internal folder")
+        } catch { precondition(!FileManager.default.fileExists(atPath: missingMount.path)) }
+        let local = try DownloadDestinationAccess.validate(directory.appendingPathComponent("not-created"))
+        if let localVolume = local.volumeID {
+            do {
+                _ = try DownloadDestinationAccess.validate(directory,
+                    checkpoint: .init(volumeID: localVolume + "-different"))
+                preconditionFailure("Destination volume mismatch was accepted")
+            } catch {}
+        }
+        print("PASS destination recovery: persisted volume identity, disconnect, permission wait, original remount, typed restart, Pause, network cooldowns and missing mount safety")
+    }
+
+    /// A download disk that was reformatted and had its unfinished files restored. Another or empty disk never
+    /// receives the download on its own; the user can accept it, and restored progress files prove it automatically.
+    static func testDownloadDestinationReplacement() throws {
+        let suite = "DownloadReplacement-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        for automatic in [false, true] {
+            let name = automatic ? "restored" : "chosen"
+            let model = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent(name))
+            defer { model.stopForWindowClose() }
+            model.failedDownloadTransfers = []
+            var volume = "exfat-volume"
+            model.downloadDestinationValidator = { url, checkpoint in
+                guard checkpoint?.volumeID == nil || checkpoint?.volumeID == volume else { throw DownloadDestinationReplaced(path: url.path) }
+                return .init(volumeID: volume)
+            }
+            let destination = directory.appendingPathComponent("\(name)-disk", isDirectory: true)
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            let request = PendingDownloadRequest.account(roots: [.init(queueID: UUID(), path: "/large.bin", name: "large.bin",
+                kind: .file, file: .init(id: "large-source", name: "large.bin", size: "1073741824", kind: .file), relativeParent: [])],
+                destination: destination, jobs: 1, proxyURL: "")
+            model.queueDownload(request)
+            precondition(model.isDownloading)
+            precondition(model.downloadDestinationReplacement == nil)
+
+            // The disk is reformatted: a new identity, and nothing restored on it yet.
+            volume = "apfs-volume"
+            model.checkDownloadDestinations(unmounted: destination)
+            model.finishDownloadProcess(exitCode: 15, errorOutput: "Synthetic reformat", operation: .download)
+            precondition(!model.isDownloading && model.pendingDownloadRequests.count == 1)
+            precondition(model.downloadDestinationReplacement == destination.path, "A replaced disk offers Use This Disk")
+            precondition(model.downloadDestinationStatus?.contains("Use This Disk") == true && model.downloadDestinationStatus?.contains("reformatted") == true,
+                         "The wait says why: \(model.downloadDestinationStatus ?? "nil")")
+            model.checkDownloadDestinations()
+            precondition(!model.isDownloading, "An empty or different disk must never receive the download on its own")
+
+            if automatic {
+                // The unfinished download's own checkpoint is put back where it belongs: the same job, restored.
+                try Data("{}".utf8).write(to: destination.appendingPathComponent("large.bin.part.resume.json"))
+                model.replacementProofCheckedAt = [:]
+                model.checkDownloadDestinations()
+            } else {
+                model.acceptReplacementDisk()
+            }
+            precondition(model.isDownloading && model.downloadDestinationStatus == nil && model.downloadDestinationReplacement == nil,
+                         "\(automatic ? "Restored progress files prove the disk" : "Use This Disk") continues the download")
+            let saved = try model.transferStore().load(SavedTransfers.self, accountID: "synthetic-download-account")!
+            precondition(saved.downloadDestinations?[destination.path]?.volumeID == "apfs-volume",
+                         "The new disk's identity is saved, so a restart does not ask again")
+            if !automatic {
+                // Acceptance is for this disk only: a third disk with nothing restored is refused again.
+                volume = "third-volume"
+                model.checkDownloadDestinations()
+                precondition(model.downloadDestinationReplacement == destination.path, "A later different disk is refused again")
+            }
+        }
+        print("PASS reformatted download disk: replaced disks wait and offer Use This Disk, Use This Disk and restored progress files continue it, and the new identity is saved")
+    }
+
+    /// Finished files read in full to prove they are the originals show as verifying, not as an idle start.
+    static func testDownloadVerificationProgress() throws {
+        let suite = "DownloadVerification-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        precondition(model.downloadVerification == nil)
+        model.downloadFixtureEvent(["event": "file_verifying", "file_id": "a", "name": "a.mp4", "verified_bytes": 100, "total_bytes": 400])
+        precondition(model.downloadVerification == .init(files: 1, verifiedBytes: 100, totalBytes: 400))
+        model.downloadFixtureEvent(["event": "file_verifying", "file_id": "b", "name": "b.mp4", "verified_bytes": 50, "total_bytes": 600])
+        precondition(model.downloadVerification == .init(files: 2, verifiedBytes: 150, totalBytes: 1000), "Files add up")
+        model.downloadFixtureEvent(["event": "file_verifying", "file_id": "a", "name": "a.mp4", "verified_bytes": 400, "total_bytes": 400])
+        precondition(model.downloadVerification == .init(files: 2, verifiedBytes: 450, totalBytes: 1000), "Progress replaces, not adds")
+        // Any other event for a file means it has moved on: it was skipped, started or failed.
+        model.downloadFixtureEvent(["event": "file_retrying", "file_id": "a", "name": "a.mp4", "retry_in_millis": 1000])
+        precondition(model.downloadVerification == .init(files: 1, verifiedBytes: 50, totalBytes: 600))
+        model.downloadFixtureEvent(["event": "file_retrying", "file_id": "unrelated", "name": "c.mp4", "retry_in_millis": 1000])
+        precondition(model.downloadVerification == .init(files: 1, verifiedBytes: 50, totalBytes: 600), "An unrelated file changes nothing")
+        // A helper that ends takes its verification with it.
+        model.finishDownloadProcess(exitCode: 0, errorOutput: "", operation: .download)
+        precondition(model.downloadVerification == nil, "Nothing is verifying once the helper has exited")
+        print("PASS download verification: per-file progress adds up, any later event for a file ends it, and the helper ending clears it")
+    }
+
+    static func testDownloadCancellationClearsQueue() async throws {
+        let suite = "DownloadCancel-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        var connected = true
+        model.downloadDestinationValidator = { _, checkpoint in
+            guard connected else { throw CloudDriveError.waiting("Synthetic disk disconnected") }
+            return checkpoint ?? .init(volumeID: "cancel-volume")
+        }
+        let rootID = UUID()
+        let folder = PendingDownloadRequest.account(roots: [.init(queueID: rootID, path: "/Folder", name: "Folder",
+            kind: .folder, file: nil, relativeParent: [])], destination: model.outputURL, jobs: 1, proxyURL: "")
+        model.queueDownload(folder)
+        let files: [[String: Any]] = ["running", "queued"].map {
+            ["file_id":$0, "source_file_id":$0, "request_id":rootID.uuidString, "name":"\($0).bin",
+             "total_bytes":100, "remote_path":"/Folder/\($0).bin", "output_directory":model.outputURL.appendingPathComponent("Folder").path]
+        }
+        model.downloadFixtureEvent(["event":"queue_append", "files":files])
+        model.downloadFixtureEvent(["event":"file_started", "file_id":"running", "name":"running.bin", "downloaded_bytes":10, "total_bytes":100])
+        precondition(model.queuedDownloadCount == 1 && model.downloadingTransfers.count == 1)
+        model.cancelAllDownloads()
+        precondition(model.queuedDownloadCount == 0 && model.downloadingTransfers.isEmpty && model.pendingDownloadItems.isEmpty)
+        precondition(model.downloadTotalFiles == 0 && model.downloadTotalBytes == 0 && model.downloadFailedFiles == 0,
+                     "Cancel All must also clear the old plan's dashboard counts")
+        precondition(model.activeDownloadRequests.isEmpty && model.pendingDownloadRequests.isEmpty && model.interruptedDownloadRequests.isEmpty)
+        let cancelled = try model.transferStore().load(SavedTransfers.self, accountID: "synthetic-download-account")!
+        precondition(cancelled.downloads.isEmpty && cancelled.cancelledDownloadCleanups?.isEmpty == false)
+        model.downloadFixtureEvent(["event":"queue_append", "files":files])
+        model.downloadFixtureEvent(["event":"file_progress", "file_id":"running", "name":"running.bin", "downloaded_bytes":20])
+        precondition(model.queuedDownloadCount == 0 && model.downloadingTransfers.isEmpty, "Late helper output must not resurrect cancelled rows")
+        let freshID = UUID()
+        let fresh = PendingDownloadRequest.account(roots: [.init(queueID: freshID, path: "/new.bin", name: "new.bin",
+            kind: .file, file: .init(id: "new-source", name: "new.bin", size: "100", kind: .file), relativeParent: [])],
+            destination: model.outputURL, jobs: 1, proxyURL: "")
+        model.queueDownload(fresh)
+        precondition(model.pendingDownloadRequests.count == 1 && model.activeDownloadRequests.isEmpty)
+        model.finishDownloadProcess(exitCode: 15, errorOutput: "", operation: .download)
+        precondition(model.isDownloading && model.activeDownloadRequests.first?.pendingItems.first?.id == freshID,
+                     "A new selection must survive termination of the cancelled helper")
+        let file: [String: Any] = ["file_id":"new-source", "request_id":freshID.uuidString, "name":"new.bin", "total_bytes":100,
+            "remote_path":"/new.bin", "output_directory":model.outputURL.path]
+        model.downloadFixtureEvent(["event":"queue_append", "files":[file]])
+        model.cancelPendingDownload(model.activeDownloadRequests[0].pendingItems[0])
+        model.downloadFixtureEvent(["event":"queue_append", "files":[file]])
+        precondition(model.queuedDownloadCount == 0 && model.activeDownloadRequests.isEmpty)
+        model.finishDownloadProcess(exitCode: 0, errorOutput: "", operation: .download)
+        connected = false
+        model.queueDownload(fresh)
+        precondition(!model.isDownloading && model.pendingDownloadRequests.count == 1)
+        model.cancelAllDownloads()
+        connected = true
+        model.checkDownloadDestinations()
+        precondition(!model.isDownloading && model.pendingDownloadRequests.isEmpty && model.automaticDownloadRetry == nil,
+                     "Reconnect must never restart a cancelled queue")
+        let restored = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { restored.stopForWindowClose() }
+        restored.transferStateReady = false
+        restored.adoptTransferAccount("synthetic-download-account")
+        precondition(restored.pendingDownloadRequests.isEmpty && !restored.isDownloading,
+                     "Cancelled queues must remain empty after relaunch")
+        let readded = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent("readded"))
+        defer { readded.stopForWindowClose() }
+        readded.failedDownloadTransfers = []
+        readded.downloadsPaused = true
+        var available = true
+        readded.downloadDestinationValidator = { _, checkpoint in
+            guard available else { throw CloudDriveError.waiting("Synthetic disconnected destination") }
+            return checkpoint ?? .init(volumeID: "readded-volume")
+        }
+        try FileManager.default.createDirectory(at: readded.outputURL, withIntermediateDirectories: true)
+        let newPartial = readded.outputURL.appendingPathComponent("again.bin.part")
+        let newPrefix = Data("new-generated-prefix".utf8)
+        try newPrefix.write(to: newPartial)
+        func selection() -> PendingDownloadRequest {
+            .account(roots: [.init(queueID: UUID(), path: "/again.bin", name: "again.bin", kind: .file,
+                file: .init(id: "again-source", name: "again.bin", size: "100", kind: .file), relativeParent: [])],
+                destination: readded.outputURL, jobs: 1, proxyURL: "")
+        }
+        readded.queueDownload(selection())
+        available = false
+        readded.cancelAllDownloads()
+        precondition(!readded.cancelledDownloadCleanups.isEmpty)
+        readded.queueDownload(selection())
+        precondition(readded.cancelledDownloadCleanups.isEmpty,
+                     "A new selection must supersede cleanup of the same cancelled output")
+        available = true
+        readded.checkDownloadDestinations()
+        if let cleanup = readded.downloadCleanupTask { await cleanup.value }
+        precondition(readded.isDownloading)
+        let preservedNewPrefix = try Data(contentsOf: newPartial)
+        precondition(preservedNewPrefix == newPrefix, "Deferred old cleanup must preserve a re-added selection's partial")
+        print("PASS cancellation: immediate active/queued clear, durable empty queue, stale output rejection, new selection during stop, per-root cancel and disconnected relaunch")
+    }
+
+    static func testDownloadCancellationOverlap() async throws {
+        let suite = "DownloadCancelOverlap-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        for cancelFolder in [false, true] {
+            let model = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent(cancelFolder ? "folder" : "file"))
+            defer { model.stopForWindowClose() }
+            model.failedDownloadTransfers = []; model.downloadsPaused = true
+            let tree = model.outputURL.appendingPathComponent("Folder", isDirectory: true)
+            try FileManager.default.createDirectory(at: tree, withIntermediateDirectories: true)
+            let output = tree.appendingPathComponent("Shared.bin")
+            let partial = output.appendingPathExtension("part")
+            let prefix = Data("generated-resumable-prefix".utf8)
+            try prefix.write(to: partial)
+            try Data("completed-sentinel".utf8).write(to: output)
+            let locks = model.accountFixtureTransferDirectory!.appendingPathComponent("TransferLocks", isDirectory: true)
+            try FileManager.default.createDirectory(at: locks, withIntermediateDirectories: true)
+            let normalized = output.deletingLastPathComponent().resolvingSymlinksInPath()
+                .appendingPathComponent(output.lastPathComponent).path
+                .decomposedStringWithCanonicalMapping.lowercased().decomposedStringWithCanonicalMapping
+            let key = SHA256.hash(data: Data(normalized.utf8)).map { String(format: "%02x", $0) }.joined()
+            try JSONEncoder().encode(["owner":model.transferOwnerKey, "file_id":"shared-source", "output_path":output.path])
+                .write(to: locks.appendingPathComponent(key))
+            let folder = PendingDownloadRequest.account(roots: [.init(queueID: UUID(), path: "/Folder", name: "Folder",
+                kind: .folder, file: nil, relativeParent: [])], destination: model.outputURL, jobs: 1, proxyURL: "")
+            let file = PendingDownloadRequest.account(roots: [.init(queueID: UUID(), path: "/Folder/Shared.bin", name: "Shared.bin",
+                kind: .file, file: .init(id: "shared-source", name: "Shared.bin", size: "100", kind: .file), relativeParent: ["Folder"])],
+                destination: model.outputURL, jobs: 1, proxyURL: "")
+            model.queueDownload(folder); model.queueDownload(file)
+            let cancelled = cancelFolder ? folder : file, survivor = cancelFolder ? file : folder
+            model.pausePendingDownload(survivor.pendingItems[0])
+            model.cancelPendingDownload(cancelled.pendingItems[0])
+            if let cleanup = model.downloadCleanupTask { await cleanup.value }
+            precondition(model.downloadCleanupTask == nil && !model.cancelledDownloadCleanups.isEmpty,
+                         "Cancel must defer cleanup of an overlapping surviving paused root")
+            let retained = try Data(contentsOf: partial)
+            precondition(retained == prefix)
+            // A known child protects the output even without a root snapshot.
+            model.pendingDownloadRequests = []; model.interruptedDownloadRequests = []
+            model.downloadQueueTransfers = [.init(id: "surviving-child", name: "Shared.bin", downloadedBytes: UInt64(prefix.count),
+                totalBytes: 100, state: .queued, remotePath: "/Folder/Shared.bin", outputDirectoryPath: tree.path)]
+            model.downloadQueueOffset = 0
+            model.cleanCancelledDownloadPartialsIfPossible()
+            if let cleanup = model.downloadCleanupTask { await cleanup.value }
+            precondition(model.downloadCleanupTask == nil && FileManager.default.fileExists(atPath: partial.path))
+            model.downloadQueueTransfers = []
+            model.cleanCancelledDownloadPartialsIfPossible()
+            precondition(model.downloadCleanupTask != nil)
+            await model.downloadCleanupTask!.value
+            precondition(!FileManager.default.fileExists(atPath: partial.path) && model.cancelledDownloadCleanups.isEmpty,
+                         "Cleanup can finish after the last surviving reference is gone")
+            precondition(FileManager.default.fileExists(atPath: output.path), "Completed output must remain intact")
+        }
+        let composed = Self.downloadPartialPathKey("/generated/Caf\u{00e9}/FILE.bin.part")
+        let decomposed = Self.downloadPartialPathKey("/generated/cafe\u{0301}/file.bin.part")
+        precondition(composed == decomposed, "Overlapping output detection must follow macOS case and Unicode normalization")
+        print("PASS overlapping cancellation: paused folder/file and known child checkpoints survive; final reference removal permits owned cleanup")
+    }
+
+    static func testDownloadCleanupResponsiveness() async throws {
+        let suite = "DownloadCleanupResponsiveness-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []; model.downloadsPaused = true
+        try FileManager.default.createDirectory(at: model.outputURL, withIntermediateDirectories: true)
+        let output = model.outputURL.appendingPathComponent("Generated.bin", isDirectory: false)
+        let partial = output.appendingPathExtension("part")
+        let prefix = Data("generated-resumable-prefix".utf8)
+        try prefix.write(to: partial)
+        let sourceID = "generated-source"
+        let locks = model.accountFixtureTransferDirectory!.appendingPathComponent("TransferLocks", isDirectory: true)
+        try FileManager.default.createDirectory(at: locks, withIntermediateDirectories: true)
+        let normalized = output.deletingLastPathComponent().resolvingSymlinksInPath()
+            .appendingPathComponent(output.lastPathComponent, isDirectory: false).path
+            .decomposedStringWithCanonicalMapping.lowercased().decomposedStringWithCanonicalMapping
+        let key = SHA256.hash(data: Data(normalized.utf8)).map { String(format: "%02x", $0) }.joined()
+        try JSONEncoder().encode(["owner":model.transferOwnerKey, "file_id":sourceID, "output_path":output.path])
+            .write(to: locks.appendingPathComponent(key, isDirectory: false))
+        model.downloadDestinations[model.outputURL.path] = try DownloadDestinationAccess.validate(model.outputURL)
+        model.cancelledDownloadCleanups = [.init(path: partial.path, destinationPath: model.outputURL.path, sourceFileID: sourceID)]
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        model.downloadCleanupPathResolver = { path in
+            precondition(!Thread.isMainThread, "Slow filesystem resolution must not run on the UI thread")
+            entered.signal()
+            precondition(release.wait(timeout: .now() + 5) == .success)
+            return Self.downloadPartialPathKey(path)
+        }
+        let started = Date()
+        model.cleanCancelledDownloadPartialsIfPossible()
+        precondition(Date().timeIntervalSince(started) < 0.5, "Scheduling cleanup blocked the interface")
+        let cleanup = model.downloadCleanupTask!
+        let didEnter = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(returning: entered.wait(timeout: .now() + 3) == .success)
+            }
+        }
+        precondition(didEnter)
+        let heartbeat = Task { @MainActor in model.status = "UI heartbeat while disk is waiting" }
+        await heartbeat.value
+        for _ in 0..<3 { model.checkDownloadDestinations() }
+        precondition(model.status == "UI heartbeat while disk is waiting")
+        // A new request arrives while the old worker is blocked in the disk.
+        // Its fence must invalidate the old snapshot before it can delete data.
+        let request = PendingDownloadRequest.account(roots: [.init(queueID: UUID(), path: "/Generated.bin", name: "Generated.bin",
+            kind: .file, file: .init(id: sourceID, name: "Generated.bin", size: "100", kind: .file), relativeParent: [])],
+            destination: model.outputURL, jobs: 1, proxyURL: "")
+        model.queueDownload(request)
+        precondition(model.cancelledDownloadCleanups.isEmpty)
+        release.signal()
+        await cleanup.value
+        let retained = try Data(contentsOf: partial)
+        precondition(retained == prefix, "A superseded cleanup deleted the new request's resumable data")
+        precondition(model.downloadCleanupTask == nil)
+        print("PASS slow disk cleanup keeps MainActor responsive, coalesces polling and preserves a re-added download")
+    }
+
+    static func testDownloadResumePreemptsCleanup() async throws {
+        let suite = "DownloadResumeCleanup-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []; model.downloadsPaused = true
+        try FileManager.default.createDirectory(at: model.outputURL, withIntermediateDirectories: true)
+        let request = PendingDownloadRequest.account(roots: [.init(queueID: UUID(), path: "/New.bin", name: "New.bin",
+            kind: .file, file: .init(id: "new-source", name: "New.bin", size: "100", kind: .file), relativeParent: [])],
+            destination: model.outputURL, jobs: 1, proxyURL: "")
+        model.queueDownload(request)
+        let oldPartial = model.outputURL.appendingPathComponent("Cancelled.bin.part", isDirectory: false)
+        try Data("cancelled resumable data".utf8).write(to: oldPartial)
+        model.cancelledDownloadCleanups = [.init(path: oldPartial.path, destinationPath: model.outputURL.path, sourceFileID: "old-source")]
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        model.downloadCleanupPathResolver = { path in
+            entered.signal()
+            precondition(release.wait(timeout: .now() + 5) == .success)
+            return Self.downloadPartialPathKey(path)
+        }
+        model.cleanCancelledDownloadPartialsIfPossible()
+        let cleanup = model.downloadCleanupTask!
+        let didEnter = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(returning: entered.wait(timeout: .now() + 3) == .success)
+            }
+        }
+        precondition(didEnter)
+        model.startPendingDownloads()
+        precondition(!model.isDownloading && model.downloadPreparationStatus != nil,
+                     "Resume must show why it is waiting while the old filesystem operation returns")
+        release.signal()
+        await cleanup.value
+        precondition(model.isDownloading && model.downloadPreparationStatus == nil,
+                     "Resume must start as soon as cleanup yields, without draining the cancelled queue")
+        precondition(model.cancelledDownloadCleanups.count == 1 && FileManager.default.fileExists(atPath: oldPartial.path),
+                     "Deferred cleanup stays durable for a later idle pass")
+        let saved = try model.transferStore().load(SavedTransfers.self, accountID: "synthetic-download-account")!
+        precondition(saved.cancelledDownloadCleanups?.count == 1 && saved.downloads.count == 1)
+
+        // Invalidate while a folder's ownership history is already being read.
+        // The folder walk must check again before reaching the next manifest.
+        let locks = directory.appendingPathComponent("history", isDirectory: true)
+        try FileManager.default.createDirectory(at: locks, withIntermediateDirectories: true)
+        for index in 0..<4 {
+            try JSONEncoder().encode(["owner": "generated-owner", "file_id": "generated-\(index)",
+                "output_path": "/Volumes/Unavailable-History/old-\(index).bin"])
+                .write(to: locks.appendingPathComponent("record-\(index)", isDirectory: false))
+        }
+        var checks = 0
+        do {
+            try TransferPartialCleanup.removeOwned(in: model.outputURL, owner: "generated-owner", locksDirectory: locks) {
+                checks += 1
+                if checks == 3 { throw CancellationError() }
+            }
+            preconditionFailure("A superseded folder cleanup must stop inside its manifest walk")
+        } catch is CancellationError { }
+        precondition(checks == 3)
+        print("PASS Resume preempts cancelled-file cleanup, shows preparation, starts after the worker yields and retains deferred cleanup")
+    }
+
+    static func testDownloadCancellationAdmissionAndProgress() throws {
+        let suite = "DownloadAdmission-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        model.downloadDestinationValidator = { url, checkpoint in
+            guard url.lastPathComponent != "blocked" else { throw CloudDriveError.waiting("Synthetic disconnected destination") }
+            return checkpoint ?? .init(volumeID: "admission-volume")
+        }
+        func request(_ name: String, destination: URL? = nil) -> PendingDownloadRequest {
+            .account(roots: [.init(queueID: UUID(), path: "/\(name)", name: name, kind: .file,
+                file: .init(id: name, name: name, size: "100", kind: .file), relativeParent: [])],
+                destination: destination ?? model.outputURL, jobs: 1, proxyURL: "")
+        }
+        let a = request("A.bin"), b = request("B.bin")
+        model.queueDownload(a); model.queueDownload(b)
+        model.cancelPendingDownload(a.pendingItems[0])
+        model.queueDownload(request("A.bin"))
+        precondition(model.activeDownloadRequests.count == 2 && model.pendingDownloadRequests.isEmpty,
+                     "A cancelled root must be re-addable while another selection is active")
+        let blockedDestination = directory.appendingPathComponent("blocked")
+        let blocked = request("blocked.bin", destination: blockedDestination)
+        model.queueDownload(blocked)
+        model.cancelPendingDownload(blocked.pendingItems[0])
+        model.queueDownload(request("blocked.bin", destination: blockedDestination))
+        precondition(model.pendingDownloadRequests.count == 1,
+                     "A cancelled held destination must also be re-addable")
+        let progress = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent("progress"))
+        defer { progress.stopForWindowClose() }
+        progress.failedDownloadTransfers = []
+        for name in ["A.bin", "B.bin", "C.bin"] {
+            progress.queueDownload(.account(roots: [.init(queueID: UUID(), path: "/\(name)", name: name,
+                kind: .file, file: .init(id: name, name: name, size: "100", kind: .file), relativeParent: [])],
+                destination: progress.outputURL, jobs: 1, proxyURL: ""))
+        }
+        let files: [[String: Any]] = progress.activeDownloadRequests.map { request in
+            let item = request.pendingItems[0]
+            return ["file_id":item.name, "source_file_id":item.name, "request_id":item.id.uuidString,
+                "name":item.name, "total_bytes":100, "remote_path":item.remotePath, "output_directory":progress.outputURL.path]
+        }
+        progress.downloadFixtureEvent(["event":"queue_append", "files":files])
+        for (id, bytes) in [("A.bin", 40), ("B.bin", 50), ("C.bin", 20)] {
+            progress.downloadFixtureEvent(["event":"file_started", "file_id":id, "name":id,
+                "downloaded_bytes":bytes, "transferred_bytes":bytes, "total_bytes":100])
+        }
+        progress.downloadFixtureEvent(["event":"file_failed", "file_id":"C.bin", "name":"C.bin", "downloaded_bytes":20, "transferred_bytes":20])
+        let cancelledA = progress.activeDownloadTransfers["A.bin"]!
+        progress.cancelDownloadFile(cancelledA)
+        progress.cancelDownloadFile(cancelledA)
+        precondition(progress.downloadTotalFiles == 2 && progress.downloadTotalBytes == 200,
+                     "Repeated cancellation must exclude a planned size exactly once")
+        progress.cancelDownloadFile(progress.failedDownloadTransfers.first { $0.id == "C.bin" }!)
+        precondition(progress.downloadTotalFiles == 1 && progress.downloadTotalBytes == 100
+            && progress.downloadDownloadedBytes == 50 && progress.downloadFailedFiles == 0)
+        precondition(progress.downloadNetworkTransferredBytes == 110,
+                     "Bytes already received by cancelled files remain real network traffic")
+        progress.downloadFixtureEvent(["event":"file_progress", "file_id":"B.bin", "name":"B.bin",
+            "downloaded_bytes":60, "transferred_bytes":60, "total_bytes":100])
+        precondition(progress.downloadNetworkTransferredBytes == 120,
+                     "Cancellation must not suppress subsequent network traffic")
+        progress.downloadFixtureEvent(["event":"file_completed", "file_id":"B.bin", "name":"B.bin",
+            "downloaded_bytes":100, "transferred_bytes":100, "total_bytes":100])
+        precondition(progress.downloadDownloadedBytes == progress.downloadTotalBytes && progress.downloadTotalBytes == 100,
+                     "Finishing the remaining file must reach 100 percent")
+        precondition(progress.completedDownloadTransfers.count == 1 && progress.completedDownloadTransfers[0].id == "B.bin")
+        print("PASS cancellation admission/progress: re-add during other work, held destination re-add, idempotent totals, failed-byte removal, real network accounting and remaining completion")
+    }
+
+    static func testDownloadDestinationRecoveryBackoff() throws {
+        let suite = "DownloadBackoff-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        model.downloadDestinationValidator = { _, checkpoint in checkpoint ?? .init(volumeID: "backoff-volume") }
+        let destinationA = directory.appendingPathComponent("disk-A"), destinationB = directory.appendingPathComponent("disk-B")
+        func request(_ name: String, _ destination: URL) -> PendingDownloadRequest {
+            .account(roots: [.init(queueID: UUID(), path: "/\(name)", name: name, kind: .file,
+                file: .init(id: name, name: name, size: "100", kind: .file), relativeParent: [])],
+                destination: destination, jobs: 1, proxyURL: "")
+        }
+        let a = request("A.bin", destinationA), b = request("B.bin", destinationB)
+        model.queueDownload(a); model.queueDownload(b)
+        func destinationError() {
+            model.downloadFixtureEvent(["event":"request_retrying", "request_id":a.pendingItems[0].id.uuidString,
+                "destination_unavailable":true])
+            model.finishDownloadProcess(exitCode: 15, errorOutput: "Synthetic device I/O error", operation: .download)
+        }
+        destinationError()
+        precondition(model.activeDownloadRequests.count == 2, "The first stale mount recovery remains immediate")
+        destinationError()
+        precondition(model.activeDownloadRequests.count == 1 && model.activeDownloadRequests[0].destinationURL == destinationB
+            && model.pendingDownloadRequests.count == 1, "Repeated failed disk A must not block ready disk B")
+        precondition(model.downloadDestinationRetryUntil[destinationA.path].map { $0 > Date() } == true)
+        model.checkDownloadDestinations()
+        precondition(model.activeDownloadRequests.count == 1, "Metadata polling must not bypass the I/O cooldown")
+        model.downloadDestinationRetryUntil[destinationA.path] = Date().addingTimeInterval(-1)
+        model.checkDownloadDestinations()
+        precondition(model.activeDownloadRequests.count == 2)
+        model.downloadDestinationRecoveryAttempts[destinationB.path] = 3
+        model.downloadFixtureEvent(["event":"queue_append", "files":[[
+            "file_id":"A-progress", "source_file_id":"A.bin", "request_id":a.pendingItems[0].id.uuidString,
+            "name":"A.bin", "total_bytes":100, "remote_path":"/A.bin", "output_directory":destinationA.path
+        ]]])
+        model.downloadFixtureEvent(["event":"file_started", "file_id":"A-progress", "name":"A.bin", "downloaded_bytes":0, "transferred_bytes":0])
+        model.downloadFixtureEvent(["event":"file_progress", "file_id":"A-progress", "name":"A.bin", "downloaded_bytes":10, "transferred_bytes":10])
+        precondition(model.downloadDestinationRecoveryAttempts[destinationA.path] == nil
+            && model.downloadDestinationRecoveryAttempts[destinationB.path] == 3,
+            "Only actual progress on the recovered destination resets its failures")
+        destinationError()
+        model.downloadFixtureEvent(["event":"queue_append", "files":[[
+            "file_id":"A-repeated-prefix", "source_file_id":"A.bin", "request_id":a.pendingItems[0].id.uuidString,
+            "name":"A.bin", "total_bytes":100, "remote_path":"/A.bin", "output_directory":destinationA.path
+        ]]])
+        model.downloadFixtureEvent(["event":"file_started", "file_id":"A-repeated-prefix", "name":"A.bin", "downloaded_bytes":10, "transferred_bytes":0])
+        model.downloadFixtureEvent(["event":"file_progress", "file_id":"A-repeated-prefix", "name":"A.bin", "downloaded_bytes":10, "transferred_bytes":10])
+        precondition(model.downloadDestinationRecoveryAttempts[destinationA.path] == 1,
+                     "Re-downloading the same retained prefix must not reset storage failures")
+        destinationError()
+        precondition(model.activeDownloadRequests.count == 1 && model.activeDownloadRequests[0].destinationURL == destinationB
+            && model.downloadDestinationRetryUntil[destinationA.path].map { $0 > Date() } == true,
+            "Repeated network traffic without retained progress must still enter the disk cooldown")
+        model.downloadDestinationRetryUntil[destinationA.path] = Date().addingTimeInterval(-1)
+        model.checkDownloadDestinations()
+        model.downloadFixtureEvent(["event":"queue_append", "files":[[
+            "file_id":"A-advancing-prefix", "source_file_id":"A.bin", "request_id":a.pendingItems[0].id.uuidString,
+            "name":"A.bin", "total_bytes":100, "remote_path":"/A.bin", "output_directory":destinationA.path
+        ]]])
+        model.downloadFixtureEvent(["event":"file_started", "file_id":"A-advancing-prefix", "name":"A.bin", "downloaded_bytes":10, "transferred_bytes":0])
+        model.downloadFixtureEvent(["event":"file_progress", "file_id":"A-advancing-prefix", "name":"A.bin", "downloaded_bytes":20, "transferred_bytes":10])
+        precondition(model.downloadDestinationRecoveryAttempts[destinationA.path] == nil
+            && model.downloadDestinationRecoveryAttempts[destinationB.path] == 3,
+            "Advancing the retained prefix must reset only that destination's cooldown")
+        model.downloadDestinationRecoveryAttempts[destinationA.path] = 4
+        model.downloadDestinationRetryUntil[destinationA.path] = Date().addingTimeInterval(300)
+        model.checkDownloadDestinations(unmounted: destinationA)
+        precondition(model.downloadDestinationRecoveryAttempts[destinationA.path] == nil
+            && model.downloadDestinationRetryUntil[destinationA.path] == nil,
+            "A confirmed unmount must permit prompt recovery after the original disk returns")
+        model.stop()
+        model.finishDownloadProcess(exitCode: 15, errorOutput: "", operation: .download)
+        model.checkDownloadDestinations()
+        precondition(model.downloadsPaused && !model.isDownloading)
+        print("PASS destination backoff: first recovery, repeated prefix I/O cooldown, destination fairness, retained progress reset, confirmed remount reset and Pause")
+    }
+
+    /// Adding to the queue changes the size readouts at once, from sizes already known, and discovery then replaces
+    /// the estimate without ever making the total fall or double count.
+    static func testQueuedDownloadSizeEstimate() throws {
+        let suite = "DownloadQueuedEstimate-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent("estimate"))
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        model.folderMeasurementAccountID = model.transferAccountID
+        model.downloadEngineFixture = { _, operation, _ in
+            model.isDownloading = true; model.downloadOperation = operation
+            model.downloadRequestedStop = false; model.downloadRunState = .scanning
+        }
+        func root(_ name: String, folder: Bool, size: String = "0") -> AccountDownloadRoot {
+            .init(queueID: UUID(), path: "/\(name)", name: name, kind: folder ? .folder : .file,
+                file: .init(id: name, name: name, size: size, kind: folder ? .folder : .file), relativeParent: [])
+        }
+        func request(_ root: AccountDownloadRoot) -> PendingDownloadRequest {
+            .account(roots: [root], destination: model.outputURL, jobs: 1, proxyURL: "http://127.0.0.1:12345")
+        }
+        func append(_ root: AccountDownloadRoot, _ id: String, bytes: UInt64) {
+            model.downloadFixtureEvent(["event":"queue_append", "files":[[
+                "file_id":id, "source_file_id":id, "request_id":root.queueID.uuidString, "name":id, "total_bytes":bytes,
+                "remote_path":"\(root.path)/\(id)", "output_directory":model.outputURL.path]]])
+        }
+
+        let big = root("Big", folder: true)
+        model.folderMeasurements["Big"] = .init(totalBytes: 10_000, fileCount: 40, folderCount: 3)
+        model.queueDownload(request(big))
+        precondition(model.downloadTotalBytes == 0 && model.downloadEstimatedTotal?.totalBytes == 10_000
+            && model.downloadEstimatedTotal?.unmeasuredRoots == 0 && model.downloadDiscoveryEstimatedRemaining?.bytes == 10_000,
+            "Adding a folder with a cached size changes the total and Remaining at once, before any file is discovered")
+        append(big, "one.bin", bytes: 100); append(big, "two.bin", bytes: 300)
+        model.downloadFixtureEvent(["event":"file_started", "file_id":"one.bin", "name":"one.bin", "total_bytes":100,
+            "downloaded_bytes":50, "transferred_bytes":50])
+        precondition(model.downloadTotalBytes == 400 && model.downloadEstimatedTotal?.totalBytes == 10_000
+            && model.downloadOverallFraction == nil && model.downloadEstimatedFraction == 0.005,
+            "Partial discovery uses the cached whole-folder size for approximate progress while exact progress stays unknown")
+
+        let file = root("Added.bin", folder: false, size: "5000")
+        model.queueDownload(request(file))
+        precondition(model.activeDownloadRequests.count == 2 && model.downloadEstimatedTotal?.totalBytes == 15_000
+            && model.downloadDiscoveryEstimatedRemaining?.bytes == 15_000 - model.downloadDownloadedBytes
+            && abs(model.downloadEstimatedFraction! - 50.0 / 15_000) < 0.000001,
+            "A file added while downloading adds its known size at once")
+        let unknown = root("Unmeasured", folder: true)
+        model.queueDownload(request(unknown))
+        precondition(model.downloadEstimatedTotal?.totalBytes == 15_000 && model.downloadEstimatedTotal?.unmeasuredRoots == 1
+            && model.downloadDiscoveryEstimatedRemaining?.lowerBound == true,
+            "A folder with no known size adds nothing, and marks the estimate as a lower bound")
+
+        append(file, "Added.bin", bytes: 5_000)
+        precondition(model.downloadTotalBytes == 5_400 && model.downloadEstimatedTotal?.totalBytes == 15_000,
+            "Discovering the added file replaces its estimate instead of adding it again, so the total never falls or doubles")
+        model.downloadFixtureEvent(["event":"request_discovered", "request_id":file.queueID.uuidString])
+        model.downloadFixtureEvent(["event":"request_discovered", "request_id":big.queueID.uuidString])
+        precondition(model.downloadTotalBytes == 5_400 && model.downloadEstimatedTotal == nil && model.downloadEstimatedFraction == nil,
+            "Once a selection is fully discovered its exact size replaces the cached one")
+
+        model.downloadsPaused = true
+        let held = root("Held.bin", folder: false, size: "700")
+        model.queueDownload(request(held))
+        precondition(model.pendingDownloadItemCount == 1 && model.downloadEstimatedTotal?.totalBytes == 6_100
+            && model.downloadEstimatedTotal?.unmeasuredRoots == 1,
+            "A selection added while downloads are paused is still part of the total")
+        model.cancelPendingDownload(model.pendingDownloadItems[0])
+        precondition(model.downloadEstimatedTotal == nil, "Cancelling a queued selection takes its size back out")
+        print("PASS queued size estimate: known sizes count at once, discovery replaces them without double counting, unmeasured folders are flagged, paused selections count and cancelled ones leave")
+    }
+
+    /// A batch that finishes completely leaves a short report in the status bar; one with anything still failing,
+    /// retrying or running does not, and the previous report is kept until a batch finishes cleanly.
+    static func testDownloadFinishedReport() throws {
+        let suite = "DownloadFinishedReport-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent("report"))
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        model.downloadEngineFixture = { _, operation, _ in
+            model.isDownloading = true; model.downloadOperation = operation
+            model.downloadRequestedStop = false; model.downloadRunState = .scanning
+        }
+        func queue(_ name: String, size: UInt64) -> UUID {
+            let root = AccountDownloadRoot(queueID: UUID(), path: "/\(name)", name: name, kind: .file,
+                file: .init(id: name, name: name, size: String(size), kind: .file), relativeParent: [])
+            model.queueDownload(.account(roots: [root], destination: model.outputURL, jobs: 1, proxyURL: "http://127.0.0.1:12345"))
+            model.downloadFixtureEvent(["event":"queue_append", "files":[[
+                "file_id":name, "source_file_id":name, "request_id":root.queueID.uuidString, "name":name, "total_bytes":size,
+                "remote_path":root.path, "output_directory":model.outputURL.path]]])
+            model.downloadFixtureEvent(["event":"file_started", "file_id":name, "name":name, "total_bytes":size,
+                "downloaded_bytes":0, "transferred_bytes":0])
+            return root.queueID
+        }
+        func report() -> FinderTaskActivity? { model.taskActivity.tasks.first { $0.kind == .downloads } }
+
+        let first = queue("Report.bin", size: 100)
+        model.downloadFixtureEvent(["event":"file_completed", "file_id":"Report.bin", "name":"Report.bin", "downloaded_bytes":100,
+            "transferred_bytes":100, "total_bytes":100])
+        model.downloadFixtureEvent(["event":"request_discovered", "request_id":first.uuidString])
+        model.downloadFixtureEvent(["event":"request_finished", "request_id":first.uuidString, "success":true])
+        precondition(report() == nil, "Nothing is reported while the helper is still running")
+        model.finishDownloadProcess(exitCode: 0, errorOutput: "", operation: .download)
+        let done = report()
+        precondition(done?.state == .completed && done?.message.hasPrefix("Downloaded 1 file") == true
+            && done?.detail.contains("Saved to: \(model.outputURL.standardizedFileURL.path)") == true
+            && done?.detail.contains("Downloaded: 1 file") == true && model.taskActivity.summary == done?.message
+            && model.taskActivity.activeTasks.isEmpty && model.downloadBatch == nil,
+            "A batch that finishes with nothing failed leaves its report in the status bar")
+
+        // The next batch restarts the dashboard, but the report stays until another batch finishes cleanly.
+        let second = queue("Broken.bin", size: 50)
+        precondition(model.downloadTotalFiles == 1 && model.downloadTotalBytes == 50 && report()?.message == done?.message,
+            "Adding files after a finished batch restarts the dashboard and keeps the report")
+        model.downloadFixtureEvent(["event":"file_failed", "file_id":"Broken.bin", "name":"Broken.bin", "downloaded_bytes":0,
+            "transferred_bytes":0, "error":"Download service returned HTTP 503"])
+        model.downloadFixtureEvent(["event":"request_finished", "request_id":second.uuidString, "success":false,
+            "error":"Download service returned HTTP 503"])
+        model.finishDownloadProcess(exitCode: 0, errorOutput: "", operation: .download)
+        precondition(report()?.message == done?.message && model.downloadBatch != nil
+            && model.failedDownloadTransfers.contains { $0.name == "Broken.bin" },
+            "A batch with a failed file is not finished, so it produces no report and the old one stays")
+        print("PASS finished-download report: a clean batch is reported in the status bar, the dashboard restarts with the next batch, and a batch with a failure is not reported")
+    }
+
+    /// Only a cause that can never clear moves a file from Retry to Failed, and only once consecutive attempts agree.
+    static func testPermanentDownloadFailures() throws {
+        let suite = "DownloadPermanentFailure-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent("permanent"))
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        model.downloadEngineFixture = { _, operation, _ in
+            model.isDownloading = true; model.downloadOperation = operation
+            model.downloadRequestedStop = false; model.downloadRunState = .scanning
+        }
+        let folder = PendingDownloadRequest.account(roots: [.init(queueID: UUID(), path: "/Folder", name: "Folder", kind: .folder,
+            file: nil, relativeParent: [])], destination: model.outputURL, jobs: 1, proxyURL: "http://127.0.0.1:12345")
+        model.queueDownload(folder)
+        let root = folder.pendingItems[0].id
+        let missing = "No longer found on PikPak; it was deleted or moved"
+        // Each attempt is a new queue row for the same source file and destination.
+        func attempt(_ id: String, _ name: String = "B.bin", permanent: String? = nil, error: String = "Synthetic failure") {
+            model.downloadFixtureEvent(["event":"queue_append", "files":[[
+                "file_id":id, "source_file_id":name, "request_id":root.uuidString, "name":name, "total_bytes":100,
+                "remote_path":"/Folder/\(name)", "output_directory":model.outputURL.appendingPathComponent("Folder").path]]])
+            model.downloadFixtureEvent(["event":"file_started", "file_id":id, "name":name, "total_bytes":100,
+                "downloaded_bytes":0, "transferred_bytes":0])
+            var event: [String: Any] = ["event":"file_failed", "file_id":id, "name":name, "downloaded_bytes":0,
+                "transferred_bytes":0, "error":error]
+            if let permanent { event["permanent"] = permanent }
+            model.downloadFixtureEvent(event)
+        }
+        func row(_ name: String) -> DownloadTransfer? { model.failedDownloadTransfers.first { $0.name == name } }
+
+        attempt("t1", "T.bin", error: "Download service returned HTTP 503")
+        precondition(model.visibleFailedDownloadTransfers.isEmpty && model.retryingDownloadTransfers.contains { $0.name == "T.bin" }
+            && model.downloadPermanentFailedFiles == 0 && model.downloadProcessedFiles == 0 && !model.downloadFailureIsFinal(row("T.bin")!),
+            "A failure with no permanent cause stays in Retry and does not count as processed")
+
+        attempt("p1", permanent: missing)
+        precondition(model.visibleFailedDownloadTransfers.isEmpty && row("B.bin")?.permanentReports == 1
+            && model.downloadRetryDetail(row("B.bin")!)?.contains("1 of 3") == true,
+            "A first report is only a suspicion: the file keeps retrying and says it is checking again")
+        attempt("p2", permanent: missing)
+        precondition(model.visibleFailedDownloadTransfers.isEmpty && row("B.bin")?.permanentReports == 2
+            && model.downloadRetryDetail(row("B.bin")!)?.contains("2 of 3") == true && model.failedDownloadTransfers.filter { $0.name == "B.bin" }.count == 1,
+            "A second report still retries, and the new attempt replaces the old row")
+        attempt("p3", permanent: missing)
+        let final = row("B.bin")!
+        precondition(final.finalFailureReason == missing && model.downloadFailureIsFinal(final)
+            && model.visibleFailedDownloadTransfers.map(\.name) == ["B.bin"]
+            && !model.retryingDownloadTransfers.contains { $0.name == "B.bin" }
+            && model.retryingDownloadTransfers.contains { $0.name == "T.bin" },
+            "The third consecutive report moves the file to Failed with its reason; other files stay in Retry")
+        precondition(model.downloadPermanentFailedFiles == 1 && model.downloadProcessedFiles == 1
+            && model.automaticDownloadRetryStatus(final) == nil && model.downloadRetryDetail(final) == nil
+            && model.canRetryFailedDownload(final),
+            "A final failure counts as processed, stops automatic retries and can still be retried by hand")
+        precondition(DownloadTransferPresentation.title(.failed, cancelled: false, paused: false) == "Failed"
+            && DownloadTransferPresentation.title(.failed, cancelled: false, paused: false, finalFailure: false) == "Waiting to retry"
+            && DownloadTransferPresentation.title(.failed, cancelled: false, paused: false, automaticRetry: "Retrying automatically",
+                finalFailure: false) == "Waiting to retry",
+            "Only a final failure is labelled Failed")
+
+        // Asking again gives the file a fresh set of confirmations.
+        model.retryFailedDownload(final)
+        attempt("p4", permanent: missing)
+        precondition(row("B.bin")?.permanentReports == 1 && model.visibleFailedDownloadTransfers.isEmpty
+            && model.downloadPermanentFailedFiles == 0,
+            "A manual retry resets the count, so one more report sends the file back to Retry, not to Failed")
+
+        // Any other outcome proves the file is not simply gone.
+        attempt("q1", "Q.bin", permanent: missing)
+        attempt("q2", "Q.bin", permanent: missing)
+        attempt("q3", "Q.bin", error: "Download service returned HTTP 503")
+        attempt("q4", "Q.bin", permanent: missing)
+        precondition(row("Q.bin")?.permanentReports == 1 && model.visibleFailedDownloadTransfers.isEmpty,
+            "A different failure between two permanent reports starts the count again")
+        attempt("c1", "C.bin", permanent: missing)
+        attempt("c2", "C.bin", permanent: missing)
+        model.downloadFixtureEvent(["event":"queue_append", "files":[[
+            "file_id":"c3", "source_file_id":"C.bin", "request_id":root.uuidString, "name":"C.bin", "total_bytes":100,
+            "remote_path":"/Folder/C.bin", "output_directory":model.outputURL.appendingPathComponent("Folder").path]]])
+        model.downloadFixtureEvent(["event":"file_completed", "file_id":"c3", "name":"C.bin", "downloaded_bytes":100,
+            "transferred_bytes":100, "total_bytes":100])
+        attempt("c4", "C.bin", permanent: missing)
+        precondition(row("C.bin")?.permanentReports == 1 && model.visibleFailedDownloadTransfers.isEmpty,
+            "A completion between permanent reports starts the count again")
+
+        // A failure the app has no source details for cannot be retried one file at a time.
+        model.downloadFixtureEvent(["event":"file_failed", "file_id":"legacy", "name":"Legacy.bin", "downloaded_bytes":0,
+            "transferred_bytes":0, "error":"Synthetic failure"])
+        let legacy = row("Legacy.bin")!
+        precondition(legacy.finalFailureReason == DownloadTransfer.missingSourceReason
+            && model.visibleFailedDownloadTransfers.map(\.name) == ["Legacy.bin"] && model.downloadPermanentFailedFiles == 1,
+            "A row without source details goes to Failed with an explanation instead of waiting for a retry that cannot happen")
+        print("PASS permanent failures: transient causes stay in Retry, three consecutive reports move a file to Failed with its reason, other outcomes and manual retries reset the count, and rows without source details explain themselves")
+    }
+
+    static func testAutomaticFailedDownloadRecovery() async throws {
+        let suite = "DownloadAutomaticFailure-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        func fixture(_ name: String) -> DownloaderModel {
+            let model = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent(name))
+            model.failedDownloadTransfers = []
+            return model
+        }
+        func request(_ model: DownloaderModel, _ name: String, folder: Bool = false) -> PendingDownloadRequest {
+            .account(roots: [.init(queueID: UUID(), path: "/\(name)", name: name, kind: folder ? .folder : .file,
+                file: folder ? nil : .init(id: name, name: name, size: "100", kind: .file), relativeParent: [])],
+                destination: model.outputURL, jobs: 1, proxyURL: "http://127.0.0.1:12345")
+        }
+        func append(_ model: DownloaderModel, _ root: UUID, _ id: String, _ name: String, folder: Bool = false) {
+            model.downloadFixtureEvent(["event":"queue_append", "files":[[
+                "file_id":id, "source_file_id":name, "request_id":root.uuidString, "name":name, "total_bytes":100,
+                "remote_path":folder ? "/Folder/\(name)" : "/\(name)",
+                "output_directory":folder ? model.outputURL.appendingPathComponent("Folder").path : model.outputURL.path]]])
+            model.downloadFixtureEvent(["event":"file_started", "file_id":id, "name":name, "total_bytes":100,
+                "downloaded_bytes":0, "transferred_bytes":0])
+        }
+        func finish(_ model: DownloaderModel, _ root: UUID) {
+            model.downloadFixtureEvent(["event":"request_finished", "request_id":root.uuidString,
+                "success":false, "error":"Synthetic finalization failure"])
+        }
+        let live = fixture("live")
+        defer { live.stopForWindowClose() }
+        var launches = 0
+        live.downloadEngineFixture = { _, operation, _ in
+            launches += 1; live.isDownloading = true; live.downloadOperation = operation
+            live.downloadRequestedStop = false; live.downloadRunState = .scanning
+        }
+        let folder = request(live, "Folder", folder: true), other = request(live, "other.bin"), active = request(live, "active.bin")
+        live.queueDownload(folder); live.queueDownload(other); live.queueDownload(active)
+        let original = folder.pendingItems[0].id, otherID = other.pendingItems[0].id
+        append(live, original, "old-complete", "A.bin", folder: true)
+        live.downloadFixtureEvent(["event":"file_completed", "file_id":"old-complete", "name":"A.bin",
+            "downloaded_bytes":100, "transferred_bytes":100, "total_bytes":100])
+        append(live, original, "old-failed", "B.bin", folder: true)
+        live.downloadFixtureEvent(["event":"file_failed", "file_id":"old-failed", "name":"B.bin",
+            "downloaded_bytes":30, "transferred_bytes":30, "error":"Synthetic failure"])
+        append(live, otherID, "old-other", "other.bin")
+        live.downloadFixtureEvent(["event":"file_failed", "file_id":"old-other", "name":"other.bin",
+            "downloaded_bytes":0, "transferred_bytes":0, "error":"Synthetic failure"])
+        let partial = live.outputURL.appendingPathComponent("Folder/B.bin.part")
+        try FileManager.default.createDirectory(at: partial.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let prefix = Data("generated retained prefix".utf8); try prefix.write(to: partial)
+        finish(live, original)
+        precondition(live.automaticDownloadRetry != nil && live.downloadRetryAttempt == 1,
+                     "A failed request must schedule recovery while unrelated live work continues")
+        finish(live, otherID)
+        precondition(live.downloadRetryAttempt == 1, "Later failures must not postpone the pending retry timer")
+        let saved = try live.transferStore().load(SavedTransfers.self, accountID: "synthetic-download-account")!
+        precondition(saved.downloads.count == 3 && saved.downloadsPaused != true,
+                     "Both failed roots and active work must be durable before the timer fires")
+        let restored = fixture("live")
+        defer { restored.stopForWindowClose() }
+        restored.transferStateReady = false; restored.adoptTransferAccount("synthetic-download-account")
+        precondition(restored.isDownloading && restored.activeDownloadRequests.count == 3,
+                     "Relaunch must continue failed downloads without a manual Retry")
+        let deadline = Date().addingTimeInterval(8)
+        while live.interruptedDownloadCount > 0 {
+            precondition(Date() < deadline, "The failed requests did not automatically rejoin the helper")
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        precondition(launches == 1 && live.activeDownloadRequests.count == 3 && live.automaticDownloadRetry == nil)
+        let fresh = live.activeDownloadRequests.first { $0.pendingItems[0].name == "Folder" }!
+        let freshID = fresh.pendingItems[0].id
+        precondition(freshID != original && fresh.destinationURL == folder.destinationURL
+            && fresh.liveInputs[0].proxyURL == folder.liveInputs[0].proxyURL,
+            "A consumed live request needs a fresh UUID while preserving its source, destination and proxy")
+        let retainedPrefix = try Data(contentsOf: partial)
+        precondition(live.submittedDownloadRequests[original] == nil && retainedPrefix == prefix,
+                     "Retry must prune consumed inbox entries and preserve the retained file")
+        precondition(!live.failedDownloadTransfers.contains { $0.id == "old-failed" || $0.id == "old-other" },
+                     "Retired failed rows must yield their controls to the durable renewed queue selections")
+        append(live, freshID, "new-complete", "A.bin", folder: true)
+        live.downloadFixtureEvent(["event":"file_skipped", "file_id":"new-complete", "name":"A.bin", "total_bytes":100])
+        append(live, freshID, "new-failed", "B.bin", folder: true)
+        live.downloadFixtureEvent(["event":"file_started", "file_id":"new-failed", "name":"B.bin",
+            "downloaded_bytes":30, "transferred_bytes":0, "total_bytes":100])
+        precondition(live.downloadTotalFiles == 3 && live.downloadTotalBytes == 300 && live.downloadFailedFiles == 1
+            && live.downloadCompletedFiles == 0 && live.downloadSkippedFiles == 1 && live.downloadDownloadedBytes == 130,
+            "Retried folder rows must replace old logical totals, including already-completed receipt skips")
+        precondition(live.downloadNetworkTransferredBytes == 130 && !live.failedDownloadTransfers.contains { $0.id == "old-failed" },
+                     "Retried rows preserve real network traffic and remove superseded failure history")
+        let renewedOther = live.activeDownloadRequests.first { $0.pendingItems[0].name == "other.bin" }!
+        finish(live, renewedOther.pendingItems[0].id)
+        live.automaticDownloadRetry?.cancel(); live.automaticDownloadRetry = nil
+        precondition(live.prepareAutomaticDownloadRetry() && live.startNextPendingDownloadIfNeeded())
+        let rediscoveredOther = live.activeDownloadRequests.first { $0.pendingItems[0].name == "other.bin" }!
+        append(live, rediscoveredOther.pendingItems[0].id, "new-other", "other.bin")
+        precondition(live.downloadTotalFiles == 3 && live.downloadTotalBytes == 300 && live.downloadFailedFiles == 0,
+                     "A second metadata failure before queue_append must still replace the original logical row")
+
+        let held = fixture("held")
+        defer { held.stopForWindowClose() }
+        let heldRequest = request(held, "held.bin"), sibling = request(held, "sibling.bin")
+        held.queueDownload(heldRequest); held.queueDownload(sibling)
+        finish(held, heldRequest.pendingItems[0].id)
+        held.pausePendingDownload(heldRequest.pendingItems[0])
+        held.automaticDownloadRetry?.cancel(); held.automaticDownloadRetry = nil
+        precondition(held.prepareAutomaticDownloadRetry() && held.interruptedDownloadCount == 1 && held.pendingDownloadRequests.isEmpty)
+        held.scheduleAutomaticDownloadRetry()
+        precondition(held.automaticDownloadRetry == nil && held.preparingDownloadItems.contains { $0.id == heldRequest.pendingItems[0].id },
+                     "A failed paused selection remains visible and must not be reminted past Pause")
+        held.resumePendingDownload(heldRequest.pendingItems[0])
+        precondition(held.automaticDownloadRetry != nil, "Resume must re-arm held failed roots in a live helper")
+        held.stop()
+        let paused = try held.transferStore().load(SavedTransfers.self, accountID: "synthetic-download-account")!
+        precondition(held.automaticDownloadRetry == nil && paused.downloadsPaused == true)
+        held.cancelPendingDownload(heldRequest.pendingItems[0])
+        precondition(!held.interruptedDownloadRequests.contains { $0.pendingItems[0].id == heldRequest.pendingItems[0].id })
+
+        let childPause = fixture("child-pause")
+        defer { childPause.stopForWindowClose() }
+        let childFolder = request(childPause, "Folder", folder: true)
+        childPause.queueDownload(childFolder)
+        let childRoot = childFolder.pendingItems[0].id
+        append(childPause, childRoot, "paused-child", "B.bin", folder: true)
+        childPause.pauseDownloadFile(childPause.downloadingTransfers.first!)
+        childPause.downloadFixtureEvent(["event":"file_failed", "file_id":"paused-child", "name":"B.bin",
+            "downloaded_bytes":30, "error":"Synthetic interrupted paused plan"])
+        finish(childPause, childRoot)
+        precondition(childPause.automaticDownloadRetry == nil && childPause.prepareAutomaticDownloadRetry()
+            && childPause.interruptedDownloadRequests[0].pendingItems[0].id == childRoot,
+            "An independently paused child must hold its failed original plan and control identity")
+
+        for beforeAdmission in [true, false] {
+            let cancelled = fixture(beforeAdmission ? "cancel-delay" : "cancel-admitted")
+            defer { cancelled.stopForWindowClose() }
+            let cancelledRequest = request(cancelled, "cancelled.bin")
+            cancelled.queueDownload(cancelledRequest)
+            append(cancelled, cancelledRequest.pendingItems[0].id, "cancelled-old", "cancelled.bin")
+            cancelled.downloadFixtureEvent(["event":"file_failed", "file_id":"cancelled-old", "name":"cancelled.bin",
+                "downloaded_bytes":30, "transferred_bytes":30, "error":"Synthetic retained-prefix failure"])
+            finish(cancelled, cancelledRequest.pendingItems[0].id)
+            precondition(cancelled.automaticDownloadRetry != nil)
+            if !beforeAdmission {
+                cancelled.automaticDownloadRetry?.cancel(); cancelled.automaticDownloadRetry = nil
+                precondition(cancelled.prepareAutomaticDownloadRetry() && cancelled.startNextPendingDownloadIfNeeded())
+            }
+            let item = beforeAdmission ? cancelledRequest.pendingItems[0] : cancelled.activeDownloadRequests[0].pendingItems[0]
+            if !beforeAdmission { precondition(item.id != cancelledRequest.pendingItems[0].id) }
+            cancelled.cancelPendingDownload(item)
+            cancelled.downloadFixtureEvent(["event":"queue_append", "files":[[
+                "file_id":"cancelled-late", "source_file_id":"cancelled.bin", "request_id":item.id.uuidString,
+                "name":"cancelled.bin", "total_bytes":100, "remote_path":"/cancelled.bin",
+                "output_directory":cancelled.outputURL.path]]])
+            precondition(cancelled.prepareAutomaticDownloadRetry() && cancelled.pendingDownloadRequests.isEmpty
+                && cancelled.activeDownloadRequests.isEmpty && cancelled.interruptedDownloadRequests.isEmpty
+                && cancelled.queuedDownloadTransfers.isEmpty && cancelled.downloadTotalFiles == 0
+                && cancelled.downloadTotalBytes == 0 && cancelled.downloadFailedFiles == 0
+                && cancelled.downloadNetworkTransferredBytes == 30,
+                "Cancel must prevent automatic revival both during the delay and after renewed UUID admission")
+        }
+
+        let gated = fixture("gated")
+        defer { gated.stopForWindowClose() }
+        let gateRequest = request(gated, "disk.bin")
+        gated.queueDownload(gateRequest)
+        finish(gated, gateRequest.pendingItems[0].id)
+        gated.automaticDownloadRetry?.cancel(); gated.automaticDownloadRetry = nil
+        gated.downloadDestinationValidator = { _, _ in throw CloudDriveError.waiting("Synthetic missing original volume") }
+        precondition(gated.prepareAutomaticDownloadRetry() && !gated.startNextPendingDownloadIfNeeded()
+            && gated.pendingDownloadRequests.count == 1 && gated.activeDownloadRequests.isEmpty,
+            "Automatic retry must wait for the original destination rather than bypassing its identity gate")
+        let waitingID = gated.pendingDownloadRequests[0].pendingItems[0].id
+        precondition(gated.prepareAutomaticDownloadRetry() && gated.pendingDownloadRequests[0].pendingItems[0].id == waitingID,
+                     "Waiting destination retries must retain one durable queue entry")
+        gated.scheduleAutomaticDownloadRetry()
+        precondition(gated.automaticDownloadRetry != nil)
+        gated.cancelAllDownloads()
+        precondition(gated.automaticDownloadRetry == nil && gated.pendingDownloadRequests.isEmpty && gated.interruptedDownloadCount == 0)
+        precondition(AutomaticRecovery.delay(attempt: Int.max, schedule: [5, 15, 30, 60]) == 60
+            && AutomaticRecovery.delay(attempt: AutomaticRecovery.nextAttempt(Int.max), schedule: [5, 15, 30, 60]) == 60)
+        print("PASS automatic failed downloads: live retry, fair batching, durable relaunch, consumed UUID renewal, retained prefix, receipt totals, traffic, Pause/Resume/Cancel, disk gates and capped unbounded backoff")
+    }
+
+    static func testAutomaticFailedChildrenBeforeFolderFinishes() throws {
+        let suite = "DownloadActiveFolderRetry-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        func fixture(_ name: String) -> (DownloaderModel, PendingDownloadRequest) {
+            let model = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent(name))
+            model.failedDownloadTransfers = []
+            let request = PendingDownloadRequest.account(roots: [.init(queueID: UUID(), path: "/Folder", name: "Folder",
+                kind: .folder, file: nil, relativeParent: [])], destination: model.outputURL, jobs: 2, proxyURL: "http://127.0.0.1:12345")
+            model.queueDownload(request)
+            model.downloadFixtureEvent(["event":"request_discovered", "request_id":request.pendingItems[0].id.uuidString])
+            return (model, request)
+        }
+        func append(_ model: DownloaderModel, _ root: UUID, _ id: String, _ name: String) {
+            model.downloadFixtureEvent(["event":"queue_append", "files":[["file_id":id, "source_file_id":name,
+                "request_id":root.uuidString, "name":name, "total_bytes":100, "remote_path":"/Folder/\(name)",
+                "output_directory":model.outputURL.appendingPathComponent("Folder").path]]])
+            model.downloadFixtureEvent(["event":"file_started", "file_id":id, "name":name,
+                "total_bytes":100, "downloaded_bytes":0, "transferred_bytes":0])
+        }
+        func fail(_ model: DownloaderModel, _ id: String, _ name: String) {
+            model.downloadFixtureEvent(["event":"file_failed", "file_id":id, "name":name,
+                "downloaded_bytes":100, "transferred_bytes":100, "error":"Generated publication failure"])
+        }
+        let (model, parent) = fixture("active")
+        defer { model.stopForWindowClose() }
+        let root = parent.pendingItems[0].id
+        append(model, root, "old-a", "A.bin"); append(model, root, "old-b", "B.bin"); append(model, root, "other", "C.bin")
+        fail(model, "old-a", "A.bin"); fail(model, "old-b", "B.bin")
+        precondition(model.automaticDownloadRetry != nil && model.hasAutomaticDownloadRetries
+            && model.failedDownloadTransfers.allSatisfy { model.automaticDownloadRetryStatus($0) == "Retrying automatically" },
+            "Eligible failures must arm automatic retry before their large folder finishes")
+        model.automaticDownloadRetry?.cancel(); model.automaticDownloadRetry = nil
+        precondition(model.prepareAutomaticDownloadRetry() && model.startNextPendingDownloadIfNeeded())
+        let children = model.activeDownloadRequests.filter { $0.pendingItems[0].id != root }
+        precondition(children.count == 2 && model.interruptedDownloadRequests.isEmpty && model.activeDownloadTransfers["other"] != nil)
+        let restoredChildControlID = children[0].pendingItems[0].id.uuidString + ":generated-child"
+        model.pausedDownloadIDs.insert(restoredChildControlID)
+        model.pausePendingDownload(parent.pendingItems[0])
+        precondition(children.allSatisfy { model.downloadRequestIsPaused($0) }, "Parent Pause must hold newly queued child retries before discovery")
+        let pausedSnapshot = try model.transferStore().load(SavedTransfers.self, accountID: "synthetic-download-account")!
+        precondition(children.allSatisfy { pausedSnapshot.pausedPendingDownloadIDs?.contains($0.pendingItems[0].id) == true }
+            && children.allSatisfy { pausedSnapshot.downloadRetryOrigins?[$0.pendingItems[0].id] == root },
+            "Pause of admitted child retries and their parent linkage must be durable")
+        var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(pausedSnapshot)) as! [String: Any]
+        legacy["downloadRetryOrigins"] = nil
+        let legacySnapshot = try JSONDecoder().decode(SavedTransfers.self, from: JSONSerialization.data(withJSONObject: legacy))
+        precondition(legacySnapshot.downloadRetryOrigins == nil,
+            "Saved queues from before retry origins existed must remain readable")
+        let restored = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent("active"))
+        defer { restored.stopForWindowClose() }
+        restored.transferStateReady = false; restored.adoptTransferAccount("synthetic-download-account")
+        precondition(!restored.isDownloading && restored.pendingDownloadRequests.count == 3
+            && restored.pendingDownloadRequests.allSatisfy { restored.downloadRequestIsPaused($0) },
+            "Relaunch must hold parent and admitted retry roots before queue_append")
+        restored.resumePendingDownload(parent.pendingItems[0])
+        precondition(restored.pausedPendingDownloadIDs.isEmpty && restored.activeDownloadRequests.count == 3
+            && !restored.pausedDownloadIDs.contains(restoredChildControlID),
+            "Resume Folder must release the durable child roots after relaunch")
+        model.resumePendingDownload(parent.pendingItems[0])
+        precondition(!children.contains { model.downloadRequestIsPaused($0) })
+        let childA = children.first { $0.pendingItems[0].name == "A.bin" }!, childB = children.first { $0.pendingItems[0].name == "B.bin" }!
+        append(model, childA.pendingItems[0].id, "new-a", "A.bin"); append(model, childB.pendingItems[0].id, "new-b", "B.bin")
+        precondition(model.downloadTotalFiles == 3 && model.downloadTotalBytes == 300 && model.downloadFailedFiles == 0
+            && model.downloadNetworkTransferredBytes == 200, "Child retries replace logical rows while retaining actual network traffic")
+        model.downloadFixtureEvent(["event":"file_completed", "file_id":"new-a", "name":"A.bin", "total_bytes":100, "transferred_bytes":0])
+        model.downloadFixtureEvent(["event":"request_finished", "request_id":childA.pendingItems[0].id.uuidString, "success":true])
+        fail(model, "new-b", "B.bin")
+        model.downloadFixtureEvent(["event":"request_finished", "request_id":childB.pendingItems[0].id.uuidString, "success":false])
+        model.downloadFixtureEvent(["event":"file_completed", "file_id":"other", "name":"C.bin", "total_bytes":100, "transferred_bytes":100])
+        model.downloadFixtureEvent(["event":"request_finished", "request_id":root.uuidString, "success":false])
+        model.automaticDownloadRetry?.cancel(); model.automaticDownloadRetry = nil
+        precondition(model.prepareAutomaticDownloadRetry() && model.startNextPendingDownloadIfNeeded())
+        precondition(model.interruptedDownloadRequests.isEmpty && model.activeDownloadRequests.count == 1
+            && model.activeDownloadRequests[0].pendingItems[0].name == "B.bin", "A finished discovered folder must not duplicate its durable child retries")
+
+        let (cancelled, cancelParent) = fixture("cancel")
+        defer { cancelled.stopForWindowClose() }
+        append(cancelled, cancelParent.pendingItems[0].id, "cancel-old", "A.bin"); fail(cancelled, "cancel-old", "A.bin")
+        cancelled.automaticDownloadRetry?.cancel(); cancelled.automaticDownloadRetry = nil
+        precondition(cancelled.prepareAutomaticDownloadRetry() && cancelled.startNextPendingDownloadIfNeeded())
+        let child = cancelled.activeDownloadRequests.first { $0.pendingItems[0].id != cancelParent.pendingItems[0].id }!
+        cancelled.cancelPendingDownload(cancelParent.pendingItems[0])
+        append(cancelled, child.pendingItems[0].id, "cancel-late", "A.bin")
+        precondition(cancelled.activeDownloadRequests.isEmpty && cancelled.pendingDownloadRequests.isEmpty
+            && cancelled.interruptedDownloadRequests.isEmpty && cancelled.queuedDownloadTransfers.isEmpty
+            && cancelled.downloadTotalFiles == 0 && cancelled.downloadFailedFiles == 0,
+            "Parent Cancel must cover inherited child retries and reject late queue rows")
+        precondition(DownloadTransferPresentation.title(.failed, cancelled: false, paused: false, automaticRetry: "Retrying automatically") == "Waiting to retry")
+        precondition(DownloadTransferPresentation.title(.failed, cancelled: false, paused: true, automaticRetry: "Retrying automatically") == "Paused")
+        let (held, heldParent) = fixture("paused-child")
+        defer { held.stopForWindowClose() }
+        append(held, heldParent.pendingItems[0].id, "held-a", "A.bin"); append(held, heldParent.pendingItems[0].id, "held-b", "B.bin")
+        fail(held, "held-a", "A.bin"); fail(held, "held-b", "B.bin")
+        let heldFile = held.failedDownloadTransfers.first { $0.id == "held-a" }!
+        held.pauseDownloadFile(heldFile)
+        held.downloadFixtureEvent(["event":"request_finished", "request_id":heldParent.pendingItems[0].id.uuidString, "success":false])
+        held.automaticDownloadRetry?.cancel(); held.automaticDownloadRetry = nil
+        held.retryFailedDownload(heldFile)
+        precondition(!held.canRetryFailedDownload(heldFile) && held.failedDownloadTransfers.contains { $0.id == heldFile.id },
+            "Retry controls must preserve a user-held failed row and its usable Resume action")
+        precondition(held.prepareAutomaticDownloadRetry() && held.startNextPendingDownloadIfNeeded())
+        precondition(held.activeDownloadRequests.count == 1 && held.activeDownloadRequests[0].pendingItems[0].name == "B.bin"
+            && held.interruptedDownloadRequests.count == 1 && held.failedDownloadTransfers.contains { $0.id == "held-a" },
+            "An unpaused failed child must recover even after its fully discovered parent finishes with another child paused")
+        let orphaned = downloadRetryFixture(defaults: defaults,
+            directory: directory.appendingPathComponent("orphaned-parent"))
+        defer { orphaned.stopForWindowClose() }
+        let firstChild = childA.pendingItems[0].id, secondChild = childB.pendingItems[0].id
+        let imported = SavedTransfers(version: 1, accountID: "synthetic-download-account",
+            downloads: [childA, childB], uploads: [],
+            pausedPendingDownloadIDs: [root, firstChild, secondChild],
+            downloadRetryOrigins: [firstChild: root, secondChild: root])
+        try orphaned.transferStore().save(imported, accountID: "synthetic-download-account")
+        orphaned.transferStateReady = false
+        orphaned.adoptTransferAccount("synthetic-download-account")
+        precondition(orphaned.pendingDownloadRequests.count == 2 && !orphaned.isDownloading)
+        orphaned.resumePendingDownload(childA.pendingItems[0])
+        precondition(orphaned.activeDownloadRequests.map { $0.pendingItems[0].id } == [firstChild]
+            && orphaned.pendingDownloadRequests.map { $0.pendingItems[0].id } == [secondChild]
+            && orphaned.pausedPendingDownloadIDs == [secondChild],
+            "Resume must release an imported child with no visible ancestor plan while its sibling remains held")
+        print("PASS active-folder automatic retry: immediate failure timer, all eligible children, parent Pause/Cancel, imported child Resume, repeated failure, exact totals and traffic, no duplicate folder re-plan")
+    }
+
+    static func testDownloadPausedPlanRecovery() throws {
+        let suite = "DownloadPausedPlan-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        for pauseRoot in [false, true] {
+            let path = directory.appendingPathComponent(pauseRoot ? "root" : "child")
+            let model = downloadRetryFixture(defaults: defaults, directory: path)
+            defer { model.stopForWindowClose() }
+            model.failedDownloadTransfers = []
+            let rootID = UUID()
+            let folder = PendingDownloadRequest.account(roots: [.init(queueID: rootID, path: "/Folder", name: "Folder",
+                kind: .folder, file: nil, relativeParent: [])], destination: model.outputURL, jobs: 1, proxyURL: "")
+            model.queueDownload(folder)
+            let files: [[String: Any]] = ["A", "B"].map { name in
+                ["file_id":"\(rootID.uuidString):\(name)", "source_file_id":name, "request_id":rootID.uuidString,
+                    "name":"\(name).bin", "total_bytes":100, "remote_path":"/Folder/\(name).bin",
+                    "output_directory":model.outputURL.appendingPathComponent("Folder").path]
+            }
+            model.downloadFixtureEvent(["event":"queue_append", "files":files])
+            model.downloadFixtureEvent(["event":"request_discovered", "request_id":rootID.uuidString])
+            let pausedFileID = rootID.uuidString + ":A"
+            if pauseRoot { model.pausePendingDownload(folder.pendingItems[0]) }
+            else { model.pauseDownloadFile(model.queuedDownloadTransfers.first { $0.id == pausedFileID }!) }
+            model.finishDownloadProcess(exitCode: 9, errorOutput: "Synthetic connection interruption", operation: .download)
+            let saved = try model.transferStore().load(SavedTransfers.self, accountID: "synthetic-download-account")!
+            precondition(saved.downloads.count == 1 && saved.downloads[0].pendingItems[0].id == rootID,
+                         "Paused plans must preserve original control UUIDs rather than flattening")
+            let restored = downloadRetryFixture(defaults: defaults, directory: path)
+            defer { restored.stopForWindowClose() }
+            restored.transferStateReady = false
+            restored.adoptTransferAccount("synthetic-download-account")
+            precondition(restored.pausedDownloadIDs.contains(pausedFileID))
+            if pauseRoot {
+                precondition(!restored.isDownloading && restored.pendingDownloadItems[0].id == rootID)
+                restored.resumePendingDownload(restored.pendingDownloadItems[0])
+                precondition(restored.isDownloading && !restored.pausedDownloadIDs.contains(pausedFileID),
+                             "Resuming a restored folder must release its captured child controls")
+            } else {
+                precondition(restored.isDownloading && restored.activeDownloadRequests[0].pendingItems[0].id == rootID,
+                             "Unpaused siblings continue under the original request identity")
+            }
+        }
+        let filePath = directory.appendingPathComponent("restored-paused-file")
+        let fileModel = downloadRetryFixture(defaults: defaults, directory: filePath)
+        defer { fileModel.stopForWindowClose() }
+        let fileRootID = UUID(), oldRootID = UUID()
+        let fileControlID = fileRootID.uuidString + ":saved-file"
+        let fileSize: UInt64 = 173_295_831
+        let fileRequest = PendingDownloadRequest.account(roots: [.init(queueID: fileRootID, path: "/Restored.mov", name: "Restored.mov",
+            kind: .file, file: .init(id: "saved-file", name: "Restored.mov", size: String(fileSize), kind: .file), relativeParent: [])],
+            destination: fileModel.outputURL, jobs: 1, proxyURL: "")
+        try fileModel.transferStore().save(SavedTransfers(version: 1, accountID: "synthetic-download-account",
+            downloads: [fileRequest], uploads: [], downloadsPaused: false, pausedDownloadIDs: [fileControlID],
+            downloadRetryOrigins: [fileRootID: oldRootID]), accountID: "synthetic-download-account")
+        fileModel.transferStateReady = false
+        fileModel.adoptTransferAccount("synthetic-download-account")
+        let heldFile = fileModel.pendingDownloadItems[0]
+        precondition(!fileModel.isDownloading && fileModel.pausedPendingDownloadIDs.isEmpty
+            && fileModel.pendingDownloadIsPaused(heldFile),
+            "A restored per-file Pause must be visible even when the selection itself has no Pause marker")
+        precondition(heldFile.knownSize == fileSize && fileModel.downloadEstimatedTotal?.totalBytes == fileSize,
+            "A restored retry's known file size belongs in its row and totals before it reaches the helper")
+        fileModel.resumePendingDownload(heldFile)
+        precondition(fileModel.isDownloading && !fileModel.pendingDownloadIsPaused(heldFile)
+            && !fileModel.pausedDownloadIDs.contains(fileControlID)
+            && fileModel.liveDownloadInbox.requests.contains { $0.id == fileRootID.uuidString },
+            "Resume must release the saved file control and immediately submit the file to the live helper")
+        fileModel.downloadFixtureEvent(["event":"queue_append", "files":[[
+            "file_id":fileControlID, "source_file_id":"saved-file", "request_id":fileRootID.uuidString,
+            "name":"Restored.mov", "total_bytes":fileSize, "remote_path":"/Restored.mov", "output_directory":fileModel.outputURL.path]]])
+        precondition(fileModel.downloadTotalBytes == fileSize && fileModel.downloadEstimatedTotal == nil,
+            "Discovery replaces the restored size estimate without counting the original twice")
+        fileModel.downloadFixtureEvent(["event":"request_discovered", "request_id":fileRootID.uuidString])
+        precondition(!fileModel.downloadTotalsAreIncomplete, "A discovered restored file must leave Discovering total size")
+
+        let heldPath = directory.appendingPathComponent("held-destination")
+        let held = downloadRetryFixture(defaults: defaults, directory: heldPath)
+        defer { held.stopForWindowClose() }
+        held.failedDownloadTransfers = []
+        held.downloadDestinationValidator = { _, _ in throw CloudDriveError.waiting("Synthetic disconnected disk") }
+        let heldRootID = UUID()
+        let heldRequest = PendingDownloadRequest.account(roots: [.init(queueID: heldRootID, path: "/Held", name: "Held",
+            kind: .folder, file: nil, relativeParent: [])], destination: held.outputURL, jobs: 1, proxyURL: "")
+        held.queueDownload(heldRequest)
+        precondition(!held.isDownloading && held.pendingDownloadRequests.count == 1)
+        held.pausePendingDownload(heldRequest.pendingItems[0])
+        // Load immediately, without normal-close persistence, as after a crash.
+        let heldSaved = try held.transferStore().load(SavedTransfers.self, accountID: "synthetic-download-account")!
+        precondition(heldSaved.pausedPendingDownloadIDs?.contains(heldRootID) == true,
+                     "Pausing a disconnected pending root must be durably saved immediately")
+        let restoredHeld = downloadRetryFixture(defaults: defaults, directory: heldPath)
+        defer { restoredHeld.stopForWindowClose() }
+        restoredHeld.downloadDestinationValidator = { _, _ in .init(volumeID: "synthetic-original-disk") }
+        restoredHeld.transferStateReady = false
+        restoredHeld.adoptTransferAccount("synthetic-download-account")
+        precondition(!restoredHeld.isDownloading && restoredHeld.pausedPendingDownloadIDs.contains(heldRootID),
+                     "The disk returning after a crash must not override an explicit pending Pause")
+        restoredHeld.resumePendingDownload(restoredHeld.pendingDownloadItems[0])
+        precondition(restoredHeld.isDownloading && !restoredHeld.pausedPendingDownloadIDs.contains(heldRootID))
+        let live = downloadRetryFixture(defaults: defaults, directory: directory.appendingPathComponent("live-folder"))
+        defer { live.stopForWindowClose() }
+        live.failedDownloadTransfers = []
+        let liveRootID = UUID()
+        let liveRequest = PendingDownloadRequest.account(roots: [.init(queueID: liveRootID, path: "/Folder", name: "Folder",
+            kind: .folder, file: nil, relativeParent: [])], destination: live.outputURL, jobs: 1, proxyURL: "")
+        live.queueDownload(liveRequest)
+        live.downloadControlURL = directory.appendingPathComponent("live-folder/control.json")
+        let liveFiles: [[String: Any]] = ["A", "B"].map { name in
+            ["file_id":"\(liveRootID.uuidString):\(name)", "source_file_id":name, "request_id":liveRootID.uuidString,
+                "name":"\(name).bin", "total_bytes":100, "remote_path":"/Folder/\(name).bin",
+                "output_directory":live.outputURL.appendingPathComponent("Folder").path]
+        }
+        live.downloadFixtureEvent(["event":"queue_append", "files":liveFiles])
+        let a = live.queuedDownloadTransfers.first { $0.name == "A.bin" }!, b = live.queuedDownloadTransfers.first { $0.name == "B.bin" }!
+        live.pauseDownloadFile(a); live.pauseDownloadFile(b); live.resumeDownloadFile(a)
+        precondition(!live.pausedDownloadIDs.contains(a.id) && live.pausedDownloadIDs.contains(b.id),
+                     "Ordinary per-file Resume must preserve an independently paused sibling")
+        let filePauseControls = try JSONDecoder().decode(TransferControlsDocument.self, from: Data(contentsOf: live.downloadControlURL!))
+        precondition(filePauseControls.actions["root:" + liveRootID.uuidString] == nil
+            && filePauseControls.actions[b.id] == "pause",
+            "A held file must not pause its containing root or unpaused siblings")
+        live.pausePendingDownload(liveRequest.pendingItems[0])
+        live.downloadFixtureEvent(["event":"request_discovered", "request_id":liveRootID.uuidString])
+        precondition(live.preparingDownloadItems.contains { $0.id == liveRootID },
+                     "A paused containing folder must remain visible after discovery completes")
+        precondition(live.pausedDownloadSelection(containing: a)?.isFolder == true,
+                     "An inherited folder Pause must be presented as Resume Folder")
+        live.resumeDownloadFile(a)
+        let resumedControls = try JSONDecoder().decode(TransferControlsDocument.self, from: Data(contentsOf: live.downloadControlURL!))
+        precondition(!live.pausedPendingDownloadIDs.contains(liveRootID) && !live.pausedDownloadIDs.contains(a.id)
+            && !live.pausedDownloadIDs.contains(b.id) && live.preparingDownloadItems.isEmpty)
+        precondition(resumedControls.actions["root:" + liveRootID.uuidString] == nil
+            && resumedControls.actions["path:\(liveRootID.uuidString):/Folder"] == nil,
+                     "Explicit Resume Folder must release both root and path controls")
+        live.pausePendingDownload(liveRequest.pendingItems[0])
+        live.finishDownloadProcess(exitCode: 9, errorOutput: "Synthetic helper interruption", operation: .download)
+        live.resumeDownloadFile(a)
+        precondition(live.isDownloading && live.interruptedDownloadCount == 0
+            && live.activeDownloadRequests.first?.pendingItems.first?.id == liveRootID,
+                     "Resume Folder after helper interruption must restart its saved root")
+        print("PASS paused plan recovery: durable held Pause, discovered parent visibility, explicit Resume Folder, independent file pauses and interrupted root restart")
+    }
+
+    static func testDownloadRetryRowsFollowCurrentAttempt() throws {
+        let suite = "DownloadRetryRows-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        let model = downloadRetryFixture(defaults: defaults, directory: directory)
+        defer { model.stopForWindowClose() }
+        model.failedDownloadTransfers = []
+        model.downloadEngineFixture = { _, operation, _ in
+            model.isDownloading = true; model.downloadOperation = operation
+            model.downloadRequestedStop = false; model.downloadRunState = .scanning
+        }
+        func request(_ destination: URL) -> PendingDownloadRequest {
+            .account(roots: [.init(queueID: UUID(), path: "/Same.mov", name: "Same.mov", kind: .file,
+                file: .init(id: "same-source", name: "Same.mov", size: "100", kind: .file), relativeParent: [])],
+                destination: destination, jobs: 1, proxyURL: "")
+        }
+        func append(_ request: PendingDownloadRequest, _ id: String) {
+            model.downloadFixtureEvent(["event":"queue_append", "files":[[
+                "file_id":id, "source_file_id":"same-source", "request_id":request.pendingItems[0].id.uuidString,
+                "name":"Same.mov", "total_bytes":100, "remote_path":"/Same.mov", "output_directory":request.destinationURL.path]]])
+        }
+        let first = request(model.outputURL), other = request(directory.appendingPathComponent("other-destination"))
+        for (selection, id) in [(first, "old-attempt"), (other, "other-attempt")] {
+            model.queueDownload(selection)
+            append(selection, id)
+            model.downloadFixtureEvent(["event":"file_started", "file_id":id, "name":"Same.mov", "total_bytes":100,
+                "downloaded_bytes":20, "transferred_bytes":20])
+            model.downloadFixtureEvent(["event":"file_failed", "file_id":id, "name":"Same.mov", "error":"HTTP 503"])
+            model.downloadFixtureEvent(["event":"request_finished", "request_id":selection.pendingItems[0].id.uuidString, "success":false])
+        }
+        precondition(model.retryingDownloadTransfers.count == 2)
+        model.finishDownloadProcess(exitCode: 0, errorOutput: "", operation: .download)
+        let restarted = request(model.outputURL)
+        model.queueDownload(restarted)
+        precondition(model.downloadRetryTargets.isEmpty && model.failedDownloadTransfers.count == 2,
+            "A fresh helper resets per-run targets while keeping unresolved failure history")
+        append(restarted, "new-attempt")
+        model.downloadFixtureEvent(["event":"file_started", "file_id":"new-attempt", "name":"Same.mov", "total_bytes":100,
+            "downloaded_bytes":25, "transferred_bytes":5])
+        precondition(model.downloadingTransfers.map(\.id) == ["new-attempt"]
+            && model.retryingDownloadTransfers.map(\.id) == ["other-attempt"]
+            && model.failedDownloadTransfers.map(\.id) == ["other-attempt"],
+            "An acknowledged new attempt replaces its older Retry row, while the same source at another destination stays independent")
+        precondition(model.downloadTotalFiles == 1 && model.downloadTotalBytes == 100 && model.downloadFailedFiles == 0,
+            "An old run's failure must not change the new run's totals")
+        model.downloadFixtureEvent(["event":"file_failed", "file_id":"new-attempt", "name":"Same.mov", "error":"HTTP 503"])
+        precondition(model.downloadingTransfers.isEmpty && model.retryingDownloadTransfers.count == 2
+            && model.failedDownloadTransfers.contains { $0.id == "new-attempt" },
+            "If the current attempt fails, only its current error returns to Retry")
+        print("PASS retry row replacement: fresh helper acknowledgement removes stale failure rows, preserves other destinations and exact totals, and reports a new failure once")
     }
 
     static func testLiveDownloadQueue() throws {
@@ -9127,7 +13138,7 @@ final class DownloaderModel: ObservableObject {
         let originals = model.failedDownloadTransfers
         model.retryFailedDownloads()
         guard case .account(let roots, let destination, let workers, _) = model.activePersistentDownload else { preconditionFailure("retry did not launch") }
-        precondition(roots.count == 6 && model.pendingDownloadItemCount == 0 && workers == TransferConcurrency.automaticLimit)
+        precondition(roots.count == 6 && model.pendingDownloadItemCount == 0 && workers == TransferConcurrency.downloadAutomaticLimit)
         precondition(roots.map { $0.file!.id } == originals.map(\.id))
         precondition(roots.allSatisfy { $0.relativeParent.isEmpty && $0.file?.size == "20000000" })
         precondition(destination.standardizedFileURL.path == model.outputURL.standardizedFileURL.path,
@@ -9143,12 +13154,16 @@ final class DownloaderModel: ObservableObject {
         let rates = model.downloadingTransfers.map(\.bytesPerSecond)
         precondition(rates[0] > 200_000 && rates[0] < 300_000 && rates[1] > 400_000 && rates[1] < 600_000,
                      "rates must be per-file network deltas, excluding the 5 MB partial prefix")
+        let measured = model.activeDownloadTransfers.mapValues(\.bytesPerSecond)
         model.sampleDownloadFileRates(at: Date().addingTimeInterval(3))
-        precondition(model.activeDownloadTransfers.values.allSatisfy { $0.bytesPerSecond == 0 }, "stalled file rates must expire")
+        precondition(model.activeDownloadTransfers.allSatisfy { $0.value.bytesPerSecond > 0 && $0.value.bytesPerSecond < measured[$0.key]! },
+                     "a stalled file's rate fades as its five-second window empties instead of dropping at once")
+        model.sampleDownloadFileRates(at: Date().addingTimeInterval(7))
+        precondition(model.activeDownloadTransfers.values.allSatisfy { $0.bytesPerSecond == 0 }, "stalled file rates must reach zero once the window has passed")
         model.showDownloadRetryFixtureProgress()
         model.downloadFixtureEvent(["event": "file_retrying", "file_id": roots[0].file!.id, "name": roots[0].name, "attempt": 2])
         precondition(model.activeDownloadTransfers[roots[0].file!.id]?.bytesPerSecond == 0)
-        print("PASS file speeds: independent network rates, resume exclusion, stalled-rate expiry and retry backoff")
+        print("PASS file speeds: independent five-second network averages, resume exclusion, stalled-rate fade and retry backoff")
 
         model.stopDownloadRetryFixture()
         precondition(model.interruptedDownloadCount == 6 && model.failedDownloadTransfers.count == 2 && model.queuedDownloadCount == 4)
@@ -9254,6 +13269,7 @@ final class DownloaderModel: ObservableObject {
 
     func canRetryFailedDownload(_ transfer: DownloadTransfer) -> Bool {
         guard !cancelledDownloadIDs.contains(transfer.id),
+              !downloadsPaused, !pausedDownloadIDs.contains(transfer.id),
               transfer.state == .failed || transfer.state == .stopped,
               transferStateReady, !isClosingWindow, !downloadRequestedStop,
               downloadRunState != .stopping,
@@ -9263,6 +13279,8 @@ final class DownloaderModel: ObservableObject {
               let outputDirectoryPath = transfer.outputDirectoryPath,
               !outputDirectoryPath.isEmpty
         else { return false }
+        if let root = downloadRequestIDsByFileID[transfer.id],
+           downloadRootHasPausedAncestor(root) { return false }
         return !transfer.isShared || downloadSharedAccessByFileID[transfer.id] != nil
     }
 
@@ -9282,6 +13300,8 @@ final class DownloaderModel: ObservableObject {
             guard canRetryFailedDownload(transfer), let request = downloadRequestForKnownFile(transfer),
                   keys.insert(request.deduplicationKey).inserted else { continue }
             accepted.append((transfer, request))
+            // Asking again gives a file that was written off a fresh set of confirmations.
+            if let identity = downloadRetryIdentity(transfer) { permanentFailureReports[identity] = nil }
         }
         guard !accepted.isEmpty else { return }
 
@@ -9289,10 +13309,20 @@ final class DownloaderModel: ObservableObject {
         // Launching inside this loop used to leave all but the first file waiting.
         let previousPending = pendingDownloadRequests
         let previousInterrupted = interruptedDownloadRequests
+        let previousOrigins = automaticDownloadRetryOrigins, previousTargets = downloadRetryTargets
+        let previousIndividualRoots = individuallyRetriedDownloadRequestIDs
         pendingDownloadRequests.append(contentsOf: accepted.map { $0.1 })
+        for (transfer, request) in accepted {
+            guard let fresh = request.pendingItems.first?.id, let identity = downloadRetryIdentity(transfer) else { continue }
+            downloadRetryTargets[fresh] = [identity: transfer.id]
+            if let original = downloadRequestIDsByFileID[transfer.id] {
+                automaticDownloadRetryOrigins[fresh] = original
+                individuallyRetriedDownloadRequestIDs.insert(original)
+            }
+        }
         let targets = Set(accepted.compactMap { transfer, _ -> DownloadRetryTarget? in
             guard let path = transfer.remotePath, let directory = transfer.outputDirectoryPath else { return nil }
-            return .init(isShared: transfer.isShared, remotePath: path, directory: URL(fileURLWithPath: directory),
+            return .init(isShared: transfer.isShared, remotePath: path, directory: URL(fileURLWithPath: directory, isDirectory: true),
                 shareURL: transfer.isShared ? downloadSharedAccessByFileID[transfer.id]?.url : nil)
         })
         interruptedDownloadRequests = interruptedDownloadRequests.compactMap { $0.removingRetriedFiles(targets) }
@@ -9301,6 +13331,8 @@ final class DownloaderModel: ObservableObject {
         guard persistTransfersSynchronously() else {
             pendingDownloadRequests = previousPending
             interruptedDownloadRequests = previousInterrupted
+            automaticDownloadRetryOrigins = previousOrigins; downloadRetryTargets = previousTargets
+            individuallyRetriedDownloadRequestIDs = previousIndividualRoots
             interruptedDownloadCount = previousInterrupted.reduce(0) { $0 + $1.itemCount }
             synchronizePendingDownloadQueue()
             return
@@ -9654,8 +13686,15 @@ final class DownloaderModel: ObservableObject {
         return SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    private func writeTransferControls(to url: URL, actions: [String: String]) throws {
-        try JSONEncoder().encode(["actions": actions]).write(to: url, options: .atomic)
+    private struct TransferControlsDocument: Codable {
+        let actions: [String: String]
+        let drain: Bool
+        let receive_only_pause: Bool
+    }
+    private func writeTransferControls(to url: URL, actions: [String: String], drain: Bool = false, receiveOnlyPause: Bool = false) throws {
+        let data = try (drain || receiveOnlyPause) ? JSONEncoder().encode(TransferControlsDocument(actions: actions, drain: drain, receive_only_pause: receiveOnlyPause))
+            : JSONEncoder().encode(["actions": actions])
+        try data.write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
     private func rememberDownloadCancellation(controlID: String, remotePath: String, destinationDirectory: String?, requestID: UUID? = nil) {
@@ -9673,7 +13712,9 @@ final class DownloaderModel: ObservableObject {
     private func restoredDownloadControls() -> [String: String] {
         var actions: [String: String] = [:]
         for request in activeDownloadRequests {
-            let records = savedDownloadCancellations.filter { $0.scope == request.cancellationScope }
+            // Normalizing the destination is costly; do it once, not per record.
+            let scope = request.cancellationScope
+            let records = savedDownloadCancellations.filter { $0.scope == scope }
             for item in request.pendingItems {
                 for record in records where record.remotePath == item.remotePath || record.remotePath.hasPrefix(item.remotePath + "/") {
                     actions[liveDownloadRun ? "path:\(item.id.uuidString):\(record.remotePath)" : record.controlID] = "cancel"
@@ -9684,6 +13725,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func writeDownloadControls() {
+        publishDownloadTransferRows()
         _ = persistTransfersSynchronously()
         guard let url = downloadControlURL else { return }
         var actions = restoredDownloadControls()
@@ -9692,13 +13734,23 @@ final class DownloaderModel: ObservableObject {
         for (path, action) in pendingRootActions { actions["path:" + path] = action }
         if liveDownloadRun {
             for id in pausedPendingDownloadIDs { actions["root:" + id.uuidString] = "pause" }
+            for request in activeDownloadRequests + pendingDownloadRequests + interruptedDownloadRequests where downloadRequestIsPaused(request, includingFolderChildren: false) {
+                for item in request.pendingItems { actions["root:" + item.id.uuidString] = "pause" }
+            }
+            for id in cancelledDownloadRequestIDs { actions["root:" + id.uuidString] = "cancel" }
         }
         if downloadsPaused { actions["*"] = "pause" }
         if cancelAllDownloadsRequested { actions["*"] = "cancel" }
-        do { try writeTransferControls(to: url, actions: actions); cancelOperationRetries(prefix: "download-control") }
+        do {
+            try writeTransferControls(to: url, actions: actions, drain: downloadDrainingForQuit, receiveOnlyPause: true)
+            #if FINDER_WORKSPACE_TESTS
+            downloadControlFixtureWrites += 1
+            #endif
+            cancelOperationRetries(prefix: "download-control")
+        }
         catch {
             setError("Could not update download controls. Retrying automatically: \(error.localizedDescription)")
-            scheduleTransferControlRetry(url, upload: false)
+            scheduleTransferControlRetry(upload: false)
         }
     }
     private func writeUploadControls() {
@@ -9715,19 +13767,21 @@ final class DownloaderModel: ObservableObject {
         do { try writeTransferControls(to: url, actions: actions); cancelOperationRetries(prefix: "upload-control") }
         catch {
             setError("Could not update upload controls. Retrying automatically: \(error.localizedDescription)")
-            scheduleTransferControlRetry(url, upload: true)
+            scheduleTransferControlRetry(upload: true)
         }
     }
 
-    private func scheduleTransferControlRetry(_ url: URL, upload: Bool) {
-        let key = upload ? "upload-control" : "download-control", context = fileOpenContext
+    private func scheduleTransferControlRetry(upload: Bool) {
+        let key = upload ? "upload-control" : "download-control"
         guard !isClosingWindow, operationRetryTasks[key] == nil else { return }
         operationRetryTasks[key] = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
             guard let self else { return }
             self.operationRetryTasks[key] = nil
-            guard !Task.isCancelled, !self.isClosingWindow, self.fileOpenContext == context,
-                  url == (upload ? self.uploadControlURL : self.downloadControlURL) else { return }
+            // Transfers continue across browser navigation and helper restarts.
+            // A pending timer writes the current helper's latest controls.
+            guard !Task.isCancelled, !self.isClosingWindow,
+                  (upload ? self.uploadControlURL : self.downloadControlURL) != nil else { return }
             if upload { self.writeUploadControls() } else { self.writeDownloadControls() }
         }
     }
@@ -9746,28 +13800,99 @@ final class DownloaderModel: ObservableObject {
         model.pausedUploadIDs = ["paused-upload"]; model.cancelledUploadIDs = ["cancelled-upload"]
         model.writeDownloadControls(); model.writeUploadControls()
         precondition(model.operationRetryTasks["download-control"] != nil && model.operationRetryTasks["upload-control"] != nil)
+        let context = model.fileOpenContext
+        model.finderSettings.contentMode = model.finderSettings.contentMode == .guest ? .user : .guest
+        precondition(model.fileOpenContext != context, "Changing preview mode must invalidate its context")
         try FileManager.default.createDirectory(at: root.appendingPathComponent("missing"), withIntermediateDirectories: true)
         let deadline = Date().addingTimeInterval(8)
         while model.operationRetryTasks["download-control"] != nil || model.operationRetryTasks["upload-control"] != nil {
             precondition(Date() < deadline, "Control files were not retried")
             try await Task.sleep(nanoseconds: 50_000_000)
         }
-        let download = try JSONDecoder().decode([String: [String: String]].self, from: Data(contentsOf: model.downloadControlURL!))
+        let download = try JSONDecoder().decode(TransferControlsDocument.self, from: Data(contentsOf: model.downloadControlURL!))
         let upload = try JSONDecoder().decode([String: [String: String]].self, from: Data(contentsOf: model.uploadControlURL!))
-        precondition(download["actions"]?["paused-download"] == "pause")
+        precondition(download.actions["paused-download"] == "pause")
         precondition(upload["actions"]?["paused-upload"] == "pause" && upload["actions"]?["cancelled-upload"] == "cancel")
-        print("PASS control recovery: failed writes retry automatically and preserve the latest Pause/Cancel actions")
+        let obsoleteDownload = root.appendingPathComponent("obsolete/download.json")
+        let obsoleteUpload = root.appendingPathComponent("obsolete/upload.json")
+        model.downloadControlURL = obsoleteDownload; model.uploadControlURL = obsoleteUpload
+        model.writeDownloadControls(); model.writeUploadControls()
+        model.downloadControlURL = root.appendingPathComponent("replacement/download.json")
+        model.uploadControlURL = root.appendingPathComponent("replacement/upload.json")
+        model.pausedDownloadIDs = ["replacement-pause"]; model.cancelledDownloadIDs = ["replacement-cancel"]
+        model.pausedUploadIDs = ["replacement-upload-pause"]; model.cancelledUploadIDs = ["replacement-upload-cancel"]
+        model.writeDownloadControls(); model.writeUploadControls()
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("replacement"), withIntermediateDirectories: true)
+        let replacementDeadline = Date().addingTimeInterval(8)
+        while model.operationRetryTasks["download-control"] != nil || model.operationRetryTasks["upload-control"] != nil {
+            precondition(Date() < replacementDeadline, "Replacement helper controls were not retried")
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let replacementDownload = try JSONDecoder().decode(TransferControlsDocument.self, from: Data(contentsOf: model.downloadControlURL!))
+        let replacementUpload = try JSONDecoder().decode([String: [String: String]].self, from: Data(contentsOf: model.uploadControlURL!))
+        precondition(replacementDownload.actions["replacement-pause"] == "pause" && replacementDownload.actions["replacement-cancel"] == "cancel")
+        precondition(replacementUpload["actions"]?["replacement-upload-pause"] == "pause" && replacementUpload["actions"]?["replacement-upload-cancel"] == "cancel")
+        precondition(!FileManager.default.fileExists(atPath: obsoleteDownload.path) && !FileManager.default.fileExists(atPath: obsoleteUpload.path))
+        print("PASS control recovery: browser mode changes, replacement helpers and latest Pause/Cancel actions survive failed writes")
     }
     #endif
     func cancelAllDownloads() {
+        downloadPreparationStatus = nil
+        permanentFailureReports = [:]
+        downloadBatch = nil
         automaticDownloadRetry?.cancel(); automaticDownloadRetry = nil
-        for item in pendingDownloadItems { cancelPendingDownload(item) }
+        stopWatchingDownloadDestinations()
+        downloadDestinationRestartPending = false
+        downloadDestinationStatus = nil
+        downloadDestinationRecoveryAttempts = [:]; downloadDestinationRetryUntil = [:]
+        unavailableDownloadDestinations = []
+        downloadProgressHighWater = [:]
+        let requests = activeDownloadRequests + pendingDownloadRequests + interruptedDownloadRequests
+        let transfers = Array(activeDownloadTransfers.values) + Array(queuedDownloadTransfers) + failedDownloadTransfers
+        for request in requests {
+            for item in request.pendingItems {
+                cancelledDownloadRequestIDs.insert(item.id)
+                savedDownloadCancellations.insert(.init(scope: request.cancellationScope,
+                    controlID: "path:" + item.remotePath, remotePath: item.remotePath))
+                pendingRootActions[liveDownloadRun ? "\(item.id.uuidString):\(item.remotePath)" : item.remotePath] = "cancel"
+                if let tree = request.partialTreeURL(for: item.id) {
+                    cancelledDownloadCleanups.insert(.init(path: tree.path,
+                        destinationPath: request.destinationURL.standardizedFileURL.path, sourceFileID: nil))
+                } else if let partial = request.partialURL(for: item.id), let fileID = request.fileID(for: item.id) {
+                    cancelledDownloadCleanups.insert(.init(path: partial.path,
+                        destinationPath: request.destinationURL.standardizedFileURL.path, sourceFileID: fileID))
+                }
+            }
+        }
+        for transfer in transfers {
+            cancelledDownloadIDs.insert(transfer.id)
+            recordCancelledDownloadPartial(transfer)
+        }
         cancelAllDownloadsRequested = true
-        if isDownloading { stop() }
-        else {
-            for transfer in failedDownloadTransfers + Array(queuedDownloadTransfers) { cancelDownloadFile(transfer) }
-            interruptedDownloadRequests = []; interruptedDownloadCount = 0
-            _ = persistTransfersSynchronously(); cancelAllDownloadsRequested = false
+        downloadsPaused = false
+        // Publish cancellation before dropping the plan. The helper may still
+        // be writing; physical cleanup starts only after its termination.
+        writeDownloadControls()
+        if isDownloading {
+            stop(automatic: true)
+            downloadRequestedStop = true
+        }
+        pendingDownloadRequests = []; activeDownloadRequests = []; interruptedDownloadRequests = []
+        submittedDownloadRequests = [:]; discoveringDownloadRequestIDs = []
+        activeDownloadSelectionKeys = []; activeDownloadSelectionRoots = [:]; interruptedDownloadCount = 0
+        pausedDownloadIDs = []; pausedPendingDownloadIDs = []
+        clearCancelledDownloadRows(Set(transfers.map(\.id)))
+        let finishedHistory = completedDownloadTransfers.filter { $0.state == .completed || $0.state == .skipped }
+        resetDownloadProgress()
+        completedDownloadTransfers = finishedHistory
+        downloadRunState = isDownloading ? .stopping : .stopped
+        synchronizePendingDownloadQueue()
+        _ = persistTransfersSynchronously()
+        setStatus("Downloads cancelled. The queue is cleared; completed files are kept.")
+        if !isDownloading {
+            cancelAllDownloadsRequested = false
+            downloadRunState = .stopped
+            cleanCancelledDownloadPartialsIfPossible()
         }
     }
     func cancelAllUploads() {
@@ -9781,30 +13906,51 @@ final class DownloaderModel: ObservableObject {
         guard !cancelledDownloadIDs.contains(transfer.id) else { return }
         pausedDownloadIDs.insert(transfer.id); writeDownloadControls()
     }
+    func pausedDownloadSelection(containing transfer: DownloadTransfer) -> PendingDownloadItem? {
+        guard !pausedPendingDownloadIDs.isEmpty else { return nil }
+        let requests = activeDownloadRequests + pendingDownloadRequests + interruptedDownloadRequests
+        if let requestID = downloadRequestIDsByFileID[transfer.id] {
+            return requests.flatMap(\.pendingItems).first { pausedPendingDownloadIDs.contains($0.id) && downloadRoot(requestID, belongsTo: $0.id) }
+        }
+        guard let remotePath = transfer.remotePath, let directory = transfer.outputDirectoryPath else { return nil }
+        let partial = Self.downloadPartialPathKey(URL(fileURLWithPath: directory, isDirectory: true)
+            .appendingPathComponent((transfer.name as NSString).lastPathComponent + ".part", isDirectory: false).path)
+        for request in requests {
+            for item in request.pendingItems where pausedPendingDownloadIDs.contains(item.id)
+                && item.isShared == transfer.isShared
+                && (remotePath == item.remotePath || remotePath.hasPrefix(item.remotePath + "/")) {
+                if let path = request.partialTreeURL(for: item.id)?.path ?? request.partialURL(for: item.id)?.path,
+                   partial.starts(with: Self.downloadPartialPathKey(path)) { return item }
+            }
+        }
+        return nil
+    }
     func resumeDownloadFile(_ transfer: DownloadTransfer) {
+        if let selection = pausedDownloadSelection(containing: transfer) {
+            resumePendingDownload(selection)
+            return
+        }
         pausedDownloadIDs.remove(transfer.id); downloadsPaused = false; writeDownloadControls()
-        if !isDownloading { retryFailedDownload(transfer) }
+        retryFailedDownload(transfer)
+        scheduleAutomaticDownloadRetry()
     }
     func cancelDownloadFile(_ transfer: DownloadTransfer) {
         if let path = transfer.remotePath { rememberDownloadCancellation(controlID: transfer.id, remotePath: path, destinationDirectory: transfer.outputDirectoryPath, requestID: downloadRequestIDsByFileID[transfer.id]) }
-        cancelledDownloadIDs.insert(transfer.id); pausedDownloadIDs.remove(transfer.id); writeDownloadControls()
-        if !isDownloading {
-            removeFailedDownloadFromHistory(transfer)
-            if let path = transfer.remotePath, let directory = transfer.outputDirectoryPath {
-                let target = DownloadRetryTarget(isShared: transfer.isShared, remotePath: path,
-                    directory: URL(fileURLWithPath: directory), shareURL: transfer.isShared ? downloadSharedAccessByFileID[transfer.id]?.url : nil)
-                pendingDownloadRequests = pendingDownloadRequests.compactMap { $0.removingRetriedFiles([target]) }
-                interruptedDownloadRequests = interruptedDownloadRequests.compactMap { $0.removingRetriedFiles([target]) }
-                interruptedDownloadCount = interruptedDownloadRequests.reduce(0) { $0 + $1.itemCount }
-                synchronizePendingDownloadQueue(); _ = persistTransfersSynchronously()
-                let partial = URL(fileURLWithPath: directory).appendingPathComponent((transfer.name as NSString).lastPathComponent + ".part")
-                let owner = transferOwnerKey, fileID = downloadSourceFileIDs[transfer.id] ?? transfer.id, importedOwners = importedTransferOwnerKeys
-                Task { [weak self] in
-                    do { try await Task.detached(priority: .utility) { try TransferPartialCleanup.remove(partial, owner: owner, fileID: fileID, importedOwners: importedOwners) }.value }
-                    catch { self?.setError("Could not remove the cancelled partial file: \(error.localizedDescription)") }
-                }
-            }
+        cancelledDownloadIDs.insert(transfer.id); pausedDownloadIDs.remove(transfer.id)
+        recordCancelledDownloadPartial(transfer)
+        writeDownloadControls()
+        if let path = transfer.remotePath, let directory = transfer.outputDirectoryPath {
+            let target = DownloadRetryTarget(isShared: transfer.isShared, remotePath: path,
+                directory: URL(fileURLWithPath: directory, isDirectory: true), shareURL: transfer.isShared ? downloadSharedAccessByFileID[transfer.id]?.url : nil)
+            pendingDownloadRequests = pendingDownloadRequests.compactMap { $0.removingRetriedFiles([target]) }
+            interruptedDownloadRequests = interruptedDownloadRequests.compactMap { $0.removingRetriedFiles([target]) }
+            activeDownloadRequests = activeDownloadRequests.compactMap { $0.removingRetriedFiles([target]) }
         }
+        clearCancelledDownloadRows([transfer.id])
+        refreshActiveDownloadSelectionKeys()
+        interruptedDownloadCount = interruptedDownloadRequests.reduce(0) { $0 + $1.itemCount }
+        synchronizePendingDownloadQueue(); _ = persistTransfersSynchronously()
+        cleanCancelledDownloadPartialsIfPossible()
     }
     func pauseUploadFile(_ transfer: UploadTransfer) {
         pausedUploadIDs.insert(transfer.id); writeUploadControls()
@@ -9816,65 +13962,318 @@ final class DownloaderModel: ObservableObject {
         cancelledUploadIDs.insert(transfer.id); pausedUploadIDs.remove(transfer.id); writeUploadControls()
     }
     func pausePendingDownload(_ item: PendingDownloadItem) {
-        pausedPendingDownloadIDs.insert(item.id)
+        let requests = activeDownloadRequests + pendingDownloadRequests + interruptedDownloadRequests
+        let roots = Set(requests.flatMap(\.pendingItems).map(\.id).filter { downloadRoot($0, belongsTo: item.id) }).union([item.id])
+        pausedPendingDownloadIDs.formUnion(roots)
         if activeDownloadRequests.contains(where: { $0.pendingItems.contains(where: { $0.id == item.id }) }) {
             pendingRootActions[liveDownloadRun ? "\(item.id.uuidString):\(item.remotePath)" : item.remotePath] = "pause"
-            for file in queuedDownloadTransfers + downloadingTransfers where liveDownloadRun ? downloadRequestIDsByFileID[file.id] == item.id : (file.remotePath == item.remotePath || file.remotePath?.hasPrefix(item.remotePath + "/") == true) {
+            for file in queuedDownloadTransfers + Array(activeDownloadTransfers.values) where liveDownloadRun ? downloadRequestIDsByFileID[file.id].map({ downloadRoot($0, belongsTo: item.id) }) == true : (file.remotePath == item.remotePath || file.remotePath?.hasPrefix(item.remotePath + "/") == true) {
                 pausedDownloadIDs.insert(file.id)
             }
-            writeDownloadControls()
         }
+        writeDownloadControls()
     }
     func resumePendingDownload(_ item: PendingDownloadItem) {
+        let requests = activeDownloadRequests + pendingDownloadRequests + interruptedDownloadRequests
+        if let parent = requests.flatMap(\.pendingItems).first(where: {
+            $0.id != item.id && pausedPendingDownloadIDs.contains($0.id) && downloadRoot(item.id, belongsTo: $0.id)
+        }) { resumePendingDownload(parent); return }
+        // A closed workspace import can deduplicate the old parent plan while
+        // retaining its retry children. Resume this child without leaving an
+        // unreachable ancestor hold; siblings keep their own persisted Pause.
+        let visibleRoots = Set(requests.flatMap(\.pendingItems).map(\.id))
+        pausedPendingDownloadIDs = pausedPendingDownloadIDs.filter {
+            visibleRoots.contains($0) || !downloadRoot(item.id, belongsTo: $0)
+        }
         downloadsPaused = false
-        pausedPendingDownloadIDs.remove(item.id); pendingRootActions[liveDownloadRun ? "\(item.id.uuidString):\(item.remotePath)" : item.remotePath] = nil
-        for file in queuedDownloadTransfers + downloadingTransfers where liveDownloadRun ? downloadRequestIDsByFileID[file.id] == item.id : (file.remotePath == item.remotePath || file.remotePath?.hasPrefix(item.remotePath + "/") == true) {
+        let roots = Set(requests.flatMap(\.pendingItems).map(\.id).filter { downloadRoot($0, belongsTo: item.id) }).union([item.id])
+        pausedPendingDownloadIDs.subtract(roots)
+        for request in requests { for child in request.pendingItems where roots.contains(child.id) {
+            pendingRootActions[liveDownloadRun ? "\(child.id.uuidString):\(child.remotePath)" : child.remotePath] = nil
+        } }
+        pendingRootActions[liveDownloadRun ? "\(item.id.uuidString):\(item.remotePath)" : item.remotePath] = nil
+        // After relaunch the held root has no visible child rows yet. Their
+        // stable request-scoped controls still need to be released together.
+        pausedDownloadIDs = pausedDownloadIDs.filter { id in !roots.contains { id.hasPrefix($0.uuidString + ":") } }
+        pausedDownloadIDs = pausedDownloadIDs.filter { downloadRequestIDsByFileID[$0].map({ downloadRoot($0, belongsTo: item.id) }) != true }
+        for file in queuedDownloadTransfers + Array(activeDownloadTransfers.values) where liveDownloadRun ? downloadRequestIDsByFileID[file.id].map({ downloadRoot($0, belongsTo: item.id) }) == true : (file.remotePath == item.remotePath || file.remotePath?.hasPrefix(item.remotePath + "/") == true) {
             pausedDownloadIDs.remove(file.id)
         }
+        if !isDownloading { requeueInterruptedDownloads() }
         writeDownloadControls(); _ = startNextPendingDownloadIfNeeded()
+        scheduleAutomaticDownloadRetry()
     }
-    private func cleanCancelledFolderPartials(_ trees: [URL], ignoringActiveWriters: Bool) {
-        guard !trees.isEmpty else { return }
-        let owner = transferOwnerKey, importedOwners = importedTransferOwnerKeys
-        Task { [weak self] in
-            do {
-                try await Task.detached(priority: .utility) {
-                    for tree in trees { try TransferPartialCleanup.removeOwned(in: tree, owner: owner, ignoringActiveWriters: ignoringActiveWriters, importedOwners: importedOwners) }
-                }.value
-            } catch { self?.setError("Could not remove a cancelled folder's partial download: \(error.localizedDescription)") }
+    func cancelPendingDownload(_ item: PendingDownloadItem) {
+        let requests = activeDownloadRequests + pendingDownloadRequests + interruptedDownloadRequests
+        let roots = Set(requests.flatMap(\.pendingItems).map(\.id).filter { downloadRoot($0, belongsTo: item.id) }).union([item.id])
+        let superseded = Set(roots.flatMap { Array((downloadRetryTargets[$0] ?? [:]).values) }.filter {
+            downloadSettledStates[$0] == .failed || downloadSettledStates[$0] == .stopped
+        })
+        for request in requests {
+          for child in request.pendingItems where roots.contains(child.id) {
+            rememberDownloadCancellation(controlID: "path:" + child.remotePath, remotePath: child.remotePath,
+                destinationDirectory: child.destinationPath, requestID: child.id)
+            pendingRootActions[liveDownloadRun ? "\(child.id.uuidString):\(child.remotePath)" : child.remotePath] = "cancel"
+            if let tree = request.partialTreeURL(for: child.id) {
+                cancelledDownloadCleanups.insert(.init(path: tree.path,
+                    destinationPath: request.destinationURL.standardizedFileURL.path, sourceFileID: nil))
+            } else if let partial = request.partialURL(for: child.id), let fileID = request.fileID(for: child.id) {
+                cancelledDownloadCleanups.insert(.init(path: partial.path,
+                    destinationPath: request.destinationURL.standardizedFileURL.path, sourceFileID: fileID))
+            }
+          }
+        }
+        rememberDownloadCancellation(controlID: "path:" + item.remotePath, remotePath: item.remotePath, destinationDirectory: item.destinationPath, requestID: item.id)
+        cancelledDownloadRequestIDs.formUnion(roots)
+        pausedPendingDownloadIDs.subtract(roots)
+        pendingRootActions[liveDownloadRun ? "\(item.id.uuidString):\(item.remotePath)" : item.remotePath] = "cancel"
+        let files = Array(queuedDownloadTransfers) + Array(activeDownloadTransfers.values) + failedDownloadTransfers
+        let cancelledFiles = files.filter { file in
+            if liveDownloadRun { return downloadRequestIDsByFileID[file.id].map(roots.contains) == true }
+            return file.remotePath == item.remotePath || file.remotePath?.hasPrefix(item.remotePath + "/") == true
+        }
+        for file in cancelledFiles {
+            cancelledDownloadIDs.insert(file.id); pausedDownloadIDs.remove(file.id)
+            recordCancelledDownloadPartial(file)
+        }
+        for id in superseded { cancelledDownloadIDs.insert(id); pausedDownloadIDs.remove(id) }
+        writeDownloadControls()
+        activeDownloadRequests = activeDownloadRequests.compactMap { $0.removingPendingItems(roots) }
+        pendingDownloadRequests = pendingDownloadRequests.compactMap { $0.removingPendingItems(roots) }
+        interruptedDownloadRequests = interruptedDownloadRequests.compactMap { $0.removingPendingItems(roots) }
+        for id in roots { submittedDownloadRequests[id] = nil; discoveringDownloadRequestIDs.remove(id) }
+        refreshActiveDownloadSelectionKeys()
+        clearCancelledDownloadRows(Set(cancelledFiles.map(\.id)).union(superseded))
+        interruptedDownloadCount = interruptedDownloadRequests.reduce(0) { $0 + $1.itemCount }
+        synchronizePendingDownloadQueue(); _ = persistTransfersSynchronously()
+        cleanCancelledDownloadPartialsIfPossible()
+    }
+
+    private func recordCancelledDownloadPartial(_ transfer: DownloadTransfer) {
+        guard let directory = transfer.outputDirectoryPath else { return }
+        let destination = downloadDestinations.keys.filter {
+            directory == $0 || directory.hasPrefix($0 + "/")
+        }.max { $0.count < $1.count } ?? directory
+        let partial = URL(fileURLWithPath: directory, isDirectory: true)
+            .appendingPathComponent((transfer.name as NSString).lastPathComponent + ".part", isDirectory: false)
+        cancelledDownloadCleanups.insert(.init(path: partial.path, destinationPath: destination,
+            sourceFileID: downloadSourceFileIDs[transfer.id] ?? transfer.id))
+    }
+
+    private func clearCancelledDownloadRows(_ ids: Set<String>) {
+        for id in ids where excludedDownloadPlanIDs.insert(id).inserted {
+            let history = completedDownloadTransfers.first { $0.id == id }
+            if history?.state == .completed || history?.state == .skipped { continue }
+            if let total = downloadFileTotalsByID.removeValue(forKey: id) {
+                downloadTotalFiles = max(0, downloadTotalFiles - 1)
+                downloadTotalBytes = downloadTotalBytes >= total ? downloadTotalBytes - total : 0
+                if let root = downloadRequestIDsByFileID[id], let discovered = discoveredBytesByRoot[root] {
+                    discoveredBytesByRoot[root] = discovered >= total ? discovered - total : 0
+                }
+            }
+            if settledDownloadIDs.contains(id), let history {
+                settledDownloadBytes = settledDownloadBytes >= history.downloadedBytes
+                    ? settledDownloadBytes - history.downloadedBytes : 0
+                if history.state == .failed { downloadFailedFiles = max(0, downloadFailedFiles - 1); releaseFinalFailure(id) }
+            } else if let active = activeDownloadTransfers[id] {
+                let baseline = downloadNetworkBaselines[id] ?? 0
+                let network = downloadNetworkBytesByID[id]
+                    ?? (active.downloadedBytes >= baseline ? active.downloadedBytes - baseline : 0)
+                settledDownloadNetworkBytes = addingWithoutOverflow(settledDownloadNetworkBytes, network)
+            }
+            downloadNetworkBaselines[id] = nil; downloadNetworkBytesByID[id] = nil
+        }
+        let queued = Array(queuedDownloadTransfers).filter { !ids.contains($0.id) }
+        downloadQueueTransfers = queued; downloadQueueOffset = 0
+        for id in ids {
+            activeDownloadTransfers[id] = nil
+            downloadFileRates[id] = nil
+            settledDownloadIDs.insert(id)
+        }
+        completedDownloadTransfers.removeAll { ids.contains($0.id) && $0.state != .completed && $0.state != .skipped }
+        failedDownloadTransfers.removeAll { ids.contains($0.id) }
+        publishDownloadProgress()
+    }
+
+    private func cleanCancelledDownloadPartialsIfPossible() {
+        guard !isClosingWindow, !isDownloading, downloadProcess?.isRunning != true,
+              !cancelledDownloadCleanups.isEmpty, downloadCleanupTask == nil else { return }
+        watchDownloadDestinations()
+        // Capture model state only. Even constructing a file URL without a
+        // directory hint can stat an SMB path, so all resolving and disk checks
+        // belong to the worker, including the eligibility filter.
+        let protectedPathNames = survivingDownloadPartialPaths()
+        let cleanups = cancelledDownloadCleanups
+        let account = transferAccountID, owner = transferOwnerKey, importedOwners = importedTransferOwnerKeys
+        let checkpoints = downloadDestinations
+        let fence = downloadCleanupFence, generation = downloadCleanupFence.generation()
+        let locksDirectory: URL?
+        let resolvePath: @Sendable (String) -> [String]
+        #if FINDER_WORKSPACE_TESTS
+        // Generated model fixtures must never inspect the real ownership store.
+        locksDirectory = isFinderWorkspaceFixture
+            ? (accountFixtureTransferDirectory ?? FileManager.default.temporaryDirectory.appendingPathComponent("CleanupFixture-\(UUID())"))
+                .appendingPathComponent("TransferLocks", isDirectory: true) : nil
+        resolvePath = downloadCleanupPathResolver ?? { Self.downloadPartialPathKey($0) }
+        #else
+        locksDirectory = nil
+        resolvePath = { Self.downloadPartialPathKey($0) }
+        #endif
+        downloadCleanupTask = Task { [weak self] in
+            let removed = await Task.detached(priority: .utility) {
+                func checkCancellation() throws {
+                    guard fence.generation() == generation else { throw CancellationError() }
+                }
+                let destinations = Set(cleanups.map(\.destinationPath))
+                let urls = destinations.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                let bookmarks = checkpoints.compactMapValues(\.bookmark)
+                let access = LocalFileAccessLease(urls, bookmarks: bookmarks)
+                let protectedPaths = protectedPathNames.map(resolvePath)
+                var removed = Set<SavedDownloadPartialCleanup>()
+                var checkedDestinations = Set<String>()
+                var unavailableDestinations = Set<String>()
+                for cleanup in cleanups {
+                    guard fence.generation() == generation else { break }
+                    guard !unavailableDestinations.contains(cleanup.destinationPath) else { continue }
+                    let destination = URL(fileURLWithPath: cleanup.destinationPath, isDirectory: true)
+                    if !checkedDestinations.contains(cleanup.destinationPath) {
+                        do {
+                            _ = try DownloadDestinationAccess.validate(destination, checkpoint: checkpoints[cleanup.destinationPath])
+                            checkedDestinations.insert(cleanup.destinationPath)
+                        } catch {
+                            // An unavailable disk is checked once per pass,
+                            // before probing thousands of individual partials.
+                            unavailableDestinations.insert(cleanup.destinationPath)
+                            continue
+                        }
+                    }
+                    let path = resolvePath(cleanup.path)
+                    guard !protectedPaths.contains(where: { path.starts(with: $0) || $0.starts(with: path) }) else { continue }
+                    do {
+                        // Recheck the persisted disk identity immediately
+                        // before mutating an owned partial on that disk.
+                        let didRemove = try fence.performIfCurrent(generation) {
+                            _ = try DownloadDestinationAccess.validate(destination,
+                                checkpoint: checkpoints[cleanup.destinationPath])
+                            let url = URL(fileURLWithPath: cleanup.path, isDirectory: cleanup.sourceFileID == nil)
+                            if let fileID = cleanup.sourceFileID {
+                                try TransferPartialCleanup.remove(url, owner: owner, fileID: fileID,
+                                    locksDirectory: locksDirectory, importedOwners: importedOwners, checkCancellation: checkCancellation)
+                            } else {
+                                try TransferPartialCleanup.removeOwned(in: url, owner: owner,
+                                    ignoringActiveWriters: false, locksDirectory: locksDirectory, importedOwners: importedOwners,
+                                    checkCancellation: checkCancellation)
+                            }
+                        }
+                        if didRemove { removed.insert(cleanup) }
+                    } catch { /* Keep the durable cleanup until access returns. */ }
+                }
+                withExtendedLifetime(access) { }
+                return removed
+            }.value
+            guard let self, !Task.isCancelled, self.transferAccountID == account else { return }
+            self.downloadCleanupTask = nil
+            self.downloadPreparationStatus = nil
+            if !removed.isEmpty {
+                self.cancelledDownloadCleanups.subtract(removed)
+                _ = self.persistTransfersSynchronously()
+            }
+            if self.cancelledDownloadCleanups.isEmpty && self.activeDownloadRequests.isEmpty && self.pendingDownloadRequests.isEmpty {
+                self.stopWatchingDownloadDestinations()
+            }
+            _ = self.startNextPendingDownloadIfNeeded()
         }
     }
 
-    func cancelPendingDownload(_ item: PendingDownloadItem) {
-        let trees = (activeDownloadRequests + pendingDownloadRequests).compactMap { $0.partialTreeURL(for: item.id) }
-        cleanCancelledFolderPartials(trees, ignoringActiveWriters: isDownloading)
-        rememberDownloadCancellation(controlID: "path:" + item.remotePath, remotePath: item.remotePath, destinationDirectory: item.destinationPath, requestID: item.id)
-        pausedPendingDownloadIDs.remove(item.id)
-        if activeDownloadRequests.contains(where: { $0.pendingItems.contains(where: { $0.id == item.id }) }) {
-            pendingRootActions[liveDownloadRun ? "\(item.id.uuidString):\(item.remotePath)" : item.remotePath] = "cancel"
-            for file in queuedDownloadTransfers + downloadingTransfers where liveDownloadRun ? downloadRequestIDsByFileID[file.id] == item.id : (file.remotePath == item.remotePath || file.remotePath?.hasPrefix(item.remotePath + "/") == true) {
-                cancelledDownloadIDs.insert(file.id); pausedDownloadIDs.remove(file.id)
-            }
-            writeDownloadControls()
-        } else {
-            let partial = pendingDownloadRequests.compactMap { $0.partialURL(for: item.id) }.first
-            let fileID = pendingDownloadRequests.compactMap { $0.fileID(for: item.id) }.first
-            removePendingDownloadItem(item.id)
-            if let partial, let fileID {
-                let owner = transferOwnerKey, importedOwners = importedTransferOwnerKeys
-                Task { [weak self] in
-                    do { try await Task.detached(priority: .utility) { try TransferPartialCleanup.remove(partial, owner: owner, fileID: fileID, importedOwners: importedOwners) }.value }
-                    catch { self?.setError("Could not remove the cancelled partial file: \(error.localizedDescription)") }
-                }
+    nonisolated private static func downloadPartialPathKey(_ path: String) -> [String] {
+        URL(fileURLWithPath: path, isDirectory: false).standardizedFileURL.resolvingSymlinksInPath().pathComponents.map {
+            $0.decomposedStringWithCanonicalMapping.lowercased().decomposedStringWithCanonicalMapping
+        }
+    }
+
+    private func survivingDownloadPartialPaths() -> [String] {
+        let requests = activeDownloadRequests + pendingDownloadRequests + interruptedDownloadRequests
+        var paths = requests.flatMap { request in
+            request.pendingItems.compactMap { item in
+                request.partialTreeURL(for: item.id)?.path ?? request.partialURL(for: item.id)?.path
             }
         }
+        // A paused child can still be known while its root's discovery or
+        // interruption snapshot is in transition. Its writer must also survive.
+        for transfer in Array(queuedDownloadTransfers) + Array(activeDownloadTransfers.values)
+            where !cancelledDownloadIDs.contains(transfer.id) {
+            if let directory = transfer.outputDirectoryPath {
+                paths.append(URL(fileURLWithPath: directory, isDirectory: true)
+                    .appendingPathComponent((transfer.name as NSString).lastPathComponent + ".part", isDirectory: false).path)
+            }
+        }
+        return paths
     }
 
     func stop() { stop(automatic: false) }
-    private func stop(automatic: Bool) {
+
+    /// Keep the app and its pipe handlers alive until the helper has stopped
+    /// receiving, drained RAM, and synced its final checkpoints. The persisted
+    /// pause intent stays unchanged, so an unpaused selection resumes on launch.
+    func prepareDownloadsForApplicationTermination() async -> Bool {
+        guard !isClosingWindow else { return true }
+        guard transferSnapshot() != nil else {
+            if downloadProcess?.isRunning != true { return true }
+            setError("Could not save the active download queue. The app will stay open.")
+            return false
+        }
+        guard persistTransfersSynchronously() else {
+            setError("Could not save the download queue. The app will stay open; try Quit again after storage is available.")
+            return false
+        }
+        guard let helper = downloadProcess, helper.isRunning else { return true }
+        guard let controls = downloadControlURL else {
+            setError("Could not request a safe download shutdown. The app will stay open.")
+            return false
+        }
         automaticDownloadRetry?.cancel(); automaticDownloadRetry = nil
-        downloadsPaused = !automatic
+        downloadDestinationRestartPending = false
+        downloadDrainingForQuit = true
+        downloadRequestedStop = true
+        downloadRunState = .stopping
+        writeDownloadControls()
+        guard let data = try? Data(contentsOf: controls),
+              let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              document["drain"] as? Bool == true else {
+            downloadDrainingForQuit = false; downloadRequestedStop = false
+            setError("Could not save the safe-shutdown request. The app will stay open.")
+            return false
+        }
+        setStatus("Saving the download RAM buffer to disk before quitting…")
+        // A large buffer on a slow disk can take time. Never turn a timeout
+        // into SIGTERM and silently discard bytes the user asked us to retain.
+        while helper.isRunning || downloadProcess === helper {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        guard helper.terminationStatus == 0 else {
+            downloadDrainingForQuit = false
+            setError("The download helper could not finish saving its RAM buffer. The app will stay open; saved checkpoints and the queue are kept for recovery.")
+            return false
+        }
+        DownloadDiagnosticsStore.shared.record(.storageWindow, values: ["normal_shutdown_drained": 1,
+            "helper_exit_code": Double(helper.terminationStatus)])
+        await Task.detached(priority: .utility) { DownloadDiagnosticsStore.shared.flush() }.value
+        return persistTransfersSynchronously()
+    }
+
+    private func stop(automatic: Bool) {
+        downloadPreparationStatus = nil
+        automaticDownloadRetry?.cancel(); automaticDownloadRetry = nil
+        if !automatic { downloadsPaused = true }
+        publishDownloadTransferRows()
         _ = persistTransfersSynchronously()
+        if !automatic {
+            // Keep the helper, output leases and RAM consumers alive. Only
+            // HTTP producers stop; disk writes/checks finish and checkpoint.
+            writeDownloadControls()
+            setStatus("Cloud reception paused; buffered writes and verification continue.")
+            return
+        }
         guard isDownloading, let downloadProcess, downloadProcess.isRunning else { return }
         downloadRequestedStop = !automatic
         downloadRunState = .stopping
@@ -9883,12 +14282,17 @@ final class DownloaderModel: ObservableObject {
     }
 
     func stopForWindowClose() {
+        cancelRequestVerification()
+        quotaRefreshPending = false
         bookmarkNavigationTask?.cancel(); bookmarkNavigationTask = nil
         pikpakManagement.clear()
         folderThumbnails.cancel()
         thumbnailPageReader?.cancel()
         transferQuotaMonitor.clear()
         automaticDownloadRetry?.cancel(); automaticUploadRetry?.cancel()
+        stopWatchingDownloadDestinations()
+        downloadCleanupFence.invalidate()
+        downloadCleanupTask?.cancel(); downloadCleanupTask = nil
         stopWatchingUploadDisk(); stopWatchingUploadRemount()
         fileSimilarity.close(preservingScans:true)
         _ = cancelQuickLook()
@@ -9987,11 +14391,7 @@ final class DownloaderModel: ObservableObject {
             stoppedArchiveTaskIDs.insert(taskID)
             archiveProcess.terminate()
         }
-        clearPendingFolderMeasurements()
-        if let folderMeasurementProcess, folderMeasurementProcess.isRunning {
-            folderMeasurementWasCancelled = true
-            folderMeasurementProcess.terminate()
-        }
+        stopFolderMeasurements()
         if let process, process.isRunning {
             requestedStop = false
             process.terminate()
@@ -10502,6 +14902,7 @@ final class DownloaderModel: ObservableObject {
                 appendOutput(redactedEngineOutput(errorOutput))
             }
         }
+        if !isBrowsingSharedLink { reconcileBrowserFilterSelection(resetsNavigation: false) }
         if browserTreeLoadErrors[folderID] != nil { scheduleBrowserTreeRetry(folderID, append: append) }
         else { cancelOperationRetries(prefix: "tree:\(folderID)") }
         resumeBrowserFolderExpansion(after: folderID)
@@ -10630,7 +15031,7 @@ final class DownloaderModel: ObservableObject {
     /// therefore cannot race another process while a refresh token rotates.
     @discardableResult
     private func startPendingQuotaRefreshIfNeeded() -> Bool {
-        guard quotaRefreshPending,
+        guard !isClosingWindow, quotaRefreshPending,
               !isRunning,
               !isScanningDuplicates,
               !isLoginPresented,
@@ -10928,6 +15329,7 @@ final class DownloaderModel: ObservableObject {
         replacingSelection: Bool = true,
         requestsPreview: Bool = true
     ) {
+        deletedBrowserSelection = nil
         collapsedBrowserFolderFocus = nil
         prefetchFolderThumbnails(for: item)
         let keepsCurrentPreview = previewFileID == item.id
@@ -10985,6 +15387,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func selectionRootID(containing itemID: String) -> String? {
+        guard !selectedBrowserItemIDs.isEmpty else { return nil }
         var candidate: String? = itemID
         var visited = Set<String>()
         while let current = candidate, visited.insert(current).inserted {
@@ -11066,6 +15469,7 @@ final class DownloaderModel: ObservableObject {
     /// the same rules and lets the active shared-link workspace persist the
     /// cleared state instead of restoring a stale selection later.
     func clearBrowserSelectionFromCanvas() {
+        deletedBrowserSelection = nil
         let clearsSharedLinkRoot = isBrowsingSharedLink
             && selectedSharedLinkRootID != nil
         guard selectedBrowserItemID != nil
@@ -11086,6 +15490,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func clearBrowserSelection() {
+        deletedBrowserSelection = nil
         collapsedBrowserFolderFocus = nil
         folderThumbnails.cancel()
         thumbnailPageReader?.cancel()
@@ -11259,9 +15664,8 @@ final class DownloaderModel: ObservableObject {
     }
 
     /// Duplicate discovery can take minutes on a large account, so it owns a
-    /// separate process from short Browser and preview requests. The scanner
-    /// remains read-only; downloads, measurements, and Trash operations stay
-    /// unavailable until it finishes to avoid competing heavy work.
+    /// separate process from short Browser and preview requests. Downloads and
+    /// independent folder calculations continue while the scanner reads metadata.
     private func runDuplicateScan(scope: BrowserLocation) {
         guard hasUsableSession else {
             presentLogin(reason: "Complete the desktop-session sign-in before accessing PikPak.")
@@ -11276,6 +15680,7 @@ final class DownloaderModel: ObservableObject {
             return
         }
 
+        var scopeInputURL: URL?
         do {
             let exchangeDirectory = try makePrivateExchangeDirectory()
 
@@ -11293,6 +15698,15 @@ final class DownloaderModel: ObservableObject {
                 "--root-path", scope.path,
                 "--progress-json",
             ]
+            if !duplicateScanLocalFolders.isEmpty || duplicateScanCloudFolders.count > 1 {
+                let scopeURL = exchangeDirectory.appendingPathComponent("duplicate-scope-\(UUID().uuidString).json")
+                let data = try JSONSerialization.data(withJSONObject: CrossDriveScope.object(
+                    cloudFolders: duplicateScanCloudFolders.map { ($0.id, $0.path) }, localFolders: duplicateScanLocalFolders))
+                try data.write(to: scopeURL, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: scopeURL.path)
+                scopeInputURL = scopeURL
+                process.arguments! += ["--scope-file", scopeURL.path]
+            }
             process.standardOutput = stdout
             process.standardError = stderr
             process.currentDirectoryURL = exchangeDirectory
@@ -11325,7 +15739,9 @@ final class DownloaderModel: ObservableObject {
                 }
             }
 
+            let completedScopeURL = scopeInputURL
             process.terminationHandler = { [weak self] finishedProcess in
+                if let completedScopeURL { try? FileManager.default.removeItem(at: completedScopeURL) }
                 stdout.fileHandleForReading.readabilityHandler = nil
                 stderr.fileHandleForReading.readabilityHandler = nil
                 stdoutBuffer.append(stdout.fileHandleForReading.readDataToEndOfFile())
@@ -11360,6 +15776,7 @@ final class DownloaderModel: ObservableObject {
             status = "Checking \(scope.name) for duplicate files…"
             try process.run()
         } catch {
+            if let scopeInputURL { try? FileManager.default.removeItem(at: scopeInputURL) }
             duplicateProcess = nil
             duplicateScanWasCancelled = false
             duplicateProgressFlushScheduled = false
@@ -11877,7 +16294,7 @@ final class DownloaderModel: ObservableObject {
             // foreground Browser and Links interaction priority as well.
             process.qualityOfService = .utility
 
-            var environment = try archiveEngineEnvironment()
+            var environment = try archiveEngineEnvironment(for: task)
             let proxy = proxyURL.trimmingCharacters(in: .whitespacesAndNewlines)
             if proxy.isEmpty {
                 environment.removeValue(forKey: "PIKPAK_PROXY")
@@ -11938,6 +16355,7 @@ final class DownloaderModel: ObservableObject {
                 $0.result = nil; $0.error = nil; $0.progress = 0; $0.hasReportedProgress = false
                 $0.phase = isInspection ? "Reading archive" : "Starting"
                 $0.generation = generation
+                $0.connectionKind = task.connectionAccountID == nil ? activeCredentialKind : .desktopOAuth
                 $0.isInspecting = isInspection; $0.isExtracting = !isInspection
             }
             stoppedArchiveTaskIDs.remove(taskID)
@@ -11965,7 +16383,7 @@ final class DownloaderModel: ObservableObject {
                 "Could not start PikPak cloud extraction: \(error.localizedDescription)",
                 diagnostic: launchDiagnostic
             )
-            requireFreshAppLoginIfSessionTrustFailed(error)
+            if task.connectionAccountID == nil { requireFreshAppLoginIfSessionTrustFailed(error) }
         }
     }
 
@@ -11983,10 +16401,27 @@ final class DownloaderModel: ObservableObject {
         return try makePrivateExchangeDirectory()
     }
 
-    private func archiveEngineEnvironment() throws -> [String: String] {
+    private func archiveEngineEnvironment(for task: CloudExtractionTask) throws -> [String: String] {
         #if ARCHIVE_TASK_TESTS
-        if archiveTestEngineURL != nil { return ["PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8"] }
+        if archiveTestEngineURL != nil {
+            if let override = task.connectionAccountID {
+                guard normalArchiveConnection(for: task, in: savedAccounts)?.id == override else { throw PikPakAccountError.accountMismatch }
+            }
+            return ["PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8",
+                    "MYCLOUD_ARCHIVE_CONNECTION": (task.connectionAccountID == nil ? activeCredentialKind : .desktopOAuth).rawValue]
+        }
         #endif
+        if let override = task.connectionAccountID {
+            guard !isClosingWindow, !isChangingAccount, let accountStore,
+                  normalArchiveConnection(for: task, in: try accountStore.load().accounts)?.id == override
+            else { throw PikPakAccountError.accountMismatch }
+            let files = accountStore.files(for: override)
+            let session = try files.load()
+            guard session.credentialKind == .desktopOAuth else { throw PikPakAccountError.accountMismatch }
+            try accountStore.retainWorkerSession(files)
+            return desktopEngineEnvironment(tokenURL: files.tokenURL, lockURL: files.lockURL,
+                deviceID: session.deviceID, credentialKind: session.credentialKind)
+        }
         return try engineEnvironment()
     }
 
@@ -12122,13 +16557,19 @@ final class DownloaderModel: ObservableObject {
                     : .archiveExtract(item: item),
                 exitCode: exitCode
             )
-            updateArchiveTask(taskID) { $0.error = failure.diagnostic; $0.phase = "Failed"; $0.password = "" }
+            let needsNormalLogin = task.connectionKind == .personalAccessToken
+                && httpStatusCode(from: errorOutput) == "403"
+                && structuredAPIError(from: errorOutput)?.code == "7"
+            updateArchiveTask(taskID) {
+                $0.error = failure.diagnostic; $0.phase = "Failed"; $0.password = ""
+                $0.needsNormalLogin = needsNormalLogin
+            }
             if !isRunning {
                 setError(failure.summary, diagnostic: failure.diagnostic)
             } else {
                 appendOutput(failure.summary + "\n" + failure.diagnostic.displayText + "\n")
             }
-            handleWebLoginNeeded(for: errorOutput)
+            if task.connectionAccountID == nil { handleWebLoginNeeded(for: errorOutput) }
         }
 
         #if ARCHIVE_TASK_TESTS
@@ -12185,6 +16626,7 @@ final class DownloaderModel: ObservableObject {
         accountRequest: AccountDownloadInput? = nil,
         liveQueue: Bool = false
     ) {
+        guard !isClosingWindow else { return }
         guard hasUsableSession else {
             presentLogin(reason: "Complete the desktop-session sign-in before accessing PikPak.")
             return
@@ -12234,9 +16676,8 @@ final class DownloaderModel: ObservableObject {
             let process = Process()
             let stdout = Pipe()
             let stderr = Pipe()
-            let stdoutBuffer = ProcessOutputBuffer()
-            let stderrBuffer = ProcessOutputBuffer()
-            let stdoutLineBuffer = ProcessLineBuffer()
+            let stderrBuffer = ProcessOutputBuffer(maximumBytes: 512 * 1024)
+            let stdoutLines = OrderedProcessLines()
 
             process.executableURL = engineURL
             process.arguments = effectiveArguments
@@ -12245,7 +16686,9 @@ final class DownloaderModel: ObservableObject {
             process.currentDirectoryURL = exchangeDirectory
             process.qualityOfService = .utility
 
-            var environment = try engineEnvironment()
+            var environment = Self.transferDownloadEnvironment(try engineEnvironment())
+            environment = finderSettings.downloadBufferEnvironment(environment)
+            downloadDrainingForQuit = false
             downloadControlURL = exchangeDirectory.appendingPathComponent("download-control-\(UUID().uuidString).json")
             if let controlURL = downloadControlURL {
                 var actions = restoredDownloadControls()
@@ -12274,14 +16717,11 @@ final class DownloaderModel: ObservableObject {
             process.environment = environment
 
             stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                guard !data.isEmpty else { return }
-                stdoutBuffer.append(data)
-                let lines = stdoutLineBuffer.append(data)
-                guard !lines.isEmpty else { return }
-                DispatchQueue.main.async {
-                    guard let self, self.downloadProcess === process else { return }
-                    self.enqueueDownloadOutputLines(lines)
+                stdoutLines.read(handle) { lines in
+                    DispatchQueue.main.async {
+                        guard let self, self.downloadProcess === process else { return }
+                        self.enqueueDownloadOutputLines(lines)
+                    }
                 }
             }
             stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -12299,30 +16739,21 @@ final class DownloaderModel: ObservableObject {
             process.terminationHandler = { [weak self] finishedProcess in
                 stdout.fileHandleForReading.readabilityHandler = nil
                 stderr.fileHandleForReading.readabilityHandler = nil
-                let trailingOutput = stdout.fileHandleForReading.readDataToEndOfFile()
                 let trailingError = stderr.fileHandleForReading.readDataToEndOfFile()
-                stdoutBuffer.append(trailingOutput)
                 stderrBuffer.append(trailingError)
-                let trailingLines = stdoutLineBuffer.append(trailingOutput)
-                    + stdoutLineBuffer.drain()
                 let trailingErrorText = String(data: trailingError, encoding: .utf8) ?? ""
-                let completeOutput = stdoutBuffer.string()
                 let errorOutput = stderrBuffer.string()
-                DispatchQueue.main.async {
-                    guard let self, self.downloadProcess === finishedProcess else { return }
-                    self.enqueueDownloadOutputLines(trailingLines)
-                    self.flushAllDownloadOutputLines()
-                    // Replaying the complete ordered transcript closes the
-                    // small race between pipe callbacks and process exit.
-                    self.replayDownloadProgress(from: completeOutput)
-                    if !trailingErrorText.isEmpty {
-                        self.appendOutput(self.redactedEngineOutput(trailingErrorText))
+                stdoutLines.finish(stdout.fileHandleForReading) { trailingLines in
+                    DispatchQueue.main.async {
+                        guard let self, self.downloadProcess === finishedProcess else { return }
+                        self.enqueueDownloadOutputLines(trailingLines)
+                        self.drainDownloadOutputLines { [weak self] in
+                            guard let self, self.downloadProcess === finishedProcess else { return }
+                            if !trailingErrorText.isEmpty { self.appendOutput(self.redactedEngineOutput(trailingErrorText)) }
+                            self.finishDownloadProcess(exitCode: finishedProcess.terminationStatus,
+                                errorOutput: errorOutput, operation: operation)
+                        }
                     }
-                    self.finishDownloadProcess(
-                        exitCode: finishedProcess.terminationStatus,
-                        errorOutput: errorOutput,
-                        operation: operation
-                    )
                 }
             }
 
@@ -12333,7 +16764,6 @@ final class DownloaderModel: ObservableObject {
             downloadRunState = .scanning
             statusIsError = false
             statusErrorDiagnostic = nil
-            if !isUploading { log = "" }
             status = {
                 if case .shareDownload = operation {
                     return "Scanning the shared selection…"
@@ -12367,10 +16797,9 @@ final class DownloaderModel: ObservableObject {
         operation finishedOperation: Operation
     ) {
         guard !isClosingWindow else { cleanupDownloadInputFile(); return }
+        verifyingDownloads = [:]; downloadVerification = nil
         let wasStopped = downloadRequestedStop
         let wasCancelled = cancelAllDownloadsRequested
-        let cancelTransfers = wasCancelled ? Array(activeDownloadTransfers.values) + Array(queuedDownloadTransfers) + failedDownloadTransfers : []
-        let cancelTrees = wasCancelled ? (activeDownloadRequests + interruptedDownloadRequests).flatMap { request in request.pendingItems.compactMap { request.partialTreeURL(for: $0.id) } } : []
         if !wasCancelled && (wasStopped || exitCode != 0) {
             retainInterruptedDownload()
         } else {
@@ -12396,17 +16825,16 @@ final class DownloaderModel: ObservableObject {
         submittedDownloadRequests = [:]
         discoveringDownloadRequestIDs = []
         activeDownloadSelectionKeys = []
+        activeDownloadSelectionRoots = [:]
         cancelAllDownloadsRequested = false
         if wasCancelled {
-            cleanCancelledFolderPartials(cancelTrees, ignoringActiveWriters: false)
-            for transfer in cancelTransfers { cancelDownloadFile(transfer) }
             interruptedDownloadRequests = []; interruptedDownloadCount = 0
             _ = persistTransfersSynchronously()
         }
 
         if wasStopped {
             finishDownloadProgress(as: .stopped)
-            if wasCancelled { setStatus("Downloads cancelled. Incomplete local copies are removed; completed files are kept.") }
+            if wasCancelled { setStatus("Downloads cancelled. The queue is cleared; completed files are kept. Incomplete copies are removed when the destination is available.") }
             if !isRunning && !wasCancelled {
                 let message = {
                     if case .shareDownload = finishedOperation {
@@ -12444,8 +16872,17 @@ final class DownloaderModel: ObservableObject {
         }
 
         stopTransferMetricsTaskIfIdle()
+        if downloadDrainingForQuit { _ = persistTransfersSynchronously(); return }
         presentDeferredLoginIfNeeded()
-        if !wasStopped {
+        if wasCancelled {
+            _ = startNextPendingDownloadIfNeeded()
+        } else if downloadDestinationRestartPending {
+            downloadDestinationRestartPending = false
+            if !downloadsPaused && !wasCancelled {
+                requeueInterruptedDownloads()
+                _ = startNextPendingDownloadIfNeeded()
+            }
+        } else if !wasStopped {
             if exitCode != 0 || !interruptedDownloadRequests.isEmpty {
                 scheduleAutomaticDownloadRetry()
             } else {
@@ -12453,24 +16890,51 @@ final class DownloaderModel: ObservableObject {
                 _ = startNextPendingDownloadIfNeeded()
             }
         }
+        cleanCancelledDownloadPartialsIfPossible()
         startPendingQuotaRefreshIfNeeded()
+        publishDownloadReportIfFinished(cancelled: wasCancelled)
+    }
+
+    /// When the whole batch has finished (nothing left to run, retry or wait for, no failed file from it, and
+    /// every file downloaded in full), keep a short report in the status bar. The dashboard restarts with the
+    /// next batch; the report stays until the next one replaces it.
+    private func publishDownloadReportIfFinished(cancelled: Bool) {
+        if cancelled { downloadBatch = nil; return }
+        guard let batch = downloadBatch, !isDownloading, !downloadsPaused, !cancelAllDownloadsRequested,
+              downloadRunState == .completed, !downloadTotalsAreIncomplete,
+              pendingDownloadRequests.isEmpty, activeDownloadRequests.isEmpty, interruptedDownloadRequests.isEmpty,
+              automaticDownloadRetry == nil,
+              !failedDownloadTransfers.contains(where: { batch.failedIDs.contains($0.id) && !cancelledDownloadIDs.contains($0.id) }),
+              batch.completedFiles + batch.skippedFiles > 0
+        else { return }
+        downloadBatch = nil
+        let finishedAt = Date()
+        let scope = batch.destinations.first.map { $0 + (batch.destinations.count > 1 ? " (+\(batch.destinations.count - 1) more)" : "") }
+            ?? "Downloads"
+        let summary = DownloadReportText.summary(batch, finishedAt: finishedAt)
+        taskActivity.begin(.downloads, scope: scope, message: summary)
+        taskActivity.finish(.downloads, state: .completed, message: summary,
+            detail: DownloadReportText.detail(batch, finishedAt: finishedAt))
     }
 
     private func scheduleAutomaticDownloadRetry() {
-        guard !isClosingWindow, !downloadsPaused, !cancelAllDownloadsRequested,
-              !interruptedDownloadRequests.isEmpty || !pendingDownloadRequests.isEmpty else { return }
+        guard !isClosingWindow, !downloadDrainingForQuit, !downloadsPaused, !cancelAllDownloadsRequested,
+              !downloadRequestedStop, !downloadDestinationRestartPending,
+              automaticDownloadRetry == nil,
+              (!(automaticDownloadRetryCandidates().isEmpty)
+                || (interruptedDownloadRequests + pendingDownloadRequests).contains(where: { !downloadRequestIsPaused($0) })) else { return }
         let account = transferAccountID
-        let delay = max(AutomaticRecovery.delay(attempt: downloadRetryAttempt), Double(downloadFailureRetryDelay) / 1_000)
+        let delay = max(AutomaticRecovery.delay(attempt: downloadRetryAttempt, schedule: [5, 15, 30, 60]), Double(downloadFailureRetryDelay) / 1_000)
         if statusIsError { status += " Retrying automatically in \(Int(min(delay, 86_400)))s." }
         downloadRetryAttempt = AutomaticRecovery.nextAttempt(downloadRetryAttempt)
-        automaticDownloadRetry?.cancel()
         automaticDownloadRetry = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: UInt64(min(delay, 86_400) * 1_000_000_000)) } catch { return }
             guard let self else { return }
             self.automaticDownloadRetry = nil
             guard !Task.isCancelled, !self.isClosingWindow, !self.downloadsPaused,
+                  !self.cancelAllDownloadsRequested, !self.downloadDestinationRestartPending,
                   self.transferAccountID == account else { return }
-            self.requeueInterruptedDownloads()
+            guard self.prepareAutomaticDownloadRetry() else { self.scheduleAutomaticDownloadRetry(); return }
             if !self.startNextPendingDownloadIfNeeded() { self.scheduleAutomaticDownloadRetry() }
         }
     }
@@ -12496,6 +16960,7 @@ final class DownloaderModel: ObservableObject {
     /// into the persistent per-account cache even if the user has navigated to
     /// another folder by the time the scan completes.
     private func runFolderMeasurementEngine(arguments: [String], operation: Operation) {
+        guard !isClosingWindow, !isChangingAccount, !isLoginPresented, deferredLoginReason == nil else { return }
         guard hasUsableSession else {
             presentLogin(reason: "Complete the desktop-session sign-in before calculating folder sizes.")
             return
@@ -12513,31 +16978,18 @@ final class DownloaderModel: ObservableObject {
             assertionFailure("Unsupported background folder measurement")
             return
         }
-        guard measuringFolderCacheKey != cacheKey,
-              !queuedFolderMeasurementCacheKeys.contains(cacheKey)
-        else { return }
-
-        if folderMeasurementProcess?.isRunning == true || isMeasuringFolder {
-            pendingFolderMeasurementRequests.append(
-                PendingFolderMeasurementRequest(
-                    arguments: arguments,
-                    operation: operation,
-                    folderID: folderID,
-                    cacheKey: cacheKey
-                )
-            )
-            queuedFolderMeasurementCacheKeys.insert(cacheKey)
-            setStatus(
-                "Folder size calculation queued; "
-                    + "\(pendingFolderMeasurementRequests.count.formatted()) waiting"
-            )
-            return
-        }
-        guard let engineURL = Bundle.main.url(forResource: "pikpak", withExtension: nil) else {
+        guard folderMeasurementRuns[cacheKey] == nil else { return }
+        var engineURL = Bundle.main.url(forResource: "pikpak", withExtension: nil)
+        #if FINDER_WORKSPACE_TESTS
+        if let folderMeasurementTestEngineURL { engineURL = folderMeasurementTestEngineURL }
+        #endif
+        guard let engineURL else {
             setError("The bundled folder-size engine is missing. Rebuild the app.")
             return
         }
-
+        let run = FolderMeasurementRun(operation: operation, folderID: folderID, cacheKey: cacheKey,
+            revision: folderSizeRevision, accountID: folderMeasurementAccountID,
+            usesCachedSubfolders: arguments.contains("--use-size-cache"))
         do {
             let exchangeDirectory = try makePrivateExchangeDirectory()
             var effectiveArguments = arguments
@@ -12549,7 +17001,7 @@ final class DownloaderModel: ObservableObject {
                     Seed(folders: folderSizeIndex.seedMeasurements(under: folderID)),
                     named: "folder-size-seed", in: exchangeDirectory
                 )
-                folderMeasurementInputURL = seedURL
+                run.inputURL = seedURL
                 effectiveArguments.append(contentsOf: ["--cache-file", seedURL.path])
             }
             if case .shareMeasure(let request, _, _) = operation {
@@ -12558,11 +17010,11 @@ final class DownloaderModel: ObservableObject {
                     named: "share-measure",
                     in: exchangeDirectory
                 )
-                folderMeasurementInputURL = requestURL
+                run.inputURL = requestURL
                 effectiveArguments.append(contentsOf: ["--request-file", requestURL.path])
             }
 
-            let process = Process()
+            let process = run.process
             let stdout = Pipe()
             let stderr = Pipe()
             let stdoutBuffer = ProcessOutputBuffer()
@@ -12575,7 +17027,13 @@ final class DownloaderModel: ObservableObject {
             process.currentDirectoryURL = exchangeDirectory
             process.qualityOfService = .utility
 
-            var environment = try engineEnvironment()
+            var environment: [String: String]
+            #if FINDER_WORKSPACE_TESTS
+            if folderMeasurementTestEngineURL != nil { environment = ["PATH": "/usr/bin:/bin"] }
+            else { environment = try engineEnvironment() }
+            #else
+            environment = try engineEnvironment()
+            #endif
             let proxy = proxyURL.trimmingCharacters(in: .whitespacesAndNewlines)
             if proxy.isEmpty {
                 environment.removeValue(forKey: "PIKPAK_PROXY")
@@ -12601,6 +17059,7 @@ final class DownloaderModel: ObservableObject {
             }
 
             process.terminationHandler = { [weak self] finishedProcess in
+                finishedProcess.terminationHandler = nil
                 stdout.fileHandleForReading.readabilityHandler = nil
                 stderr.fileHandleForReading.readabilityHandler = nil
                 stdoutBuffer.append(stdout.fileHandleForReading.readDataToEndOfFile())
@@ -12622,22 +17081,13 @@ final class DownloaderModel: ObservableObject {
                         report: report,
                         errorOutput: errorOutput,
                         arguments: arguments,
-                        operation: operation,
-                        folderID: folderID
+                        run: run
                     )
                 }
             }
 
-            folderMeasurementProcess = process
-            folderMeasurementStartRevision = folderSizeRevision
-            folderMeasurementStartAccountID = folderMeasurementAccountID
-            folderMeasurementUsesCachedSubfolders = arguments.contains("--use-size-cache")
-            folderMeasurementOperation = operation
-            folderMeasurementWasCancelled = false
-            measuringFolderID = folderID
-            measuringFolderCacheKey = cacheKey
-            queuedFolderMeasurementCacheKeys.remove(cacheKey)
-            isMeasuringFolder = true
+            folderMeasurementRuns[cacheKey] = run
+            updateFolderMeasurementActivity()
             statusIsError = false
             statusErrorDiagnostic = nil
             status = {
@@ -12648,17 +17098,12 @@ final class DownloaderModel: ObservableObject {
             }()
             try process.run()
         } catch {
-            cleanupFolderMeasurementInputFile()
-            folderMeasurementProcess = nil
-            folderMeasurementOperation = nil
-            folderMeasurementWasCancelled = false
-            isMeasuringFolder = false
-            measuringFolderID = nil
-            measuringFolderCacheKey = nil
+            cleanupFolderMeasurementInputFile(run)
+            folderMeasurementRuns.removeValue(forKey: cacheKey)
+            updateFolderMeasurementActivity()
             setError("Could not start folder-size calculation: \(error.localizedDescription)")
             requireFreshAppLoginIfSessionTrustFailed(error)
             scheduleOperationRetry(arguments: arguments, operation: operation)
-            startNextPendingFolderMeasurementIfNeeded()
         }
     }
 
@@ -12667,19 +17112,26 @@ final class DownloaderModel: ObservableObject {
         report: Result<FolderMeasurementReport, Error>?,
         errorOutput: String,
         arguments: [String],
-        operation finishedOperation: Operation,
-        folderID: String
+        run: FolderMeasurementRun
     ) {
-        let wasCancelled = folderMeasurementWasCancelled
+        cleanupFolderMeasurementInputFile(run)
+        guard folderMeasurementRuns[run.cacheKey] === run else { return }
+        let wasCancelled = run.wasCancelled
+        let finishedOperation = run.operation
+        let folderID = run.folderID
         synchronizeSharedSessionFromDisk()
-        cleanupFolderMeasurementInputFile()
-        folderMeasurementProcess = nil
-        folderMeasurementOperation = nil
-        folderMeasurementWasCancelled = false
-        isMeasuringFolder = false
-        measuringFolderID = nil
-        measuringFolderCacheKey = nil
+        folderMeasurementRuns.removeValue(forKey: run.cacheKey)
+        updateFolderMeasurementActivity()
         guard !isClosingWindow else { return }
+        defer {
+            presentDeferredLoginIfNeeded()
+            startPendingQuotaRefreshIfNeeded()
+            scheduleFolderSizeRepair()
+        }
+        guard run.accountID == folderMeasurementAccountID else { return }
+        if case .shareMeasure(let request, _, let linkID) = finishedOperation {
+            guard sharedLinkSessions[linkID]?.access.url == request.url else { return }
+        }
 
         if wasCancelled {
             if !isRunning {
@@ -12696,9 +17148,9 @@ final class DownloaderModel: ObservableObject {
                 report: report,
                 folderID: folderID,
                 linkID: linkID,
-                scanRevision: folderMeasurementStartRevision,
-                scanAccountID: folderMeasurementStartAccountID,
-                usedCachedSubfolders: folderMeasurementUsesCachedSubfolders
+                scanRevision: run.revision,
+                scanAccountID: run.accountID,
+                usedCachedSubfolders: run.usesCachedSubfolders
             )
         } else {
             let failure = engineErrorPresentation(
@@ -12717,32 +17169,6 @@ final class DownloaderModel: ObservableObject {
         // Keep the original arguments so a failed seeded repair retries as a
         // seeded repair rather than as a walk of the whole tree.
         if !wasCancelled, exitCode != 0 { scheduleOperationRetry(arguments: arguments, operation: finishedOperation) }
-        presentDeferredLoginIfNeeded()
-        startPendingQuotaRefreshIfNeeded()
-        startNextPendingFolderMeasurementIfNeeded()
-        scheduleFolderSizeRepair()
-    }
-
-    private func startNextPendingFolderMeasurementIfNeeded() {
-        guard
-            folderMeasurementProcess?.isRunning != true,
-            !isMeasuringFolder,
-            !isLoginPresented,
-            deferredLoginReason == nil,
-            !pendingFolderMeasurementRequests.isEmpty
-        else { return }
-
-        let next = pendingFolderMeasurementRequests.removeFirst()
-        queuedFolderMeasurementCacheKeys.remove(next.cacheKey)
-        runFolderMeasurementEngine(
-            arguments: next.arguments,
-            operation: next.operation
-        )
-    }
-
-    private func clearPendingFolderMeasurements() {
-        pendingFolderMeasurementRequests.removeAll(keepingCapacity: false)
-        queuedFolderMeasurementCacheKeys.removeAll(keepingCapacity: false)
     }
 
     /// Run uploads independently from the foreground browser engine. The
@@ -12870,7 +17296,6 @@ final class DownloaderModel: ObservableObject {
             }
             statusIsError = false
             statusErrorDiagnostic = nil
-            if !isDownloading { log = "" }
             if !isRunning {
                 status = "Preparing local files for upload…"
             }
@@ -12906,6 +17331,12 @@ final class DownloaderModel: ObservableObject {
         let wasCancelled = cancelAllUploadsRequested
         let wasStopped = uploadRequestedStop || wasCancelled
         let finishedBatchID = activeUploadBatchID
+        let outcomeIsUnknown = TransferFailure.hasUncertainMutation(
+            NSError(domain: "PikPakUpload", code: Int(exitCode), userInfo: [NSLocalizedDescriptionKey: errorOutput]))
+        if outcomeIsUnknown, let id = finishedBatchID, let index = savedUploadBatches.firstIndex(where: { $0.id == id }) {
+            savedUploadBatches[index].automaticallyResume = false
+            automaticUploadBatchIDs.remove(id)
+        }
         if !uploadUndoMutations.isEmpty {
             fileUndoHistory.record(FinderUndoEntry(title: "Upload", mutations: uploadUndoMutations,
                                                   uploadBatchID: activeUploadBatchID))
@@ -12968,7 +17399,7 @@ final class DownloaderModel: ObservableObject {
 
         stopTransferMetricsTaskIfIdle()
         if !wasStopped {
-            if exitCode != 0, let id = finishedBatchID {
+            if exitCode != 0, !outcomeIsUnknown, let id = finishedBatchID {
                 scheduleAutomaticUploadRetry(id)
             } else {
                 uploadRetryAttempt = 0
@@ -13102,15 +17533,10 @@ final class DownloaderModel: ObservableObject {
                 guard !data.isEmpty else { return }
                 stdoutBuffer.append(data)
             }
-            stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            stderr.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 guard !data.isEmpty else { return }
                 stderrBuffer.append(data)
-                if let text = String(data: data, encoding: .utf8) {
-                    DispatchQueue.main.async {
-                        self?.appendOutput(self?.redactedEngineOutput(text) ?? text)
-                    }
-                }
             }
 
             process.terminationHandler = { [weak self] finishedProcess in
@@ -13203,6 +17629,7 @@ final class DownloaderModel: ObservableObject {
         if stoppedForLogin {
             markSharedLinkFailed(linkID, message: "Sign in again, then select Retry.")
         } else if exitCode == 0 {
+            if !errorOutput.isEmpty { appendOutput(errorOutput) }
             finishInitialSharedLinkPage(
                 output: structuredOutput,
                 linkID: linkID
@@ -13224,9 +17651,9 @@ final class DownloaderModel: ObservableObject {
                 setShareLinkFeedback("Could not open this link. \(failure.summary)", tone: .error)
                 setError(failure.summary, diagnostic: failure.diagnostic)
             } else {
-                appendOutput(
-                    "A shared link could not be opened.\n\(failure.diagnostic.displayText)\n"
-                )
+                activityLog.record(redactedEngineOutput(
+                    "Saved share link unavailable: \(failure.summary)\nDownloads of saved account copies will try a replacement share link."
+                ), level: .warning)
             }
             handleWebLoginNeeded(for: errorOutput)
         }
@@ -13367,6 +17794,8 @@ final class DownloaderModel: ObservableObject {
         guard !isClosingWindow, !isChangingAccount, let key = operationRetryKey(operation),
               operationRetryTasks[key] == nil else { return }
         let context = fileOpenContext
+        let accountID = folderMeasurementAccountID
+        let isMeasurement: Bool = { switch operation { case .measure, .shareMeasure: return true; default: return false } }()
         let link = activeSharedLinkID, shared = isBrowsingSharedLink
         let attempt = operationRetryAttempts[key] ?? 0
         let delay = AutomaticRecovery.delay(attempt: attempt)
@@ -13375,7 +17804,13 @@ final class DownloaderModel: ObservableObject {
             do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return }
             guard let self else { return }
             self.operationRetryTasks[key] = nil
-            guard !Task.isCancelled, !self.isClosingWindow, self.fileOpenContext == context else { return }
+            guard !Task.isCancelled, !self.isClosingWindow else { return }
+            if isMeasurement {
+                guard self.folderMeasurementAccountID == accountID else { return }
+                if case .shareMeasure(let request, _, let linkID) = operation {
+                    guard self.sharedLinkSessions[linkID]?.access.url == request.url else { return }
+                }
+            } else if self.fileOpenContext != context { return }
             switch operation {
             case .preview(let id), .sharePreview(_, let id):
                 guard self.selectedBrowserItemID == id, self.isBrowsingSharedLink == shared,
@@ -13384,7 +17819,8 @@ final class DownloaderModel: ObservableObject {
                 guard self.isBrowsingSharedLink == shared, !shared || self.activeSharedLinkID == link else { return }
             default: break
             }
-            guard self.hasUsableSession, !self.isRunning, !self.hasExclusiveBackgroundTask else {
+            guard self.hasUsableSession, !self.isLoginPresented, self.deferredLoginReason == nil,
+                  isMeasurement || (!self.isRunning && !self.hasExclusiveBackgroundTask) else {
                 self.scheduleOperationRetry(arguments: arguments, operation: operation); return
             }
             switch operation {
@@ -13407,8 +17843,15 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func runEngine(arguments: [String], operation: Operation, retrying: Bool = false) {
+        guard !isClosingWindow else { return }
         if !retrying, let key = operationRetryKey(operation) { cancelOperationRetries(prefix: key) }
         guard !isChangingAccount else { return }
+        switch operation {
+        case .measure, .shareMeasure:
+            runFolderMeasurementEngine(arguments: arguments, operation: operation)
+            return
+        default: break
+        }
         if case .archiveInspect(let request, let item) = operation {
             inspectArchive(item, password: request.password)
             return
@@ -13418,6 +17861,17 @@ final class DownloaderModel: ObservableObject {
             return
         }
         guard !isRunning else { return }
+        switch operation {
+        case .download, .shareDownload:
+            let output = arguments.firstIndex(of: "--output").flatMap { index in
+                arguments.indices.contains(index + 1) ? URL(fileURLWithPath: arguments[index + 1], isDirectory: true) : nil
+            } ?? outputURL
+            guard downloadDestinationIsReady(output) else {
+                if let downloadDestinationStatus { setError(downloadDestinationStatus) }
+                return
+            }
+        default: break
+        }
         operationArguments = arguments
         if hasExclusiveBackgroundTask {
             switch operation {
@@ -13548,8 +18002,8 @@ final class DownloaderModel: ObservableObject {
             let stdout = Pipe()
             let stderr = Pipe()
             let stdoutBuffer = ProcessOutputBuffer()
-            let stderrBuffer = ProcessOutputBuffer()
-            let stdoutLineBuffer = ProcessLineBuffer()
+            let stderrBuffer = ProcessOutputBuffer(maximumBytes: 512 * 1024)
+            let progressLines = OrderedProcessLines()
             let stderrLineBuffer = ProcessLineBuffer()
             let structured = operation.hasStructuredOutput
             let tracksDownloadProgress: Bool
@@ -13585,6 +18039,14 @@ final class DownloaderModel: ObservableObject {
             process.currentDirectoryURL = exchangeDirectory
 
             var environment = try engineEnvironment()
+            if tracksDownloadProgress {
+                environment = Self.transferDownloadEnvironment(environment)
+                environment = finderSettings.downloadBufferEnvironment(environment)
+                let destination = effectiveArguments.firstIndex(of: "--output").flatMap { index in
+                    effectiveArguments.indices.contains(index + 1) ? URL(fileURLWithPath: effectiveArguments[index + 1], isDirectory: true) : nil
+                } ?? outputURL
+                environment = DownloadDestinationPolicy.environment(applying: ExternalVolume.bufferedKind(destination), to: environment)
+            }
             let proxy = proxyURL.trimmingCharacters(in: .whitespacesAndNewlines)
             if proxy.isEmpty {
                 environment.removeValue(forKey: "PIKPAK_PROXY")
@@ -13594,31 +18056,21 @@ final class DownloaderModel: ObservableObject {
             process.environment = environment
 
             stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                guard !data.isEmpty else { return }
-                if structured {
-                    stdoutBuffer.append(data)
-                } else if tracksDownloadProgress || tracksUploadProgress {
-                    if tracksDownloadProgress {
-                        // Keep an ordered source of truth for the final
-                        // dashboard in addition to the live line callbacks.
-                        stdoutBuffer.append(data)
-                    }
-                    let lines = stdoutLineBuffer.append(data)
-                    guard !lines.isEmpty else { return }
-                    DispatchQueue.main.async {
-                        for line in lines {
-                            if tracksDownloadProgress {
-                                self?.handleDownloadOutputLine(line)
-                            } else {
-                                self?.handleUploadOutputLine(line)
-                            }
+                if tracksDownloadProgress || tracksUploadProgress {
+                    progressLines.read(handle) { lines in
+                        DispatchQueue.main.async {
+                            guard let self, self.process === process else { return }
+                            if tracksDownloadProgress { self.enqueueDownloadOutputLines(lines) }
+                            else { for line in lines { self.handleUploadOutputLine(line) } }
                         }
                     }
-                } else if let text = String(data: data, encoding: .utf8) {
-                    DispatchQueue.main.async {
-                        self?.appendOutput(text)
-                    }
+                    return
+                }
+                let data = handle.availableData
+                guard !data.isEmpty else { return }
+                if structured { stdoutBuffer.append(data) }
+                else if let text = String(data: data, encoding: .utf8) {
+                    DispatchQueue.main.async { self?.appendOutput(text) }
                 }
             }
             stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -13654,9 +18106,9 @@ final class DownloaderModel: ObservableObject {
             process.terminationHandler = { [weak self] finishedProcess in
                 stdout.fileHandleForReading.readabilityHandler = nil
                 stderr.fileHandleForReading.readabilityHandler = nil
-                let trailingOutput = stdout.fileHandleForReading.readDataToEndOfFile()
+                let trailingOutput = tracksDownloadProgress || tracksUploadProgress ? Data() : stdout.fileHandleForReading.readDataToEndOfFile()
                 let trailingError = stderr.fileHandleForReading.readDataToEndOfFile()
-                if structured || tracksDownloadProgress {
+                if structured {
                     stdoutBuffer.append(trailingOutput)
                 }
                 let trailingDuplicateLines: [String]
@@ -13676,18 +18128,13 @@ final class DownloaderModel: ObservableObject {
                 }
                 let trailingOutputText = String(data: trailingOutput, encoding: .utf8) ?? ""
                 let trailingErrorText = String(data: trailingError, encoding: .utf8) ?? ""
-                let trailingDownloadLines: [String]
-                if tracksDownloadProgress || tracksUploadProgress {
-                    trailingDownloadLines = stdoutLineBuffer.append(trailingOutput) + stdoutLineBuffer.drain()
-                } else {
-                    trailingDownloadLines = []
-                }
                 let structuredOutput = stdoutBuffer.string()
                 let errorOutput = stderrBuffer.string()
-                DispatchQueue.main.async {
-                    guard let self else { return }
+                let deliverCompletion: ([String]) -> Void = { trailingDownloadLines in
+                  DispatchQueue.main.async {
+                    guard let self, self.process === finishedProcess else { return }
                     if tracksDownloadProgress {
-                        self.replayDownloadProgress(from: structuredOutput)
+                        self.enqueueDownloadOutputLines(trailingDownloadLines)
                     } else if tracksUploadProgress {
                         for line in trailingDownloadLines {
                             self.handleUploadOutputLine(line)
@@ -13706,12 +18153,24 @@ final class DownloaderModel: ObservableObject {
                     } else if !trailingErrorText.isEmpty {
                         self.appendOutput(self.redactedEngineOutput(trailingErrorText))
                     }
+                    if tracksDownloadProgress {
+                        self.drainDownloadOutputLines { [weak self] in
+                            guard let self, self.process === finishedProcess else { return }
+                            self.finishProcess(exitCode: finishedProcess.terminationStatus,
+                                structuredOutput: structuredOutput, errorOutput: errorOutput)
+                        }
+                    } else {
                     self.finishProcess(
                         exitCode: finishedProcess.terminationStatus,
                         structuredOutput: structuredOutput,
                         errorOutput: errorOutput
                     )
+                    }
+                  }
                 }
+                if tracksDownloadProgress || tracksUploadProgress {
+                    progressLines.finish(stdout.fileHandleForReading, deliver: deliverCompletion)
+                } else { deliverCompletion([]) }
             }
 
             self.process = process
@@ -13730,9 +18189,6 @@ final class DownloaderModel: ObservableObject {
             isMovingBrowserItems = false
             statusIsError = false
             statusErrorDiagnostic = nil
-            if !structured {
-                log = ""
-            }
             switch operation {
             case .quota(let announcesResult):
                 isQuotaLoading = true
@@ -13863,14 +18319,10 @@ final class DownloaderModel: ObservableObject {
                 storageQuotaError = "Storage information could not be loaded."
             }
             if case .measure = operation {
-                isMeasuringFolder = false
-                measuringFolderID = nil
-                measuringFolderCacheKey = nil
+                updateFolderMeasurementActivity()
             }
             if case .shareMeasure = operation {
-                isMeasuringFolder = false
-                measuringFolderID = nil
-                measuringFolderCacheKey = nil
+                updateFolderMeasurementActivity()
             }
             isDeletingDuplicates = false
             if case .emptyFolders = operation {
@@ -13978,14 +18430,10 @@ final class DownloaderModel: ObservableObject {
             isQuotaLoading = false
         }
         if case .some(.measure) = completedOperation {
-            isMeasuringFolder = false
-            measuringFolderID = nil
-            measuringFolderCacheKey = nil
+            updateFolderMeasurementActivity()
         }
         if case .some(.shareMeasure) = completedOperation {
-            isMeasuringFolder = false
-            measuringFolderID = nil
-            measuringFolderCacheKey = nil
+            updateFolderMeasurementActivity()
         }
         isDeletingDuplicates = false
         if case .some(.emptyFolders) = completedOperation {
@@ -14396,24 +18844,35 @@ final class DownloaderModel: ObservableObject {
         downloadCompletedFiles = 0
         downloadSkippedFiles = 0
         downloadFailedFiles = 0
+        resetDownloadFailureTracking()
+        discoveredBytesByRoot = [:]
         downloadBytesPerSecond = 0
         downloadQueueTransfers = []
         downloadQueueOffset = 0
-        downloadingTransfers = []
         completedDownloadTransfers = []
         activeDownloadTransfers = [:]
         queuedDownloadIDs = []
         settledDownloadIDs = []
+        downloadSettledStates = [:]
+        downloadSettledBytesByID = [:]
+        downloadRetryTargets = [:]
+        automaticDownloadRetryOrigins = retainedDownloadRetryOrigins(for: activeDownloadRequests + pendingDownloadRequests + interruptedDownloadRequests)
+        individuallyRetriedDownloadRequestIDs = []; fullyDiscoveredDownloadRequestIDs = []
+        excludedDownloadPlanIDs = []
         settledDownloadBytes = 0
         settledDownloadNetworkBytes = 0
         downloadNetworkBaselines = [:]
         downloadNetworkBytesByID = [:]
         downloadFileTotalsByID = [:]
         downloadFileRates = [:]
+        restartDownloadSpeedCounter(at: Date())
         downloadNetworkTransferredBytes = 0
-        lastDownloadSpeedSampleDate = Date()
-        lastDownloadSpeedSampleBytes = 0
-        lastDownloadNetworkProgressDate = nil
+        downloadHelperReceivedBytes = nil
+        downloadBufferUsage = nil
+        downloadDiagnosticRates = DownloadDiagnosticRates()
+        downloadDiagnosticMetrics = [:]
+        downloadRate.restart(bytes: 0, at: Date())
+        publishDownloadTransferRows()
     }
 
     private func resetUploadProgress(
@@ -14490,9 +18949,7 @@ final class DownloaderModel: ObservableObject {
         )
         let lines = Array(pendingDownloadOutputLines.prefix(count))
         pendingDownloadOutputLines.removeFirst(count)
-        for line in lines {
-            handleDownloadOutputLine(line)
-        }
+        handleDownloadOutputBatch(lines)
         scheduleDownloadOutputFlush()
     }
 
@@ -14501,15 +18958,25 @@ final class DownloaderModel: ObservableObject {
         guard !pendingDownloadOutputLines.isEmpty else { return }
         let lines = pendingDownloadOutputLines
         pendingDownloadOutputLines.removeAll(keepingCapacity: true)
-        for line in lines {
-            handleDownloadOutputLine(line)
+        handleDownloadOutputBatch(lines)
+    }
+
+    private func handleDownloadOutputBatch(_ lines: [String]) {
+        downloadOutputBatchDepth += 1
+        defer {
+            downloadOutputBatchDepth -= 1
+            if downloadOutputBatchDepth == 0, downloadProgressPublicationDeferred {
+                downloadProgressPublicationDeferred = false
+                publishDownloadProgress()
+            }
         }
+        for line in lines { handleDownloadOutputLine(line) }
     }
 
     private func handleDownloadOutputLine(_ rawLine: String) {
         // A pipe callback can already be queued on the main actor when the
         // process exits. Ignore that stale callback after finalization; the
-        // termination path deterministically replays the complete transcript.
+        // ordered EOF path has already delivered every prior event.
         guard isDownloading else { return }
         let line = rawLine.trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
         let prefix = "@pikpak-progress:"
@@ -14542,19 +19009,18 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
-    /// Rebuild the final dashboard from the engine's complete ordered stdout.
-    /// Live pipe callbacks make the UI responsive, but Process termination and
-    /// main-actor delivery can race. Replaying once before finalization ensures
-    /// no last progress event, completed row, or byte count is lost.
-    private func replayDownloadProgress(from output: String) {
-        resetDownloadProgress()
-        let prefix = "@pikpak-progress:"
-        for rawLine in output.split(whereSeparator: { $0.isNewline }) {
-            let line = String(rawLine)
-            guard line.hasPrefix(prefix),
-                  let event = decodeDownloadProgressEvent(line, prefix: prefix)
-            else { continue }
-            applyDownloadProgressEvent(event)
+    /// Finish in short batches so a large discovery backlog does not block
+    /// window input. OrderedProcessLines already guarantees event ordering.
+    private func drainDownloadOutputLines(completion: @escaping () -> Void) {
+        downloadOutputFlushScheduled = false
+        guard !pendingDownloadOutputLines.isEmpty else { completion(); return }
+        let count = min(pendingDownloadOutputLines.count, Self.downloadOutputBatchSize)
+        let batch = Array(pendingDownloadOutputLines.prefix(count))
+        pendingDownloadOutputLines.removeFirst(count)
+        handleDownloadOutputBatch(batch)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.drainDownloadOutputLines(completion: completion)
         }
     }
 
@@ -15219,7 +19685,7 @@ final class DownloaderModel: ObservableObject {
         transferMetricsTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
-                    try await Task.sleep(nanoseconds: 500_000_000)
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
                 } catch {
                     return
                 }
@@ -15236,13 +19702,10 @@ final class DownloaderModel: ObservableObject {
         transferMetricsTask = nil
     }
 
-    private func sampleTransferRates() {
-        let now = Date()
+    private func sampleTransferRates(at now: Date = Date()) {
         sampleDownloadRate(at: now)
         if sampleDownloadFileRates(at: now) {
-            downloadingTransfers = activeDownloadTransfers.values.sorted {
-                $0.name.localizedStandardCompare($1.name) == .orderedAscending
-            }
+            publishDownloadTransferRows()
         }
 
         if isUploading, !isUploadPaused, uploadRunState == .uploading {
@@ -15254,19 +19717,20 @@ final class DownloaderModel: ObservableObject {
                     : 0
                 let current = Double(delta) / interval
                 if delta > 0 {
-                    uploadBytesPerSecond = uploadBytesPerSecond > 0
+                    let speed = uploadBytesPerSecond > 0
                         ? uploadBytesPerSecond * 0.65 + current * 0.35
                         : current
+                    if uploadBytesPerSecond != speed { uploadBytesPerSecond = speed }
                 } else if lastUploadNetworkProgressDate.map({
                     now.timeIntervalSince($0) >= 2.0
                 }) ?? true {
-                    uploadBytesPerSecond = 0
+                    if uploadBytesPerSecond != 0 { uploadBytesPerSecond = 0 }
                 }
                 lastUploadSpeedSampleDate = now
                 lastUploadSpeedSampleBytes = uploadNetworkTransferredBytes
             }
         } else {
-            uploadBytesPerSecond = 0
+            if uploadBytesPerSecond != 0 { uploadBytesPerSecond = 0 }
             lastUploadSpeedSampleDate = now
             lastUploadSpeedSampleBytes = uploadNetworkTransferredBytes
         }
@@ -15280,19 +19744,20 @@ final class DownloaderModel: ObservableObject {
                     : 0
                 let current = Double(delta) / interval
                 if delta > 0 {
-                    uploadHashBytesPerSecond = uploadHashBytesPerSecond > 0
+                    let speed = uploadHashBytesPerSecond > 0
                         ? uploadHashBytesPerSecond * 0.65 + current * 0.35
                         : current
+                    if uploadHashBytesPerSecond != speed { uploadHashBytesPerSecond = speed }
                 } else if lastUploadHashProgressDate.map({
                     now.timeIntervalSince($0) >= 2.0
                 }) ?? true {
-                    uploadHashBytesPerSecond = 0
+                    if uploadHashBytesPerSecond != 0 { uploadHashBytesPerSecond = 0 }
                 }
                 lastUploadHashSpeedSampleDate = now
                 lastUploadHashSpeedSampleBytes = uploadHashedBytes
             }
         } else {
-            uploadHashBytesPerSecond = 0
+            if uploadHashBytesPerSecond != 0 { uploadHashBytesPerSecond = 0 }
             lastUploadHashSpeedSampleDate = now
             lastUploadHashSpeedSampleBytes = uploadHashedBytes
         }
@@ -15318,51 +19783,441 @@ final class DownloaderModel: ObservableObject {
         return changed
     }
 
+    /// The headline speed is the average of the last five seconds of network bytes, refreshed about once a second.
     private func sampleDownloadRate(at now: Date) {
-        guard isDownloading, downloadRunState == .downloading else {
-            downloadBytesPerSecond = 0
-            lastDownloadSpeedSampleDate = now
-            lastDownloadSpeedSampleBytes = downloadNetworkTransferredBytes
+        recordDownloadSpeedHistory(at: now)
+        guard isDownloading, downloadRunState == .downloading, activeDownloadCount > 0 else {
+            if downloadBytesPerSecond != 0 { downloadBytesPerSecond = 0 }
+            downloadRate.restart(bytes: downloadNetworkTransferredBytes, at: now)
             return
         }
+        guard let speed = downloadRate.sample(bytes: downloadNetworkTransferredBytes, at: now) else { return }
+        if downloadBytesPerSecond != speed { downloadBytesPerSecond = speed }
+    }
 
-        let previousDate = lastDownloadSpeedSampleDate ?? now
-        let interval = now.timeIntervalSince(previousDate)
-        guard interval >= 0.35 else { return }
-
-        let delta = downloadNetworkTransferredBytes >= lastDownloadSpeedSampleBytes
-            ? downloadNetworkTransferredBytes - lastDownloadSpeedSampleBytes
-            : 0
-        if delta > 0 {
-            let current = Double(delta) / interval
-            // A modest moving average keeps the readout readable without
-            // allowing a long-lived historical speed to distort the ETA.
-            downloadBytesPerSecond = downloadBytesPerSecond > 0
-                ? downloadBytesPerSecond * 0.55 + current * 0.45
-                : current
-        } else if lastDownloadNetworkProgressDate.map({
-            now.timeIntervalSince($0) >= 1.5
-        }) ?? true {
-            downloadBytesPerSecond = 0
+    /// Preparation needs sleep protection even before any network data arrives.
+    private var downloadReceptionIsEnabled: Bool {
+        guard isDownloading, !downloadsPaused else { return false }
+        var hasUnfinished = false
+        for transfer in activeDownloadTransfers.values {
+            switch transfer.state {
+            case .completed, .skipped, .failed: continue
+            case .queued, .preparing, .downloading, .retrying, .stopped:
+                hasUnfinished = true
+                if !pausedDownloadIDs.contains(transfer.id) { return true }
+            }
         }
-        lastDownloadSpeedSampleDate = now
-        lastDownloadSpeedSampleBytes = downloadNetworkTransferredBytes
+        return !hasUnfinished
+    }
+
+    /// Start with actual payload, excluding saved prefixes and startup work.
+    /// Once reception starts, stalls count toward the average; pauses do not.
+    var downloadSpeedChartIsRunning: Bool {
+        downloadReceptionIsEnabled && downloadNetworkTransferredBytes > 0
+    }
+
+    var downloadSpeedChartWaitingMessage: String? {
+        guard downloadReceptionIsEnabled, downloadNetworkTransferredBytes == 0,
+              downloadRunState != .stopping else { return nil }
+        return downloadVerification == nil ? "Preparing downloads…" : "Checking saved download progress…"
+    }
+
+    private func recordDownloadSpeedHistory(at now: Date) {
+        updateDownloadSleepPrevention()
+        if downloadSpeedTracker.observe(bytes: downloadNetworkTransferredBytes, active: downloadSpeedChartIsRunning, at: now) {
+            downloadSpeedHistory = downloadSpeedTracker.snapshot
+        }
+    }
+
+    private func updateDownloadSleepPrevention(receptionActive: Bool? = nil) {
+        let needed = !isClosingWindow && isDownloading
+            && (downloadDrainingForQuit || (receptionActive ?? downloadReceptionIsEnabled)
+                || downloadBufferUsage?.hasPendingDiskWork == true)
+        downloadSleepPrevention.setActive(needed)
+    }
+
+    private func restartDownloadSpeedCounter(at now: Date) {
+        // Capture the previous helper's final traffic before its counter resets.
+        _ = downloadSpeedTracker.observe(bytes: downloadNetworkTransferredBytes, active: false, at: now)
+        // Each new helper starts with no payload. Its setup time must not be
+        // charged to the previous helper's last active interval.
+        downloadSpeedTracker.restartCounter(at: now, active: false)
+        downloadSpeedHistory = downloadSpeedTracker.snapshot
+    }
+
+    /// A file is verifying from its first `file_verifying` event until any other event for it arrives.
+    private func updateDownloadVerification(_ event: DownloadProgressEvent) {
+        guard let id = event.fileId else { return }
+        if event.event == "file_verifying" {
+            verifyingDownloads[id] = (event.verifiedBytes ?? 0, event.totalBytes ?? 0)
+        } else if verifyingDownloads.removeValue(forKey: id) == nil {
+            return
+        }
+        let current = verifyingDownloads.values
+        let next = current.isEmpty ? nil : DownloadVerification(files: current.count,
+            verifiedBytes: current.reduce(0) { $0 + $1.verified }, totalBytes: current.reduce(0) { $0 + $1.total })
+        if next != downloadVerification { downloadVerification = next }
+    }
+
+    /// Uses the same aggregate counters and cached discovery estimates as the
+    /// download dashboard. It never traverses download paths or serializes rows.
+    private func recordDownloadMonitorSnapshot(_ event: DownloadProgressEvent, store: DownloadDiagnosticsStore) {
+        let estimate = downloadEstimatedTotal
+        let total = estimate?.totalBytes ?? downloadTotalBytes
+        let remaining = total > downloadDownloadedBytes ? total - downloadDownloadedBytes : 0
+        var values: [String: Double] = [
+            "build": Double(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0") ?? 0,
+            "downloaded_bytes": Double(downloadDownloadedBytes), "total_bytes": Double(total),
+            "remaining_bytes": Double(remaining), "estimated": estimate != nil ? 1 : 0,
+            "lower_bound": (estimate?.unmeasuredRoots ?? 0) > 0 ? 1 : 0,
+            "totals_incomplete": downloadTotalsAreIncomplete ? 1 : 0,
+            "total_files": Double(downloadTotalFiles), "completed_files": Double(downloadCompletedFiles),
+            "skipped_files": Double(downloadSkippedFiles), "failed_files": Double(downloadFailedFiles),
+            "active_files": Double(activeDownloadTransfers.count), "queued_downloads": Double(queuedDownloadCount),
+            "retrying_files": Double(retryingDownloadTransfers.count),
+            "reception_paused": downloadsPaused ? 1 : 0, "is_downloading": isDownloading ? 1 : 0,
+            "app_bytes_per_second": downloadBytesPerSecond,
+            "overall_bytes_per_second": downloadSpeedHistory.averageBytesPerSecond,
+            "ram_buffered_bytes": Double(event.bufferedBytes ?? 0), "ram_peak_bytes": Double(event.bufferPeakBytes ?? 0),
+            "ram_limit_bytes": Double(event.bufferLimitBytes ?? 0), "ram_configured_bytes": Double(event.bufferConfiguredBytes ?? 0),
+            "ram_reserve_bytes": Double(event.bufferReserveBytes ?? 0), "ram_memory_pressure": Double(event.bufferMemoryPressure ?? 0)
+        ]
+        if let fraction = downloadOverallFraction ?? downloadEstimatedFraction { values["fraction"] = fraction }
+        if downloadRunState == .downloading, downloadBytesPerSecond > 1, remaining > 0 {
+            values["eta_seconds"] = Double(remaining) / downloadBytesPerSecond
+        }
+        if let seconds = downloadSpeedHistory.estimatedSeconds(remainingBytes: remaining) {
+            values["chart_eta_seconds"] = seconds
+        }
+        if let t = event.diskTraffic {
+            values["pending_read_bytes"] = Double(t.pendingReadBytes)
+            values["reading_bytes"] = Double(t.readingBytes)
+            values["pending_read_tasks"] = Double(t.pendingReadTasks)
+            values["reading_tasks"] = Double(t.readingTasks)
+            values["read_drives"] = Double(t.readDrives)
+            values["write_drives"] = Double(t.writeDrives)
+            values["oldest_pending_read_ms"] = Double(t.oldestPendingMs ?? 0)
+            values["pending_write_bytes"] = Double(t.pendingWriteBytes ?? 0)
+            values["writing_bytes"] = Double(t.writingBytes ?? 0)
+            values["writing_tasks"] = Double(t.writingTasks ?? 0)
+            values["active_read_tasks"] = Double(t.activeReadTasks ?? 0)
+            values["active_write_tasks"] = Double(t.activeWriteTasks ?? 0)
+            values["ready_read_tasks"] = Double(t.readyReadTasks ?? 0)
+            values["ready_read_bytes"] = Double(t.readyReadBytes ?? 0)
+            values["turn_elapsed_ms"] = Double(t.turnElapsedMs ?? 0)
+            values["switch_wait_ms"] = Double(t.switchWaitMs ?? 0)
+            values["read_write_threshold_percent"] = Double(t.readWriteThresholdPercent ?? 0)
+            values["read_tasks_started"] = Double(t.readTasksStarted ?? 0)
+            values["read_tasks_finished"] = Double(t.readTasksFinished ?? 0)
+            values["read_work_added_bytes"] = Double(t.readWorkAddedBytes ?? 0)
+            values["read_work_processed_bytes"] = Double(t.readWorkProcessedBytes ?? 0)
+            values["read_work_removed_bytes"] = Double(t.readWorkRemovedBytes ?? 0)
+            values["prefetch_bytes"] = Double(t.prefetchBytes ?? 0)
+            values["prefetch_tasks"] = Double(t.prefetchTasks ?? 0)
+            values["prefetch_discarded_bytes"] = Double(t.prefetchDiscardedBytes ?? 0)
+            values["prefetch_active_slots"] = Double(t.prefetchActiveSlots ?? 0)
+            values["prefetch_contexts"] = Double(t.prefetchContexts ?? 0)
+            values["prefetch_receiver_limit"] = Double(t.prefetchReceiverLimit ?? 0)
+            values["prefetch_context_limit"] = Double(t.prefetchContextLimit ?? 0)
+            values["prefetch_finished"] = Double(t.prefetchFinished ?? 0)
+            values["prefetch_failed"] = Double(t.prefetchFailed ?? 0)
+            values["prefetch_empty_ends"] = Double(t.prefetchEmptyEnds ?? 0)
+            values["read_turns"] = Double(t.readTurns ?? 0)
+            values["write_turns"] = Double(t.writeTurns ?? 0)
+            values["receiving_tasks"] = Double(t.receivingTasks ?? 0)
+            values["ram_waiting_receivers"] = Double(t.ramWaitingReceivers ?? 0)
+            values["ram_wait_count"] = Double(t.ramWaitCount ?? 0)
+            values["ram_wait_total_ms"] = Double(t.ramWaitTotalMs ?? 0)
+            values["file_network_workers"] = Double(t.fileNetworkWorkers ?? 0)
+            values["file_worker_limit"] = Double(t.fileWorkerLimit ?? 0)
+            values["admitted_read_tasks"] = Double(t.admittedReadTasks ?? 0)
+            values["deferred_read_tasks"] = Double(t.deferredReadTasks ?? 0)
+            values["download_has_ready"] = t.downloadHasReady == true ? 1 : 0
+            values["waiting_writers"] = Double(t.waitingWriters ?? 0)
+            values["eligible_waiting_writers"] = Double(t.eligibleWaitingWriters ?? 0)
+            values["checkpoint_batch_pending"] = Double(t.checkpointBatchPending ?? 0)
+        }
+
+        for (key, value) in event.receiveDiagnostics ?? [:] where DownloadReceiveDiagnostics.keys.contains(key) {
+            values[key] = Double(value)
+        }
+        store.recordMonitor(values: values, helperPID: downloadProcess?.processIdentifier ?? 0)
+    }
+
+    private func recordDownloadDiagnostics(_ event: DownloadProgressEvent) {
+        guard let received = event.receivedBytes else { return }
+        let store = DownloadDiagnosticsStore.shared
+        store.recordLiveSpeed(receivedBytes: received, helperPID: downloadProcess?.processIdentifier ?? 0)
+        recordDownloadMonitorSnapshot(event, store: store)
+        let handoverHelperPID = downloadProcess?.processIdentifier ?? 0
+        if let traffic = event.diskTraffic, handoverHelperPID > 0,
+           let sequence = traffic.lastReadHandoverSequence, sequence > 0,
+           sequence != downloadDiagnosticHandoverSequence || handoverHelperPID != downloadDiagnosticHandoverHelperPID {
+            downloadDiagnosticHandoverSequence = sequence
+            downloadDiagnosticHandoverHelperPID = handoverHelperPID
+            // Persist each observed handover independently of the ten-second
+            // throughput summary, including its exact cause and retained work.
+            store.record(.storageWindow, values: [
+                "helper_pid": Double(handoverHelperPID), "last_read_handover_sequence": Double(sequence),
+                "last_read_handover_reason": Double(traffic.lastReadHandoverReason ?? 0),
+                "last_read_turn_ms": Double(traffic.lastReadTurnMs ?? 0),
+                "last_read_remaining_bytes": Double(traffic.lastReadRemainingBytes ?? 0),
+                "read_turn_timeouts": Double(traffic.readTurnTimeouts ?? 0),
+                "read_turn_finishes": Double(traffic.readTurnFinishes ?? 0),
+                "read_turn_pressure_handoffs": Double(traffic.readTurnPressureHandoffs ?? 0),
+                "read_turn_control_handoffs": Double(traffic.readTurnControlHandoffs ?? 0),
+                "read_turn_write_handoffs": Double(traffic.readTurnWriteHandoffs ?? 0),
+                "read_turn_idle_handoffs": Double(traffic.readTurnIdleHandoffs ?? 0),
+                "read_write_threshold_percent": Double(traffic.readWriteThresholdPercent ?? 0),
+                "last_read_pending_write_bytes": Double(traffic.lastReadPendingWriteBytes ?? 0),
+                "last_read_buffer_limit_bytes": Double(traffic.lastReadBufferLimitBytes ?? 0),
+                "ram_buffered_bytes": Double(event.bufferedBytes ?? 0)])
+        }
+        if !downloadDiagnosticSessionStarted {
+            downloadDiagnosticSessionStarted = true
+            store.record(.session, values: ["build": Double(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0") ?? 0,
+                "helper_pid": Double(downloadProcess?.processIdentifier ?? 0)])
+            activityLog.record("Anonymous download diagnostics are saved for up to eight days within 128 MiB. Use Open Saved Logs or Copy Diagnostics.", level: .info)
+        }
+        let kinds = ["resume_read", "final_read", "checkpoint", "retry_cache_hit", "retry_cache_miss", "checkpoint_wait", "checkpoint_sync", "payload_write",
+            "read_preparation", "read_queue_wait", "read_gate_wait", "read_turn_wait", "read_io", "read_hash", "scheduler_pass", "replay_read",
+            "resume_plan_new", "resume_plan_missing", "resume_plan_unverified", "resume_plan_length", "resume_plan_revision",
+            "resume_plan_source", "resume_plan_validator", "resume_plan_range", "resume_plan_accepted", "resume_plan_full",
+            "resume_plan_promoted", "resume_plan_tail"]
+        for (kind, metric) in event.diagnostics ?? [:] where kinds.contains(kind) {
+            if let old = downloadDiagnosticMetrics[kind] {
+                downloadDiagnosticMetrics[kind] = .init(count: old.count &+ metric.count, bytes: old.bytes &+ metric.bytes,
+                    elapsedMs: old.elapsedMs &+ metric.elapsedMs, maxMs: max(old.maxMs, metric.maxMs), failed: old.failed &+ metric.failed,
+                    active: metric.active,
+                    transferId: old.maxMs > metric.maxMs ? old.transferId : metric.transferId)
+            } else { downloadDiagnosticMetrics[kind] = metric }
+        }
+        guard var values = downloadDiagnosticRates.sample(bytes: received, at: Date()) else { return }
+        for (key, value) in event.receiveDiagnostics ?? [:] where DownloadReceiveDiagnostics.keys.contains(key) {
+            values[key] = Double(value)
+        }
+        values["active_files"] = Double(activeDownloadTransfers.count)
+        values["retrying_files"] = Double(activeDownloadTransfers.values.filter { if case .retrying = $0.state { return true }; return false }.count)
+        values["verifying_files"] = Double(verifyingDownloads.count)
+        values["ram_buffered_bytes"] = Double(event.bufferedBytes ?? 0)
+        values["ram_reserved_bytes"] = Double(event.bufferReservedBytes ?? event.bufferedBytes ?? 0)
+        values["ram_peak_bytes"] = Double(event.bufferPeakBytes ?? 0)
+        values["ram_limit_bytes"] = Double(event.bufferLimitBytes ?? 0)
+        values["ram_configured_bytes"] = Double(event.bufferConfiguredBytes ?? 0)
+        values["ram_reserve_bytes"] = Double(event.bufferReserveBytes ?? 0)
+        values["ram_memory_pressure"] = Double(event.bufferMemoryPressure ?? 0)
+        if let traffic = event.diskTraffic {
+            values["pending_read_bytes"] = Double(traffic.pendingReadBytes)
+            values["reading_bytes"] = Double(traffic.readingBytes)
+            values["pending_read_tasks"] = Double(traffic.pendingReadTasks)
+            values["reading_tasks"] = Double(traffic.readingTasks)
+            values["read_drives"] = Double(traffic.readDrives)
+            values["write_drives"] = Double(traffic.writeDrives)
+            values["read_batch_remaining_bytes"] = Double(traffic.batchRemainingBytes)
+            values["oldest_pending_read_ms"] = Double(traffic.oldestPendingMs ?? 0)
+            values["read_tasks_started"] = Double(traffic.readTasksStarted ?? 0)
+            values["read_tasks_finished"] = Double(traffic.readTasksFinished ?? 0)
+            values["read_work_added_bytes"] = Double(traffic.readWorkAddedBytes ?? 0)
+            values["read_work_processed_bytes"] = Double(traffic.readWorkProcessedBytes ?? 0)
+            values["read_work_removed_bytes"] = Double(traffic.readWorkRemovedBytes ?? 0)
+            values["prefetch_bytes"] = Double(traffic.prefetchBytes ?? 0)
+            values["prefetch_tasks"] = Double(traffic.prefetchTasks ?? 0)
+            values["prefetch_discarded_bytes"] = Double(traffic.prefetchDiscardedBytes ?? 0)
+            values["prefetch_active_slots"] = Double(traffic.prefetchActiveSlots ?? 0)
+            values["prefetch_contexts"] = Double(traffic.prefetchContexts ?? 0)
+            values["prefetch_receiver_limit"] = Double(traffic.prefetchReceiverLimit ?? 0)
+            values["prefetch_context_limit"] = Double(traffic.prefetchContextLimit ?? 0)
+            values["prefetch_finished"] = Double(traffic.prefetchFinished ?? 0)
+            values["prefetch_failed"] = Double(traffic.prefetchFailed ?? 0)
+            values["prefetch_empty_ends"] = Double(traffic.prefetchEmptyEnds ?? 0)
+            values["admitted_read_tasks"] = Double(traffic.admittedReadTasks ?? 0)
+            values["admitted_read_bytes"] = Double(traffic.admittedReadBytes ?? 0)
+            values["deferred_read_tasks"] = Double(traffic.deferredReadTasks ?? 0)
+            values["deferred_read_bytes"] = Double(traffic.deferredReadBytes ?? 0)
+            values["read_admission_deferrals"] = Double(traffic.readAdmissionDeferrals ?? 0)
+            values["receiving_tasks"] = Double(traffic.receivingTasks ?? 0)
+            values["ram_draining_tasks"] = Double(traffic.ramDrainingTasks ?? 0)
+            values["disk_only_tasks"] = Double(traffic.diskOnlyTasks ?? 0)
+            values["pending_write_bytes"] = Double(traffic.pendingWriteBytes ?? 0)
+            values["writing_bytes"] = Double(traffic.writingBytes ?? 0)
+            values["writing_tasks"] = Double(traffic.writingTasks ?? 0)
+            values["active_write_tasks"] = Double(traffic.activeWriteTasks ?? 0)
+            values["active_write_bytes"] = Double(traffic.activeWriteBytes ?? 0)
+            values["file_task_capacity"] = Double(traffic.fileTaskCapacity ?? 0)
+            values["file_task_capacity_reached"] = traffic.fileTaskCapacityReached == true ? 1 : 0
+            values["receiving_admission_waiters"] = Double(traffic.receivingAdmissionWaiters ?? 0)
+            values["read_turn_timeouts"] = Double(traffic.readTurnTimeouts ?? 0)
+            values["read_turn_finishes"] = Double(traffic.readTurnFinishes ?? 0)
+            values["read_turn_pressure_handoffs"] = Double(traffic.readTurnPressureHandoffs ?? 0)
+            values["read_turn_control_handoffs"] = Double(traffic.readTurnControlHandoffs ?? 0)
+            values["last_read_handover_sequence"] = Double(traffic.lastReadHandoverSequence ?? 0)
+            values["last_read_handover_reason"] = Double(traffic.lastReadHandoverReason ?? 0)
+            values["last_read_turn_ms"] = Double(traffic.lastReadTurnMs ?? 0)
+            values["last_read_remaining_bytes"] = Double(traffic.lastReadRemainingBytes ?? 0)
+            values["read_turn_write_handoffs"] = Double(traffic.readTurnWriteHandoffs ?? 0)
+            values["read_turn_idle_handoffs"] = Double(traffic.readTurnIdleHandoffs ?? 0)
+            values["read_write_threshold_percent"] = Double(traffic.readWriteThresholdPercent ?? 0)
+            values["read_write_threshold_bytes"] = Double(traffic.readWriteThresholdBytes ?? 0)
+            values["last_read_pending_write_bytes"] = Double(traffic.lastReadPendingWriteBytes ?? 0)
+            values["last_read_buffer_limit_bytes"] = Double(traffic.lastReadBufferLimitBytes ?? 0)
+            values["waiting_writers"] = Double(traffic.waitingWriters ?? 0)
+            values["write_dispatch_polls"] = Double(traffic.writeDispatchPolls ?? 0)
+            values["eligible_waiting_writers"] = Double(traffic.eligibleWaitingWriters ?? 0)
+            values["turn_elapsed_ms"] = Double(traffic.turnElapsedMs ?? 0)
+            values["turn_target_ms"] = Double(traffic.turnTargetMs ?? 0)
+            values["ready_read_tasks"] = Double(traffic.readyReadTasks ?? 0)
+            values["ready_read_bytes"] = Double(traffic.readyReadBytes ?? 0)
+            values["active_read_tasks"] = Double(traffic.activeReadTasks ?? 0)
+            values["active_read_bytes"] = Double(traffic.activeReadBytes ?? 0)
+            values["switch_wait_ms"] = Double(traffic.switchWaitMs ?? 0)
+            values["read_turns"] = Double(traffic.readTurns ?? 0)
+            values["write_turns"] = Double(traffic.writeTurns ?? 0)
+            values["backlog_drives"] = Double(traffic.backlogDrives ?? 0)
+            values["file_worker_limit"] = Double(traffic.fileWorkerLimit ?? 0)
+            values["file_network_workers"] = Double(traffic.fileNetworkWorkers ?? 0)
+            values["queued_downloads"] = Double(traffic.queuedDownloads ?? 0)
+            values["download_has_ready"] = traffic.downloadHasReady == true ? 1 : 0
+            values["ram_waiting_receivers"] = Double(traffic.ramWaitingReceivers ?? 0)
+            values["ram_wait_count"] = Double(traffic.ramWaitCount ?? 0)
+            values["ram_wait_total_ms"] = Double(traffic.ramWaitTotalMs ?? 0)
+            values["ram_wait_max_ms"] = Double(traffic.ramWaitMaxMs ?? 0)
+            values["checkpoint_batches"] = Double(traffic.checkpointBatches ?? 0)
+            values["checkpoint_batched_files"] = Double(traffic.checkpointBatchedFiles ?? 0)
+            values["checkpoint_barriers"] = Double(traffic.checkpointBarriers ?? 0)
+            values["checkpoint_batch_total_ms"] = Double(traffic.checkpointBatchTotalMs ?? 0)
+            values["checkpoint_batch_pending"] = Double(traffic.checkpointBatchPending ?? 0)
+        }
+        let metrics = downloadDiagnosticMetrics
+        downloadDiagnosticMetrics = [:]
+        for (kind, metric) in metrics {
+            values[kind + "_count"] = Double(metric.count)
+            values[kind + "_bytes"] = Double(metric.bytes)
+            if kind.hasPrefix("resume_plan_") { continue }
+            values[kind + "_total_ms"] = Double(metric.elapsedMs)
+            values[kind + "_max_ms"] = Double(metric.maxMs)
+            values[kind + "_failed"] = Double(metric.failed)
+            values[kind + "_active"] = Double(metric.active ?? 0)
+            if metric.maxMs >= 1_000 {
+                store.record(.slowOperation, transferID: metric.transferId,
+                    values: [kind + "_max_ms": Double(metric.maxMs), kind + "_count": Double(metric.count)])
+            }
+        }
+        store.record(.downloadWindow, values: values)
+        func mib(_ bytes: Double) -> String { String(format: "%.1f", bytes / 1_048_576) }
+        let message = "Downloads: \(mib(values["bytes_per_second"] ?? 0)) MiB/s (1s min \(mib(values["min_bytes_per_second"] ?? 0)), max \(mib(values["max_bytes_per_second"] ?? 0))); "
+            + DownloadReceiveDiagnostics.summary(values) + "; "
+            + "saved-prefix reads \(mib(values["resume_read_bytes"] ?? 0)) MiB, final checks \(mib(values["final_read_bytes"] ?? 0)) MiB, prefix comparisons \(mib(values["replay_read_bytes"] ?? 0)) MiB; "
+            + "range resumes \(Int(values["resume_plan_accepted_count"] ?? 0)) accepted / \(Int(values["resume_plan_full_count"] ?? 0)) full responses, missing checkpoints \(Int(values["resume_plan_missing_count"] ?? 0)), changed sources \(Int(values["resume_plan_source_count"] ?? 0)); "
+            + "saved comparison progress \(Int(values["resume_plan_promoted_count"] ?? 0)), retained-tail resumes \(Int(values["resume_plan_tail_count"] ?? 0)); "
+            + "retry cache \(metrics["retry_cache_hit"]?.count ?? 0) hits / \(metrics["retry_cache_miss"]?.count ?? 0) misses; "
+            + "checkpoint wait \(String(format: "%.2f", Double(metrics["checkpoint_wait"]?.maxMs ?? 0) / 1_000))s, disk save \(String(format: "%.2f", Double(metrics["checkpoint_sync"]?.maxMs ?? 0) / 1_000))s; "
+            + "group commits \(Int(values["checkpoint_batched_files"] ?? 0)) files / \(Int(values["checkpoint_batches"] ?? 0)) batches / \(Int(values["checkpoint_barriers"] ?? 0)) cache flushes, \(Int(values["checkpoint_batch_pending"] ?? 0)) pending; "
+            + "RAM \(mib(values["ram_buffered_bytes"] ?? 0))/\(mib(values["ram_limit_bytes"] ?? 0)) MiB (\(mib(values["ram_reserved_bytes"] ?? 0)) MiB reserved); "
+            + "\(Int(values["receiving_tasks"] ?? 0)) receiving, \(Int(values["ram_draining_tasks"] ?? 0)) draining RAM, \(Int(values["disk_only_tasks"] ?? 0)) preparing/checking disk; "
+            + "network workers \(Int(values["file_network_workers"] ?? 0))/\(Int(values["file_worker_limit"] ?? 0)), \(Int(values["queued_downloads"] ?? 0)) queued; RAM waits \(Int(values["ram_waiting_receivers"] ?? 0)); "
+            + "pending reads \(mib(values["pending_read_bytes"] ?? 0)) MiB, oldest wait \(String(format: "%.1f", (values["oldest_pending_read_ms"] ?? 0) / 1_000))s; "
+            + "pending writes \(mib(values["pending_write_bytes"] ?? 0)) MiB, writing \(mib(values["writing_bytes"] ?? 0)) MiB; "
+            + "writer queue \(Int(values["waiting_writers"] ?? 0)) waiting / \(Int(values["eligible_waiting_writers"] ?? 0)) eligible, \(Int(values["write_dispatch_polls"] ?? 0)) dispatch polls; "
+            + "\(Int(values["ready_read_tasks"] ?? 0)) ready reads (\(mib(values["ready_read_bytes"] ?? 0)) MiB); "
+            + "\(event.diskTraffic?.turnSummary ?? "Turn unavailable"), I/O handover wait \(Int((values["switch_wait_ms"] ?? 0) / 1_000))s; "
+            + (event.diskTraffic?.lastReadHandoverSummary.map { $0 + "; " } ?? "")
+            + "read stages max: preparation \(Int((values["read_preparation_max_ms"] ?? 0) / 1_000))s, queue \(Int((values["read_queue_wait_max_ms"] ?? 0) / 1_000))s, gate \(Int((values["read_gate_wait_max_ms"] ?? 0) / 1_000))s; "
+            + "read I/O \(Int(values["read_io_total_ms"] ?? 0))ms, hashing \(Int(values["read_hash_total_ms"] ?? 0))ms, scheduler max \(Int(values["scheduler_pass_max_ms"] ?? 0))ms; "
+            + "\(Int(values["active_files"] ?? 0)) active, \(Int(values["retrying_files"] ?? 0)) retrying."
+        activityLog.record(message, level: (metrics["checkpoint"]?.maxMs ?? 0) >= 1_000
+            || (values["oldest_pending_read_ms"] ?? 0) >= 60_000 ? .warning : .info)
+        if store.writeFailureCount != downloadDiagnosticLogFailuresSeen {
+            downloadDiagnosticLogFailuresSeen = store.writeFailureCount
+            activityLog.record("Saved diagnostic logging encountered a storage error. Downloads continue; recent activity remains visible here.", level: .warning)
+        }
+        let rootPID = getpid()
+        let helperPID = downloadProcess?.processIdentifier ?? 0
+        Task.detached(priority: .utility) {
+            let processes = TaskResourceSampler.sample(rootPID: rootPID)
+            let ui = processes.filter { $0.pid == rootPID }
+            let helpers = processes.filter { $0.pid != rootPID }
+            var counters: [String: Double] = ["helper_pid": Double(helperPID), "helper_processes": Double(helpers.count)]
+            for (role, rows) in [("interface", ui), ("helpers", helpers)] {
+                if rows.allSatisfy({ $0.diskReadBytes != nil && $0.diskWrittenBytes != nil }) {
+                    counters[role + "_read_bytes"] = rows.reduce(0) { $0 + Double($1.diskReadBytes ?? 0) }
+                    counters[role + "_written_bytes"] = rows.reduce(0) { $0 + Double($1.diskWrittenBytes ?? 0) }
+                }
+            }
+            store.record(.storageWindow, values: counters)
+            for disk in TaskDiskSampler.sample() {
+                guard let read = disk.readBytes, let written = disk.writtenBytes else { continue }
+                store.record(.storageWindow, transferID: "disk:\(disk.id)", values: ["read_bytes": Double(read), "written_bytes": Double(written),
+                    "device_unit": Double(disk.device.dropFirst(4)) ?? -1, "rotating": disk.medium == "HDD" ? 1 : 0])
+            }
+        }
     }
 
     private func applyDownloadProgressEvent(_ event: DownloadProgressEvent) {
+        // Buffered progress can arrive after Cancel has already removed the
+        // durable selection. It must never recreate that selection's rows.
+        guard !cancelAllDownloadsRequested,
+              event.requestId.map({ !cancelledDownloadRequestIDs.contains($0) }) ?? true,
+              event.fileId.map({ !cancelledDownloadIDs.contains($0) }) ?? true else { return }
+        if event.event == "network_sample" {
+            if let used = event.bufferedBytes, let limit = event.bufferLimitBytes {
+                downloadBufferUsage = .init(used: used, peak: event.bufferPeakBytes ?? used, limit: limit,
+                    configured: event.bufferConfiguredBytes ?? limit, reserve: event.bufferReserveBytes ?? 0,
+                    pressure: event.bufferMemoryPressure ?? 1, receivedAt: Date(), traffic: event.diskTraffic)
+            }
+            if let received = event.receivedBytes {
+                downloadHelperReceivedBytes = max(downloadHelperReceivedBytes ?? 0, received)
+                downloadNetworkTransferredBytes = max(downloadNetworkTransferredBytes, received)
+                sampleDownloadRate(at: Date())
+            }
+            recordDownloadDiagnostics(event)
+            return
+        }
+        if event.event == "file_retrying", let attempt = event.attempt,
+           attempt > 0, attempt == 1 || (attempt & (attempt - 1)) == 0 {
+            let store = DownloadDiagnosticsStore.shared
+            let reason = DownloadDiagnosticReason.classify(event.error, storage: event.destinationUnavailable == true)
+            store.record(.retry, transferID: event.fileId, reason: reason, values: ["attempt": Double(attempt),
+                "retry_ms": Double(event.retryInMillis ?? 0), "destination_unavailable": event.destinationUnavailable == true ? 1 : 0])
+            let id = event.fileId.map(store.anonymousID) ?? "queue"
+            activityLog.record("Download \(id): retry \(attempt) (\(reason.rawValue)), next attempt in \(Double(event.retryInMillis ?? 0) / 1_000)s.", level: .debug)
+        }
+        if event.event == "file_completed" || event.event == "file_failed" {
+            DownloadDiagnosticsStore.shared.record(event.event == "file_completed" ? .completed : .failed,
+                transferID: event.fileId, reason: event.event == "file_failed" ? .classify(event.error,
+                    storage: event.destinationUnavailable == true, permanent: event.permanent != nil) : nil,
+                values: ["received_bytes": Double(event.transferredBytes ?? 0), "total_bytes": Double(event.totalBytes ?? 0)])
+        }
+        updateDownloadVerification(event)
+        if event.destinationUnavailable == true, isDownloading, !downloadDestinationRestartPending {
+            for key in downloadRecoveryKeys(event) {
+                let attempt = downloadDestinationRecoveryAttempts[key] ?? 0
+                downloadDestinationRecoveryAttempts[key] = AutomaticRecovery.nextAttempt(attempt)
+                if attempt > 0 {
+                    downloadDestinationRetryUntil[key] = Date().addingTimeInterval(AutomaticRecovery.delay(attempt: attempt - 1))
+                }
+            }
+            downloadDestinationRestartPending = true
+            downloadDestinationStatus = "The download destination is unavailable. Reconnect the original disk or restore folder access; downloads will continue automatically."
+            stop(automatic: true)
+            if let downloadDestinationStatus { setError(downloadDestinationStatus) }
+        }
         switch event.event {
         case "request_started":
             if let id = event.requestId, submittedDownloadRequests[id] != nil {
                 discoveringDownloadRequestIDs.insert(id)
+                fullyDiscoveredDownloadRequestIDs.remove(id)
                 objectWillChange.send()
             }
         case "request_discovered":
             if let id = event.requestId {
                 discoveringDownloadRequestIDs.remove(id)
+                if event.discoveryComplete != false { fullyDiscoveredDownloadRequestIDs.insert(id) }
+                else { fullyDiscoveredDownloadRequestIDs.remove(id) }
+                publishDownloadTransferRows()
                 objectWillChange.send()
             }
         case "request_retrying":
-            if let id = event.requestId, discoveringDownloadRequestIDs.contains(id) {
+            if event.destinationUnavailable != true, let id = event.requestId, discoveringDownloadRequestIDs.contains(id) {
                 setStatus("Waiting for the network to continue finding download files…")
             }
         case "request_finished":
@@ -15370,15 +20225,21 @@ final class DownloaderModel: ObservableObject {
             discoveringDownloadRequestIDs.remove(id)
             guard let index = activeDownloadRequests.firstIndex(where: { $0.pendingItems.contains(where: { $0.id == id }) }) else { return }
             let request = activeDownloadRequests.remove(at: index)
-            activeDownloadSelectionKeys.remove(request.deduplicationKey)
+            submittedDownloadRequests[id] = nil
+            refreshActiveDownloadSelectionKeys()
             if event.success != true {
                 if !interruptedDownloadRequests.contains(where: { $0.deduplicationKey == request.deduplicationKey }) {
                     interruptedDownloadRequests.append(request)
                     interruptedDownloadCount = interruptedDownloadRequests.reduce(0) { $0 + $1.itemCount }
                 }
-                if let error = event.error { setError("Some downloads need attention: \(FileSearchIndex.redacted(error))") }
+                if let error = event.error {
+                    setError("Some downloads were interrupted: \(FileSearchIndex.redacted(error))")
+                    handleWebLoginNeeded(for: error)
+                }
             }
             _ = persistTransfersSynchronously()
+            if event.success != true { scheduleAutomaticDownloadRetry() }
+            publishDownloadTransferRows()
             objectWillChange.send()
         case "batch_failed":
             downloadFailureRetryable = event.retryable == true
@@ -15387,16 +20248,26 @@ final class DownloaderModel: ObservableObject {
             activeDownloadTransfers = [:]
             queuedDownloadIDs = []
             settledDownloadIDs = []
+            downloadSettledStates = [:]
+            downloadSettledBytesByID = [:]
+            downloadRetryTargets = [:]
+            automaticDownloadRetryOrigins = retainedDownloadRetryOrigins(for: activeDownloadRequests + pendingDownloadRequests + interruptedDownloadRequests)
+            individuallyRetriedDownloadRequestIDs = []; fullyDiscoveredDownloadRequestIDs = []
+            if !liveDownloadRun {
+                // Legacy Plan follows complete account/shared traversal.
+                fullyDiscoveredDownloadRequestIDs.formUnion(activeDownloadRequests.flatMap(\.pendingItems).map(\.id))
+            }
             settledDownloadBytes = 0
             settledDownloadNetworkBytes = 0
             downloadNetworkBaselines = [:]
             downloadNetworkBytesByID = [:]
             downloadFileTotalsByID = [:]
             downloadFileRates = [:]
+            restartDownloadSpeedCounter(at: Date())
             downloadNetworkTransferredBytes = 0
+            downloadHelperReceivedBytes = nil
             downloadQueueTransfers = []
             downloadQueueOffset = 0
-            downloadingTransfers = []
             completedDownloadTransfers = []
             downloadTotalFiles = max(event.totalFiles ?? 0, 0)
             downloadTotalBytes = event.totalBytes ?? 0
@@ -15404,19 +20275,28 @@ final class DownloaderModel: ObservableObject {
             downloadCompletedFiles = 0
             downloadSkippedFiles = 0
             downloadFailedFiles = 0
+            resetDownloadFailureTracking()
+            discoveredBytesByRoot = [:]
             downloadBytesPerSecond = 0
             if isDownloading {
                 downloadRunState = downloadTotalFiles > 0 ? .downloading : .completed
             }
-            lastDownloadSpeedSampleDate = Date()
-            lastDownloadSpeedSampleBytes = 0
-            lastDownloadNetworkProgressDate = nil
+            downloadRate.restart(bytes: 0, at: Date())
             if isDownloading, downloadTotalFiles > 0 {
                 setStatus("Downloading \(downloadTotalFiles) file(s)…")
             }
+            publishDownloadTransferRows()
 
         case "queue_batch", "queue_append":
             let additions = (event.files ?? []).compactMap { file -> DownloadTransfer? in
+                guard !cancelledDownloadIDs.contains(file.fileId),
+                      file.requestId.map({ !cancelledDownloadRequestIDs.contains($0) }) ?? true else { return nil }
+                if let path = file.remotePath {
+                    let scoped = file.requestId.map { "\($0.uuidString):\(path)" } ?? path
+                    if pendingRootActions.contains(where: {
+                        $0.value == "cancel" && (scoped == $0.key || scoped.hasPrefix($0.key + "/"))
+                    }) { cancelledDownloadIDs.insert(file.fileId); return nil }
+                }
                 guard queuedDownloadIDs.insert(file.fileId).inserted else { return nil }
                 // The plan already includes this value in its aggregate. Keep
                 // the per-file component so an authoritative download URL can
@@ -15432,33 +20312,55 @@ final class DownloaderModel: ObservableObject {
                 } else if lastDownloadUsedSharedLink, let access = lastSharedDownloadAccess {
                     downloadSharedAccessByFileID[file.fileId] = access
                 }
+                let transfer = DownloadTransfer(id: file.fileId, name: file.name, downloadedBytes: 0,
+                    totalBytes: file.totalBytes, state: .queued, remotePath: file.remotePath,
+                    outputDirectoryPath: file.outputDirectory, isShared: shared)
+                if let requestID = file.requestId, let identity = downloadRetryIdentity(transfer) {
+                    let previous = automaticDownloadRetryOrigins[requestID].flatMap { downloadRetryTargets[$0]?[identity] }
+                        ?? downloadRetryTargets[requestID]?[identity]
+                    if let previous, previous != file.fileId {
+                        replaceAutomaticDownloadRetryRow(previous)
+                    }
+                    var ancestor = automaticDownloadRetryOrigins[requestID], seen = Set<UUID>()
+                    while let original = ancestor, seen.insert(original).inserted {
+                        if downloadRetryTargets[original]?[identity] != nil { downloadRetryTargets[original]?[identity] = file.fileId }
+                        ancestor = automaticDownloadRetryOrigins[original]
+                    }
+                    downloadRetryTargets[requestID, default: [:]][identity] = file.fileId
+                }
+                // A fresh helper resets its per-run retry targets while keeping
+                // failed history. Match the acknowledged source/output too,
+                // so an older failure cannot stay visible beside its new attempt.
+                let supersededFailures = failedDownloadTransfers.filter {
+                    $0.id != transfer.id && sameDownloadRetryTarget($0, transfer)
+                }.map(\.id)
+                for id in supersededFailures { replaceAutomaticDownloadRetryRow(id) }
+                removeFailedDownloadFromHistory(transfer)
                 if event.event == "queue_append" {
                     downloadTotalFiles += 1
                     downloadTotalBytes = addingWithoutOverflow(downloadTotalBytes, file.totalBytes)
-                    if isDownloading { downloadRunState = .downloading }
+                    if let requestID = file.requestId {
+                        discoveredBytesByRoot[requestID] = addingWithoutOverflow(discoveredBytesByRoot[requestID] ?? 0, file.totalBytes)
+                    }
+                    if isDownloading, downloadRunState != .downloading { downloadRunState = .downloading }
                 }
-                return DownloadTransfer(
-                    id: file.fileId,
-                    name: file.name,
-                    downloadedBytes: 0,
-                    totalBytes: file.totalBytes,
-                    state: .queued,
-                    remotePath: file.remotePath,
-                    outputDirectoryPath: file.outputDirectory,
-                    isShared: shared
-                )
+                return transfer
             }
             if !additions.isEmpty {
                 downloadQueueTransfers.append(contentsOf: additions)
+                var controlsChanged = false
                 for file in additions {
                     guard let path = file.remotePath else { continue }
                     let scoped = downloadRequestIDsByFileID[file.id].map { "\($0.uuidString):\(path)" } ?? path
                     var actions = pendingRootActions.filter { scoped == $0.key || scoped.hasPrefix($0.key + "/") }.map(\.value)
                     if let requestID = downloadRequestIDsByFileID[file.id], pausedPendingDownloadIDs.contains(requestID) { actions.append("pause") }
-                    if actions.contains("cancel") { cancelledDownloadIDs.insert(file.id) }
-                    else if actions.contains("pause") { pausedDownloadIDs.insert(file.id) }
+                    if actions.contains("cancel") { controlsChanged = cancelledDownloadIDs.insert(file.id).inserted || controlsChanged }
+                    else if actions.contains("pause") { controlsChanged = pausedDownloadIDs.insert(file.id).inserted || controlsChanged }
                 }
-                writeDownloadControls()
+                // The source requests were saved before publishing the inbox.
+                // Discovery rows are presentation only: avoid re-encoding the
+                // whole unchanged request plan and controls for every file.
+                if controlsChanged { writeDownloadControls() }
             }
 
         case "file_dequeued":
@@ -15475,9 +20377,10 @@ final class DownloaderModel: ObservableObject {
                 state: .preparing,
                 remotePath: queued?.remotePath,
                 outputDirectoryPath: queued?.outputDirectoryPath,
+                outputFilePath: queued?.outputFilePath,
                 isShared: queued?.isShared ?? lastDownloadUsedSharedLink
             )
-            if isDownloading {
+            if isDownloading, downloadRunState != .downloading {
                 downloadRunState = .downloading
             }
             publishDownloadProgress()
@@ -15488,6 +20391,22 @@ final class DownloaderModel: ObservableObject {
             let previous = activeDownloadTransfers[fileID] ?? dequeueTransfer(fileID: fileID)
             let downloaded = event.downloadedBytes ?? previous?.downloadedBytes ?? 0
             let total = event.totalBytes ?? previous?.totalBytes ?? 0
+            if let directory = previous?.outputDirectoryPath {
+                let identity = DownloadProgressIdentity(sourceID: downloadSourceFileIDs[fileID] ?? fileID,
+                    outputPath: URL(fileURLWithPath: directory, isDirectory: true)
+                        .appendingPathComponent((name as NSString).lastPathComponent, isDirectory: false).path,
+                    shareURL: downloadSharedAccessByFileID[fileID]?.url)
+                let retained = downloadProgressHighWater[identity] ?? 0
+                if event.event == "file_progress", downloaded > retained {
+                    for key in downloadRecoveryKeys(event) {
+                        downloadDestinationRecoveryAttempts[key] = nil
+                        downloadDestinationRetryUntil[key] = nil
+                    }
+                }
+                // A restart may read the same prefix again. Network traffic
+                // alone cannot establish that storage has started advancing.
+                downloadProgressHighWater[identity] = max(retained, downloaded)
+            }
             reconcileDownloadTotal(total, for: fileID)
             if event.event == "file_started", downloadNetworkBaselines[fileID] == nil {
                 // A resumed .part file contributes to logical completion, but
@@ -15509,9 +20428,10 @@ final class DownloaderModel: ObservableObject {
                 state: .downloading,
                 remotePath: previous?.remotePath,
                 outputDirectoryPath: previous?.outputDirectoryPath,
+                outputFilePath: previous?.outputFilePath,
                 isShared: previous?.isShared ?? lastDownloadUsedSharedLink
             )
-            if isDownloading {
+            if isDownloading, downloadRunState != .downloading {
                 downloadRunState = .downloading
             }
             publishDownloadProgress()
@@ -15519,7 +20439,7 @@ final class DownloaderModel: ObservableObject {
         case "file_retrying":
             guard let fileID = event.fileId, let name = event.name else { return }
             guard !settledDownloadIDs.contains(fileID) else { return }
-            let previous = activeDownloadTransfers[fileID]
+            let previous = activeDownloadTransfers[fileID] ?? dequeueTransfer(fileID: fileID)
             if let total = event.totalBytes {
                 reconcileDownloadTotal(total, for: fileID)
             }
@@ -15532,28 +20452,50 @@ final class DownloaderModel: ObservableObject {
             activeDownloadTransfers[fileID] = DownloadTransfer(
                 id: fileID,
                 name: name,
-                downloadedBytes: previous?.downloadedBytes ?? 0,
-                totalBytes: previous?.totalBytes ?? 0,
+                downloadedBytes: max(previous?.downloadedBytes ?? 0, event.downloadedBytes ?? 0),
+                totalBytes: event.totalBytes ?? previous?.totalBytes ?? 0,
                 state: .retrying(attempt: event.attempt ?? 1),
                 remotePath: previous?.remotePath,
                 outputDirectoryPath: previous?.outputDirectoryPath,
-                isShared: previous?.isShared ?? lastDownloadUsedSharedLink
+                outputFilePath: previous?.outputFilePath,
+                isShared: previous?.isShared ?? lastDownloadUsedSharedLink,
+                error: event.error ?? previous?.error
             )
-            if isDownloading, let retryMilliseconds = event.retryInMillis {
+            if isDownloading, event.destinationUnavailable != true, let retryMilliseconds = event.retryInMillis {
                 let delay = Double(retryMilliseconds) / 1_000
                 setStatus("Retrying a transfer in \(delay.formatted(.number.precision(.fractionLength(1))))s…")
             }
             publishDownloadProgress()
 
         case "file_completed":
+            for key in downloadRecoveryKeys(event) {
+                downloadDestinationRecoveryAttempts[key] = nil
+                downloadDestinationRetryUntil[key] = nil
+            }
             settleDownloadTransfer(event, state: .completed)
         case "file_skipped":
             settleDownloadTransfer(event, state: .skipped)
+        case "file_source_trashed", "file_source_cleanup_failed":
+            guard let id = event.fileId,
+                  let index = completedDownloadTransfers.firstIndex(where: { $0.id == id }),
+                  completedDownloadTransfers[index].state == .completed || completedDownloadTransfers[index].state == .skipped,
+                  !completedDownloadTransfers[index].isShared else { return }
+            let failed = event.event == "file_source_cleanup_failed"
+            completedDownloadTransfers[index].sourceCleanupFailed = failed
+            completedDownloadTransfers[index].sourceCleanupMessage = failed
+                ? String(FileSearchIndex.redacted(event.error ?? "Download complete; could not confirm removal from PikPak.").prefix(500))
+                : "Moved to PikPak Trash"
+            if !failed, let sourceID = event.sourceFileId ?? downloadSourceFileIDs[id] {
+                removeCachedAccountBrowserItems(withIDs: [sourceID], preservingExpansion: true)
+                quotaRefreshPending = true
+            }
+            publishDownloadTransferRows()
         case "file_cancelled":
             if let id = event.fileId { cancelledDownloadIDs.insert(id); pausedDownloadIDs.remove(id) }
-            settleDownloadTransfer(event, state: .stopped)
+            if let id = event.fileId { clearCancelledDownloadRows([id]) }
         case "file_failed":
             settleDownloadTransfer(event, state: .failed)
+            scheduleAutomaticDownloadRetry()
         default:
             break
         }
@@ -15590,6 +20532,25 @@ final class DownloaderModel: ObservableObject {
                 ? downloadTotalBytes - (previous - total)
                 : 0
         }
+        if let root = downloadRequestIDsByFileID[fileID] {
+            let discovered = discoveredBytesByRoot[root] ?? 0
+            discoveredBytesByRoot[root] = total > previous
+                ? addingWithoutOverflow(discovered, total - previous)
+                : (discovered >= previous - total ? discovered - (previous - total) : 0)
+        }
+    }
+
+    /// Keep failed and interrupted records for accurate resume; successful
+    /// history is presentation only and does not affect cumulative counters.
+    private func appendDownloadHistory(_ transfer: DownloadTransfer) {
+        completedDownloadTransfers.append(transfer)
+        let success = completedDownloadTransfers.indices.filter {
+            completedDownloadTransfers[$0].state == .completed || completedDownloadTransfers[$0].state == .skipped
+        }
+        if success.count > 160 {
+            let removed = Set(success.prefix(success.count - 160))
+            completedDownloadTransfers = completedDownloadTransfers.enumerated().compactMap { removed.contains($0.offset) ? nil : $0.element }
+        }
     }
 
     private func settleDownloadTransfer(
@@ -15598,8 +20559,9 @@ final class DownloaderModel: ObservableObject {
     ) {
         guard let fileID = event.fileId, let name = event.name else { return }
         guard settledDownloadIDs.insert(fileID).inserted else { return }
+        downloadSettledStates[fileID] = state
 
-        let previous = activeDownloadTransfers.removeValue(forKey: fileID)
+        let previous = activeDownloadTransfers.removeValue(forKey: fileID) ?? dequeueTransfer(fileID: fileID)
         downloadFileRates.removeValue(forKey: fileID)
         let networkBaseline = downloadNetworkBaselines.removeValue(forKey: fileID) ?? 0
         // A failure wrapper may only know the older browser-list size. Once a
@@ -15625,6 +20587,7 @@ final class DownloaderModel: ObservableObject {
             downloaded = max(previous?.downloadedBytes ?? 0, reportedDownloaded)
         }
         settledDownloadBytes = addingWithoutOverflow(settledDownloadBytes, downloaded)
+        downloadSettledBytesByID[fileID] = downloaded
         let measuredNetworkBytes = downloadNetworkBytesByID.removeValue(forKey: fileID)
         let networkBytes: UInt64
         if state == .skipped {
@@ -15641,6 +20604,18 @@ final class DownloaderModel: ObservableObject {
             settledDownloadNetworkBytes,
             networkBytes
         )
+        if var batch = downloadBatch {
+            batch.networkBytes = addingWithoutOverflow(batch.networkBytes, networkBytes)
+            switch state {
+            case .completed:
+                batch.completedFiles += 1
+                batch.savedBytes = addingWithoutOverflow(batch.savedBytes, total)
+            case .skipped: batch.skippedFiles += 1
+            case .failed: batch.failedIDs.insert(fileID)
+            case .queued, .preparing, .downloading, .retrying, .stopped: break
+            }
+            downloadBatch = batch
+        }
 
         switch state {
         case .completed:
@@ -15653,7 +20628,7 @@ final class DownloaderModel: ObservableObject {
             break
         }
 
-        let settledTransfer = DownloadTransfer(
+        var settledTransfer = DownloadTransfer(
             id: fileID,
             name: name,
             downloadedBytes: downloaded,
@@ -15661,16 +20636,59 @@ final class DownloaderModel: ObservableObject {
             state: state,
             remotePath: previous?.remotePath,
             outputDirectoryPath: previous?.outputDirectoryPath,
+            outputFilePath: (state == .completed || state == .skipped)
+                ? DownloadTransfer.validatedOutputFilePath(event.outputPath) ?? previous?.outputFilePath
+                : previous?.outputFilePath,
             isShared: previous?.isShared ?? lastDownloadUsedSharedLink,
             error: event.error.map { String(FileSearchIndex.redacted($0).prefix(500)) }
         )
-        completedDownloadTransfers.append(settledTransfer)
+        noteDownloadOutcome(of: &settledTransfer, permanent: event.permanent)
+        appendDownloadHistory(settledTransfer)
         if state == .failed || state == .stopped {
             if !cancelledDownloadIDs.contains(settledTransfer.id) { appendFailedDownloadHistory(settledTransfer) }
         } else if state == .completed || state == .skipped {
             removeFailedDownloadFromHistory(settledTransfer)
         }
         publishDownloadProgress()
+    }
+
+    /// Count a permanent cause only while consecutive attempts keep reporting it. A different failure or a
+    /// completion proves the file is not simply gone, so its count starts again.
+    private func noteDownloadOutcome(of transfer: inout DownloadTransfer, permanent reason: String?) {
+        let identity = downloadRetryIdentity(transfer)
+        switch transfer.state {
+        case .failed:
+            if let reason, let identity {
+                let reports = (permanentFailureReports[identity] ?? 0) + 1
+                permanentFailureReports[identity] = reports
+                transfer.permanentReason = reason
+                transfer.permanentReports = reports
+            } else if let identity {
+                permanentFailureReports[identity] = nil
+            }
+            trackFinalFailure(transfer)
+        case .completed, .skipped:
+            if let identity { permanentFailureReports[identity] = nil }
+        case .queued, .preparing, .downloading, .retrying, .stopped:
+            break
+        }
+    }
+
+    private func trackFinalFailure(_ transfer: DownloadTransfer) {
+        if transfer.finalFailureReason != nil, permanentFailedDownloadIDs.insert(transfer.id).inserted {
+            downloadPermanentFailedFiles += 1
+        }
+    }
+
+    private func releaseFinalFailure(_ id: String) {
+        if permanentFailedDownloadIDs.remove(id) != nil { downloadPermanentFailedFiles = max(0, downloadPermanentFailedFiles - 1) }
+    }
+
+    /// A new run recounts its own final failures. The consecutive-report counts survive it: each automatic
+    /// retry cycle can start a new run, and those counts are what confirm a file is gone.
+    private func resetDownloadFailureTracking() {
+        permanentFailedDownloadIDs = []
+        downloadPermanentFailedFiles = 0
     }
 
     private func appendFailedDownloadHistory(_ transfer: DownloadTransfer) {
@@ -15713,20 +20731,65 @@ final class DownloaderModel: ObservableObject {
         return transfer
     }
 
+    private func publishDownloadTransferRows(active suppliedActive: [DownloadTransfer]? = nil) {
+        guard downloadOutputBatchDepth == 0 else {
+            downloadProgressPublicationDeferred = true
+            return
+        }
+        let active = suppliedActive ?? activeDownloadTransfers.values.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+        let downloading = active.filter {
+            $0.state == .preparing || $0.state == .downloading
+        }
+        if downloadingTransfers != downloading { downloadingTransfers = downloading }
+
+        let hasSession = hasUsableSession
+        if downloadRetryRowsDirty || hasSession != downloadRetryRowsHadSession {
+            downloadRetryRowsDirty = false
+            downloadRetryRowsHadSession = hasSession
+            // Only a confirmed permanent cause (or missing source details) is a failure. Everything else is a
+            // file still retrying, even while the app waits for a sign-in, a resume or the next timer.
+            var retrying: [DownloadTransfer] = [], failed: [DownloadTransfer] = []
+            var automatic = 0
+            for transfer in failedDownloadTransfers {
+                if transfer.finalFailureReason != nil { failed.append(transfer); continue }
+                retrying.append(transfer)
+                if automaticDownloadRetryStatus(transfer) != nil { automatic += 1 }
+            }
+            automaticRetryDownloadRows = retrying
+            automaticRetryDownloadCount = automatic
+            if visibleFailedDownloadTransfers != failed { visibleFailedDownloadTransfers = failed }
+            #if FINDER_WORKSPACE_TESTS
+            downloadRetryProjectionFixtureRefreshes += 1
+            #endif
+        }
+        let retrying = active.filter {
+            if case .retrying = $0.state { return true }
+            return false
+        } + automaticRetryDownloadRows
+        if retryingDownloadTransfers != retrying { retryingDownloadTransfers = retrying }
+    }
+
     private func publishDownloadProgress() {
+        guard downloadOutputBatchDepth == 0 else {
+            downloadProgressPublicationDeferred = true
+            return
+        }
         sampleDownloadFileRates(at: Date())
         let active = activeDownloadTransfers.values.sorted {
             $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
-        downloadingTransfers = active
+        publishDownloadTransferRows(active: active)
 
         let activeBytes = active.reduce(UInt64(0)) {
             addingWithoutOverflow($0, $1.downloadedBytes)
         }
         let currentBytes = addingWithoutOverflow(settledDownloadBytes, activeBytes)
-        downloadDownloadedBytes = downloadTotalBytes > 0
+        let downloadedBytes = downloadTotalBytes > 0
             ? min(currentBytes, downloadTotalBytes)
             : currentBytes
+        if downloadDownloadedBytes != downloadedBytes { downloadDownloadedBytes = downloadedBytes }
 
         let activeNetworkBytes = active.reduce(UInt64(0)) { total, transfer in
             let bytes: UInt64
@@ -15745,9 +20808,9 @@ final class DownloaderModel: ObservableObject {
             settledDownloadNetworkBytes,
             activeNetworkBytes
         )
-        if networkBytes > downloadNetworkTransferredBytes {
-            downloadNetworkTransferredBytes = networkBytes
-            lastDownloadNetworkProgressDate = Date()
+        let receivedBytes = max(networkBytes, downloadHelperReceivedBytes ?? 0)
+        if receivedBytes > downloadNetworkTransferredBytes {
+            downloadNetworkTransferredBytes = receivedBytes
         }
         sampleDownloadRate(at: Date())
     }
@@ -15755,7 +20818,7 @@ final class DownloaderModel: ObservableObject {
     private func finishDownloadProgress(as state: DownloadRunState) {
         downloadRunState = state
         downloadBytesPerSecond = 0
-        lastDownloadSpeedSampleDate = nil
+        downloadRate = RollingRate()
 
         if state == .stopped || state == .failed {
             let transferState: DownloadTransferState = state == .stopped ? .stopped : .failed
@@ -15764,6 +20827,8 @@ final class DownloaderModel: ObservableObject {
             }
             for var transfer in unfinished where settledDownloadIDs.insert(transfer.id).inserted {
                 transfer.state = transferState
+                downloadSettledStates[transfer.id] = transferState
+                downloadSettledBytesByID[transfer.id] = transfer.downloadedBytes
                 transfer.bytesPerSecond = 0
                 settledDownloadBytes = addingWithoutOverflow(
                     settledDownloadBytes,
@@ -15780,8 +20845,9 @@ final class DownloaderModel: ObservableObject {
                 )
                 if state == .failed {
                     downloadFailedFiles += 1
+                    trackFinalFailure(transfer)
                 }
-                completedDownloadTransfers.append(transfer)
+                appendDownloadHistory(transfer)
                 appendFailedDownloadHistory(transfer)
             }
             activeDownloadTransfers = [:]
@@ -16025,15 +21091,23 @@ final class DownloaderModel: ObservableObject {
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
             let result = try decoder.decode(ShareSaveResult.self, from: Data(output.utf8))
-            let count = max(result.savedCount, requestedIDs.count)
+            let skipped = max(0, result.skippedDuplicateCount ?? 0)
+            let count = result.skippedDuplicateCount == nil
+                ? max(result.savedCount, requestedIDs.count) : result.savedCount
             let noun = count == 1 ? "item" : "items"
-            if activeSharedLinkID == linkID {
-                setShareLinkFeedback(
-                    "Saved \(count.formatted()) \(noun) to Pack From Shared in your PikPak.",
-                    tone: .success
-                )
+            var message = skipped > 0
+                ? (count == 0 ? "Skipped \(skipped.formatted()) duplicate file(s) already in your PikPak."
+                    : "Saved \(count.formatted()) \(noun); skipped \(skipped.formatted()) duplicate file(s).")
+                : "Saved \(count.formatted()) \(noun) to Pack From Shared in your PikPak."
+            if result.duplicateCacheRefreshNeeded == true {
+                message = "Save accepted for \(count.formatted()) \(noun)"
+                    + (skipped > 0 ? "; skipped \(skipped.formatted()) duplicate file(s)." : ".")
+                    + " Still processing; check for duplicates again after it finishes."
             }
-            setStatus("Shared selection saved to PikPak")
+            if activeSharedLinkID == linkID {
+                setShareLinkFeedback(message, tone: result.duplicateCacheRefreshNeeded == true ? .info : .success)
+            }
+            setStatus(message)
             let knownSharedParents = (accountBrowserWorkspace?.items ?? [])
                 .filter { $0.isFolder && $0.name == "Pack From Shared" }.map(\.id)
             let changedParents = Set(result.cacheParentIds ?? knownSharedParents)
@@ -16443,9 +21517,10 @@ final class DownloaderModel: ObservableObject {
 
                 switch result {
                 case .success(let output):
-                    guard let decoded = Self.decodeTextPreview(
+                    guard let decoded = TextPreviewDecoder.decode(
                         output.data,
-                        responseEncodingName: output.responseEncodingName
+                        responseEncodingName: output.responseEncodingName,
+                        wasTruncated: output.wasTruncated
                     ) else {
                         self.setTextPreviewFailure(
                             summary: "This file does not contain readable plain text.",
@@ -16517,99 +21592,6 @@ final class DownloaderModel: ObservableObject {
         quickLookPreviewCoordinator.showFailure("Could not prepare this file for preview. Try again.")
     }
 
-    private nonisolated static func decodeTextPreview(
-        _ data: Data,
-        responseEncodingName: String?
-    ) -> (text: String, encodingName: String)? {
-        guard !data.isEmpty else { return ("", "UTF-8") }
-
-        var candidates: [(String.Encoding, String)] = []
-        if data.starts(with: [0xEF, 0xBB, 0xBF]) {
-            candidates.append((.utf8, "UTF-8"))
-        } else if data.starts(with: [0xFF, 0xFE]) {
-            candidates.append((.utf16LittleEndian, "UTF-16 LE"))
-        } else if data.starts(with: [0xFE, 0xFF]) {
-            candidates.append((.utf16BigEndian, "UTF-16 BE"))
-        }
-
-        if let responseEncodingName,
-           let responseEncoding = textEncoding(named: responseEncodingName) {
-            candidates.append(responseEncoding)
-        }
-
-        let sample = data.prefix(4_096)
-        if sample.count >= 4 {
-            var evenZeroes = 0
-            var oddZeroes = 0
-            for (index, byte) in sample.enumerated() where byte == 0 {
-                if index.isMultiple(of: 2) {
-                    evenZeroes += 1
-                } else {
-                    oddZeroes += 1
-                }
-            }
-            if oddZeroes > max(sample.count / 10, 2) && evenZeroes <= oddZeroes / 4 {
-                candidates.append((.utf16LittleEndian, "UTF-16 LE"))
-            } else if evenZeroes > max(sample.count / 10, 2) && oddZeroes <= evenZeroes / 4 {
-                candidates.append((.utf16BigEndian, "UTF-16 BE"))
-            }
-        }
-
-        candidates.append(contentsOf: [
-            (.utf8, "UTF-8"),
-            (.windowsCP1252, "Windows-1252"),
-            (.isoLatin1, "ISO-8859-1"),
-        ])
-
-        var tried = Set<UInt>()
-        for (encoding, name) in candidates where tried.insert(encoding.rawValue).inserted {
-            guard var text = String(data: data, encoding: encoding),
-                  looksLikePlainText(text) else { continue }
-            if text.first == "\u{FEFF}" {
-                text.removeFirst()
-            }
-            return (text, name)
-        }
-        return nil
-    }
-
-    private nonisolated static func textEncoding(
-        named rawName: String
-    ) -> (String.Encoding, String)? {
-        let name = rawName
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "_", with: "-")
-        switch name {
-        case "utf-8", "utf8": return (.utf8, "UTF-8")
-        case "utf-16", "utf16": return (.utf16, "UTF-16")
-        case "utf-16le": return (.utf16LittleEndian, "UTF-16 LE")
-        case "utf-16be": return (.utf16BigEndian, "UTF-16 BE")
-        case "us-ascii", "ascii": return (.ascii, "ASCII")
-        case "windows-1252", "cp1252": return (.windowsCP1252, "Windows-1252")
-        case "iso-8859-1", "latin1", "latin-1": return (.isoLatin1, "ISO-8859-1")
-        default: return nil
-        }
-    }
-
-    private nonisolated static func looksLikePlainText(_ text: String) -> Bool {
-        var inspected = 0
-        var unsupportedControls = 0
-        for scalar in text.unicodeScalars.prefix(40_000) {
-            inspected += 1
-            switch scalar.value {
-            case 0x09, 0x0A, 0x0C, 0x0D:
-                continue
-            case 0x00 ..< 0x20, 0x7F:
-                unsupportedControls += 1
-            default:
-                continue
-            }
-        }
-        guard inspected > 0 else { return true }
-        return unsupportedControls <= max(2, inspected / 100)
-    }
-
     private func playbackSources(from preview: PreviewInfo) -> [PreviewSource] {
         var candidates = preview.sources ?? []
         if let contentURL = preview.contentURL,
@@ -16667,7 +21649,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     @discardableResult
-    private func startCompatibleVideoPreview(fileID: String, autoplay: Bool) -> Bool {
+    private func startCompatibleVideoPreview(fileID: String, autoplay: Bool, reuseBufferedSource: Bool = false) -> Bool {
         guard compatiblePreviewCopy == nil, compatiblePreviewTask == nil,
               selectedBrowserItemID == fileID, previewFileID == fileID,
               let source = preferredQuickLookSource(), let url = source.contentURL,
@@ -16683,53 +21665,109 @@ final class DownloaderModel: ObservableObject {
         if VideoPreviewPreparation.ffmpegURL == nil, activateCompatibilityPreview() { return true }
         removePreviewPlayerObservers()
         previewPlayer?.pause(); previewPlayer = nil
-        // A failed parser must not reuse potentially incomplete cached bytes.
-        // Preparation downloads a fresh complete file through the same route.
+        let size = source.isOrigin ? (previewInfo?.size ?? 0) : 0
+        let key = previewResourceCacheKey(for: source, index: index)
+        let cachedInput = reuseBufferedSource ? try? previewResourceCaches[key]?.takeCompleteFile(expectedSize: size) : nil
+        // A partial cache still requires a complete download. A complete one
+        // survives cache cleanup as an owned input until conversion finishes.
         clearPreviewResourceCaches()
         let generation = UUID()
         previewLoadGeneration = generation
         previewPlaybackWasRequested = autoplay
         previewPlaybackError = nil; previewErrorDiagnostic = nil
         previewRequiresCompatibilityPlayer = false; previewCompatibilityPlayerName = nil
-        previewPreparationFraction = nil
-        previewSourceLabel = "Downloading \(format.displayName) for preview…"
+        previewSourceLabel = cachedInput == nil ? "Downloading \(format.displayName) for preview…" : "Preparing buffered video preview…"
         isPreviewLoading = true
         resetPreviewStreamingMetrics(state: .preparing)
-        let size = source.isOrigin ? (previewInfo?.size ?? 0) : 0
         let proxy = proxyURL
         #if FINDER_WORKSPACE_TESTS
-        let preparationURL = previewFixtureMediaURL ?? url
+        let preparationURL = cachedInput?.url ?? previewFixtureMediaURL ?? url
         #else
-        let preparationURL = url
+        let preparationURL = cachedInput?.url ?? url
         #endif
+        clearPreviewPreparationProgress()
+        updatePreviewPreparationProgress(.init(message: previewSourceLabel ?? "Preparing preview…",
+            fileSize: size, activity: preparationURL.isFileURL ? .processing : .transferring))
+        previewPreparationRateTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard self?.previewLoadGeneration == generation else { return }
+                self?.updatePreviewPreparationRate()
+                do { try await Task.sleep(nanoseconds: 250_000_000) }
+                catch { return }
+            }
+        }
         compatiblePreviewTask = Task { [weak self] in
+            defer { withExtendedLifetime(cachedInput) {} }
             do {
                 let copy = try await VideoPreviewPreparation.prepare(source: preparationURL, format: format, expectedSize: size, proxyURL: proxy) { [weak self] progress in
                     Task { @MainActor in
-                        guard let self, self.previewLoadGeneration == generation, self.previewFileID == fileID else { return }
-                        self.previewSourceLabel = progress.message
-                        self.previewPreparationFraction = progress.fraction
+                        guard let self, self.previewLoadGeneration == generation, self.previewFileID == fileID,
+                              self.compatiblePreviewTask != nil else { return }
+                        self.updatePreviewPreparationProgress(progress)
                     }
                 }
                 try Task.checkCancellation()
                 guard let self, self.previewLoadGeneration == generation, self.selectedBrowserItemID == fileID else { return }
                 self.compatiblePreviewTask = nil
                 self.compatiblePreviewCopy = copy
-                self.previewPreparationFraction = nil
+                self.clearPreviewPreparationProgress()
                 self.loadPreviewSource(at: index, fileID: fileID, autoplay: autoplay, localURL: copy.url)
             } catch {
                 guard let self, !Task.isCancelled, self.previewLoadGeneration == generation else { return }
                 self.compatiblePreviewTask = nil
                 // Invalidate any final queued progress callback.
                 self.previewLoadGeneration = UUID()
-                self.previewPreparationFraction = nil
+                self.clearPreviewPreparationProgress()
                 self.isPreviewLoading = false
                 self.previewStreamingState = .failed
+                self.previewSourceLabel = nil
                 self.previewPlaybackError = error.localizedDescription
-                self.setError(error.localizedDescription)
+                let detail = self.diagnostic(for: error, source: "Video preview preparation")
+                self.previewErrorDiagnostic = detail
+                self.setError(error.localizedDescription, diagnostic: detail)
             }
         }
         return true
+    }
+
+    private func updatePreviewPreparationProgress(_ update: CloudDriveProgress) {
+        // A queued download callback must not replace the later conversion phase.
+        guard !(previewPreparationProgress?.activity == .processing && update.activity == .transferring) else { return }
+        var progress = update
+        if let value = progress.fraction {
+            progress.fraction = value.isFinite ? min(1, max(0, value)) : nil
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        if progress.activity == .transferring {
+            if previewPreparationProgress?.activity != .transferring {
+                previewPreparationReadActivity = FilePreviewReadActivity()
+                previewPreparationReadActivity.begin(at: now)
+            }
+            let previous = previewPreparationProgress?.bytes ?? 0
+            progress.bytes = max(previous, progress.bytes)
+            if progress.bytes > previous {
+                previewPreparationReadActivity.record(bytes: Int(clamping: progress.bytes - previous), at: now)
+            }
+            if progress.fileSize > 0 { progress.fraction = min(1, Double(progress.bytes) / Double(progress.fileSize)) }
+            previewPreparationBytesPerSecond = previewPreparationReadActivity.bytesPerSecond(at: now)
+        } else {
+            previewPreparationReadActivity.end()
+            previewPreparationBytesPerSecond = nil
+        }
+        previewPreparationProgress = progress
+        previewSourceLabel = progress.message
+    }
+
+    private func clearPreviewPreparationProgress() {
+        previewPreparationRateTask?.cancel(); previewPreparationRateTask = nil
+        previewPreparationReadActivity.end()
+        previewPreparationProgress = nil
+        previewPreparationBytesPerSecond = nil
+    }
+
+    private func updatePreviewPreparationRate() {
+        guard previewPreparationProgress?.activity == .transferring else { return }
+        previewPreparationBytesPerSecond = previewPreparationReadActivity.bytesPerSecond(at: ProcessInfo.processInfo.systemUptime)
     }
 
     private func activateCompatibilityPreview() -> Bool {
@@ -16773,8 +21811,18 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func preferredCompatibilitySource() -> PreviewSource? {
-        previewSources.first(where: { !$0.isOrigin && $0.contentURL != nil })
+        // IINA can decode the original directly. A cloud transcode may be the
+        // same stalled/unavailable stream that just failed in the preview.
+        previewSources.first(where: { $0.isOrigin && $0.contentURL != nil })
             ?? previewSources.first(where: { $0.contentURL != nil })
+    }
+
+    private static func compatibilityPlayerArguments(playlistURL: URL) -> [String] {
+        ["--no-stdin", "--separate-windows",
+         "--mpv-user-agent=\(PreviewTransport.userAgent)",
+         "--mpv-referrer=\(PreviewTransport.mediaHeaders["Referer"]!)",
+         "--mpv-http-header-fields=Origin: \(PreviewTransport.mediaHeaders["Origin"]!)",
+         "--mpv-save-position-on-quit=no", "--mpv-resume-playback=no", playlistURL.path]
     }
 
     private func preferredQuickLookSource() -> PreviewSource? {
@@ -17566,7 +22614,7 @@ final class DownloaderModel: ObservableObject {
         let bytesPerSecond = Double(contentLength) / previewDurationSeconds
         guard bytesPerSecond > 0 else { return 0 }
         let clamped = min(max(playbackSeconds, 0), previewDurationSeconds)
-        let offset = Int64(clamped * bytesPerSecond)
+        let offset = Int64(SafeDisplayNumber.integer(clamped * bytesPerSecond))
         guard let end = snapshot.contiguousEnd(from: offset) else { return 0 }
         let reachable = Double(end) / bytesPerSecond
         return min(max(reachable - clamped, 0), previewDurationSeconds - clamped)
@@ -17641,7 +22689,7 @@ final class DownloaderModel: ObservableObject {
         let key = previewResourceCacheKey(for: previewSources[previewSourceIndex], index: previewSourceIndex)
         guard previewResumeRetries.insert(key).inserted else { return false }
         appendOutput(
-            "Playback stopped \(Int(position))s in; resuming the same source from there.\n"
+            "Playback stopped \(SafeDisplayNumber.integer(position))s in; resuming the same source from there.\n"
         )
         loadPreviewSource(
             at: previewSourceIndex,
@@ -17689,7 +22737,8 @@ final class DownloaderModel: ObservableObject {
         let extensionName = selectedBrowserItem?.normalizedFileExtension ?? ""
         let isConvertibleFormatFailure = VideoPreviewPreparation.InputFormat(fileExtension: extensionName) != nil
             && VideoPreviewPreparation.isFormatFailure(error)
-        if isConvertibleFormatFailure, compatiblePreviewCopy == nil, previewUsesRetainedCache,
+        if isConvertibleFormatFailure, !VideoPreviewPreparation.isVideoDecoderFailure(error),
+           compatiblePreviewCopy == nil, previewUsesRetainedCache,
            previewSources.indices.contains(previewSourceIndex) {
             let key = previewResourceCacheKey(for: previewSources[previewSourceIndex], index: previewSourceIndex)
             if previewFreshCacheRetries.insert(key).inserted {
@@ -17702,7 +22751,8 @@ final class DownloaderModel: ObservableObject {
         }
         let canPrepareCompatibleCopy = extensionName == "avi"
             || isConvertibleFormatFailure
-        if canPrepareCompatibleCopy, startCompatibleVideoPreview(fileID: fileID, autoplay: shouldResumePlayback) {
+        if canPrepareCompatibleCopy, startCompatibleVideoPreview(fileID: fileID, autoplay: shouldResumePlayback,
+            reuseBufferedSource: VideoPreviewPreparation.isVideoDecoderFailure(error)) {
             return
         }
         if extensionName == "avi",
@@ -18103,9 +23153,13 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func removeAccountFolderSizes(_ ids: Set<String>) {
-        if let activeID = measuringFolderID,
-           folderSizeIndex.ancestors(of: activeID).contains(where: ids.contains) {
-            removedSizeFolderIDs.insert(activeID)
+        for run in folderMeasurementRuns.values {
+            if case .measure(let id) = run.operation,
+               folderSizeIndex.ancestors(of: id).contains(where: ids.contains) {
+                removedSizeFolderIDs.insert(id)
+                run.wasCancelled = true
+                if run.process.isRunning { run.process.terminate() }
+            }
         }
         removedSizeFolderIDs.formUnion(ids)
         let workspaceItems = isBrowsingSharedLink
@@ -18136,12 +23190,11 @@ final class DownloaderModel: ObservableObject {
 
     private func removeSharedLinkMeasurements(_ linkID: UUID) {
         let prefix = sharedLinkMeasurementPrefix(linkID)
-        pendingFolderMeasurementRequests.removeAll { request in
-            request.cacheKey.hasPrefix(prefix)
+        for run in folderMeasurementRuns.values where run.cacheKey.hasPrefix(prefix) {
+            run.wasCancelled = true
+            if run.process.isRunning { run.process.terminate() }
         }
-        queuedFolderMeasurementCacheKeys = Set(
-            queuedFolderMeasurementCacheKeys.filter { !$0.hasPrefix(prefix) }
-        )
+        cancelOperationRetries(prefix: "measure:\(linkID):")
         folderMeasurements = folderMeasurements.filter { key, _ in
             !key.hasPrefix(prefix)
         }
@@ -18260,9 +23313,8 @@ final class DownloaderModel: ObservableObject {
         folderMeasurements.removeAll(keepingCapacity: false)
         folderMeasurement = nil
         measuredFolderID = nil
-        measuringFolderID = nil
-        measuringFolderCacheKey = nil
-        clearPendingFolderMeasurements()
+        stopFolderMeasurements()
+        updateFolderMeasurementActivity()
     }
 
     private func finishQuota(output: String, announcesResult: Bool) {
@@ -18314,7 +23366,7 @@ final class DownloaderModel: ObservableObject {
             selectedDuplicateFileIDs = Set(
                 scan.groups
                     .filter { $0.matchKind == .exactContent }
-                    .flatMap { $0.files.dropFirst().map(\.id) }
+                    .flatMap { CrossDriveDuplicatePolicy.recommendedIDs($0.files) }
             )
             let message: String
             if scan.failedFolders > 0 {
@@ -18345,12 +23397,15 @@ final class DownloaderModel: ObservableObject {
                 return
             }
 
+            let focusedID = isBrowsingSharedLink ? nil : selectedBrowserItemID
+            let navigation = DeletedBrowserSelection(visibleIDs: browserFilterSelectionItems.map(\.id), selectedID: focusedID)
             recordTrashUndo(ids: [itemID])
             fileSimilarity.cloud.results.setCloudFilesTrashed([itemID], true)
             removeCachedAccountBrowserItems(withIDs: Set([itemID]))
             if !isBrowsingSharedLink {
-                if selectedBrowserItemID == itemID {
+                if let focusedID, !browserFilterSelectionItems.contains(where: { $0.id == focusedID }) {
                     clearBrowserSelection()
+                    deletedBrowserSelection = navigation
                 } else {
                     selectedBrowserItemIDs.remove(itemID)
                 }
@@ -18378,6 +23433,8 @@ final class DownloaderModel: ObservableObject {
                 return
             }
 
+            let focusedID = isBrowsingSharedLink ? nil : selectedBrowserItemID
+            let navigation = DeletedBrowserSelection(visibleIDs: browserFilterSelectionItems.map(\.id), selectedID: focusedID)
             recordTrashUndo(ids: requestedIDs.filter { trashed.contains($0) })
             if pendingSimilarityTrash == nil || pendingSimilarityTrash?.session == fileSimilarity.cloud.results.sessionToken {
                 fileSimilarity.cloud.results.setCloudFilesTrashed(trashed, true)
@@ -18391,6 +23448,9 @@ final class DownloaderModel: ObservableObject {
             } else {
                 removeCachedBrowserItems(withIDs: trashed)
                 clearBrowserSelection()
+            }
+            if let focusedID, !browserFilterSelectionItems.contains(where: { $0.id == focusedID }) {
+                deletedBrowserSelection = navigation
             }
             duplicateScan = nil
             selectedDuplicateFileIDs = []
@@ -18859,7 +23919,7 @@ final class DownloaderModel: ObservableObject {
                 let groups = scan.groups.compactMap { group -> DuplicateGroup? in
                     let files = group.files.filter { !trashed.contains($0.id) }
                     guard files.count > 1 else { return nil }
-                    let extraCopies = UInt64(files.count - 1)
+                    let extraCopies = UInt64(CrossDriveDuplicatePolicy.recommendedIDs(files).count)
                     return DuplicateGroup(
                         id: group.id,
                         matchKind: group.matchKind,
@@ -19073,7 +24133,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func engineEnvironment() throws -> [String: String] {
-        guard !isChangingAccount else { throw PikPakAccountError.cancelled }
+        guard !isClosingWindow, !isChangingAccount else { throw PikPakAccountError.cancelled }
         if let accountStore {
             guard let activeAccountID,
                   try accountStore.load().accounts.first(where: { $0.id == activeAccountID })?.needsSignIn == false
@@ -19081,6 +24141,7 @@ final class DownloaderModel: ObservableObject {
             let files = accountStore.files(for: activeAccountID)
             let session = try files.load()
             guard session.deviceID == deviceID else { throw LocalCredentialStoreError.untrustedSession }
+            try accountStore.retainWorkerSession(files)
             return desktopEngineEnvironment(tokenURL: files.tokenURL, lockURL: files.lockURL, deviceID: session.deviceID, credentialKind: session.credentialKind)
         }
         guard
@@ -19094,6 +24155,15 @@ final class DownloaderModel: ObservableObject {
         }
         return desktopEngineEnvironment(tokenURL: try LocalCredentialStore.tokenFileURL(),
             lockURL: try LocalCredentialStore.refreshLockFileURL(), deviceID: persistedDeviceID)
+    }
+
+    /// Every PikPak download uses Guest first and an account fallback. The
+    /// preview/scan preference must not disable recovery of a limited original.
+    private static func transferDownloadEnvironment(_ source: [String: String]) -> [String: String] {
+        var environment = source
+        environment.removeValue(forKey: "PIKPAK_GUEST_MODE")
+        environment["PIKPAK_CONTENT_MODE"] = PikPakContentMode.dynamic.rawValue
+        return environment
     }
 
     private func desktopEngineEnvironment(tokenURL: URL, lockURL: URL, deviceID: String, credentialKind: PikPakCredentialKind = .desktopOAuth) -> [String: String] {
@@ -19111,12 +24181,15 @@ final class DownloaderModel: ObservableObject {
             environment["PIKPAK_REFRESH_TOKEN_LOCK_FILE"] = lockURL.path
         }
         environment["PIKPAK_DEVICE_ID"] = deviceID
+        environment["PIKPAK_VERIFICATION_CACHE_FILE"] = tokenURL.deletingLastPathComponent()
+            .appendingPathComponent("verified-requests.json").path
         environment.removeValue(forKey: "PIKPAK_GUEST_MODE")
         environment["PIKPAK_CONTENT_MODE"] = finderSettings.contentMode.rawValue
         if let support = try? LocalCredentialStore.applicationSupportDirectoryURL() {
             // Normal and similarity helpers share one socket allowance, across
             // accounts and windows. The engine owns and releases advisory locks.
             environment["MYCLOUDDRIVER_DOWNLOAD_CONNECTIONS"] = support.appendingPathComponent("Download Connections", isDirectory: true).path
+            environment["PIKPAK_DUPLICATE_CACHE_DIR"] = support.appendingPathComponent("Duplicate Cache", isDirectory: true).path
         }
         // The GUI session is deliberately issued to PikPak's desktop client.
         // Never let a shell-level Web-client override rejoin Safari's token
@@ -19203,11 +24276,9 @@ final class DownloaderModel: ObservableObject {
         }
     }
 
-    private func cleanupFolderMeasurementInputFile() {
-        if let folderMeasurementInputURL {
-            try? FileManager.default.removeItem(at: folderMeasurementInputURL)
-        }
-        folderMeasurementInputURL = nil
+    private func cleanupFolderMeasurementInputFile(_ run: FolderMeasurementRun) {
+        if let url = run.inputURL { try? FileManager.default.removeItem(at: url) }
+        run.inputURL = nil
     }
 
     private func cleanupMergeInputFile() {
@@ -19224,7 +24295,7 @@ final class DownloaderModel: ObservableObject {
         previewFreshCacheRetries.removeAll()
         previewResumeRetries.removeAll()
         previewResumeSeconds = nil
-        previewPreparationFraction = nil
+        clearPreviewPreparationProgress()
         imagePreview.reset(unlessFileID: retainedFileID)
         textPreviewLoader?.cancel()
         textPreviewLoader = nil
@@ -19360,8 +24431,8 @@ final class DownloaderModel: ObservableObject {
         let summary: String
         if isRejectedSessionError(lowered) {
             summary = "Your PikPak session expired or was rejected. Sign in again to continue."
-        } else if lowered.contains("additional verification") || lowered.contains("need verify") {
-            summary = "PikPak requires account verification. Complete the sign-in prompt to continue."
+        } else if lowered.contains("additional verification") || lowered.contains("need verify") || lowered.contains("pikpak verification required:") {
+            summary = "PikPak needs verification for this request. Your saved sign-in has been kept. Choose Verify Request to continue."
         } else if lowered.contains("timed out") || lowered.contains("connect") || lowered.contains("dns") {
             summary = "Could not reach PikPak. Check the network or proxy setting, then try again."
         } else if let serviceMessage {
@@ -19573,13 +24644,14 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func redactedEngineOutput(_ raw: String) -> String {
-        var safe = raw
+        var safe = raw.replacingOccurrences(of: #"(?m)^PikPak verification required: [^\n]*"#,
+            with: "PikPak requires verification for this request.", options: .regularExpression)
         let token = refreshToken.trimmingCharacters(in: .whitespacesAndNewlines)
         if !token.isEmpty {
             safe = safe.replacingOccurrences(of: token, with: "[credential redacted]")
         }
         safe = safe.replacingOccurrences(
-            of: #"(?i)(\"?(?:access_token|refresh_token|authorization)\"?\s*[:=]\s*\"?)[^\",\s}]+"#,
+            of: #"(?i)(\"?(?:access_token|refresh_token|captcha_token|authorization)\"?\s*[:=]\s*\"?)[^\",\s}]+"#,
             with: "$1[credential redacted]",
             options: .regularExpression
         )
@@ -19606,12 +24678,72 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func handleWebLoginNeeded(for raw: String) {
+        if let challenge = PikPakVerificationChallenge.fromEngine(raw) {
+            receiveRequestVerification(challenge)
+            return
+        }
         guard let reason = webLoginReason(for: raw) else { return }
         if isRejectedSessionError(raw.lowercased()) {
             presentCleanLoginAfterRejectedSession(reason: reason)
         } else {
-            presentLogin(reason: reason)
+            // Captcha challenges are scoped to an operation/device and can
+            // even come from an anonymous shared link. Issuing another account
+            // session cannot solve them and creates an immediate sign-in loop.
+            accountLoginStatus = .verificationRequired
+            accountSettingsError = "Your account credential is saved, but PikPak is blocking requests with verification. Check Login Status to get the verification request."
+            setStatus("PikPak needs verification for this request. Your saved sign-in has been kept.")
         }
+    }
+
+    private func receiveRequestVerification(_ challenge: PikPakVerificationChallenge) {
+        guard !isClosingWindow, !isChangingAccount, challenge.validURL() != nil,
+              challenge.clientID != PikPakDesktopOAuth.clientID || challenge.deviceID == deviceID else { return }
+        // Do not replace the request already open in the system browser.
+        if !isVerifyingRequest { requestVerificationChallenge = challenge }
+        accountLoginStatus = .verificationRequired
+        accountSettingsError = "Your account credential is saved. PikPak needs verification before this request can continue."
+        setStatus("PikPak verification required. Choose Verify Request to continue.")
+    }
+
+    func beginRequestVerification() {
+        guard let challenge = requestVerificationChallenge, !isVerifyingRequest, !isClosingWindow else { return }
+        guard challenge.validURL() != nil else {
+            accountSettingsError = PikPakRequestVerificationError.invalidChallenge.localizedDescription
+            requestVerificationChallenge = nil
+            return
+        }
+        let account = activeAccountID
+        let nativeDevice = deviceID
+        let storeURL: URL
+        if let accountStore, let account { storeURL = accountStore.files(for: account).directory.appendingPathComponent("verified-requests.json") }
+        else if let url = try? LocalCredentialStore.tokenFileURL() { storeURL = url.deletingLastPathComponent().appendingPathComponent("verified-requests.json") }
+        else { accountSettingsError = PikPakAccountError.invalidStorage.localizedDescription; return }
+        isVerifyingRequest = true
+        requestVerifier.start(challenge) { [weak self] result in
+            guard let self, !self.isClosingWindow, self.activeAccountID == account, self.deviceID == nativeDevice,
+                  self.requestVerificationChallenge == challenge else { return }
+            self.isVerifyingRequest = false
+            switch result {
+            case .success(let proof):
+                do {
+                    try PikPakVerifiedRequestStore.save(proof, to: storeURL)
+                    self.requestVerificationChallenge = nil
+                    self.accountSettingsError = nil
+                    self.accountLoginStatus = .unverified
+                    self.setStatus("PikPak verification completed. Retrying browsing; retry any other interrupted operation.")
+                    self.checkAccountStatus()
+                    // Only a read-only browse is retried. Mutations retain their
+                    // normal reconciliation and explicit retry safeguards.
+                    if !self.isRunning { self.refreshBrowser() }
+                } catch { self.accountSettingsError = error.localizedDescription }
+            case .failure(let error): self.accountSettingsError = error.localizedDescription
+            }
+        }
+    }
+
+    func cancelRequestVerification() {
+        requestVerifier.cancel()
+        isVerifyingRequest = false
     }
 
     private func presentCleanLoginAfterRejectedSession(reason: String) {
@@ -19652,7 +24784,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func clearRejectedSessionAndPresentLogin(reason: String) {
-        clearPendingFolderMeasurements()
+        stopFolderMeasurements()
         if isRunning
             || sharedLinkLoadProcesses.values.contains(where: { $0.isRunning })
             || sharedSaveProcesses.values.contains(where: { $0.isRunning })
@@ -19662,7 +24794,7 @@ final class DownloaderModel: ObservableObject {
             || maintenanceProcess?.isRunning == true
             || mergeProcess?.isRunning == true
             || archiveProcesses.values.contains(where: { $0.isRunning })
-            || folderMeasurementProcess?.isRunning == true {
+            || !folderMeasurementRuns.isEmpty {
             deferredLoginRequiresCleanStart = true
             presentLogin(reason: reason)
             return
@@ -19674,6 +24806,7 @@ final class DownloaderModel: ObservableObject {
         requiresDedicatedSignIn = true
         accountLoginStatus = .needsSignIn
         accountLoginTargetID = activeAccountID
+        accountLoginDeviceID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         attemptedInitialBrowse = false
         loginCredentialKind = activeSavedAccount?.credentialKind ?? .desktopOAuth
         storageQuota = nil
@@ -19693,15 +24826,10 @@ final class DownloaderModel: ObservableObject {
             )
         }
         setStatus("Preparing a clean PikPak sign-in…")
-        #if FINDER_WORKSPACE_TESTS
-        if isFinderWorkspaceFixture {
-            loginReason = reason
-            isLoginPresented = true
-            return
-        }
-        #endif
-        PikPakLoginDataStore.clearPikPakWebsiteData { [weak self] in
-            guard let self else { return }
+        let loginDevice = accountLoginDeviceID
+        clearAccountLoginWebsiteData { [weak self] in
+            guard let self, !self.isClosingWindow, !self.isChangingAccount, !self.isLoginPresented,
+                  self.accountLoginDeviceID == loginDevice else { return }
             self.loginReason = reason
             self.isLoginPresented = true
         }
@@ -19718,7 +24846,7 @@ final class DownloaderModel: ObservableObject {
                 accountLoginDeviceID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
             }
         }
-        clearPendingFolderMeasurements()
+        stopFolderMeasurements()
         if isRunning {
             deferredLoginReason = reason
             setStatus("Finishing the current browser request before secure sign-in…")
@@ -19794,11 +24922,10 @@ final class DownloaderModel: ObservableObject {
             setStatus("Stopping archive helpers before secure sign-in…")
             return
         }
-        if let folderMeasurementProcess, folderMeasurementProcess.isRunning {
+        if !folderMeasurementRuns.isEmpty {
             deferredLoginReason = reason
-            folderMeasurementWasCancelled = true
-            folderMeasurementProcess.terminate()
-            setStatus("Stopping folder-size calculation before secure sign-in…")
+            stopFolderMeasurements()
+            setStatus("Stopping folder-size calculations before secure sign-in…")
             return
         }
         loginReason = reason
@@ -19818,20 +24945,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func appendOutput(_ text: String) {
-        var safeText = text.replacingOccurrences(of: "\r", with: "\n")
-        let token = refreshToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !token.isEmpty {
-            safeText = safeText.replacingOccurrences(of: token, with: "[credential redacted]")
-        }
-        log.append(safeText)
-
-        // A capped text log prevents this GUI from repeating PikPak's own
-        // thousands-of-rows renderer failure on very large folder downloads.
-        let maximumCharacters = 120_000
-        let retainedCharacters = 90_000
-        if log.count > maximumCharacters {
-            log = "… older activity trimmed …\n" + String(log.suffix(retainedCharacters))
-        }
+        activityLog.append(redactedEngineOutput(text))
     }
 
     private func setStatus(_ message: String) {
@@ -19881,6 +24995,7 @@ final class DownloaderModel: ObservableObject {
         status = message
         statusIsError = true
         statusErrorDiagnostic = diagnostic
+        activityLog.record(redactedEngineOutput(diagnostic?.copyText(summary: message) ?? message), level: .error)
     }
 }
 
@@ -19937,13 +25052,25 @@ extension DownloaderModel {
             model.isUploading = true // Also avoids unrelated size-cache reconciliation.
             return model
         }
-        func drain() async {
-            for _ in 0..<8 { await Task.yield() }
-            try? await Task.sleep(nanoseconds: 5_000_000)
+        func drain(_ model: DownloaderModel) async {
+            for _ in 0..<1_000 {
+                await Task.yield()
+                if model.browserFolderExpansionTask == nil { return }
+                try? await Task.sleep(nanoseconds: 5_000_000)
+            }
+            preconditionFailure("Generated expansion work did not reach its next listing or completion")
         }
         func finish(_ model: DownloaderModel, _ id: String, files: [BrowserItem] = [],
-                    next: String = "", error: Bool = false, staleGeneration: UUID? = nil) throws {
-            let request = model.recordedExpansionLoads.last { $0.id == id }!
+                    next: String = "", error: Bool = false, staleGeneration: UUID? = nil) async throws {
+            // A UI-hosted run can resume this test before the expansion task.
+            // Wait for the expected request instead of assuming a 5 ms drain.
+            for _ in 0..<200 {
+                if model.recordedExpansionLoads.contains(where: { $0.id == id }) { break }
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            guard let request = model.recordedExpansionLoads.last(where: { $0.id == id }) else {
+                preconditionFailure("Missing generated listing request for \(id): \(model.status)")
+            }
             let data = try JSONSerialization.data(withJSONObject: [
                 "files": files.map { ["id": $0.id, "name": $0.name,
                                       "size": 42, "kind": $0.isFolder ? "drive#folder" : "drive#file"] },
@@ -19964,7 +25091,7 @@ extension DownloaderModel {
             model.selectedBrowserItemIDs = [other.id]
             model.selectedBrowserItemID = other.id
             model.expandBrowserSubfolders(root, levels: levels)
-            await drain()
+            await drain(model)
             let expected: Set<String> = levels == 1 ? [root.id, a.id, other.id, c.id] : [root.id, a.id, b.id, other.id, c.id]
             precondition(model.expandedBrowserFolderIDs == expected, "exact requested depth; keep already-open branches")
             precondition(model.recordedExpansionLoads.isEmpty && model.browserFolderExpansionProgress == nil)
@@ -19979,7 +25106,7 @@ extension DownloaderModel {
             let selection = fixture()
             selection.browserTreeChildren = [root.id: [a], a.id: [], other.id: []]
             selection.expandBrowserSubfolders(roots, levels: nil)
-            await drain()
+            await drain(selection)
             precondition(selection.expandedBrowserFolderIDs == [root.id, a.id, other.id],
                          "every selected folder expands under one plan")
             precondition(selection.recordedExpansionLoads.isEmpty && selection.browserFolderExpansionProgress == nil)
@@ -19987,7 +25114,7 @@ extension DownloaderModel {
         let nested = fixture()
         nested.browserTreeChildren = [root.id: [a], a.id: [], other.id: []]
         nested.expandBrowserSubfolders([root, a], levels: nil)
-        await drain()
+        await drain(nested)
         precondition(nested.expandedBrowserFolderIDs == [root.id, a.id], "an ancestor and its child expand once, not twice")
         let filesOnly = fixture()
         filesOnly.expandBrowserSubfolders([item("plain.txt", folder: false)], levels: nil)
@@ -20001,7 +25128,7 @@ extension DownloaderModel {
         let interrupted = fixture(), leaf = item("leaf.txt", folder: false)
         interrupted.browserTreeChildren = [root.id: [a], a.id: [b]]
         interrupted.expandBrowserSubfolders(root, levels: nil)
-        await drain()
+        await drain(interrupted)
         precondition(interrupted.isBrowserFolderExpanded(b.id) && interrupted.isBrowserFolderLoading(b.id))
         let interruptedGeneration = interrupted.browserTreeLoadGenerations[b.id]!
         interrupted.toggleBrowserFolderExpansion(root)
@@ -20009,9 +25136,9 @@ extension DownloaderModel {
         interrupted.toggleBrowserFolderExpansion(root)
         precondition(interrupted.isBrowserFolderLoading(b.id), "Reopening a parent must resume its open but unloaded descendant")
         precondition(interrupted.browserTreeLoadGenerations[b.id] != interruptedGeneration)
-        try finish(interrupted, b.id, files: [item("stale.txt", folder: false)], staleGeneration: interruptedGeneration)
+        try await finish(interrupted, b.id, files: [item("stale.txt", folder: false)], staleGeneration: interruptedGeneration)
         precondition(interrupted.browserTreeChildren[b.id] == nil)
-        try finish(interrupted, b.id, files: [leaf]); await drain()
+        try await finish(interrupted, b.id, files: [leaf]); await drain(interrupted)
         precondition(interrupted.browserTreeEntries.map(\.id).contains(leaf.id))
         print("PASS model: interrupted All Levels resumes unloaded nested folders on parent expansion; late cancelled replies are ignored")
 
@@ -20023,7 +25150,7 @@ extension DownloaderModel {
         restored.restoreBrowserWorkspace(saved)
         precondition(restored.isBrowserFolderLoading(a.id), "Restoring open disclosures must restart missing child listings")
         precondition(!restored.isBrowserFolderLoading(b.id), "Hidden descendants must wait for their parent")
-        try finish(restored, a.id, files: [b]); await drain()
+        try await finish(restored, a.id, files: [b]); await drain(restored)
         precondition(restored.browserTreeEntries.map(\.id).contains(leaf.id))
         precondition(restored.recordedExpansionLoads.map(\.id) == [a.id], "Already loaded descendants must not be refetched")
         print("PASS model: restored workspaces resume visible missing listings and reveal cached descendants without refetching")
@@ -20032,11 +25159,11 @@ extension DownloaderModel {
         cascade.expandedBrowserFolderIDs = [root.id, a.id, b.id]
         cascade.saveActiveBrowserWorkspace()
         cascade.restoreBrowserWorkspace(cascade.accountBrowserWorkspace!)
-        try finish(cascade, root.id, files: [a]); await drain()
+        try await finish(cascade, root.id, files: [a]); await drain(cascade)
         precondition(cascade.isBrowserFolderLoading(a.id))
-        try finish(cascade, a.id, files: [b]); await drain()
+        try await finish(cascade, a.id, files: [b]); await drain(cascade)
         precondition(cascade.isBrowserFolderLoading(b.id))
-        try finish(cascade, b.id, files: [leaf]); await drain()
+        try await finish(cascade, b.id, files: [leaf]); await drain(cascade)
         precondition(cascade.browserTreeEntries.map(\.id).contains(leaf.id))
         print("PASS model: restored nested disclosures resume as each ancestor listing arrives")
 
@@ -20045,14 +25172,14 @@ extension DownloaderModel {
         concurrent.expandedBrowserFolderIDs = [root.id, a.id, b.id]
         precondition(concurrent.requestBrowserTreeLoad(a, append: false))
         concurrent.expandBrowserSubfolders(other, levels: nil)
-        await drain()
+        await drain(concurrent)
         precondition(concurrent.browserFolderExpansion != nil)
-        try finish(concurrent, a.id, files: [b])
+        try await finish(concurrent, a.id, files: [b])
         precondition(concurrent.isBrowserFolderLoading(b.id),
                      "An unrelated All Levels expansion must not block restored descendants")
-        try finish(concurrent, b.id, files: [leaf])
-        try finish(concurrent, other.id, files: [])
-        await drain()
+        try await finish(concurrent, b.id, files: [leaf])
+        try await finish(concurrent, other.id, files: [])
+        await drain(concurrent)
         precondition(concurrent.browserTreeEntries.map(\.id).contains(leaf.id))
         precondition(concurrent.browserFolderExpansion == nil && concurrent.pendingBrowserTreeLoads.isEmpty)
         precondition(concurrent.recordedExpansionLoads.count == 3)
@@ -20065,7 +25192,7 @@ extension DownloaderModel {
         back.browserItems = []
         precondition(back.restoreBrowserFolder(from: [.root]))
         precondition(back.isBrowserFolderLoading(a.id), "Back navigation must reload an interrupted visible listing")
-        try finish(back, a.id, files: [leaf]); await drain()
+        try await finish(back, a.id, files: [leaf]); await drain(back)
         precondition(back.browserTreeEntries.map(\.id).contains(leaf.id))
 
         let bounded = fixture()
@@ -20080,7 +25207,7 @@ extension DownloaderModel {
         precondition(!bounded.isBrowserFolderLoading(empty.id) && !bounded.isBrowserFolderLoading(failed.id) && !bounded.isBrowserFolderLoading(hidden.id))
         while !bounded.browserTreeLoadGenerations.isEmpty {
             precondition(bounded.browserTreeLoadProcesses.count <= 4)
-            for id in Array(bounded.browserTreeLoadGenerations.keys) { try finish(bounded, id, files: []) }
+            for id in Array(bounded.browserTreeLoadGenerations.keys) { try await finish(bounded, id, files: []) }
         }
         precondition(bounded.recordedExpansionLoads.count == waiting.count)
         print("PASS model: Back navigation recovery, four-request limit, and no refetch of empty, failed or hidden branches")
@@ -20088,7 +25215,7 @@ extension DownloaderModel {
         let deep = fixture()
         deep.browserTreeChildren = [root.id: [a], a.id: [b], b.id: [c], c.id: []]
         deep.expandBrowserSubfolders(root, levels: nil)
-        await drain()
+        await drain(deep)
         precondition(deep.expandedBrowserFolderIDs == [root.id, a.id, b.id, c.id])
         let large = fixture()
         let manyFolders = (0..<2_048).map { item("Cached \($0)") }
@@ -20097,18 +25224,18 @@ extension DownloaderModel {
         large.expandBrowserSubfolders(root)
         precondition(large.expandedBrowserFolderIDs.isEmpty && large.browserFolderExpansionProgress != nil,
                      "starting expansion yields immediately instead of blocking on cached recursion")
-        for _ in 0..<100 where large.browserFolderExpansion != nil { await drain() }
+        for _ in 0..<100 where large.browserFolderExpansion != nil { await drain(large) }
         precondition(large.expandedBrowserFolderIDs.count == 2_049 && large.browserFolderExpansion == nil)
         precondition(large.recordedExpansionLoads.isEmpty)
         print("PASS model: all levels, 2,049 cached folders, asynchronous bounded UI batches without re-fetching")
 
         let paged = fixture()
         paged.expandBrowserSubfolders(root)
-        await drain()
+        await drain(paged)
         let children = (0..<6).map { item("Folder \($0)") }
         let files = (0..<494).map { item("File \($0).txt", folder: false) }
-        try finish(paged, root.id, files: files + children, next: "root-page-2")
-        await drain()
+        try await finish(paged, root.id, files: files + children, next: "root-page-2")
+        await drain(paged)
         precondition(paged.browserTreeLoadProcesses.count == 4, "fill all four listing slots")
         precondition(!paged.pendingBrowserTreeLoads.isEmpty && paged.browserTreeLoadingFolderIDs.count > 4)
         var iteration = 0
@@ -20120,16 +25247,16 @@ extension DownloaderModel {
                 let request = paged.recordedExpansionLoads.last { $0.id == id }!
                 if id == root.id {
                     precondition(request.token == "root-page-2")
-                    try finish(paged, id, files: [children[0], item("Late Folder")])
+                    try await finish(paged, id, files: [children[0], item("Late Folder")])
                 } else if id == children[0].id && !request.append {
-                    try finish(paged, id, files: (0..<500).map { item("Nested \($0).txt", folder: false) }, next: "child-page-2")
+                    try await finish(paged, id, files: (0..<500).map { item("Nested \($0).txt", folder: false) }, next: "child-page-2")
                 } else if id == children[0].id {
-                    try finish(paged, id, files: [item("Grandchild")])
+                    try await finish(paged, id, files: [item("Grandchild")])
                 } else {
-                    try finish(paged, id, error: id == children[5].id)
+                    try await finish(paged, id, error: id == children[5].id)
                 }
             }
-            await drain()
+            await drain(paged)
         }
         precondition(paged.browserTreeChildren[root.id]?.count == 501, "all pages and no duplicated folder entries")
         precondition(paged.browserTreeChildren[children[0].id]?.count == 501, "paginate boundary-level folders too")
@@ -20142,23 +25269,23 @@ extension DownloaderModel {
         let cancelled = fixture()
         cancelled.toggleBrowserFolderExpansion(other)
         cancelled.expandBrowserSubfolders(root, levels: nil)
-        await drain()
+        await drain(cancelled)
         let oldGeneration = cancelled.browserTreeLoadGenerations[root.id]!
         cancelled.cancelBrowserFolderExpansion()
         precondition(cancelled.browserTreeLoadGenerations[other.id] != nil, "Cancel never cancels a manual browse")
         precondition(cancelled.browserTreeLoadGenerations[root.id] == nil && cancelled.expandedBrowserFolderIDs.contains(root.id))
         precondition(cancelled.browserTreeLoadErrors[root.id] == Self.browserFolderLoadStopped)
-        try finish(cancelled, other.id)
+        try await finish(cancelled, other.id)
         precondition(cancelled.browserTreeLoadGenerations[root.id] == nil, "Completing an unrelated manual request must respect Cancel Expansion")
         cancelled.expandBrowserSubfolders(root)
-        await drain()
+        await drain(cancelled)
         let newGeneration = cancelled.browserTreeLoadGenerations[root.id]!
-        try finish(cancelled, root.id, files: [item("Stale")], staleGeneration: oldGeneration)
+        try await finish(cancelled, root.id, files: [item("Stale")], staleGeneration: oldGeneration)
         precondition(cancelled.browserTreeChildren[root.id] == nil)
         precondition(cancelled.browserTreeLoadGenerations[root.id] == newGeneration, "old completion cannot clear new spinner")
         cancelled.toggleBrowserFolderExpansion(root)
         precondition(cancelled.browserFolderExpansion == nil && !cancelled.expandedBrowserFolderIDs.contains(root.id))
-        try finish(cancelled, root.id, files: [item("Late")], staleGeneration: newGeneration)
+        try await finish(cancelled, root.id, files: [item("Late")], staleGeneration: newGeneration)
         precondition(cancelled.browserTreeChildren[root.id] == nil, "collapse stays collapsed after late reply")
         cancelled.cancelBrowserTreeLoads()
         print("PASS model: Cancel, collapsed branches, unrelated manual requests, replacement generations and late callbacks")
@@ -20167,9 +25294,9 @@ extension DownloaderModel {
         repeated.browserTreeChildren[root.id] = []
         repeated.browserTreeNextPageTokens[root.id] = "repeated"
         repeated.expandBrowserSubfolders(root)
-        await drain()
-        try finish(repeated, root.id, next: "repeated")
-        await drain()
+        await drain(repeated)
+        try await finish(repeated, root.id, next: "repeated")
+        await drain(repeated)
         precondition(repeated.browserFolderExpansion == nil && repeated.recordedExpansionLoads.count == 1)
         precondition(repeated.browserTreeLoadErrors[root.id]?.contains("repeated") == true)
 
@@ -20186,21 +25313,21 @@ extension DownloaderModel {
         }
         links.activateSharedLink(firstID)
         links.expandBrowserSubfolders(root)
-        await drain()
+        await drain(links)
         let firstGeneration = links.browserTreeLoadGenerations[root.id]!
         links.activateSharedLink(secondID)
         precondition(links.browserFolderExpansion == nil)
         precondition(links.sharedLinkSessions[firstID]?.workspace?.expandedFolderIDs.contains(root.id) == true)
         links.expandBrowserSubfolders(root)
-        await drain()
-        try finish(links, root.id, files: [item("Wrong Link")], staleGeneration: firstGeneration)
+        await drain(links)
+        try await finish(links, root.id, files: [item("Wrong Link")], staleGeneration: firstGeneration)
         precondition(links.browserTreeChildren[root.id] == nil)
-        try finish(links, root.id, files: [])
-        await drain()
+        try await finish(links, root.id, files: [])
+        await drain(links)
         precondition(links.browserFolderExpansion == nil && links.browserTreeChildren[root.id] == [])
         links.activateSharedLink(firstID)
         precondition(links.isBrowserFolderLoading(root.id), "Returning to the first link must resume its interrupted listing")
-        try finish(links, root.id, files: [leaf]); await drain()
+        try await finish(links, root.id, files: [leaf]); await drain(links)
         precondition(links.sharedLinkTreeEntries(for: firstID).map(\.id).contains(leaf.id))
         precondition(!links.sharedLinkTreeEntries(for: secondID).map(\.id).contains(leaf.id))
         print("PASS model: repeated-token termination, shared-link scope, preserved workspace, no cross-link results or persistence")
@@ -20258,6 +25385,34 @@ extension DownloaderModel {
             "A generated copy must not cause a conversion loop")
         model.clearPreview()
         precondition(!FileManager.default.fileExists(atPath: output.path))
+        model.previewFileID = item.id; model.previewSources = [second]; model.previewFixtureMediaURL = nil
+        let bufferedBytes = try Data(contentsOf: unsupported)
+        model.previewInfo = .init(name: item.name, size: UInt64(bufferedBytes.count), mimeType: "video/mp4",
+            thumbnailLink: nil, iconLink: nil, contentLink: second.url, sources: [second])
+        let cache = try PreviewResourceCache()
+        cache.updateMetadata(typeIdentifier: "public.mpeg-4", contentLength: Int64(bufferedBytes.count), supportsByteRanges: true)
+        cache.store(bufferedBytes, at: 0)
+        model.previewResourceCacheFileID = item.id
+        model.previewResourceCaches[model.previewResourceCacheKey(for: second, index: 0)] = cache
+        model.loadPreviewSource(at: 0, fileID: item.id, autoplay: false)
+        for _ in 0..<200 {
+            if model.mediaPlayback.canSeek { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        precondition(model.mediaPlayback.canSeek && model.previewUsesRetainedCache)
+        model.reportVideoPreviewFailure(failure, fileID: item.id, player: model.previewPlayer!)
+        precondition(model.compatiblePreviewTask != nil && model.previewFreshCacheRetries.isEmpty,
+            "A fully buffered decoder failure must convert existing bytes without retrying the URL")
+        for _ in 0..<600 {
+            if model.compatiblePreviewCopy != nil && model.mediaPlayback.canSeek || model.previewPlaybackError != nil { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        precondition(model.previewPlaybackError == nil && model.compatiblePreviewCopy != nil,
+            "A complete buffered video must recover even when its signed remote URL is unreachable")
+        let cachedFrame = try await AVAssetImageGenerator(asset: model.previewPlayer!.currentItem!.asset)
+            .image(at: CMTime(seconds: 1, preferredTimescale: 600))
+        precondition(cachedFrame.image.width == 160 && model.previewPlayer!.rate == 0)
+        model.clearPreview()
         print("PASS video frame recovery: next cloud source, stale-view rejection, compatible copy, paused intent, bounded failure and cleanup")
     }
 
@@ -20271,6 +25426,27 @@ extension DownloaderModel {
         model.saveActiveBrowserWorkspace()
         _ = model.activateAccountBrowser()
         return model
+    }
+
+    static func testExternalPreviewHandoff(defaults: UserDefaults) throws {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        let transcode = PreviewSource(url: "https://fixture.invalid/stalled.m3u8?signature=fixture-secret", label: "720P",
+            isOrigin: false, videoCodec: "h264", audioCodec: "aac")
+        let original = PreviewSource(url: "https://fixture.invalid/original.mp4?signature=fixture-secret", label: "Original",
+            isOrigin: true, videoCodec: nil, audioCodec: nil)
+        model.previewSources = [transcode, original]
+        precondition(model.preferredCompatibilitySource()?.url == original.url)
+        let playlist = try model.makePrivateCompatibilityPlaylist(for: original.contentURL!)
+        defer { try? FileManager.default.removeItem(at: playlist) }
+        let arguments = compatibilityPlayerArguments(playlistURL: playlist)
+        precondition(arguments.contains("--mpv-http-header-fields=Origin: https://mypikpak.com"))
+        precondition(arguments.contains("--mpv-referrer=https://mypikpak.com/"))
+        precondition(arguments.last == playlist.path && !arguments.joined().contains("fixture-secret"))
+        let permissions = try FileManager.default.attributesOfItem(atPath: playlist.path)[.posixPermissions] as? NSNumber
+        precondition(permissions?.intValue == 0o600)
+        let data = try String(contentsOf: playlist, encoding: .utf8)
+        precondition(data.contains(original.url) && !data.contains(transcode.url))
+        print("PASS IINA handoff: original source, matching Origin/Referer, signed URL private and absent from arguments")
     }
 
     static func testAVIPreviewRouting(defaults: UserDefaults, original: URL) async throws {
@@ -20422,6 +25598,78 @@ extension DownloaderModel {
         precondition(model.compatiblePreviewTask == nil && model.previewFreshCacheRetries.isEmpty)
         precondition(model.previewPlaybackError != nil, "Network failures must not download/convert again")
         print("PASS MP4: network errors keep their diagnostic without cache or conversion retries")
+    }
+
+    static func testPreviewPreparationProgress(defaults: UserDefaults, remote: URL, bytes: Data) async throws {
+        let model = finderWorkspaceFixture(defaults: defaults)
+        defer { model.clearPreview(); model.clearPreviewResourceCaches() }
+        func wait(_ condition: () -> Bool) async throws {
+            for _ in 0..<600 {
+                if condition() { return }
+                try await Task.sleep(nanoseconds: 25_000_000)
+            }
+            preconditionFailure("Timed out waiting for preview preparation progress")
+        }
+        let item = BrowserItem(id: "progress-fixture", name: "Progress.mp4", size: UInt64(bytes.count), kind: .file,
+            parentId: "", mimeType: "video/mp4", createdTime: nil, modifiedTime: nil, fileExtension: "mp4",
+            iconLink: nil, thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+        model.browserItems = [item]; model.selectedBrowserItemID = item.id; model.selectedBrowserItemIDs = [item.id]
+        for (suffix, origin, knownTotal) in [("progress", true, true), ("no-length.progress", true, true), ("no-length.progress", false, false)] {
+            model.clearPreview(); model.clearPreviewResourceCaches()
+            let source = PreviewSource(url: "https://fixture.invalid/download/progress", label: "Original", isOrigin: origin,
+                videoCodec: nil, audioCodec: nil)
+            model.previewFixtureMediaURL = remote.appendingPathExtension(suffix)
+            model.previewFileID = item.id; model.previewSources = [source]
+            model.previewInfo = PreviewInfo(name: item.name, size: item.size, mimeType: item.mimeType,
+                thumbnailLink: nil, iconLink: nil, contentLink: source.url, sources: [source])
+            precondition(model.startCompatibleVideoPreview(fileID: item.id, autoplay: false))
+            try await wait { (model.previewPreparationProgress?.bytes ?? 0) > 0 && (model.previewPreparationBytesPerSecond ?? 0) > 0 }
+            let progress = model.previewPreparationProgress!
+            precondition(model.previewPlayer == nil && model.isPreviewLoading && progress.activity == .transferring,
+                "The loading overlay must have real download metrics before a player exists")
+            precondition(progress.bytes < UInt64(bytes.count))
+            if knownTotal {
+                precondition(progress.fileSize == UInt64(bytes.count)
+                    && progress.fraction == Double(progress.bytes) / Double(bytes.count),
+                    "Use HTTP length or the known source size for download percentage")
+            } else {
+                precondition(progress.fileSize == 0 && progress.fraction == nil,
+                    "An unknown-length download still reports bytes and speed without inventing a percentage")
+            }
+            try await wait { model.previewPreparationBytesPerSecond == 0 }
+            precondition(model.previewPreparationProgress?.bytes == progress.bytes && model.isPreviewLoading,
+                "Download speed must decay to zero while a server stalls")
+            try await wait { model.mediaPlayback.canSeek || model.previewPlaybackError != nil }
+            precondition(model.previewPlaybackError == nil, model.previewPlaybackError ?? "")
+            precondition(model.previewPreparationProgress == nil && model.previewPreparationBytesPerSecond == nil,
+                "Completed downloads must not leave preparation metrics attached to playback")
+        }
+        model.clearPreview()
+        model.previewPreparationReadActivity = FilePreviewReadActivity()
+        model.updatePreviewPreparationProgress(.init(message: "Downloading", bytes: 40, fileSize: 100, activity: .transferring))
+        precondition(model.previewPreparationFraction == 0.4 && (model.previewPreparationBytesPerSecond ?? 0) > 0)
+        model.updatePreviewPreparationProgress(.init(message: "Preparing", activity: .processing))
+        model.updatePreviewPreparationProgress(.init(message: "Late download", fraction: 1, bytes: 100, fileSize: 100, activity: .transferring))
+        precondition(model.previewPreparationProgress?.activity == .processing && model.previewPreparationFraction == nil
+            && model.previewPreparationBytesPerSecond == nil, "Conversion must not reuse download percentage or speed")
+        model.clearPreviewPreparationProgress()
+        let source = PreviewSource(url: "https://fixture.invalid/download/progress", label: "Original", isOrigin: true,
+            videoCodec: nil, audioCodec: nil)
+        model.previewFixtureMediaURL = remote.appendingPathExtension("progress")
+        model.previewFileID = item.id; model.previewSources = [source]
+        precondition(model.startCompatibleVideoPreview(fileID: item.id, autoplay: false))
+        try await wait { (model.previewPreparationProgress?.bytes ?? 0) > 0 }
+        model.clearPreview()
+        try await Task.sleep(nanoseconds: 1_300_000_000)
+        precondition(model.previewPreparationProgress == nil && model.previewPreparationBytesPerSecond == nil
+            && model.previewPlayer == nil, "Cancellation and queued progress must not restore the loading card")
+        model.previewFixtureMediaURL = remote.deletingLastPathComponent().appendingPathComponent("error")
+        model.previewFileID = item.id; model.previewSources = [source]
+        precondition(model.startCompatibleVideoPreview(fileID: item.id, autoplay: false))
+        try await wait { model.previewPlaybackError != nil }
+        precondition(model.previewPreparationProgress == nil && model.previewPreparationBytesPerSecond == nil,
+            "A failed download must clear its progress and speed")
+        print("PASS loading preview: real download bytes/speed/percentage, HTTP and source totals, unknown length, stalled speed, conversion, completion, failure and cancellation")
     }
 
     static func testMergeFolderSelection(defaults: UserDefaults) throws {
@@ -20680,6 +25928,47 @@ extension DownloaderModel {
         return model
     }
 
+    static func testRequestVerificationStatus() async throws {
+        let model = try finderAccountsFixture()
+        let store = model.accountStore!
+        defer { model.stopForWindowClose(); try? FileManager.default.removeItem(at: store.directory) }
+        let id = model.activeAccountID!
+        let original = try store.files(for: id).load()
+        let challenge = PikPakVerificationChallenge(url: "https://user.mypikpak.com/verify?captcha_token=generated-private-proof",
+            clientID: PikPakDesktopOAuth.clientID, deviceID: model.deviceID,
+            action: "GET:/drive/v1/files", expiresAt: Date().timeIntervalSince1970 + 600)
+        let raw = PikPakVerificationChallenge.diagnosticPrefix + String(decoding: try JSONEncoder().encode(challenge), as: UTF8.self)
+        model.handleWebLoginNeeded(for: raw)
+        precondition(model.accountConnectionStatus == .verificationRequired && model.requestVerificationChallenge == challenge)
+        precondition(!model.isLoginPresented && model.hasAccountSession)
+        precondition(!model.redactedEngineOutput(raw).contains("generated-private-proof"))
+        let profile = model.accountProfile!
+        model.accountProfileLoader = { _ in throw PikPakRequestVerificationError.required(challenge) }
+        model.checkAccountStatus()
+        await model.accountCheckTask?.value
+        precondition(model.accountConnectionStatus == .verificationRequired && !model.isLoginPresented)
+        let retained = try store.files(for: id).load()
+        precondition(retained.token == original.token)
+        model.cancelRequestVerification()
+        precondition(model.requestVerificationChallenge == challenge && !model.isVerifyingRequest)
+        model.accountProfileLoader = { _ in profile }
+        model.checkAccountStatus()
+        await model.accountCheckTask?.value
+        precondition(model.accountConnectionStatus == .signedIn && model.requestVerificationChallenge == nil)
+        model.handleWebLoginNeeded(for: raw)
+        let other = model.savedAccounts.first { $0.id != id }!
+        model.applyAccounts(try store.activate(other.id))
+        precondition(model.requestVerificationChallenge == nil)
+        model.handleWebLoginNeeded(for: raw)
+        // applyAccounts changes identity; adopting the new session establishes
+        // its device, as normal account switching does.
+        model.deviceID = try store.files(for: other.id).load().deviceID
+        model.requestVerificationChallenge = nil
+        model.handleWebLoginNeeded(for: raw)
+        precondition(model.requestVerificationChallenge == nil)
+        print("PASS connection status: verification blocks green signed-in status, status check retains the challenge and session, verified gate clears it, account switches reject stale challenges")
+    }
+
     static func testSessionRecovery() async throws {
         func require(_ condition: Bool) { precondition(condition) }
         let model = try finderAccountsFixture()
@@ -20692,10 +25981,17 @@ extension DownloaderModel {
             "HTTP request failed: HTTP status 401 Unauthorized",
             "connection timed out at request 4126",
             "Could not open fixture-invalid_grant.txt",
+            "error: authentication failed: PikPak requires additional verification in the official web app",
+            "error: PikPak shared link unavailable: PikPak requires additional verification before opening this link",
         ] {
             model.handleWebLoginNeeded(for: message)
             require(model.sessionRecoveryTask == nil && !model.isLoginPresented && model.hasAccountSession)
+            require(try store.files(for: id).load().token == "fixture-account-a")
         }
+        let restarted = try PikPakAccountStore(directory: store.directory)
+        let restored = try restarted.files(for: id).load()
+        require(restored.token == model.refreshToken && restored.deviceID == model.deviceID)
+        require(try restarted.load().accounts.first(where: { $0.id == id })?.needsSignIn == false)
         let rejection = "error: PikPak session rejected: fixture credential rejected"
         let profile = model.accountProfile!
         var checks = 0
@@ -20729,7 +26025,97 @@ extension DownloaderModel {
         require(model.isLoginPresented && model.requiresDedicatedSignIn && !model.hasAccountSession)
         require(!FileManager.default.fileExists(atPath: store.files(for: id).tokenURL.path))
         require(try store.files(for: other.id).load().token == "fixture-account-b")
-        print("PASS session recovery: temporary failures preserve credentials, stale errors recheck once, late replies respect account switches, confirmed rejection requires sign-in")
+        print("PASS session recovery: verification and temporary failures preserve saved credentials across restart, stale errors recheck once, late replies respect account switches, confirmed rejection requires sign-in")
+    }
+
+    static func testWindowAccountInheritance() throws {
+        let primary = try finderAccountsFixture()
+        let store = primary.accountStore!
+        let firstID = primary.activeAccountID!
+        let secondID = primary.savedAccounts.first { $0.id != firstID }!.id
+        let source = finderWorkspaceFixture(workspaceSessionID: "secondary", settings: primary.finderSettings)
+        let child = finderWorkspaceFixture(workspaceSessionID: PikPakWorkspaceStorage.newSessionID(), settings: primary.finderSettings)
+        defer {
+            [primary, source, child].forEach { $0.stopForWindowClose() }
+            try? FileManager.default.removeItem(at: store.directory)
+        }
+        source.accountStore = try PikPakAccountStore(directory: store.directory)
+        source.applyAccounts(try store.activate(secondID, workspaceSessionID: source.workspaceSessionID))
+        source.accountLoginStatus = .signedIn
+        child.accountStore = try PikPakAccountStore(directory: store.directory)
+        child.applyAccounts(try store.registerWorkspace(child.workspaceSessionID))
+        precondition(child.activeAccountID == firstID, "a fresh workspace initially offers the primary account")
+        child.inheritWindowAccount(from: source)
+        precondition(child.activeAccountID == secondID && child.accountProfile?.sub == "offline-account-b"
+                     && child.hasAccountSession && child.accountLoginStatus == .signedIn,
+                     "New Window must inherit its focused workspace's account")
+        let storedPrimaryID = try store.load().activeID
+        precondition(storedPrimaryID == firstID, "inheriting an account must not change the primary selection")
+        source.applyAccounts(try store.selectWorkspaceAccount(nil, workspaceSessionID: source.workspaceSessionID))
+        child.inheritWindowAccount(from: source)
+        precondition(child.activeAccountID == nil && !child.hasAccountSession && !child.requiresDedicatedSignIn,
+                     "an explicitly signed-out source must not reopen the primary account")
+        let rejected = try store.logOut(secondID, deactivate: false)
+        source.applyAccounts(rejected)
+        source.applyAccounts(try store.selectWorkspaceAccount(secondID, workspaceSessionID: source.workspaceSessionID))
+        child.inheritWindowAccount(from: source)
+        precondition(child.activeAccountID == secondID && child.requiresDedicatedSignIn && !child.hasAccountSession,
+                     "a rejected account must be inherited without copying stale credentials")
+        let primaryToken = try store.files(for: firstID).load().token
+        precondition(primaryToken == "fixture-account-a")
+        print("PASS New Window account inheritance: focused account, signed-out and rejected selections, preserved primary credentials")
+    }
+
+    static func testAccountLoginPreparationContext() throws {
+        let model = try finderAccountsFixture()
+        let store = model.accountStore!
+        let otherWindow = finderWorkspaceFixture(workspaceSessionID: "secondary", settings: model.finderSettings)
+        defer {
+            model.stopForWindowClose(); otherWindow.stopForWindowClose()
+            try? FileManager.default.removeItem(at: store.directory)
+        }
+        var completions: [() -> Void] = []
+        model.accountLoginWebsiteDataClearer = { completions.append($0) }
+        model.beginAccountLogin(credentialKind: .desktopOAuth)
+        precondition(model.isChangingAccount && !model.isLoginPresented && completions.count == 1)
+        let previewContext = model.fileOpenContext
+        otherWindow.finderSettings.contentMode = .guest
+        precondition(model.fileOpenContext != previewContext, "another window invalidates the preview context")
+        completions.removeFirst()()
+        precondition(model.isLoginPresented && !model.isChangingAccount,
+                     "Download Mode changes must still finish the current login preparation")
+        model.cancelLogin()
+        precondition(model.canChangeAccount && model.canCheckAccountStatus,
+                     "cancelling the prepared sheet releases account management")
+
+        model.beginAccountLogin(credentialKind: .desktopOAuth)
+        let cancelledCompletion = completions.removeFirst()
+        let cancelledDevice = model.accountLoginDeviceID
+        model.cancelLogin()
+        model.beginAccountLogin(credentialKind: .desktopOAuth)
+        precondition(model.accountLoginDeviceID != cancelledDevice)
+        cancelledCompletion()
+        precondition(model.isChangingAccount && !model.isLoginPresented,
+                     "an old callback cannot release or present a newer login attempt")
+        otherWindow.finderSettings.contentMode = .user
+        completions.removeFirst()()
+        precondition(model.isLoginPresented && !model.isChangingAccount)
+        model.cancelLogin()
+
+        model.clearRejectedSessionAndPresentLogin(reason: "Synthetic rejected session")
+        precondition(!model.isLoginPresented && completions.count == 1)
+        otherWindow.finderSettings.contentMode = .dynamic
+        completions.removeFirst()()
+        precondition(model.isLoginPresented && model.loginReason == "Synthetic rejected session",
+                     "rejected-session preparation also survives Download Mode changes")
+        model.cancelLogin()
+
+        model.beginAccountLogin(credentialKind: .desktopOAuth)
+        precondition(completions.count == 1)
+        model.stopForWindowClose()
+        completions.removeFirst()()
+        precondition(!model.isLoginPresented, "a closed workspace cannot present a late login sheet")
+        print("PASS login preparation: cross-window mode changes, cancelled and newer attempts, rejected sessions and window closure")
     }
 
     static func testAccountManagement() async throws {
@@ -20790,7 +26176,8 @@ extension DownloaderModel {
         require(model.activeAccountID == idB && model.savedAccounts.first(where: { $0.id == idA })?.needsSignIn == true,
                 "expired inactive account prompts sign-in without logging out the current account")
         model.accountProfileLoader = loader
-        model.completeWebLogin(with: .init(refreshToken: "fixture-account-c", deviceID: String(repeating: "c", count: 32)))
+        model.beginAccountLogin(credentialKind: .desktopOAuth)
+        model.completeWebLogin(with: .init(refreshToken: "fixture-account-c", deviceID: model.loginDeviceID))
         await model.accountCheckTask?.value
         require(model.savedAccounts.count == 3 && model.accountProfile?.sub == "offline-account-c", "new login adds an account and preserves the others")
         let idC = model.activeAccountID!
@@ -20851,17 +26238,20 @@ extension DownloaderModel {
         model.cancelLogin()
         model.accountLoginTargetID = previousID
         model.accountProfileLoader = { _ in throw PikPakAccountError.needsSignIn }
-        model.completeWebLogin(with: .init(refreshToken: newToken, deviceID: String(repeating: "p", count: 32), credentialKind: .personalAccessToken))
+        model.beginAccountLogin(accountID: previousID, credentialKind: .personalAccessToken)
+        model.completeWebLogin(with: .init(refreshToken: newToken, deviceID: model.loginDeviceID, credentialKind: .personalAccessToken))
         await model.accountCheckTask?.value
         require(try model.activeAccountID == previousID && oldFiles.load().token == "fixture-account-a")
         model.accountLoginTargetID = previousID
         model.accountProfileLoader = { _ in .init(sub: "other-account", name: "Other") }
-        model.completeWebLogin(with: .init(refreshToken: newToken, deviceID: String(repeating: "p", count: 32), credentialKind: .personalAccessToken))
+        model.beginAccountLogin(accountID: previousID, credentialKind: .personalAccessToken)
+        model.completeWebLogin(with: .init(refreshToken: newToken, deviceID: model.loginDeviceID, credentialKind: .personalAccessToken))
         await model.accountCheckTask?.value
         require(try model.activeAccountID == previousID && oldFiles.load().token == "fixture-account-a")
         model.accountLoginTargetID = previousID
         model.accountProfileLoader = { _ in try await Task.sleep(nanoseconds: 5_000_000_000); return profile }
-        model.completeWebLogin(with: .init(refreshToken: newToken, deviceID: String(repeating: "p", count: 32), credentialKind: .personalAccessToken))
+        model.beginAccountLogin(accountID: previousID, credentialKind: .personalAccessToken)
+        model.completeWebLogin(with: .init(refreshToken: newToken, deviceID: model.loginDeviceID, credentialKind: .personalAccessToken))
         model.cancelAccountCheck()
         await model.accountCheckTask?.value
         require(try model.activeAccountID == previousID && oldFiles.load().token == "fixture-account-a")
@@ -20872,7 +26262,8 @@ extension DownloaderModel {
             require(try files.load().credentialKind == .personalAccessToken)
             return profile
         }
-        model.completeWebLogin(with: .init(refreshToken: newToken, deviceID: String(repeating: "p", count: 32), credentialKind: .personalAccessToken))
+        model.beginAccountLogin(accountID: previousID, credentialKind: .personalAccessToken)
+        model.completeWebLogin(with: .init(refreshToken: newToken, deviceID: model.loginDeviceID, credentialKind: .personalAccessToken))
         await model.accountCheckTask?.value
         require(model.accountProfile == profile && model.activeSavedAccount?.credentialKind == .personalAccessToken)
         require(model.validateConfiguration(), "PAT JWTs must not go through the refresh-token parser")
@@ -20984,6 +26375,48 @@ extension DownloaderModel {
         }
     }
 
+    /// Large outlines used by performance checks contain generated names only.
+    /// All folders are already in memory; expansion never opens a real file or
+    /// launches a listing helper.
+    func populateExpandedScrollingFixture(folderCount: Int = 100, filesPerFolder: Int = 100,
+                                          levels: Int = 2) {
+        precondition(isFinderWorkspaceFixture)
+        populateScrollingFixture(count: 0)
+        var children: [String: [BrowserItem]] = [:]
+        var paths: [String: String] = [:]
+        var parents: [String: String] = [:]
+        var expanded = Set<String>()
+        func item(folder: Bool, parent: String, path: String) -> BrowserItem {
+            let id = UUID().uuidString
+            let name = UUID().uuidString + (folder ? "" : ".txt")
+            paths[id] = path + "/" + name
+            parents[id] = parent
+            return BrowserItem(id: id, name: name, size: folder ? 0 : 24_576,
+                kind: folder ? .folder : .file, parentId: parent, mimeType: folder ? nil : "text/plain",
+                createdTime: "2026-09-01T10:00:00Z", modifiedTime: "2026-09-08T01:00:00Z",
+                fileExtension: folder ? nil : "txt", iconLink: nil, thumbnailLink: nil,
+                fileCategory: nil, hash: nil, md5Checksum: nil)
+        }
+        func branch(parent: String, path: String, level: Int) -> BrowserItem {
+            let folder = item(folder: true, parent: parent, path: path)
+            let folderPath = paths[folder.id]!
+            var listing: [BrowserItem] = []
+            if level < max(1, levels) { listing.append(branch(parent: folder.id, path: folderPath, level: level + 1)) }
+            listing += (0..<max(0, filesPerFolder)).map { _ in item(folder: false, parent: folder.id, path: folderPath) }
+            children[folder.id] = listing
+            expanded.insert(folder.id)
+            return folder
+        }
+        let roots = (0..<max(0, folderCount)).map { _ in branch(parent: "", path: "", level: 1) }
+        browserItems = roots
+        browserTreeChildren = children
+        browserItemPaths = paths
+        browserItemParentIDs = parents
+        expandedBrowserFolderIDs = expanded
+        finderFixtureFolders = children.merging(["": roots]) { _, new in new }
+        status = "Offline expanded outline · \(browserTreeEntries.count.formatted()) rows · generated names only"
+    }
+
     func setResourceScanFixture(_ child: Process, files: Int, folders: Int, path: String) {
         precondition(isFinderWorkspaceFixture)
         duplicateProcess = child
@@ -21054,6 +26487,7 @@ extension DownloaderModel {
     static func testSharedLinkRetries(defaults: UserDefaults) {
         typealias Load = (id: UUID, request: ShareBrowseInput, process: Process)
         let model = sharedLinkRetryFixture(defaults: defaults, failedCount: 10)
+        let initialErrorCount = model.activityLog.errorCount
         var launched: [Load] = []
         model.sharedLinkLoadFixture = { launched.append(($0, $1, $2)) }
         let alreadyLoading = model.sharedLinks.last!.id
@@ -21102,6 +26536,11 @@ extension DownloaderModel {
         precondition(model.shareLinkFeedbackMessage == "Retry complete: 7 opened, 1 still failed. 1 disconnected.")
         precondition(model.browserSource == .account, "late completions never switch tabs")
         precondition(model.sharedLinkSessions[failedID]!.savedItemIDs == ["already-saved"], "retry keeps saved-item history")
+        precondition(model.activityLog.errorCount == initialErrorCount,
+            "Background link refresh must not appear as a failed download")
+        precondition(model.activityLog.entries(matching: .warning).contains {
+            $0.message.contains("Saved share link unavailable") && $0.message.contains("replacement share link")
+        }, "Background link failures explain account-download recovery as a Warning")
         model.retryAllFailedSharedLinks()
         precondition(model.sharedLinkRetryProgress == .init(completed: 0, total: 1) && launched.last!.id == failedID)
         let last = launched.last!
@@ -21173,6 +26612,17 @@ extension DownloaderModel {
         precondition(model.activeSharedLinkID == second && model.browserActionSelectionCount == 3)
         model.saveSelectedSharedItems()
         precondition(model.sharedSaveFixtureRequests.count == 2, "saved selections are not resubmitted")
+        model.finishShareSave(output: #"{"restore_status":"complete","saved_count":0,"skipped_duplicate_count":1}"#,
+            requestedIDs: [readme.id], linkID: second)
+        precondition(model.shareLinkFeedbackMessage == "Skipped 1 duplicate file(s) already in your PikPak.",
+            "skipped link files must not be reported as new saves")
+        model.finishShareSave(output: #"{"restore_status":"complete","saved_count":1,"skipped_duplicate_count":1}"#,
+            requestedIDs: [readme.id, notes.id], linkID: second)
+        precondition(model.shareLinkFeedbackMessage == "Saved 1 item; skipped 1 duplicate file(s).")
+        model.finishShareSave(output: #"{"restore_status":"RESTORE_PROGRESS","saved_count":1,"skipped_duplicate_count":0,"duplicate_cache_refresh_needed":true}"#,
+            requestedIDs: [readme.id], linkID: second)
+        precondition(model.shareLinkFeedbackMessage?.hasPrefix("Save accepted for 1 item. Still processing") == true
+            && model.shareLinkFeedbackTone == .info, "unfinished remote saves must be reported as still processing")
         print("PASS Links selection: additive folders, recursive roots, duplicate IDs across shares, context batch save and correct per-share authorization")
 
         model.clearBrowserSelectionFromCanvas()
@@ -21261,10 +26711,12 @@ extension DownloaderModel {
         print("PASS Links download compatibility: multiple shared selections enter the queue with separate authorization")
     }
 
-    static func finderWorkspaceFixture(defaults: UserDefaults = .standard, workspaceSessionID: String = "primary",
+    static func finderWorkspaceFixture(defaults: UserDefaults? = nil, workspaceSessionID: String = "primary",
                                        settings: FinderSettings? = nil) -> DownloaderModel {
         precondition(PikPakWorkspaceStorage.isValidSessionID(workspaceSessionID))
-        let model = DownloaderModel(finderFixture: true, defaults: defaults)
+        let suiteName = "com.wky.MyCloudDriver.FinderFixture.\(UUID().uuidString)"
+        let model = DownloaderModel(finderFixture: true, defaults: defaults ?? UserDefaults(suiteName: suiteName)!)
+        if defaults == nil { model.isolatedPreferencesSuite = suiteName }
         model.workspaceSessionID = workspaceSessionID
         if let settings { model.finderSettings = settings }
         model.accountProfile = PikPakAccountProfile(sub: "offline-account", name: "Taylor Chen")
@@ -21652,7 +27104,7 @@ extension DownloaderModel {
     }
 
     private static var taskActivityDuplicateFixture: String {
-        #"{"root_path":"/Projects","scanned_files":1250,"scanned_folders":86,"failed_folders":0,"duplicate_files":2,"exact_groups":1,"possible_groups":0,"reclaimable_bytes":24576,"groups":[{"id":"fixture-group","match_kind":"exact_content","size":24576,"copies":2,"reclaimable_bytes":24576,"files":[{"id":"Readme.txt","name":"Readme.txt","path":"/Projects/Readme.txt","size":24576},{"id":"Design.txt","name":"Readme copy.txt","path":"/Projects/Drafts/Readme copy.txt","size":24576}]}]}"#
+        #"{"root_path":"/Projects","scanned_files":1250,"scanned_folders":86,"failed_folders":0,"duplicate_files":2,"exact_groups":1,"possible_groups":0,"reclaimable_bytes":24576,"groups":[{"id":"fixture-group","match_kind":"exact_content","size":24576,"copies":2,"reclaimable_bytes":24576,"files":[{"id":"Readme.txt","name":"Readme.txt","path":"/Projects/Readme.txt","size":24576,"folder_created_time":"2020-01-01T00:00:00Z"},{"id":"Design.txt","name":"Readme copy.txt","path":"/Projects/Drafts/Readme copy.txt","size":24576,"folder_created_time":"2026-01-01T00:00:00Z"}]}]}"#
     }
 
     static func testTaskActivity(defaults: UserDefaults) throws {
@@ -21767,7 +27219,7 @@ extension DownloaderModel {
     static func testFinderWorkspace(defaults: UserDefaults) throws {
         let model = finderWorkspaceFixture(defaults: defaults)
         defaults.set(1, forKey: "finderTransferWorkers")
-        precondition(model.effectiveDownloadConcurrentJobs == TransferConcurrency.automaticLimit
+        precondition(model.effectiveDownloadConcurrentJobs == TransferConcurrency.downloadAutomaticLimit
                      && model.effectiveUploadConcurrentJobs == TransferConcurrency.automaticLimit,
                      "Legacy worker preferences must not constrain automatic transfers")
 
@@ -21785,7 +27237,7 @@ extension DownloaderModel {
         let original = PendingDownloadRequest.account(roots: [root], destination: model.outputURL, jobs: 2, proxyURL: "")
         let updated = original.withWorkerLimit(model.effectiveDownloadConcurrentJobs)
         precondition(updated.pendingItems == original.pendingItems)
-        if case .account(_, _, let jobs, _) = updated { precondition(jobs == TransferConcurrency.automaticLimit) }
+        if case .account(_, _, let jobs, _) = updated { precondition(jobs == TransferConcurrency.downloadAutomaticLimit) }
         else { preconditionFailure("account queue source changed") }
 
         let first = model.sharedLinks[0].id, second = model.sharedLinks[1].id
@@ -22211,16 +27663,20 @@ extension DownloaderModel {
     static func testBrowserFileFiltering(defaults: UserDefaults) {
         let model = browserFileFilterFixture(defaults: defaults)
         defer { model.stopForWindowClose() }
+        // These checks are about the type filter itself, where every folder stays; hiding empty folders has its own suite.
+        model.hidesEmptyFolders = false
         let raw = model.browserTreeEntries
         let folder = model.browserItems.first { $0.isFolder }!
         model.selectBrowserItem(folder)
         model.browserFileFilter = .category(.videos)
-        precondition(model.selectedBrowserItemIDs.isEmpty && model.selectedBrowserItem == nil)
+        precondition(model.selectedBrowserItemIDs == [folder.id] && model.selectedBrowserItem?.id == folder.id,
+                     "A visible selected folder survives a filter change")
         precondition(model.displayedBrowserTreeEntries.map(\.id) == ["Projects", "Nested.mp4", "Clip.MP4"],
                      "folders stay visible and keep their expanded matches")
         precondition(model.displayedBrowserItems.map(\.id) == ["Projects", "Clip.MP4"])
         precondition(model.browserTreeEntries == raw && model.expandedBrowserFolderIDs == [folder.id])
         precondition(Set(model.availableBrowserFileExtensions(includingExpanded: true)) == ["jpg", "mp4", "txt", "pdf", "zip"])
+        model.clearBrowserSelectionFromCanvas()
         _ = model.selectAdjacentBrowserItem(by: 1)
         _ = model.selectAdjacentBrowserItem(by: 1, extendingSelection: true)
         precondition(model.selectedBrowserItems.map(\.id) == ["Projects"],
@@ -22255,6 +27711,131 @@ extension DownloaderModel {
         precondition(model.browserFileFilter == .category(.videos))
         precondition(Set(model.displayedBrowserTreeEntries.map(\.id)) == ["Projects", "Clip.MP4", "Nested.mp4"])
         print("PASS PikPak filter: visible folders, expanded rows, thumbnails, selection, pagination, cache invalidation, reset and workspace isolation")
+    }
+
+    static func testBrowserFilterSelectionRetention(defaults: UserDefaults) {
+        let model = browserFileFilterFixture(defaults: defaults)
+        defer { model.stopForWindowClose() }
+        let clip = model.browserItems.first { $0.id == "Clip.MP4" }!
+        let readme = model.browserItems.first { $0.id == "Readme.txt" }!
+        model.selectBrowserItem(clip)
+        model.previewFileID = clip.id
+        let player = AVPlayer()
+        model.previewPlayer = player
+        model.previewPreparationProgress = .init(message: "Generated transfer", fraction: 0.25,
+            bytes: 25, fileSize: 100, activity: .transferring)
+        model.previewPreparationBytesPerSecond = 42
+        for filter in [BrowserFileFilter.category(.videos), .fileExtension("mp4"), .all] {
+            model.browserFileFilter = filter
+            precondition(model.selectedBrowserItemID == clip.id && model.selectedBrowserItemIDs == [clip.id])
+            precondition(model.previewPlayer === player && model.previewFileID == clip.id
+                         && model.previewPreparationProgress?.bytes == 25 && model.previewPreparationBytesPerSecond == 42,
+                         "Matching filters must keep focus, the existing player and in-flight buffering")
+        }
+        model.selectedBrowserItemIDs = [clip.id, readme.id]
+        model.browserFileFilter = .category(.videos)
+        precondition(model.selectedBrowserItemIDs == [clip.id] && model.selectedBrowserItemID == clip.id
+                     && model.previewPlayer === player, "Pruning another selected file must not restart the focused preview")
+        model.browserFileFilter = .category(.images)
+        precondition(model.selectedBrowserItemID == nil && model.selectedBrowserItemIDs.isEmpty
+                     && model.previewFileID == nil && model.previewPlayer == nil,
+                     "A file the filter actually hides must not stay selected out of sight")
+        model.browserFileFilter = .all
+        let nested = model.browserItem(withID: "Nested.mp4")!
+        model.selectBrowserItem(nested)
+        model.browserFileFilter = .category(.videos)
+        precondition(model.selectedBrowserItemID == nested.id && model.expandedBrowserFolderIDs == ["Projects"],
+                     "A matching nested file keeps its focused row and expanded parent")
+        print("PASS filter selection: matching files/folders, nested focus, live player/buffering, mixed selections and hidden-file cleanup")
+    }
+
+    /// A type filter can leave folders with nothing to show. Only folders known to hold nothing are hidden: one that
+    /// was never opened, is still loading, failed, or has more pages to come might hold a match, so it stays.
+    static func testBrowserEmptyFolders(defaults: UserDefaults) {
+        let model = browserFileFilterFixture(defaults: defaults)
+        defer { model.stopForWindowClose() }
+        precondition(model.hidesEmptyFolders, "Hiding empty folders starts on")
+        func file(_ name: String, parent: String = "") -> BrowserItem {
+            BrowserItem(id: name, name: name, size: 1024, kind: .file, parentId: parent,
+                mimeType: nil, createdTime: nil, modifiedTime: nil, fileExtension: nil,
+                iconLink: nil, thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+        }
+        func folder(_ name: String, parent: String = "") -> BrowserItem {
+            BrowserItem(id: name, name: name, size: 0, kind: .folder, parentId: parent,
+                mimeType: nil, createdTime: nil, modifiedTime: nil, fileExtension: nil,
+                iconLink: nil, thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+        }
+        let projects = folder("Projects"), inner = folder("Inner", parent: "Projects")
+        let unopened = folder("Unopened"), paged = folder("Paged"), loading = folder("Loading"), failed = folder("Failed"), hollow = folder("Hollow")
+        model.browserItems = [projects, unopened, paged, loading, failed, hollow, file("Clip.MP4"), file("Notes.txt")]
+        model.browserTreeChildren = [
+            "Projects": [inner, file("Nested.mp4", parent: "Projects")],
+            "Inner": [file("Inner.txt", parent: "Inner")],
+            "Paged": [file("Page.txt", parent: "Paged")],
+            "Loading": [file("Load.txt", parent: "Loading")],
+            "Failed": [file("Fail.txt", parent: "Failed")],
+            "Hollow": [],
+        ]
+        model.expandedBrowserFolderIDs = ["Projects"]
+        model.browserTreeNextPageTokens["Paged"] = "more"
+        model.browserTreeLoadingFolderIDs.insert("Loading")
+        model.browserTreeLoadErrors["Failed"] = "Offline"
+        for (parent, children) in model.browserTreeChildren.merging(["": model.browserItems]) { _, new in new } {
+            model.registerBrowserItems(children, parentID: parent, parentPath: parent.isEmpty ? "/" : "/\(parent)")
+        }
+        model.clearBrowserSelection()
+
+        precondition(model.displayedBrowserItems == model.browserItems.filter { $0.id != "Hollow" }
+                     && model.displayedBrowserHiddenFolderCount(includingExpanded: false) == 1,
+                     "All Types hides known-empty folders while keeping unknown and incomplete folders")
+        model.browserFileFilter = .category(.audio)
+        precondition(model.displayedBrowserItems.map(\.id) == ["Unopened", "Paged", "Loading", "Failed"],
+                     "Known-empty folders go; folders that might hold a match stay: \(model.displayedBrowserItems.map(\.id))")
+        precondition(model.displayedBrowserHiddenFolderCount(includingExpanded: false) == 2)
+        precondition(model.displayedBrowserTreeEntries.map(\.id) == ["Unopened", "Paged", "Loading", "Failed"],
+                     "A hidden folder takes its empty subfolders with it: \(model.displayedBrowserTreeEntries.map(\.id))")
+        precondition(model.displayedBrowserHiddenFolderCount(includingExpanded: true) == 3)
+
+        model.browserFileFilter = .category(.videos)
+        precondition(model.displayedBrowserItems.map(\.id) == ["Projects", "Unopened", "Paged", "Loading", "Failed", "Clip.MP4"])
+        precondition(model.displayedBrowserTreeEntries.map(\.id) == ["Projects", "Nested.mp4", "Unopened", "Paged", "Loading", "Failed", "Clip.MP4"],
+                     "A folder stays while it holds a match, and only its empty subfolder goes: \(model.displayedBrowserTreeEntries.map(\.id))")
+        precondition(model.displayedBrowserHiddenFolderCount(includingExpanded: true) == 2 && model.displayedBrowserHiddenFolderCount(includingExpanded: false) == 1)
+
+        model.browserFileFilter = .category(.audio)
+        model.hidesEmptyFolders = false
+        precondition(model.displayedBrowserItems.map(\.id) == ["Projects", "Unopened", "Paged", "Loading", "Failed", "Hollow"]
+                     && model.displayedBrowserHiddenFolderCount(includingExpanded: false) == 0, "Turned off, every folder stays")
+        precondition(!BrowserEmptyFolders.preference(in: defaults), "The choice is remembered")
+        model.selectBrowserItem(hollow)
+        precondition(model.selectedBrowserItem?.id == "Hollow")
+        model.hidesEmptyFolders = true
+        precondition(model.selectedBrowserItem == nil && model.selectedBrowserItemIDs.isEmpty, "Turning it on drops folders it now hides from the selection")
+        precondition(BrowserEmptyFolders.preference(in: defaults))
+        model.hidesEmptyFolders = false
+        precondition(browserFileFilterFixture(defaults: defaults).hidesEmptyFolders == false, "A new window starts with the saved choice")
+        model.hidesEmptyFolders = true
+        model.browserFileFilter = .all
+        precondition(model.displayedBrowserItems == model.browserItems.filter { $0.id != "Hollow" },
+                     "Clearing the type filter still hides known-empty folders")
+        model.browserTreeLoadingFolderIDs.insert("Hollow")
+        precondition(model.displayedBrowserItems.contains { $0.id == "Hollow" }, "A loading folder must stay")
+        model.browserTreeLoadingFolderIDs.remove("Hollow")
+        precondition(!model.displayedBrowserItems.contains { $0.id == "Hollow" }, "Completion invalidates the empty-folder cache")
+        model.browserTreeLoadErrors["Hollow"] = "Generated retryable error"
+        precondition(model.displayedBrowserItems.contains { $0.id == "Hollow" }, "A failed listing is unknown")
+        model.browserTreeLoadErrors.removeValue(forKey: "Hollow")
+        precondition(!model.displayedBrowserItems.contains { $0.id == "Hollow" })
+        model.browserTreeNextPageTokens["Hollow"] = "more"
+        precondition(model.displayedBrowserItems.contains { $0.id == "Hollow" }, "An incomplete listing is unknown")
+        model.browserTreeNextPageTokens.removeValue(forKey: "Hollow")
+        precondition(!model.displayedBrowserItems.contains { $0.id == "Hollow" }, "The final page invalidates the empty-folder cache")
+        model.hidesEmptyFolders = false
+        model.selectBrowserItem(hollow)
+        model.hidesEmptyFolders = true
+        precondition(model.selectedBrowserItem == nil && model.selectedBrowserItemIDs.isEmpty,
+                     "All Types also clears a selected folder that becomes hidden")
+        print("PASS PikPak empty folders: All Types and category filters, live loading/error/page invalidation, known-empty subfolders; unopened, loading, failed and paged folders stay; counts, selection and saved choice")
     }
 
     /// Command-A over the folder on screen, and the refresh that used to
@@ -22354,6 +27935,59 @@ extension DownloaderModel {
         links.toggleFocusedBrowserFolder()
         precondition(links.selectedBrowserItemID == "Drafts", "Identical IDs in a different link cannot restore the previous link's file")
         print("PASS folder toggle: nearest folder, remembered nested file, disclosure focus, repeated toggles, missing files and link isolation")
+    }
+
+    static func testDeletedBrowserNavigation(defaults: UserDefaults) {
+        func item(_ id: String, folder: Bool = false) -> BrowserItem {
+            BrowserItem(id: id, name: folder ? id.uppercased() : "\(id.uppercased()).txt", size: 1, kind: folder ? .folder : .file,
+                parentId: id.hasPrefix("b-") ? "b" : "", mimeType: folder ? nil : "text/plain", createdTime: nil, modifiedTime: nil,
+                fileExtension: folder ? nil : "txt", iconLink: nil, thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+        }
+        func fixture() -> DownloaderModel {
+            let model = finderWorkspaceFixture(defaults: defaults)
+            model.clearBrowserSelection()
+            model.browserItems = [item("a", folder: true), item("b", folder: true), item("c", folder: true), item("d"), item("e")]
+            model.browserTreeChildren = ["b": [item("b-1"), item("b-2")]]
+            model.expandedBrowserFolderIDs = ["b"]
+            model.browserItemParentIDs = ["a": "", "b": "", "c": "", "d": "", "e": "", "b-1": "b", "b-2": "b"]
+            model.hidesEmptyFolders = false
+            precondition(model.browserFilterSelectionItems.map(\.id) == ["a", "b", "b-1", "b-2", "c", "d", "e"])
+            return model
+        }
+        for (focus, removed, direction, expected) in [
+            ("b", ["b"], -1, "a"), ("b", ["b"], 1, "c"),
+            ("d", ["d"], -1, "c"), ("d", ["d"], 1, "e"),
+            ("b-2", ["b-2"], -1, "b-1"), ("b-2", ["b-2"], 1, "c"),
+            ("c", ["b", "c"], -1, "a"), ("c", ["b", "c"], 1, "d")
+        ] {
+            let model = fixture(); defer { model.stopForWindowClose() }
+            model.selectBrowserItem(model.browserItem(withID: focus)!)
+            model.finishTrashBrowserItems(output: String(decoding: try! JSONSerialization.data(withJSONObject: ["trashed_ids": removed]), as: UTF8.self), requestedIDs: removed)
+            precondition(model.selectedBrowserItemID == nil)
+            precondition(model.selectAdjacentBrowserItem(by: direction) == expected,
+                "Deleting \(focus), arrow \(direction) must select \(expected)")
+        }
+        for (focus, boundaryDirection, opposite, expected) in [("a", -1, 1, "b"), ("e", 1, -1, "d")] {
+            let model = fixture(); defer { model.stopForWindowClose() }
+            model.selectBrowserItem(model.browserItem(withID: focus)!)
+            model.finishTrash(output: "{\"trashed_ids\":[\"\(focus)\"]}", itemID: focus, itemName: focus)
+            precondition(model.selectAdjacentBrowserItem(by: boundaryDirection) == nil, "An arrow past the deleted boundary must not wrap")
+            precondition(model.selectAdjacentBrowserItem(by: opposite) == expected)
+        }
+        let model = fixture(); defer { model.stopForWindowClose() }
+        model.selectBrowserItem(model.browserItem(withID: "b")!)
+        model.finishTrashBrowserItems(output: #"{"trashed_ids":[]}"#, requestedIDs: ["b"])
+        precondition(model.selectedBrowserItemID == "b" && model.deletedBrowserSelection == nil,
+            "An unconfirmed delete must preserve the selected row")
+        model.finishTrashBrowserItems(output: #"{"trashed_ids":["b"]}"#, requestedIDs: ["b"])
+        model.clearBrowserSelectionFromCanvas()
+        precondition(model.deletedBrowserSelection == nil && model.selectAdjacentBrowserItem(by: 1) == "a",
+            "A canvas click discards the deleted-row anchor")
+        model.selectBrowserItem(model.browserItem(withID: "d")!)
+        model.finishTrashBrowserItems(output: #"{"trashed_ids":["d"]}"#, requestedIDs: ["d"])
+        model.browserFileFilter = .fileExtension("txt")
+        precondition(model.deletedBrowserSelection == nil, "A changed filter must discard the old navigation position")
+        print("PASS PikPak deletion navigation: previous/next file or folder, expanded descendants, batch deletion, boundaries, failed deletion and cleared/filter-changed selections")
     }
 
     static func testTrashUndoOutline(defaults: UserDefaults) throws {
@@ -22480,6 +28114,178 @@ extension DownloaderModel {
         precondition(model.showsSharedLinkOverview && model.activeSharedLinkID == second)
         precondition(model.sharedLinks.allSatisfy { model.sharedLinkHasContents($0.id) })
         print("PASS Links state: link/account isolation, restored folder navigation, real page decoding, empty folders and pagination")
+    }
+}
+#endif
+
+#if FINDER_WORKSPACE_TESTS
+extension DownloaderModel {
+    static func testRootAuditModelSafety() throws {
+        let suite = "RootAuditModel.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("RootAuditModel-\(UUID().uuidString)")
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: root) }
+        let model = downloadRetryFixture(defaults: defaults, directory: root)
+        _ = model.activateAccountBrowser()
+        let first = model.browserTreeEntries[0].item
+        let second = model.browserTreeEntries[1].item
+        let context = model.browserActionContext
+        model.updateBrowserSelection(to: first)
+        let confirmed = model.browserItemsSelectedForTrash
+        model.updateBrowserSelection(to: second)
+        var trashed: [String] = []
+        model.trashConfirmationFixture = { trashed = $0 }
+        model.trashBrowserItems(confirmed, expectedContext: context)
+        precondition(trashed == confirmed.map(\.id).sorted(), "confirmation must own its original selection")
+        trashed = []
+        model.fileOpenContext = UUID()
+        model.trashBrowserItems(confirmed, expectedContext: context)
+        precondition(trashed.isEmpty, "another account/navigation generation must invalidate confirmation")
+        print("PASS root model: immutable Trash selection and context")
+
+        let filename = BrowserItem(id: "trailing-space", name: "File.txt ", size: 7, kind: .file,
+            parentId: nil, mimeType: "text/plain", createdTime: nil, modifiedTime: nil,
+            fileExtension: "txt", iconLink: nil, thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+        model.registerBrowserItems([filename], parentID: "", parentPath: "/")
+        model.downloadBrowserItem(filename)
+        precondition(model.preparingDownloadItems.last?.name == "File.txt ")
+        if case .account(let roots, _, _, _) = model.activeDownloadRequests.last {
+            precondition(roots.last?.path.hasSuffix("File.txt ") == true)
+            precondition(roots.last?.file?.id == filename.id)
+        } else { preconditionFailure("account file selection missing") }
+        print("PASS root model: filename whitespace and selected file identity")
+        model.isDownloading = false; model.activeDownloadRequests = []
+
+        let entry = model.sharedLinks[0]
+        while model.sharedLinks.count < SharedLinksStateStore.maximumLinks {
+            model.sharedLinks.append(.init(id: UUID(), url: "https://mypikpak.com/s/fixture-\(model.sharedLinks.count)",
+                name: "Fixture", state: entry.state, savedItemCount: 0, addedAt: Date()))
+        }
+        model.shareURLInput = "https://mypikpak.com/s/new-257"
+        model.openSharedLink()
+        precondition(model.sharedLinks.count == SharedLinksStateStore.maximumLinks)
+        precondition(model.shareLinkFeedbackMessage?.contains("256") == true)
+        print("PASS root model: link capacity rejects excess before activation")
+
+        for index in 0..<200 {
+            model.downloadFixtureEvent(["event":"file_completed", "file_id":"history-\(index)",
+                "name":"Fixture", "total_bytes":7, "downloaded_bytes":7])
+        }
+        precondition(model.completedDownloadTransfers.filter { $0.state == .completed }.count == 160)
+        precondition(model.downloadCompletedFiles == 200 && model.settledDownloadIDs.count == 200)
+        model.downloadFixtureEvent(["event":"file_failed", "file_id":"failed-history", "name":"Fixture", "total_bytes":7])
+        precondition(model.completedDownloadTransfers.contains { $0.id == "failed-history" && $0.state == .failed })
+        print("PASS root model: bounded successful history preserves totals and failed resume state")
+
+        model.stopForWindowClose()
+        model.quotaRefreshPending = true
+        model.startPendingQuotaRefreshIfNeeded()
+        precondition(!model.isQuotaLoading && model.operation == nil)
+        precondition((try? model.engineEnvironment()) == nil)
+        print("PASS root model: closed windows reject late quota and helper admission")
+    }
+}
+#endif
+
+#if FINDER_WORKSPACE_TESTS
+extension DownloaderModel {
+    static func testConcurrentFolderMeasurements(defaults: UserDefaults) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("FolderMeasurements-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let gate = directory.appendingPathComponent("release")
+        let engine = directory.appendingPathComponent("fixture-engine")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .withoutEscapingSlashes
+        let gateLiteral = String(decoding: try encoder.encode(gate.path), as: UTF8.self)
+        let script = """
+        #!/usr/bin/python3
+        import json, os, sys, time
+        args = sys.argv[1:]
+        if args[0] == 'share-measure':
+            with open(args[args.index('--request-file') + 1]) as request_file:
+                request = json.load(request_file)
+            size = 101 if request['url'].endswith('-1') else 202
+        else:
+            size = 303
+        end = time.monotonic() + 10
+        while not os.path.exists(\(gateLiteral)):
+            if time.monotonic() > end:
+                sys.exit(2)
+            time.sleep(0.01)
+        print(json.dumps({'total_bytes':size, 'file_count':1, 'folder_count':0}))
+        """
+        try Data(script.utf8).write(to: engine)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: engine.path)
+        let model = sharedSelectionFixture(defaults: defaults)
+        model.folderMeasurementTestEngineURL = engine
+        defer {
+            model.stopForWindowClose()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let first = model.sharedLinks[0].id, second = model.sharedLinks[1].id
+        // Foreground requests, downloads and duplicate scans must not disable Calculate.
+        model.isRunning = true
+        model.isDownloading = true
+        model.isScanningDuplicates = true
+        precondition(model.canMeasureSharedLink(first) && model.canMeasureSharedLink(second))
+        model.measureSharedLink(first)
+        precondition(model.isMeasuringSharedLink(first) && !model.canMeasureSharedLink(first))
+        precondition(model.canMeasureSharedLink(second) && !model.isMeasuringSharedLink(second))
+        model.measureSharedLink(second)
+        let projects = model.browserItem(withID: "Projects")!
+        model.measureFolder(projects, in: second)
+        model.runFolderMeasurementEngine(arguments: ["measure", "--id", "account-folder"], operation: .measure(folderID: "account-folder"))
+        precondition(model.activeSharedLinkID == first, "Calculation must not retarget the active browser request")
+        precondition(model.folderMeasurementRuns.count == 4, model.status)
+        precondition(model.folderMeasurementRuns.values.allSatisfy { $0.process.isRunning })
+        precondition(model.sharedLinks.allSatisfy { !model.isSharedLinkMeasurementQueued($0.id) })
+        precondition(!model.canDisconnectSharedLink(first) && !model.canDisconnectSharedLink(second))
+        // Repeat clicks deduplicate by link+folder, even when both share roots have id "".
+        model.measureSharedLink(first)
+        precondition(model.folderMeasurementRuns.count == 4)
+        let requestFiles = model.folderMeasurementRuns.values.compactMap(\.inputURL)
+        precondition(Set(requestFiles).count == 3 && requestFiles.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
+        try Data().write(to: gate)
+        func waitUntil(_ condition: () -> Bool) async throws {
+            for _ in 0..<500 {
+                if condition() { return }
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            preconditionFailure("Folder measurement helpers did not settle: \(model.status)")
+        }
+        try await waitUntil { model.folderMeasurementRuns.isEmpty }
+        precondition(model.cachedSharedLinkMeasurement(for: first)?.totalBytes == 101)
+        precondition(model.cachedSharedLinkMeasurement(for: second)?.totalBytes == 202)
+        precondition(model.folderMeasurements["account-folder"]?.totalBytes == 303)
+        precondition(model.cachedFolderMeasurement(for: "Projects", in: second)?.totalBytes == 202)
+        precondition(!model.isMeasuringFolder && model.canDisconnectSharedLink(first))
+        precondition(requestFiles.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        print("PASS folder calculations: four real concurrent helpers, foreground/download/duplicate independence, identical root ids, separate request files/caches, repeated-click suppression")
+
+        try FileManager.default.removeItem(at: gate)
+        model.selectSharedLinkRoot(first)
+        model.measureSharedLink(first)
+        model.measureSharedLink(second)
+        model.selectSharedLinkRoot(first)
+        model.cancelFolderMeasurement()
+        try await waitUntil { !model.isMeasuringSharedLink(first) }
+        precondition(model.isMeasuringSharedLink(second) && model.isMeasuringFolder)
+        precondition(model.canMeasureSharedLink(first) && !model.canMeasureSharedLink(second))
+        try Data().write(to: gate)
+        try await waitUntil { model.folderMeasurementRuns.isEmpty }
+        precondition(model.cachedSharedLinkMeasurement(for: second)?.totalBytes == 202)
+        print("PASS folder calculations: cancelling one link leaves another running and preserves its result")
+
+        try FileManager.default.removeItem(at: gate)
+        let access = model.sharedLinkSessions[first]!.access
+        model.runFolderMeasurementEngine(arguments: ["share-measure"], operation: .shareMeasure(
+            request: .init(access: access, folderId: "stale-folder"), folderID: "stale-folder", linkID: first))
+        model.folderMeasurementAccountID = "different-account"
+        try Data().write(to: gate)
+        try await waitUntil { model.folderMeasurementRuns.isEmpty }
+        precondition(model.cachedFolderMeasurement(for: "stale-folder", in: first) == nil)
+        model.folderMeasurementAccountID = nil
+        print("PASS folder calculations: late results cannot leak into a different account")
     }
 }
 #endif

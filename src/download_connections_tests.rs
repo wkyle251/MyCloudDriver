@@ -335,6 +335,16 @@ fn independent_connections_scale_when_aggregate_throughput_improves() {
 }
 
 #[test]
+fn unlimited_download_admission_grows_past_sixty_four_and_still_obeys_bandwidth() {
+    let mut fast = Network::new(usize::MAX);
+    fast.run(90, None, true);
+    assert!(fast.pool.limit > 64, "The former file cap still limits admission");
+    let mut limited = Network::new(usize::MAX);
+    limited.run(90, Some(4 * MIB), true);
+    assert_eq!(limited.pool.probe.as_ref().map_or(limited.pool.limit, |p| p.previous_limit), 4);
+}
+
+#[test]
 fn proven_spare_bandwidth_scales_quickly_without_exceeding_the_ceiling() {
     let mut network = Network::new(64);
     network.run(6, None, true);

@@ -64,9 +64,9 @@ fn range(response: &reqwest::Response) -> Option<(u64, u64, u64)> {
 }
 
 async fn original(client: &Client, target: &Target) -> Result<pikpak::DownloadInfo> {
-    let info = client
-        .get_download_url(&target.id)
+    let info = tokio::time::timeout(Duration::from_secs(60), client.get_download_url(&target.id))
         .await
+        .map_err(|_| anyhow!("Original metadata setup exceeded sixty seconds"))?
         .map_err(|_| anyhow!("Could not resolve the selected original"))?;
     ensure!(
         info.name == target.name && info.size == target.size,
@@ -129,6 +129,7 @@ async fn run() -> Result<()> {
     let http = client.download_http_client();
     let probe = http
         .get(&info.web_content_link)
+        .timeout(Duration::from_secs(30))
         .header(header::RANGE, "bytes=0-0")
         .header(header::ACCEPT_ENCODING, "identity")
         .send()

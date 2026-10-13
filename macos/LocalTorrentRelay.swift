@@ -156,13 +156,39 @@ extension LocalTorrentJob {
     }
 
     func configureRelayAccount(_ account: DownloaderModel) {
-        relayFilesChanged = { [weak account] in account?.pikpakManagement.onFilesChanged?() }
-        relayContextProvider = { [weak account] in
-            account?.preparePikPakManagement()
-            return account?.pikpakManagement.context
-        }
+        let identity = ObjectIdentifier(account)
+        relayAccountCandidates.removeAll { $0.account == nil || $0.identity == identity }
+        relayAccountCandidates.insert(TorrentRelayAccountCandidate(account), at: 0)
         // Completed jobs also need the one-time legacy padding migration.
         if jobs.contains(where: { $0.relay != nil && $0.files.contains(where: \.isPadding) }) { startPolling() }
+    }
+
+    func registeredRelayContexts() -> [(DownloaderModel, PikPakManagementContext)] {
+        relayAccountCandidates.removeAll { $0.account == nil }
+        return relayAccountCandidates.compactMap { candidate in
+            guard let account = candidate.account, account.canProvidePikPakRelayContext else { return nil }
+            account.preparePikPakManagement()
+            guard let context = account.pikpakManagement.context else { return nil }
+            return (account, context)
+        }
+    }
+
+    /// Closing a Browser window must not invalidate credentials used by this
+    /// Mac's unfinished relay. The workspace manager retains its model when
+    /// no other live window can provide that transfer's account.
+    func needsRelayAccount(_ account: DownloaderModel) -> Bool {
+        guard !closed else { return false }
+        let contexts = registeredRelayContexts()
+        guard let context = contexts.first(where: { $0.0 === account })?.1,
+              jobs.contains(where: { $0.relay?.accountID == context.accountID && $0.phase != .completed && $0.phase != .stopped }) else { return false }
+        return !contexts.contains(where: { $0.0 !== account && $0.1.accountID == context.accountID })
+    }
+
+    func notifyRelayFilesChanged(accountID: String) {
+        relayFilesChanged?()
+        for (account, context) in registeredRelayContexts() where context.accountID == accountID {
+            account.pikpakManagement.onFilesChanged?()
+        }
     }
     /// The PikPak account this transfer belongs to — not one of this Mac's
     /// saved login entries.
@@ -174,7 +200,10 @@ extension LocalTorrentJob {
     /// allowance. The account is what must not change, and the upload helper
     /// re-verifies it against the server before any cloud mutation.
     func relayContext(_ state: TorrentRelayState) throws -> PikPakManagementContext {
-        guard let context = relayContextProvider?(), context.accountID == state.accountID else {
+        let context: PikPakManagementContext?
+        if let provider = relayContextOverride { context = provider() }
+        else { context = registeredRelayContexts().first(where: { $0.1.accountID == state.accountID })?.1 }
+        guard let context, context.accountID == state.accountID else {
             throw LocalTorrentError.message("Sign in to \(state.accountName) to resume PikPak uploads. Downloaded files are kept.")
         }
         return context
@@ -451,7 +480,7 @@ extension LocalTorrentJob {
         if !reconcile, !files.allSatisfy({ job(id)?.relay?.uploaded.contains($0.index) == true }) {
             throw LocalTorrentError.message("PikPak did not confirm every file. Saved uploads will be checked again before clearing the buffer.")
         }
-        if !reconcile { relayFilesChanged?() }
+        if !reconcile { notifyRelayFilesChanged(accountID: state.accountID) }
     }
     /// A census advances the window independently of the upload worker.
     private func drainCompletedFiles(_ id: UUID, gid: String, force: Bool = false) async throws {
@@ -633,7 +662,7 @@ extension LocalTorrentJob {
         if !removableFiles.isEmpty { try await validateRelayBuffer(id, state: state) }
         guard !closed, job(id)?.relay?.payload == payload else { throw CancellationError() }
         for file in removableFiles {
-            if let url = try TorrentRelayStorage.file(file.path, under: payload) { try FileManager.default.removeItem(at: url) }
+            try TorrentRelayStorage.removeFile(file.path, under: payload)
         }
         // Live storage cleanup preserves the engine's current selection to
         // keep its peers. On a later start, exclude durable cloud receipts
@@ -754,7 +783,7 @@ extension LocalTorrentJob {
         try await runRelayUpload(id, reconcile: false, generation: generation, indexes: indexes)
         if job(id)?.phase == .uploading { edit(id) { $0.phase = .downloading; $0.relayUploadSpeed = nil } }
         saveOrReport()
-        relayFilesChanged?()
+        if let accountID = job(id)?.relay?.accountID { notifyRelayFilesChanged(accountID: accountID) }
     }
 
     private func receiveRelay(_ id: UUID, event: [String: Any]) {
@@ -796,11 +825,13 @@ extension LocalTorrentJob {
             let draining = value.phase == .uploading
             guard value.phase == .downloading || draining, let gid = gids[id] else { return }
             guard let status = try await pollStatus(id, gid: gid, files: false) else {
+                guard !closed, job(id)?.phase == value.phase, gids[id] == gid, !busy.contains(id) else { return }
                 edit(id) { $0.downloadSpeed = 0; $0.uploadSpeed = 0
                            if !draining { $0.message = "Reconnecting to download status…" } }
+                invalidatePeerRates(id)
                 return
             }
-            guard job(id)?.phase == value.phase, gids[id] == gid, !busy.contains(id) else { return }
+            guard !closed, job(id)?.phase == value.phase, gids[id] == gid, !busy.contains(id) else { return }
             let mapping = portMapping
             edit(id) {
                 if status.completed > ($0.relay?.batchDownloaded ?? 0) { $0.retryAttempt = nil; $0.retryAt = nil }
@@ -815,6 +846,7 @@ extension LocalTorrentJob {
                 // The uploader owns the line while it runs: it names the file.
                 if !draining { $0.message = $0.relayProgressMessage(portMapping: mapping, dns: dnsState) }
             }
+            if status.state != "active" || status.connections == 0 { invalidatePeerRates(id) }
             if status.state == "active", !status.checkingPieces { await refreshCensus(id, gid: gid, attempted: status.connections) }
             guard job(id)?.phase.active == true, gids[id] == gid, !busy.contains(id) else { return }
             if ["active", "complete"].contains(status.state), !status.checkingPieces {

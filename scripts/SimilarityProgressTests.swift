@@ -12,6 +12,8 @@ import Foundation
     @MainActor static func main() async throws {
         try fractionsAndSnapshots()
         downloadTimeEstimates()
+        processingSpeeds()
+        try sourceTransferProgress()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("SimilarityProgress-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -148,6 +150,100 @@ import Foundation
         precondition(future.id == saved.id && future.progress == nil,"Unknown snapshots must not hide Resume")
         print("PASS byte-weighted cloud progress, local/comparison fallback and recoverable snapshot decoding")
     }
+    static func sourceTransferProgress() throws {
+        let start = Date(timeIntervalSince1970: 2000)
+        var progress = SimilarityScanProgress(event: ["stage":"analysing", "discovery_complete":true,
+            "counts":["files_discovered":91,"files_processed":9],
+            "work":["reading":4,"hashing":0,"encoding":0,"ready":0,"waiting_read":78,"original_bytes_read":0]])
+        precondition(progress.readyFiles == 0 && progress.waitingReadFiles == 78 && progress.encodingFiles == 0)
+        precondition(progress.displayTitle == "Reading files into RAM" && progress.waitingSummary.contains("78 waiting to read"))
+        precondition(progress.phaseSummary == "Reading 4 files into RAM")
+        var history = SimilarityReadHistory()
+        history.observe(progress,running:true,at:start)
+        progress.originalBytesRead = 1_048_576
+        history.observe(progress,running:true,at:start.addingTimeInterval(2))
+        precondition(history.bytesPerSecond == 524_288)
+        progress.bytesRead += 20 * 1_048_576; progress.bytesHashed += 20 * 1_048_576
+        history.observe(progress,running:true,at:start.addingTimeInterval(4))
+        precondition(history.bytesPerSecond == 0,"Hashing and calculations must never inflate source download speed")
+        history.observe(progress,running:false,at:start.addingTimeInterval(4))
+        progress.originalBytesRead = 20 * 1_048_576
+        history.observe(progress,running:false,at:start.addingTimeInterval(24))
+        history.observe(progress,running:true,at:start.addingTimeInterval(26))
+        precondition(history.bytesPerSecond == 0)
+        progress.originalBytesRead! += 2 * 1_048_576
+        history.observe(progress,running:true,at:start.addingTimeInterval(28))
+        precondition(history.bytesPerSecond == 1_048_576,"Paused bytes and time must not appear in resumed speed")
+        history.observe(progress,running:true,restoring:true,at:start.addingTimeInterval(30))
+        precondition(history.bytesPerSecond == 0)
+        progress = SimilarityScanProgress(event: ["stage":"analysing","discovery_complete":true,
+            "work":["reading":0,"hashing":2,"encoding":0]])
+        precondition(progress.encodingFiles == 2 && progress.displayTitle == "Hashing file content")
+        var old = try JSONSerialization.jsonObject(with:JSONEncoder().encode(progress)) as! [String:Any]
+        for key in ["originalBytesRead","hashingFiles","waitingReadFiles"] { old.removeValue(forKey:key) }
+        let restored = try JSONDecoder().decode(SimilarityScanProgress.self,from:JSONSerialization.data(withJSONObject:old))
+        precondition(restored.hashingFiles == nil && restored.originalBytesRead == nil,"Old saved progress must remain decodable")
+        print("PASS acquisition speed excludes RAM hashing, pauses and restored counters; queue labels and old snapshots remain correct")
+    }
+    static func processingSpeeds() {
+        let start = Date(timeIntervalSince1970: 1_000)
+        var progress = SimilarityScanProgress()
+        progress.stage = .analysing; progress.foundFiles = 20; progress.total = 20; progress.discoveryComplete = true
+        progress.cloudBytesReady = 900; progress.cloudBytesTotal = 1_000; progress.cloudByteInventoryComplete = true
+        var history = SimilarityProcessingHistory()
+        history.restart(progress, at: start)
+        history.observe(progress, running: true, at: start)
+        progress.analysed = 4; progress.skipped = 1; progress.unsupportedFiles = 1
+        history.observe(progress, running: true, at: start.addingTimeInterval(2))
+        precondition(history.snapshot(for: progress).averageBytesPerSecond == 2.5)
+        let work = SimilarityProcessingWork(progress)
+        precondition(work.completed == 5 && work.fraction == 0.25 && progress.fraction == 0.9,
+                     "Processing progress must measure finished files separately from cloud download bytes")
+        history.observe(progress, running: true, at: start.addingTimeInterval(4))
+        precondition(history.snapshot(for: progress).averageBytesPerSecond == 1.25,
+                     "Analysis stalls must lower the average instead of retaining a stale rate")
+        precondition(history.snapshot(for: progress).samples.last?.bytesPerSecond == 0)
+        history.observe(progress, running: false, at: start.addingTimeInterval(4))
+        progress.analysed = 6
+        history.observe(progress, running: false, at: start.addingTimeInterval(104))
+        history.observe(progress, running: true, at: start.addingTimeInterval(106))
+        progress.analysed = 9
+        history.observe(progress, running: true, at: start.addingTimeInterval(108))
+        let resumed = history.snapshot(for: progress)
+        precondition(resumed.activeSeconds == 6 && resumed.transferredBytes == 8,
+                     "Paused time and analyses finishing during Pause must not inflate resumed throughput")
+
+        progress.stage = .comparison; progress.pairsCompared = 100; progress.total = 1_000
+        history.observe(progress, running: true, at: start.addingTimeInterval(109))
+        precondition(history.snapshot(for: progress).averageBytesPerSecond == 0, "Saved pair counts are a baseline, not work just performed")
+        progress.pairsCompared = 150
+        history.observe(progress, running: true, at: start.addingTimeInterval(111))
+        let comparison = history.snapshot(for: progress)
+        precondition(comparison.averageBytesPerSecond == 25 && comparison.estimatedSeconds(remainingBytes: 850) == 34)
+        precondition(SimilarityProcessingWork(progress).unit == .pairs && SimilarityProcessingWork(progress).fraction == 0.15)
+        progress.pairsCompared = 500
+        history.observe(progress, running: true, restoring: true, at: start.addingTimeInterval(112))
+        progress.pairsCompared = 600
+        history.observe(progress, running: true, at: start.addingTimeInterval(113))
+        progress.pairsCompared = 620
+        history.observe(progress, running: true, at: start.addingTimeInterval(115))
+        precondition(history.snapshot(for: progress).transferredBytes == 70, "Checkpoint replay must not create a processing-speed spike")
+        progress.discoveryComplete = false; progress.stage = .analysing
+        precondition(SimilarityProcessingWork(progress).fraction == nil && SimilarityProcessingWork(progress).remaining == nil)
+        precondition(SimilarityProcessingHistory.rateLabel(.nan,unit:.files) == "0 files/s")
+
+        var long = SimilarityProcessingHistory(), fresh = SimilarityScanProgress()
+        fresh.stage = .analysing; long.restart(fresh,at:start); long.observe(fresh,running:true,at:start)
+        for second in 1...20_000 {
+            fresh.analysed = UInt64(second * 2)
+            long.observe(fresh,running:true,at:start.addingTimeInterval(Double(second)))
+        }
+        let compacted = long.snapshot(for:fresh)
+        precondition(compacted.samples.count <= DownloadSpeedHistory.maximumChartSamples && compacted.averageBytesPerSecond == 2)
+        precondition(SimilarityProcessingHistory().snapshot(for:fresh).samples.isEmpty)
+        print("PASS processing progress separates files from downloaded bytes; files/s and pairs/s have independent histories, accurate averages/ETA, stalls, pauses, restore baselines and bounded charts")
+    }
+
     static func downloadTimeEstimates() {
         let now = Date(timeIntervalSince1970: 1000)
         var progress = SimilarityScanProgress(event: ["stage":"analysing", "completed":9, "total":10,

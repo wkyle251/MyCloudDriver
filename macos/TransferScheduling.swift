@@ -5,39 +5,78 @@ import Foundation
 import Photos
 import UniformTypeIdentifiers
 
-/// Internal resource ceiling. The engine admits transfers according to
-/// measured throughput; saved user preferences do not constrain it.
+/// Download admission is determined by measured throughput and OS resources.
+/// Uploads retain their own ceiling; saved preferences do not constrain either.
 enum TransferConcurrency {
     static let automaticLimit = 64
+    static let downloadAutomaticLimit = Int.max
+}
+
+/// Average speed over the trailing five seconds, from samples of a cumulative byte counter.
+/// A burst therefore lingers for the whole window and a stall fades to zero as the window
+/// empties, instead of jumping. Samples closer than `minimumSpacing` change nothing, so the
+/// published speed refreshes about once a second however often it is asked.
+struct RollingRate {
+    static let window: TimeInterval = 5
+    /// Just under the one-second timer tick, so ordinary timer jitter cannot skip a refresh.
+    static let minimumSpacing: TimeInterval = 0.9
+    private var samples: [(date: Date, bytes: UInt64)] = []
+    private(set) var bytesPerSecond: Double = 0
+
+    /// Begin measuring from `bytes` at `now`, reporting no speed until the next sample.
+    mutating func restart(bytes: UInt64, at now: Date) {
+        samples = [(now, bytes)]
+        bytesPerSecond = 0
+    }
+
+    /// Record the counter and return the average over the last `window` seconds, or over the
+    /// history so far when there is less. A counter that moves backwards starts over. Returns nil,
+    /// recording nothing, when called again before `minimumSpacing` has passed.
+    @discardableResult
+    mutating func sample(bytes: UInt64, at now: Date) -> Double? {
+        guard let last = samples.last, now >= last.date, bytes >= last.bytes else {
+            restart(bytes: bytes, at: now)
+            return 0
+        }
+        guard now.timeIntervalSince(last.date) >= Self.minimumSpacing else { return nil }
+        samples.append((now, bytes))
+        let start = now.addingTimeInterval(-Self.window)
+        // Keep the newest sample at or before the window start; it anchors the interpolation below.
+        while samples.count > 2, samples[1].date <= start { samples.removeFirst() }
+        var baseDate = samples[0].date
+        // Subtract integer counters before converting to Double, so a small
+        // delta remains accurate even after a very large cumulative baseline.
+        var receivedBytes = Double(bytes - samples[0].bytes)
+        if baseDate < start {
+            let next = samples[1]
+            let fraction = start.timeIntervalSince(baseDate) / next.date.timeIntervalSince(baseDate)
+            baseDate = start
+            receivedBytes -= Double(next.bytes - samples[0].bytes) * fraction
+        }
+        // Date arithmetic is only good to about 100 ns, so a base within a millisecond of the window edge
+        // counts as exactly one window; an unchanged transfer then reports an identical speed every time.
+        var elapsed = now.timeIntervalSince(baseDate)
+        if elapsed > Self.window - 0.001 { elapsed = Self.window }
+        bytesPerSecond = elapsed > 0 ? max(receivedBytes, 0) / elapsed : 0
+        return bytesPerSecond
+    }
 }
 
 /// Sample one transfer's network counter, excluding any resumed local prefix.
-/// Each file has its own baseline, moving average and idle timeout.
+/// Each file has its own baseline and five-second average.
 struct DownloadFileRate {
-    private var sampledAt: Date?
-    private var sampledBytes: UInt64 = 0
-    private var latestBytes: UInt64 = 0
-    private var progressedAt: Date?
-    private(set) var bytesPerSecond: Double = 0
+    private var rate = RollingRate()
+    private var wasTransferring = false
+    var bytesPerSecond: Double { rate.bytesPerSecond }
 
     mutating func sample(networkBytes: UInt64, at now: Date, transferring: Bool) -> Double {
-        if networkBytes > latestBytes { progressedAt = now }
-        latestBytes = networkBytes
-        guard transferring, let previous = sampledAt, networkBytes >= sampledBytes else {
-            sampledAt = now; sampledBytes = networkBytes; bytesPerSecond = 0
+        let continues = transferring && wasTransferring
+        wasTransferring = transferring
+        guard continues else {
+            rate.restart(bytes: networkBytes, at: now)
             return 0
         }
-        let interval = now.timeIntervalSince(previous)
-        guard interval >= 0.35 else { return bytesPerSecond }
-        let delta = networkBytes - sampledBytes
-        if delta > 0 {
-            let current = Double(delta) / interval
-            bytesPerSecond = bytesPerSecond > 0 ? bytesPerSecond * 0.55 + current * 0.45 : current
-        } else if progressedAt.map({ now.timeIntervalSince($0) >= 1.5 }) ?? true {
-            bytesPerSecond = 0
-        }
-        sampledAt = now; sampledBytes = networkBytes
-        return bytesPerSecond
+        return rate.sample(bytes: networkBytes, at: now) ?? rate.bytesPerSecond
     }
 }
 
@@ -230,12 +269,14 @@ private final class FinderURLBatch: @unchecked Sendable {
 /// Deletes only regular partial data and its resume journals. The caller must first stop its writer;
 /// originals, directories, aliases and symbolic links are never eligible.
 enum TransferPartialCleanup {
-    static func remove(_ url: URL, owner: String, fileID: String, locksDirectory: URL? = nil, importedOwners: Set<String> = []) throws {
+    static func remove(_ url: URL, owner: String, fileID: String, locksDirectory: URL? = nil, importedOwners: Set<String> = [], checkCancellation: () throws -> Void = {}) throws {
+        try checkCancellation()
         guard url.lastPathComponent.hasSuffix(".part") else { throw CocoaError(.fileWriteNoPermission) }
         let locks = try locksDirectory ?? LocalCredentialStore.applicationSupportDirectoryURL().appendingPathComponent("TransferLocks", isDirectory: true)
         try FileManager.default.createDirectory(at: locks, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let outputName = String(url.lastPathComponent.dropLast(5))
-        let output = url.deletingLastPathComponent().resolvingSymlinksInPath().appendingPathComponent(outputName).path.lowercased()
+        let output = url.deletingLastPathComponent().resolvingSymlinksInPath().appendingPathComponent(outputName).path
+            .decomposedStringWithCanonicalMapping.lowercased().decomposedStringWithCanonicalMapping
         let key = SHA256.hash(data: Data(output.utf8)).map { String(format: "%02x", $0) }.joined()
         let descriptor = Darwin.open(locks.appendingPathComponent(key).path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
         guard descriptor >= 0 else { throw CocoaError(.fileWriteNoPermission) }
@@ -248,11 +289,20 @@ enum TransferPartialCleanup {
               let claim = try? JSONSerialization.jsonObject(with: data) as? [String: String],
               let previousOwner = claim["owner"], previousOwner == owner || importedOwners.contains(previousOwner),
               claim["file_id"] == fileID else { return }
-        for sibling in [url, URL(fileURLWithPath: url.path + ".resume.json"),
-                        URL(fileURLWithPath: url.path + ".ranges.data"), URL(fileURLWithPath: url.path + ".ranges.json")] {
+        // An interrupted ExFAT finalization owns a second, partially copied
+        // file. Keep its original and journal for the helper to reconcile;
+        // removing only the original would strand that safe-copy recovery.
+        if FileManager.default.fileExists(atPath: url.path + ".publication.json") {
+            throw NSError(domain: "MyCloudDriver.Transfer", code: 2, userInfo:
+                [NSLocalizedDescriptionKey: "Download finalization cleanup is waiting for its saved publication journal."])
+        }
+        for sibling in [url, URL(fileURLWithPath: url.path + ".resume.json", isDirectory: false),
+                        URL(fileURLWithPath: url.path + ".ranges.data", isDirectory: false), URL(fileURLWithPath: url.path + ".ranges.json", isDirectory: false)] {
+            try checkCancellation()
             guard FileManager.default.fileExists(atPath: sibling.path) else { continue }
             let values = try sibling.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
             guard values.isRegularFile == true, values.isSymbolicLink != true else { throw CocoaError(.fileWriteNoPermission) }
+            try checkCancellation()
             try FileManager.default.removeItem(at: sibling)
         }
     }
@@ -260,21 +310,25 @@ enum TransferPartialCleanup {
     /// An interrupted folder can have owned partials before its resumed cloud
     /// discovery reaches those children. The private ownership manifest supplies
     /// exact output paths; every deletion still reacquires that output's lock.
-    static func removeOwned(in tree: URL, owner: String, ignoringActiveWriters: Bool = false, locksDirectory: URL? = nil, importedOwners: Set<String> = []) throws {
+    static func removeOwned(in tree: URL, owner: String, ignoringActiveWriters: Bool = false, locksDirectory: URL? = nil, importedOwners: Set<String> = [], checkCancellation: () throws -> Void = {}) throws {
+        try checkCancellation()
         let locks = try locksDirectory ?? LocalCredentialStore.applicationSupportDirectoryURL().appendingPathComponent("TransferLocks", isDirectory: true)
         guard FileManager.default.fileExists(atPath: locks.path) else { return }
         let root = tree.resolvingSymlinksInPath().standardizedFileURL.pathComponents
         for manifest in try FileManager.default.contentsOfDirectory(at: locks, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]) {
+            try checkCancellation()
             let attributes = try manifest.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
             guard attributes.isRegularFile == true, attributes.isSymbolicLink != true, (attributes.fileSize ?? 0) < 64 * 1024,
                   let data = try? Data(contentsOf: manifest),
                   let record = try? JSONSerialization.jsonObject(with: data) as? [String: String],
                   let previousOwner = record["owner"], previousOwner == owner || importedOwners.contains(previousOwner),
                   let fileID = record["file_id"], let path = record["output_path"] else { continue }
-            let output = URL(fileURLWithPath: path).standardizedFileURL
+            // A directory hint avoids probing every historical output on SMB
+            // before finding out whether it belongs to the cancelled folder.
+            let output = URL(fileURLWithPath: path, isDirectory: false).standardizedFileURL
             guard output.pathComponents.starts(with: root), output.pathComponents.count > root.count else { continue }
             let partial = output.appendingPathExtension("part")
-            do { try remove(partial, owner: owner, fileID: fileID, locksDirectory: locks, importedOwners: importedOwners) }
+            do { try remove(partial, owner: owner, fileID: fileID, locksDirectory: locks, importedOwners: importedOwners, checkCancellation: checkCancellation) }
             catch let error as NSError where ignoringActiveWriters && error.domain == "MyCloudDriver.Transfer" && error.code == 1 {
                 // The helper sees the same cancellation and cleans its active
                 // writer after flushing. Never unlink while it holds the lock.
@@ -285,6 +339,7 @@ enum TransferPartialCleanup {
 
 enum TransferFailure {
     static func isRetryable(_ error: Error, depth: Int = 0) -> Bool {
+        guard !hasUncertainMutation(error) else { return false }
         // Callers check their own cancellation first. A provider cancelling a
         // request without a user cancellation is an interruption to recover.
         if error is CancellationError { return true }
@@ -306,6 +361,16 @@ enum TransferFailure {
             ECONNABORTED, ECONNRESET, ENOTCONN, ETIMEDOUT, ECONNREFUSED, EHOSTDOWN, EHOSTUNREACH,
             ENOSPC, EDQUOT, ENODEV, ENXIO, EBUSY, EIO, ENOENT, EACCES, EPERM].contains(Int32(value.code)) { return true }
         if depth < 3, let underlying = value.userInfo[NSUnderlyingErrorKey] as? Error { return isRetryable(underlying, depth: depth + 1) }
+        return false
+    }
+    static func hasUncertainMutation(_ error: Error) -> Bool {
+        var pending = [error as NSError], visited = Set<ObjectIdentifier>()
+        while let value = pending.popLast() {
+            guard visited.insert(ObjectIdentifier(value)).inserted else { continue }
+            if value.localizedDescription.localizedCaseInsensitiveContains("Cloud operation outcome is unknown") { return true }
+            if let underlying = value.userInfo[NSUnderlyingErrorKey] as? NSError { pending.append(underlying) }
+            if let underlying = value.userInfo[NSMultipleUnderlyingErrorsKey] as? [NSError] { pending.append(contentsOf: underlying) }
+        }
         return false
     }
 }

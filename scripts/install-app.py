@@ -5,6 +5,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 import plistlib
 import shutil
@@ -110,6 +111,8 @@ def quit_app(bundle):
 
 def install(source, destination, launch=True):
     started = time.monotonic()
+    if destination.is_symlink():
+        raise RuntimeError(f"The installation path is a symlink; choose a real app destination: {destination}")
     verify(source)
     expected = inventory(source)
     if source == destination:
@@ -174,9 +177,14 @@ def main():
     args = parser.parse_args()
     (ROOT / ".build").mkdir(exist_ok=True)
     (ROOT / "dist").mkdir(exist_ok=True)
-    with (ROOT / ".build/app-install.lock").open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        install(args.source.resolve(), args.destination.resolve(), not args.no_launch)
+    # Standalone installs must not inventory/copy a bundle while a build swaps
+    # it. A --install child already inherits its parent's held build lock.
+    with (ROOT / ".build/app-build.lock").open("a") as build_lock:
+        if os.environ.get("MYCLOUD_APP_BUILD_LOCK") != str(ROOT):
+            fcntl.flock(build_lock, fcntl.LOCK_EX)
+        with (ROOT / ".build/app-install.lock").open("a") as install_lock:
+            fcntl.flock(install_lock, fcntl.LOCK_EX)
+            install(args.source.resolve(), args.destination.absolute(), not args.no_launch)
 
 
 if __name__ == "__main__":

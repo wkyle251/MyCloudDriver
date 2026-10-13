@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::auth::{OAuthCredentials, TokenManager, DESKTOP_CLIENT_ID};
 use crate::captcha::CaptchaManager;
+use crate::duplicate_cache::DuplicateCache;
 use crate::error::{Error, Result};
 use crate::types::{deserialize_string_to_u64, AccountProfile, FileInfo, FilePage, Quota};
 
@@ -54,6 +55,8 @@ pub struct Client {
     proxy: Option<String>,
     content_mode: crate::ContentMode,
     guest: std::sync::Arc<crate::guest::GuestState>,
+    duplicate_cache_directory: Option<PathBuf>,
+    verification_cache: Option<PathBuf>,
 }
 
 /// Result returned after PikPak accepts a server-side shared-item restore.
@@ -77,6 +80,7 @@ pub struct ClientBuilder {
     user_agent: String,
     proxy: Option<String>,
     shared_refresh_store: Option<(PathBuf, PathBuf)>,
+    verification_cache: Option<PathBuf>,
 }
 
 impl Default for ClientBuilder {
@@ -92,6 +96,7 @@ impl Default for ClientBuilder {
             user_agent: DEFAULT_USER_AGENT.into(),
             proxy: None,
             shared_refresh_store: None,
+            verification_cache: None,
         }
     }
 }
@@ -176,27 +181,44 @@ impl ClientBuilder {
     }
 
     /// Finalize and build the [`Client`].
+    pub fn verification_cache(mut self, path: impl Into<PathBuf>) -> Self {
+        self.verification_cache = Some(path.into());
+        self
+    }
+
+    /// Finalize and build the [`Client`].
     pub fn build(self) -> Result<Client> {
         if self.personal_access_token.is_some()
-            && (self.refresh_token.is_some() || self.shared_refresh_store.is_some()) {
-            return Err(Error::Auth("choose either a Personal Access Token or an OAuth refresh token".into()));
+            && (self.refresh_token.is_some() || self.shared_refresh_store.is_some())
+        {
+            return Err(Error::Auth(
+                "choose either a Personal Access Token or an OAuth refresh token".into(),
+            ));
         }
         let personal_access_token = self.personal_access_token;
-        let credential = personal_access_token.as_ref().or(self.refresh_token.as_ref())
-            .ok_or(Error::NotConfigured("refresh_token or personal_access_token"))?;
+        let credential = personal_access_token
+            .as_ref()
+            .or(self.refresh_token.as_ref())
+            .ok_or(Error::NotConfigured(
+                "refresh_token or personal_access_token",
+            ))?;
         if credential.trim().is_empty() || credential.chars().any(char::is_whitespace) {
-            return Err(Error::Auth("the configured credential is empty or contains whitespace".into()));
+            return Err(Error::Auth(
+                "the configured credential is empty or contains whitespace".into(),
+            ));
         }
 
-        let device_id = self
-            .device_id
-            .unwrap_or_else(|| device_id_from(credential));
+        let device_id = self.device_id.unwrap_or_else(|| device_id_from(credential));
 
         let build_http = |timeout: Duration| -> Result<reqwest::Client> {
             let mut builder = reqwest::Client::builder()
                 .no_proxy()
                 .timeout(timeout)
-                .user_agent(if personal_access_token.is_some() { "MyCloudDriver" } else { &self.user_agent });
+                .user_agent(if personal_access_token.is_some() {
+                    "MyCloudDriver"
+                } else {
+                    &self.user_agent
+                });
             if let Some(proxy) = self.proxy.as_deref() {
                 builder = builder.proxy(reqwest::Proxy::all(proxy)?);
             }
@@ -214,7 +236,11 @@ impl ClientBuilder {
                 // GUI helpers may inherit shell/system proxy variables. Only an
                 // explicitly chosen app/CLI proxy may route these requests.
                 .no_proxy()
-                .user_agent(if guest { DEFAULT_USER_AGENT } else { &self.user_agent })
+                .user_agent(if guest {
+                    DEFAULT_USER_AGENT
+                } else {
+                    &self.user_agent
+                })
                 .connect_timeout(Duration::from_secs(20))
                 .read_timeout(Duration::from_secs(90))
                 // Keep reusable connections between waves of originals. This is
@@ -226,7 +252,10 @@ impl ClientBuilder {
             }
             if guest {
                 let mut headers = reqwest::header::HeaderMap::new();
-                headers.insert(REFERER, reqwest::header::HeaderValue::from_static("https://mypikpak.com/"));
+                headers.insert(
+                    REFERER,
+                    reqwest::header::HeaderValue::from_static("https://mypikpak.com/"),
+                );
                 download_builder = download_builder.default_headers(headers);
             }
             Ok(download_builder.build()?)
@@ -239,15 +268,22 @@ impl ClientBuilder {
         let captcha_endpoint = format!("{auth_base}/v1/shield/captcha/init");
 
         let tokens = if let Some(token) = personal_access_token {
-            TokenManager::personal_access_token(http.clone(), auth_endpoint, device_id.clone(), token)
-        } else { TokenManager::new_with_shared_store(
-            http.clone(),
-            auth_endpoint,
-            self.credentials.clone(),
-            &device_id,
-            self.refresh_token.expect("credential checked above"),
-            self.shared_refresh_store,
-        ) };
+            TokenManager::personal_access_token(
+                http.clone(),
+                auth_endpoint,
+                device_id.clone(),
+                token,
+            )
+        } else {
+            TokenManager::new_with_shared_store(
+                http.clone(),
+                auth_endpoint,
+                self.credentials.clone(),
+                &device_id,
+                self.refresh_token.expect("credential checked above"),
+                self.shared_refresh_store,
+            )
+        };
 
         let captcha = CaptchaManager::new(
             http.clone(),
@@ -255,6 +291,7 @@ impl ClientBuilder {
             &self.credentials.client_id,
             &device_id,
             tokens.clone(),
+            self.verification_cache.clone(),
         );
 
         Ok(Client {
@@ -270,46 +307,192 @@ impl ClientBuilder {
             proxy: self.proxy,
             content_mode: crate::ContentMode::User,
             guest: Default::default(),
+            duplicate_cache_directory: None,
+            verification_cache: self.verification_cache,
         })
     }
 }
 
 impl Client {
-    /// Select anonymous original-share URLs for content operations. Metadata,
-    /// quota, uploads and account mutations retain their normal authorization.
-    pub fn with_guest_mode(mut self, enabled: bool) -> Self {
-        self.content_mode = if enabled { crate::ContentMode::Guest } else { crate::ContentMode::User };
+    /// Check the same shield action used by browsing without requesting any
+    /// folder entries. Account identity alone does not establish drive access.
+    pub async fn check_drive_access(&self) -> Result<()> {
+        if !self.tokens.is_personal_access_token() {
+            self.captcha.check_for("GET:/drive/v1/files").await?;
+        } else {
+            self.quota().await?;
+        }
+        Ok(())
+    }
+
+    /// Persist account metadata used by shared saves and download-share reuse.
+    pub fn with_duplicate_cache_directory(mut self, directory: PathBuf) -> Self {
+        self.duplicate_cache_directory = Some(directory);
         self
     }
 
-    pub fn guest_mode(&self) -> bool { self.content_mode == crate::ContentMode::Guest }
+    /// Use current metadata without reading or writing the persistent account inventory.
+    pub fn without_duplicate_cache(mut self) -> Self {
+        self.duplicate_cache_directory = None;
+        self
+    }
+
+    /// Where the persistent account inventory lives, when enabled.
+    pub fn duplicate_cache_directory(&self) -> Option<&std::path::Path> {
+        self.duplicate_cache_directory.as_deref()
+    }
+
+    pub(crate) fn uses_persistent_metadata_cache(&self) -> bool {
+        self.duplicate_cache_directory.is_some()
+    }
+
+    /// Cache availability never changes the result of a successful cloud
+    /// operation. Account identity, rather than credentials, isolates caches.
+    pub async fn duplicate_cache(&self) -> Option<DuplicateCache> {
+        let _stage = crate::download_waits::Stage::enter(crate::download_waits::Kind::CacheOpen);
+        let directory = self.duplicate_cache_directory.as_ref()?.clone();
+        let account_id = match self.tokens().user_id().await {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::warn!(%error, "could not identify the account for the duplicate cache");
+                return None;
+            }
+        };
+        let opened =
+            tokio::task::spawn_blocking(move || DuplicateCache::open(&directory, &account_id))
+                .await;
+        match opened.unwrap_or_else(|error| Err(anyhow::Error::from(error))) {
+            Ok(cache) => Some(cache),
+            Err(error) => {
+                tracing::warn!(%error, "duplicate cache unavailable; using PikPak metadata");
+                None
+            }
+        }
+    }
+
+    pub(crate) async fn update_duplicate_cache(
+        &self,
+        update: impl FnOnce(&DuplicateCache) -> anyhow::Result<()>,
+    ) {
+        if let Some(cache) = self.duplicate_cache().await {
+            if let Err(error) = update(&cache) {
+                tracing::warn!(%error, "could not update the duplicate cache");
+            }
+        }
+    }
+
+    async fn duplicate_cache_generation(&self) -> Option<(DuplicateCache, u64)> {
+        let cache = self.duplicate_cache().await?;
+        match cache.generation() {
+            Ok(generation) => Some((cache, generation)),
+            Err(error) => {
+                tracing::warn!(%error, "could not read duplicate-cache generation");
+                None
+            }
+        }
+    }
+
+    fn observe_duplicate_metadata(
+        cache: &DuplicateCache,
+        generation: u64,
+        value: &Value,
+    ) -> anyhow::Result<()> {
+        // Unfinished uploads and Trash entries must never become live duplicate
+        // candidates. Some metadata responses omit phase, so only record an
+        // explicitly complete item with its actual parent.
+        if value["phase"] != "PHASE_TYPE_COMPLETE"
+            || value["trashed"] == true
+            || value["parent_id"].as_str().is_none()
+        {
+            return Ok(());
+        }
+        if let Ok(file) = serde_json::from_value::<FileInfo>(value.clone()) {
+            let parent = file.parent_id.as_deref().unwrap_or("");
+            if cache.upsert_files_if_generation(parent, std::slice::from_ref(&file), generation)? {
+                cache.complete_pending_task(&file.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn complete_listed_uploads(cache: &DuplicateCache, files: &[FileInfo]) -> anyhow::Result<()> {
+        let pending = cache
+            .pending_task_ids()?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        for file in files.iter().filter(|file| pending.contains(&file.id)) {
+            // Folder listings filter unfinished placeholders, so appearance of
+            // an upload's actual file ID proves that upload has completed.
+            cache.complete_pending_task(&file.id)?;
+        }
+        Ok(())
+    }
+
+    /// Select anonymous original-share URLs for content operations. Metadata,
+    /// quota, uploads and account mutations retain their normal authorization.
+    pub fn with_guest_mode(mut self, enabled: bool) -> Self {
+        self.content_mode = if enabled {
+            crate::ContentMode::Guest
+        } else {
+            crate::ContentMode::User
+        };
+        self
+    }
+
+    pub fn guest_mode(&self) -> bool {
+        self.content_mode == crate::ContentMode::Guest
+    }
 
     pub fn with_content_mode(mut self, mode: crate::ContentMode) -> Self {
         self.content_mode = mode;
         self
     }
 
-    pub fn content_mode(&self) -> crate::ContentMode { self.content_mode }
+    pub fn content_mode(&self) -> crate::ContentMode {
+        self.content_mode
+    }
 
     /// Links downloads use the same policy as saved account files. The guest
     /// and account clients keep separate authorization and captcha sessions.
-    pub fn share_client(&self, url: &str, pass_code: &str, token: &str) -> Result<crate::ShareClient> {
+    pub fn share_client(
+        &self,
+        url: &str,
+        pass_code: &str,
+        token: &str,
+    ) -> Result<crate::ShareClient> {
         use crate::ContentMode;
         match self.content_mode {
             ContentMode::Guest => self.anonymous_share_client(url, pass_code, token),
-            ContentMode::User => Ok(crate::ShareClient::new_authenticated(url, pass_code, token, self.clone())?
-                .with_endpoints(&self.api_base, &self.auth_base)),
+            ContentMode::User => {
+                Ok(
+                    crate::ShareClient::new_authenticated(url, pass_code, token, self.clone())?
+                        .with_endpoints(&self.api_base, &self.auth_base),
+                )
+            }
             ContentMode::Dynamic => {
-                let user = self.clone().with_content_mode(ContentMode::User).share_client(url, pass_code, token)?;
-                Ok(self.anonymous_share_client(url, pass_code, token)?.with_user_fallback(user))
+                let user = self
+                    .clone()
+                    .with_content_mode(ContentMode::User)
+                    .share_client(url, pass_code, token)?;
+                Ok(self
+                    .anonymous_share_client(url, pass_code, token)?
+                    .with_user_fallback(user))
             }
         }
     }
 
     /// A separate transport/session: never copy account authorization headers.
-    pub fn anonymous_share_client(&self, url: &str, pass_code: &str, token: &str) -> Result<crate::ShareClient> {
-        Ok(crate::ShareClient::new(url, pass_code, token, None, self.proxy.as_deref())?
-            .with_endpoints(&self.api_base, &self.auth_base))
+    pub fn anonymous_share_client(
+        &self,
+        url: &str,
+        pass_code: &str,
+        token: &str,
+    ) -> Result<crate::ShareClient> {
+        Ok(
+            crate::ShareClient::new(url, pass_code, token, None, self.proxy.as_deref())?
+                .with_endpoints(&self.api_base, &self.auth_base)
+                .with_verification_cache(self.verification_cache.clone()),
+        )
     }
 
     /// Convenience for [`ClientBuilder::new`].
@@ -343,7 +526,11 @@ impl Client {
     /// Direct original downloads use inactivity limits, with the same proxy
     /// and user agent as metadata requests. No account headers are attached.
     pub fn download_http_client(&self) -> &reqwest::Client {
-        if self.content_mode.tries_guest() { &self.guest_download_http } else { &self.download_http }
+        if self.content_mode.tries_guest() {
+            &self.guest_download_http
+        } else {
+            &self.download_http
+        }
     }
 
     /// Read the signed-in user's display name from PikPak's account service.
@@ -352,12 +539,17 @@ impl Client {
     pub async fn account_profile(&self) -> Result<AccountProfile> {
         for attempt in 0..2 {
             let token = self.tokens.access_token().await?;
-            let response = self.http
-                .get(format!("{}/v1/user/me", self.auth_base.trim_end_matches('/')))
+            let response = self
+                .http
+                .get(format!(
+                    "{}/v1/user/me",
+                    self.auth_base.trim_end_matches('/')
+                ))
                 .bearer_auth(&token)
                 .header("X-Device-Id", &self.device_id)
                 .timeout(Duration::from_secs(8))
-                .send().await?;
+                .send()
+                .await?;
             if response.status() == reqwest::StatusCode::UNAUTHORIZED {
                 if self.tokens.is_personal_access_token() {
                     return Err(Error::SessionRejected("Personal Access Token expired or revoked. Replace it in Settings > Accounts."));
@@ -400,27 +592,42 @@ impl Client {
     /// The official web app reads monthly traffic from the quantity service.
     /// Desktop sessions do not consistently expose these counters in /about.
     pub async fn transfer_quota(&self) -> Result<crate::TransferQuota> {
-        let url = format!("{}/vip/v1/quantity/list", self.api_base.trim_end_matches('/'));
+        let url = format!(
+            "{}/vip/v1/quantity/list",
+            self.api_base.trim_end_matches('/')
+        );
         let mut refreshed_auth = false;
         let mut network_retries = 0;
         loop {
             let access = self.tokens.access_token().await?;
-            let request = self.http.get(&url)
+            let request = self
+                .http
+                .get(&url)
                 .query(&[("type", "transfer")])
                 .bearer_auth(&access)
                 .header("X-Device-Id", &self.device_id)
                 .timeout(Duration::from_secs(10))
-                .send().await;
+                .send()
+                .await;
             let response = match request {
                 Ok(response) => response,
-                Err(error) if network_retries < 2 && (error.is_connect() || error.is_timeout() || error.is_request() || error.is_body()) => {
+                Err(error)
+                    if network_retries < 2
+                        && (error.is_connect()
+                            || error.is_timeout()
+                            || error.is_request()
+                            || error.is_body()) =>
+                {
                     network_retries += 1;
                     tokio::time::sleep(Duration::from_millis(250 * network_retries)).await;
                     continue;
                 }
                 Err(error) => return Err(error.into()),
             };
-            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refreshed_auth && !self.tokens.is_personal_access_token() {
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                && !refreshed_auth
+                && !self.tokens.is_personal_access_token()
+            {
                 refreshed_auth = true;
                 self.tokens.reject_access_token(&access).await?;
                 continue;
@@ -432,7 +639,10 @@ impl Client {
             }
             let body: Value = response.error_for_status()?.json().await?;
             if !body["base"].is_object() || !body["transfer"].is_object() {
-                return Err(Error::Api { status: 200, message: "PikPak returned unrecognized transfer counters".into() });
+                return Err(Error::Api {
+                    status: 200,
+                    message: "PikPak returned unrecognized transfer counters".into(),
+                });
             }
             return Ok(crate::TransferQuota::from_quantity(&body));
         }
@@ -440,6 +650,7 @@ impl Client {
 
     /// List the direct children of a folder. Pass `""` for the root.
     pub async fn list_folder(&self, parent_id: &str) -> Result<Vec<FileInfo>> {
+        let cache_generation = self.duplicate_cache_generation().await;
         let action = "GET:/drive/v1/files";
         let url = format!("{}/drive/v1/files", self.api_base.trim_end_matches('/'));
 
@@ -463,7 +674,9 @@ impl Client {
             }
 
             let resp = self.drive_get(&url, action, &params).await?;
-            if self.content_mode.tries_guest() { self.guest.remember_listing(&resp); }
+            if self.content_mode.tries_guest() {
+                self.guest.remember_listing(&resp);
+            }
             let body: ListResponse = serde_json::from_str(&resp)?;
             all.extend(body.files);
 
@@ -473,6 +686,19 @@ impl Client {
             }
         }
 
+        if let Some((cache, generation)) = cache_generation {
+            let stored = cache
+                .replace_folder_if_generation(parent_id, &all, generation)
+                .and_then(|stored| {
+                    if stored {
+                        Self::complete_listed_uploads(&cache, &all)?;
+                    }
+                    Ok(stored)
+                });
+            if let Err(error) = stored {
+                tracing::warn!(%error, "could not cache the complete folder listing");
+            }
+        }
         Ok(all)
     }
 
@@ -484,15 +710,24 @@ impl Client {
         let mut page: Option<String> = None;
         let mut seen = HashSet::new();
         loop {
-            let mut query = vec![("parent_id", parent_id.to_string()), ("limit", "500".into()),
-                ("filters", r#"{"trashed":{"eq":false}}"#.into())];
-            if let Some(token) = &page { query.push(("page_token", token.to_string())); }
+            let mut query = vec![
+                ("parent_id", parent_id.to_string()),
+                ("limit", "500".into()),
+                ("filters", r#"{"trashed":{"eq":false}}"#.into()),
+            ];
+            if let Some(token) = &page {
+                query.push(("page_token", token.to_string()));
+            }
             let response = self.drive_get(&url, "GET:/drive/v1/files", &query).await?;
             let body: ListResponse = serde_json::from_str(&response)?;
             all.extend(body.files);
-            if all.len() > 200_000 { return Err(Error::InvalidPath("upload recovery folder is too large")); }
+            if all.len() > 200_000 {
+                return Err(Error::InvalidPath("upload recovery folder is too large"));
+            }
             page = validated_next_page_token(body.next_page_token, &mut seen)?;
-            if page.is_none() { return Ok(all); }
+            if page.is_none() {
+                return Ok(all);
+            }
         }
     }
 
@@ -504,6 +739,14 @@ impl Client {
         page_token: Option<&str>,
         limit: usize,
     ) -> Result<FilePage> {
+        if page_token.filter(|token| !token.is_empty()).is_none() {
+            // A fresh interactive pass can reveal external removals. Until a
+            // complete snapshot is available, old rows are hints rather than a
+            // complete folder inventory for duplicate decisions.
+            self.update_duplicate_cache(|cache| cache.invalidate_folder(parent_id))
+                .await;
+        }
+        let cache_generation = self.duplicate_cache_generation().await;
         let action = "GET:/drive/v1/files";
         let url = format!("{}/drive/v1/files", self.api_base.trim_end_matches('/'));
         let mut params: Vec<(&str, String)> = vec![
@@ -521,12 +764,33 @@ impl Client {
         }
 
         let resp = self.drive_get(&url, action, &params).await?;
-        if self.content_mode.tries_guest() { self.guest.remember_listing(&resp); }
+        if self.content_mode.tries_guest() {
+            self.guest.remember_listing(&resp);
+        }
         let body: ListResponse = serde_json::from_str(&resp)?;
-        Ok(FilePage {
+        let page = FilePage {
             files: body.files,
             next_page_token: body.next_page_token.filter(|value| !value.is_empty()),
-        })
+        };
+        if let Some((cache, generation)) = cache_generation {
+            let stored = if page_token.filter(|token| !token.is_empty()).is_none()
+                && page.next_page_token.is_none()
+            {
+                cache.replace_folder_if_generation(parent_id, &page.files, generation)
+            } else {
+                cache.upsert_files_if_generation(parent_id, &page.files, generation)
+            };
+            let stored = stored.and_then(|stored| {
+                if stored {
+                    Self::complete_listed_uploads(&cache, &page.files)?;
+                }
+                Ok(stored)
+            });
+            if let Err(error) = stored {
+                tracing::warn!(%error, "could not cache the folder page");
+            }
+        }
+        Ok(page)
     }
 
     /// Move files or folders to PikPak's Trash. This is recoverable from the
@@ -544,6 +808,7 @@ impl Client {
         let body = serde_json::json!({ "ids": ids });
         self.drive_request(reqwest::Method::POST, &url, action, &[], Some(&body))
             .await?;
+        self.update_duplicate_cache(|cache| cache.remove(ids)).await;
         Ok(())
     }
 
@@ -565,15 +830,46 @@ impl Client {
         let body = batch_move_body(ids, parent_id);
         self.drive_request(reqwest::Method::POST, &url, action, &[], Some(&body))
             .await?;
+        self.update_duplicate_cache(|cache| cache.move_files(ids, parent_id))
+            .await;
         Ok(())
     }
 
     /// Restore the same cloud IDs from Trash; never recreate or re-upload them.
     pub async fn untrash_files(&self, ids: &[String]) -> Result<()> {
-        if ids.is_empty() { return Err(Error::InvalidPath("at least one file id is required")); }
+        if ids.is_empty() {
+            return Err(Error::InvalidPath("at least one file id is required"));
+        }
+        let unknown = if let Some(cache) = self.duplicate_cache().await {
+            ids.iter()
+                .filter(|id| !matches!(cache.contains_file(id), Ok(true)))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let action = "POST:/drive/v1/files:batchUntrash";
-        let url = format!("{}/drive/v1/files:batchUntrash", self.api_base.trim_end_matches('/'));
-        self.drive_request(reqwest::Method::POST, &url, action, &[], Some(&serde_json::json!({"ids": ids}))).await?;
+        let url = format!(
+            "{}/drive/v1/files:batchUntrash",
+            self.api_base.trim_end_matches('/')
+        );
+        self.drive_request(
+            reqwest::Method::POST,
+            &url,
+            action,
+            &[],
+            Some(&serde_json::json!({"ids": ids})),
+        )
+        .await?;
+        for id in unknown {
+            if let Err(error) = self.file_metadata(&id).await {
+                tracing::warn!(%error, "could not refresh restored-file metadata for the duplicate cache");
+                self.update_duplicate_cache(|cache| cache.invalidate_subtree(""))
+                    .await;
+            }
+        }
+        self.update_duplicate_cache(|cache| cache.untrash(ids))
+            .await;
         Ok(())
     }
 
@@ -583,18 +879,39 @@ impl Client {
 
     /// Refresh an original's metadata without downloading its content.
     pub async fn file_metadata(&self, id: &str) -> Result<serde_json::Value> {
-        let mut url = reqwest::Url::parse(&format!("{}/drive/v1/files/", self.api_base.trim_end_matches('/')))
-            .map_err(|_| Error::InvalidPath("invalid drive endpoint"))?;
-        url.path_segments_mut().map_err(|_| Error::InvalidPath("invalid drive endpoint"))?.pop_if_empty().push(id);
-        let response = self.drive_get(url.as_str(), "GET:/drive/v1/files/:id", &[]).await?;
-        Ok(serde_json::from_str(&response)?)
+        let cache_generation = self.duplicate_cache_generation().await;
+        let mut url = reqwest::Url::parse(&format!(
+            "{}/drive/v1/files/",
+            self.api_base.trim_end_matches('/')
+        ))
+        .map_err(|_| Error::InvalidPath("invalid drive endpoint"))?;
+        url.path_segments_mut()
+            .map_err(|_| Error::InvalidPath("invalid drive endpoint"))?
+            .pop_if_empty()
+            .push(id);
+        let response = self
+            .drive_get(url.as_str(), "GET:/drive/v1/files/:id", &[])
+            .await?;
+        let value = serde_json::from_str(&response)?;
+        if let Some((cache, generation)) = cache_generation {
+            if let Err(error) = Self::observe_duplicate_metadata(&cache, generation, &value) {
+                tracing::warn!(%error, "could not cache file metadata");
+            }
+        }
+        Ok(value)
     }
 
     /// Include unfinished upload placeholders when checking a folder before undo.
     pub async fn folder_has_live_children(&self, id: &str) -> Result<bool> {
         let url = format!("{}/drive/v1/files", self.api_base.trim_end_matches('/'));
-        let query = [("parent_id", id.to_string()), ("limit", "1".to_string()),
-            ("filters", serde_json::json!({"trashed":{"eq":false}}).to_string())];
+        let query = [
+            ("parent_id", id.to_string()),
+            ("limit", "1".to_string()),
+            (
+                "filters",
+                serde_json::json!({"trashed":{"eq":false}}).to_string(),
+            ),
+        ];
         let response = self.drive_get(&url, "GET:/drive/v1/files", &query).await?;
         let page: crate::FilePage = serde_json::from_str(&response)?;
         Ok(!page.files.is_empty() || page.next_page_token.is_some_and(|token| !token.is_empty()))
@@ -622,6 +939,8 @@ impl Client {
         let body = rename_file_body(name);
         self.drive_request(reqwest::Method::PATCH, &url, action, &[], Some(&body))
             .await?;
+        self.update_duplicate_cache(|cache| cache.rename_file(file_id, name))
+            .await;
         Ok(())
     }
 
@@ -629,14 +948,19 @@ impl Client {
     /// id. Folder trees are built a level at a time so local directory uploads
     /// can preserve their structure without flattening file names.
     pub async fn create_folder(&self, parent_id: &str, name: &str) -> Result<String> {
-        self.create_folder_retry(parent_id, name, true).await
+        self.create_folder_retry(parent_id, name, false).await
     }
 
     pub(crate) async fn create_folder_once(&self, parent_id: &str, name: &str) -> Result<String> {
         self.create_folder_retry(parent_id, name, false).await
     }
 
-    async fn create_folder_retry(&self, parent_id: &str, name: &str, retry_network: bool) -> Result<String> {
+    async fn create_folder_retry(
+        &self,
+        parent_id: &str,
+        name: &str,
+        retry_network: bool,
+    ) -> Result<String> {
         if name.trim().is_empty() {
             return Err(Error::InvalidPath("folder name must not be empty"));
         }
@@ -649,18 +973,40 @@ impl Client {
             "name": name
         });
         let response = self
-            .drive_request_with_retry(reqwest::Method::POST, &url, action, &[], Some(&body), retry_network)
+            .drive_request_with_retry(
+                reqwest::Method::POST,
+                &url,
+                action,
+                &[],
+                Some(&body),
+                retry_network,
+            )
             .await?;
-        let response: CreateFolderResponse = serde_json::from_str(&response)?;
-        response
+        let response: CreateFolderResponse = serde_json::from_str(&response)
+            .map_err(|_| Error::MutationUncertain("the folder reply was unreadable"))?;
+        let id = response
             .file
             .and_then(|file| file.id)
             .or(response.id)
             .filter(|id| !id.trim().is_empty())
-            .ok_or_else(|| Error::Api {
-                status: 502,
-                message: "PikPak created a folder without returning its id".to_string(),
-            })
+            .ok_or(Error::MutationUncertain(
+                "the folder reply did not contain its identity",
+            ))?;
+        self.update_duplicate_cache(|cache| {
+            cache.upsert_files(
+                parent_id,
+                &[known_created_file(
+                    &id,
+                    parent_id,
+                    name,
+                    crate::types::FileKind::Folder,
+                    0,
+                    None,
+                )],
+            )
+        })
+        .await;
+        Ok(id)
     }
 
     /// Resolve the GCID required by PikPak's cloud-extraction service. Folder
@@ -745,6 +1091,18 @@ impl Client {
         let gcid = normalized_gcid(gcid).ok_or(Error::InvalidPath(
             "archive GCID must be a 40-character hexadecimal value",
         ))?;
+        let cache_parent = if let Some(cache) = self.duplicate_cache().await {
+            match cache.file(file_id.trim()) {
+                Ok(Some(file)) => Some(file.parent_id.unwrap_or_default()),
+                _ => self
+                    .file_metadata(file_id.trim())
+                    .await
+                    .ok()
+                    .and_then(|value| value["parent_id"].as_str().map(str::to_owned)),
+            }
+        } else {
+            None
+        };
         let body = archive_extract_body(file_id.trim(), &gcid, password, files);
         let action = "POST:/decompress/v1/decompress";
         let url = format!(
@@ -754,10 +1112,23 @@ impl Client {
         let response = self
             .drive_request(reqwest::Method::POST, &url, action, &[], Some(&body))
             .await?;
-        serde_json::from_str(&response).map_err(|error| Error::Api {
-            status: 502,
-            message: format!("PikPak returned an unreadable extraction task: {error}"),
+        let task: ArchiveExtractionTask = serde_json::from_str(&response)
+            .map_err(|_| Error::MutationUncertain("the extraction task reply was unreadable"))?;
+        self.update_duplicate_cache(|cache| {
+            let parent = cache_parent.as_deref().unwrap_or("");
+            if task.task_id.is_empty() {
+                cache.invalidate_folder(parent)
+            } else {
+                cache.mark_pending_folder(parent, &task.task_id)
+            }
         })
+        .await;
+        if task.task_id.trim().is_empty() {
+            return Err(Error::MutationUncertain(
+                "the extraction reply did not contain its task identity",
+            ));
+        }
+        Ok(task)
     }
 
     /// Read the latest server-side extraction percentage and result file id.
@@ -779,10 +1150,20 @@ impl Client {
         let response = self
             .drive_get(&url, action, &[("task_id", task_id.to_string())])
             .await?;
-        serde_json::from_str(&response).map_err(|error| Error::Api {
-            status: 502,
-            message: format!("PikPak returned unreadable extraction progress: {error}"),
-        })
+        let progress: ArchiveExtractionProgress =
+            serde_json::from_str(&response).map_err(|error| Error::Api {
+                status: 502,
+                message: format!("PikPak returned unreadable extraction progress: {error}"),
+            })?;
+        if progress.progress >= 100.0
+            || progress.phase.eq_ignore_ascii_case("PHASE_TYPE_COMPLETE")
+            || progress.phase.eq_ignore_ascii_case("PHASE_TYPE_ERROR")
+            || !progress.error_description.trim().is_empty()
+        {
+            self.update_duplicate_cache(|cache| cache.complete_pending_task(task_id))
+                .await;
+        }
+        Ok(progress)
     }
 
     /// Create a PikPak file upload task. The service either completes an
@@ -795,14 +1176,29 @@ impl Client {
         size: u64,
         gcid: &str,
     ) -> Result<UploadTask> {
-        self.create_upload_task_retry(parent_id, name, size, gcid, true).await
+        self.create_upload_task_retry(parent_id, name, size, gcid, false)
+            .await
     }
 
-    pub(crate) async fn create_upload_task_once(&self, parent_id: &str, name: &str, size: u64, gcid: &str) -> Result<UploadTask> {
-        self.create_upload_task_retry(parent_id, name, size, gcid, false).await
+    pub(crate) async fn create_upload_task_once(
+        &self,
+        parent_id: &str,
+        name: &str,
+        size: u64,
+        gcid: &str,
+    ) -> Result<UploadTask> {
+        self.create_upload_task_retry(parent_id, name, size, gcid, false)
+            .await
     }
 
-    async fn create_upload_task_retry(&self, parent_id: &str, name: &str, size: u64, gcid: &str, retry_network: bool) -> Result<UploadTask> {
+    async fn create_upload_task_retry(
+        &self,
+        parent_id: &str,
+        name: &str,
+        size: u64,
+        gcid: &str,
+        retry_network: bool,
+    ) -> Result<UploadTask> {
         if name.trim().is_empty() {
             return Err(Error::InvalidPath("upload file name must not be empty"));
         }
@@ -825,20 +1221,55 @@ impl Client {
             "folder_type": "NORMAL"
         });
         let response = self
-            .drive_request_with_retry(reqwest::Method::POST, &url, action, &[], Some(&body), retry_network)
+            .drive_request_with_retry(
+                reqwest::Method::POST,
+                &url,
+                action,
+                &[],
+                Some(&body),
+                retry_network,
+            )
             .await?;
-        let response: UploadTaskResponse = serde_json::from_str(&response)?;
-        let file = response.file.ok_or_else(|| Error::Api {
-            status: 502,
-            message: "PikPak returned an upload task without file metadata".to_string(),
-        })?;
+        let response: UploadTaskResponse = serde_json::from_str(&response)
+            .map_err(|_| Error::MutationUncertain("the upload reply was unreadable"))?;
+        let file = response.file.ok_or(Error::MutationUncertain(
+            "the upload reply did not contain its identity",
+        ))?;
+        if file.id.as_deref().is_none_or(|id| id.trim().is_empty()) {
+            return Err(Error::MutationUncertain(
+                "the upload reply did not contain its identity",
+            ));
+        }
         let completed = file.phase.as_deref() == Some("PHASE_TYPE_COMPLETE");
+        self.update_duplicate_cache(|cache| {
+            if completed {
+                if let Some(id) = file.id.as_deref().filter(|id| !id.is_empty()) {
+                    cache.upsert_files(
+                        parent_id,
+                        &[known_created_file(
+                            id,
+                            parent_id,
+                            name,
+                            crate::types::FileKind::File,
+                            size,
+                            Some(gcid.to_ascii_uppercase()),
+                        )],
+                    )?;
+                    cache.complete_pending_task(id)
+                } else {
+                    cache.invalidate_folder(parent_id)
+                }
+            } else if let Some(id) = file.id.as_deref().filter(|id| !id.is_empty()) {
+                cache.mark_pending_folder(parent_id, id)
+            } else {
+                cache.invalidate_folder(parent_id)
+            }
+        })
+        .await;
         if !completed && response.resumable.is_none() {
-            return Err(Error::Api {
-                status: 502,
-                message: "PikPak returned an incomplete upload task without a transfer method"
-                    .to_string(),
-            });
+            return Err(Error::MutationUncertain(
+                "the existing upload did not provide a transfer method",
+            ));
         }
         Ok(UploadTask {
             file_id: file.id,
@@ -847,20 +1278,129 @@ impl Client {
         })
     }
 
+    /// Capture before creating a resumable upload, including placeholders.
+    pub async fn upload_creation_snapshot(&self, parent: &str, name: &str) -> Result<Vec<String>> {
+        Ok(self
+            .list_upload_candidates(parent)
+            .await?
+            .into_iter()
+            .filter(|file| file.name == name)
+            .map(|file| file.id)
+            .collect())
+    }
+
+    /// A lost create reply never licenses another create. Require one new,
+    /// content-confirmed identity; an empty/ambiguous listing remains uncertain.
+    pub async fn reconcile_upload_creation(
+        &self,
+        parent: &str,
+        name: &str,
+        size: u64,
+        gcid: &str,
+        previous: &[String],
+    ) -> Result<String> {
+        let matches: Vec<_> = self
+            .list_upload_candidates(parent)
+            .await?
+            .into_iter()
+            .filter(|file| {
+                !previous.contains(&file.id)
+                    && file.name == name
+                    && file.kind.is_file()
+                    && file.size == size
+                    && file
+                        .hash
+                        .as_deref()
+                        .is_some_and(|hash| hash.eq_ignore_ascii_case(gcid))
+            })
+            .collect();
+        if matches.len() != 1 {
+            return Err(Error::MutationUncertain(
+                "the upload is not uniquely visible in the recovery listing yet",
+            ));
+        }
+        Ok(matches[0].id.clone())
+    }
+
+    /// Replace only a placeholder explicitly owned by this journal. Reconcile
+    /// an already-discarded ID without sending Trash again; a live complete or
+    /// unrecognizable entry is preserved even if its metadata is unexpected.
+    pub async fn discard_owned_incomplete_upload(
+        &self,
+        id: &str,
+        gcid: &str,
+        size: u64,
+    ) -> Result<()> {
+        let detail = match self.get_file_detail(id).await {
+            Ok(detail) => detail,
+            Err(error) if upload_metadata_is_missing(&error) => {
+                self.update_duplicate_cache(|cache| {
+                    cache.remove(&[id.to_owned()])?;
+                    cache.complete_pending_task(id)
+                })
+                .await;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if detail.size != size
+            || !detail
+                .hash
+                .as_deref()
+                .is_some_and(|hash| hash.eq_ignore_ascii_case(gcid))
+        {
+            return Err(Error::MutationUncertain(
+                "the existing upload cannot be safely replaced",
+            ));
+        }
+        if detail.trashed {
+            self.update_duplicate_cache(|cache| {
+                cache.remove(&[id.to_owned()])?;
+                cache.complete_pending_task(id)
+            })
+            .await;
+            return Ok(());
+        }
+        if detail
+            .phase
+            .as_deref()
+            .is_none_or(|phase| phase == "PHASE_TYPE_COMPLETE")
+        {
+            return Err(Error::MutationUncertain(
+                "the existing upload cannot be safely replaced",
+            ));
+        }
+        self.trash_files(&[id.to_owned()]).await?;
+        self.update_duplicate_cache(|cache| cache.complete_pending_task(id))
+            .await;
+        Ok(())
+    }
+
     /// Reconcile a response lost during shutdown without recreating a file
     /// whose server-side upload already finished. No storage keys are saved.
-    pub async fn completed_upload_matches(&self, file_id: &str, gcid: &str, size: u64) -> Result<bool> {
+    pub async fn completed_upload_matches(
+        &self,
+        file_id: &str,
+        gcid: &str,
+        size: u64,
+    ) -> Result<bool> {
         match self.get_file_detail(file_id).await {
-            Ok(detail) if detail.phase.as_deref() == Some("PHASE_TYPE_COMPLETE") => {
-                if detail.size == size && detail.hash.as_deref().is_some_and(|value| value.eq_ignore_ascii_case(gcid)) {
+            Ok(detail)
+                if !detail.trashed && detail.phase.as_deref() == Some("PHASE_TYPE_COMPLETE") =>
+            {
+                if detail.size == size
+                    && detail
+                        .hash
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(gcid))
+                {
                     Ok(true)
                 } else {
                     Err(Error::Api { status: 409, message: "saved upload is complete but its identity could not be verified; it was not uploaded again".into() })
                 }
             }
             Ok(_) => Ok(false),
-            Err(Error::Api { status: 404, .. }) => Ok(false),
-            Err(Error::Api { ref message, .. }) if message.contains("file_not_found") => Ok(false),
+            Err(error) if upload_metadata_is_missing(&error) => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -874,9 +1414,9 @@ impl Client {
             .await
     }
 
-    /// Execute an authenticated drive request, applying the same bounded
-    /// retries to reads and mutations. Mutating callers provide a JSON body;
-    /// GET callers leave it empty.
+    /// Reads use bounded network retries. Mutations preserve ambiguous outcomes
+    /// without replaying their request; definitive auth/captcha rejections may
+    /// refresh once before the service accepts the operation.
     pub(crate) async fn drive_request(
         &self,
         method: reqwest::Method,
@@ -885,40 +1425,70 @@ impl Client {
         query: &[(&str, String)],
         body: Option<&Value>,
     ) -> Result<String> {
-        self.drive_request_with_retry(method, url, action, query, body, true).await
+        let retry_network = method == reqwest::Method::GET || action == "POST:/decompress/v1/list";
+        self.drive_request_with_retry(method, url, action, query, body, retry_network)
+            .await
     }
 
     /// Creating a task or share is not idempotent. A lost response must not
     /// silently submit the same mutation again. Definitive auth rejections
     /// can still refresh credentials once before the service accepts it.
     pub(crate) async fn drive_request_with_retry(
-        &self, method: reqwest::Method, url: &str, action: &str,
-        query: &[(&str, String)], body: Option<&Value>, retry_network: bool,
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        action: &str,
+        query: &[(&str, String)],
+        body: Option<&Value>,
+        retry_network: bool,
     ) -> Result<String> {
+        use crate::download_waits::{track, Kind};
+        let _stage = crate::download_waits::Stage::enter(Kind::AccountMetadata);
         // 401 and captcha-expiry each get one targeted retry; transient
         // network failures and 5xx/429 get bounded exponential-backoff retries.
         let mut auth_retried = false;
         let mut captcha_retried = false;
         let mut net_retries: u32 = 0;
+        let non_idempotent = !retry_network && method == reqwest::Method::POST;
+        let mut mutation_may_have_been_sent = false;
+        let preparation_error = |error: Error, may_have_been_sent: bool| {
+            if non_idempotent && !may_have_been_sent {
+                Error::MutationNotDispatched(Box::new(error))
+            } else {
+                error
+            }
+        };
 
         loop {
-            let access = self.tokens.access_token().await?;
-            let captcha = if self.tokens.is_personal_access_token() { None }
-                else { Some(self.captcha.token_for(action).await?) };
+            let access = track(Kind::AccountToken, self.tokens.access_token())
+                .await
+                .map_err(|error| preparation_error(error, mutation_may_have_been_sent))?;
+            let captcha = if self.tokens.is_personal_access_token() {
+                None
+            } else {
+                Some(
+                    track(Kind::AccountCaptcha, self.captcha.token_for(action))
+                        .await
+                        .map_err(|error| preparation_error(error, mutation_may_have_been_sent))?,
+                )
+            };
 
             let mut request = self
                 .http
                 .request(method.clone(), url)
                 .bearer_auth(&access)
                 .header("X-Device-Id", &self.device_id);
-            if let Some(captcha) = &captcha { request = request.header("X-Captcha-Token", captcha); }
+            if let Some(captcha) = &captcha {
+                request = request.header("X-Captcha-Token", captcha);
+            }
             if !query.is_empty() {
                 request = request.query(query);
             }
             if let Some(body) = body {
                 request = request.json(body);
             }
-            let send = request.send().await;
+            mutation_may_have_been_sent |= non_idempotent;
+            let send = track(Kind::AccountHeaders, request.send()).await;
 
             let resp = match send {
                 Ok(r) => r,
@@ -926,21 +1496,30 @@ impl Client {
                     let delay = backoff_delay(net_retries);
                     tracing::debug!(action = %action, error = %e, ?delay, "transient network error, retrying");
                     net_retries += 1;
-                    tokio::time::sleep(delay).await;
+                    track(Kind::AccountBackoff, tokio::time::sleep(delay)).await;
                     continue;
+                }
+                Err(e) if !retry_network && method == reqwest::Method::POST && !e.is_connect() => {
+                    return Err(Error::MutationUncertain("the operation response was lost"))
                 }
                 Err(e) => return Err(e.into()),
             };
 
             let status = resp.status();
+            crate::download_waits::response(false, status.as_u16());
             let retry_after = crate::download_policy::retry_after(resp.headers());
-            let text = match resp.text().await {
+            let text = match track(Kind::AccountBody, resp.text()).await {
                 Ok(t) => t,
                 Err(e) if retry_network && is_transient(&e) && net_retries < MAX_NET_RETRIES => {
                     let delay = backoff_delay(net_retries);
                     net_retries += 1;
-                    tokio::time::sleep(delay).await;
+                    track(Kind::AccountBackoff, tokio::time::sleep(delay)).await;
                     continue;
+                }
+                Err(_) if !retry_network && method == reqwest::Method::POST => {
+                    return Err(Error::MutationUncertain(
+                        "the operation response could not be read",
+                    ))
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -949,8 +1528,11 @@ impl Client {
                 return Ok(text);
             }
 
-            if self.tokens.is_personal_access_token() && status == reqwest::StatusCode::UNAUTHORIZED {
-                return Err(Error::SessionRejected("Personal Access Token expired or revoked. Replace it in Settings > Accounts."));
+            if self.tokens.is_personal_access_token() && status == reqwest::StatusCode::UNAUTHORIZED
+            {
+                return Err(Error::SessionRejected(
+                    "Personal Access Token expired or revoked. Replace it in Settings > Accounts.",
+                ));
             }
 
             if status == reqwest::StatusCode::UNAUTHORIZED && !auth_retried {
@@ -959,11 +1541,21 @@ impl Client {
                     "access token rejected, invalidating and retrying"
                 );
                 auth_retried = true;
-                self.tokens.reject_access_token(&access).await?;
+                // This response definitively rejected the previous request.
+                // Authentication preparation for its replacement is safe to retry.
+                mutation_may_have_been_sent = false;
+                self.tokens
+                    .reject_access_token(&access)
+                    .await
+                    .map_err(|error| preparation_error(error, mutation_may_have_been_sent))?;
                 continue;
             }
 
-            if !captcha_retried && !self.tokens.is_personal_access_token() {
+            if !captcha_retried
+                && !self.tokens.is_personal_access_token()
+                && status.is_client_error()
+                && status != reqwest::StatusCode::REQUEST_TIMEOUT
+            {
                 if let Ok(err) = serde_json::from_str::<ApiError>(&text) {
                     if err.error_code == 9 {
                         tracing::debug!(
@@ -971,7 +1563,14 @@ impl Client {
                             "captcha expired, refreshing and retrying"
                         );
                         captcha_retried = true;
-                        let _ = self.captcha.refresh(action, captcha.as_deref()).await?;
+                        mutation_may_have_been_sent = false;
+                        let _ = self
+                            .captcha
+                            .refresh(action, captcha.as_deref())
+                            .await
+                            .map_err(|error| {
+                                preparation_error(error, mutation_may_have_been_sent)
+                            })?;
                         continue;
                     }
                 }
@@ -979,17 +1578,31 @@ impl Client {
 
             // Server-side transient failures (5xx, 429) are worth a backoff retry.
             if crate::download_policy::transient_status(status.as_u16())
-                && retry_network && net_retries < MAX_NET_RETRIES
+                && retry_network
+                && net_retries < MAX_NET_RETRIES
             {
                 let delay = backoff_delay(net_retries).max(retry_after.unwrap_or_default());
                 tracing::debug!(action = %action, status = %status.as_u16(), ?delay, "server error, retrying");
                 net_retries += 1;
-                tokio::time::sleep(delay).await;
+                track(Kind::AccountBackoff, tokio::time::sleep(delay)).await;
                 continue;
             }
 
+            if !retry_network
+                && method == reqwest::Method::POST
+                && matches!(status.as_u16(), 408 | 500..=599)
+            {
+                return Err(Error::MutationUncertain(
+                    "the service did not confirm the operation",
+                ));
+            }
             if crate::download_policy::transient_status(status.as_u16()) {
-                if let Some(delay) = retry_after { return Err(Error::RetryAfter { status: status.as_u16(), delay }); }
+                if let Some(delay) = retry_after {
+                    return Err(Error::RetryAfter {
+                        status: status.as_u16(),
+                        delay,
+                    });
+                }
             }
             return Err(Error::Api {
                 status: status.as_u16(),
@@ -1022,6 +1635,19 @@ impl Client {
                 "at least one shared file or folder is required",
             ));
         }
+        let cached_destinations = if let Some(cache) = self.duplicate_cache().await {
+            cache
+                .folder("")
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|file| file.kind.is_folder() && file.name == "Pack From Shared")
+                .map(|file| file.id)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
         let action = "POST:/drive/v1/share/restore";
         let url = format!(
@@ -1037,10 +1663,8 @@ impl Client {
         let response = self
             .drive_request(reqwest::Method::POST, &url, action, &[], Some(&body))
             .await?;
-        let value: Value = serde_json::from_str(&response).map_err(|error| Error::Api {
-            status: 502,
-            message: format!("PikPak returned unreadable restore data: {error}"),
-        })?;
+        let value: Value = serde_json::from_str(&response)
+            .map_err(|_| Error::MutationUncertain("the shared-item save reply was unreadable"))?;
         let error_code = value
             .get("error_code")
             .and_then(|value| {
@@ -1073,12 +1697,12 @@ impl Client {
                 .and_then(Value::as_str)
                 .filter(|message| !message.trim().is_empty())
                 .unwrap_or("PikPak returned an unknown save status");
-            return Err(Error::Api {
-                status: 502,
-                message: message.to_string(),
-            });
+            let _ = message;
+            return Err(Error::MutationUncertain(
+                "the shared-item save was not confirmed",
+            ));
         }
-        Ok(ShareRestoreResult {
+        let result = ShareRestoreResult {
             restore_status,
             restore_task_id: value
                 .get("restore_task_id")
@@ -1086,7 +1710,19 @@ impl Client {
                 .filter(|id| !id.trim().is_empty())
                 .map(str::to_string),
             saved_count: file_ids.len(),
+        };
+        self.update_duplicate_cache(|cache| {
+            cache.invalidate_folder("")?;
+            for folder in &cached_destinations {
+                // Shared restores have no supported task-status polling API.
+                // Invalidate their destination, leaving the link-save caller
+                // to refresh it after observing restored account metadata.
+                cache.invalidate_subtree(folder)?;
+            }
+            Ok(())
         })
+        .await;
+        Ok(result)
     }
 
     /// Resolve a Unix-style path (e.g. `"/My Pack/videos"`) to the
@@ -1169,47 +1805,95 @@ impl Client {
     }
 
     /// Get a download URL for a file by its id.
-    pub async fn similarity_file_revision(&self, file_id: &str, parent_id: &str) -> Result<(u64, Option<String>)> {
+    pub async fn similarity_file_revision(
+        &self,
+        file_id: &str,
+        parent_id: &str,
+    ) -> Result<(u64, Option<String>)> {
         if self.content_mode.tries_guest() {
-            if let Some(file) = self.content_mode.guest_result(self.guest_metadata(file_id, Some(parent_id), true).await)? {
+            if let Some(file) = self
+                .content_mode
+                .guest_result(self.guest_metadata(file_id, Some(parent_id), true).await)?
+            {
                 let file = file.info;
-                return Ok((file.size, file.hash.filter(|s| !s.trim().is_empty())
-                    .or_else(|| file.modified_time.filter(|s| !s.trim().is_empty()))));
+                return Ok((
+                    file.size,
+                    file.hash
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| file.modified_time.filter(|s| !s.trim().is_empty())),
+                ));
             }
         }
         let body = self.get_file_detail(file_id).await?;
-        if body.trashed { return Err(Error::Api { status:404, message:"The original is in Trash".into() }); }
-        Ok((body.size, body.hash.filter(|s| !s.trim().is_empty())
-            .or_else(|| body.modified_time.filter(|s| !s.trim().is_empty()))))
+        if body.trashed {
+            return Err(Error::Api {
+                status: 404,
+                message: "The original is in Trash".into(),
+            });
+        }
+        Ok((
+            body.size,
+            body.hash
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| body.modified_time.filter(|s| !s.trim().is_empty())),
+        ))
     }
 
     /// Bind a similarity original to the revision returned with its signed URL.
-    pub(crate) async fn similarity_download_info(&self, file_id: &str, parent_id: &str) -> Result<(DownloadInfo, Option<String>)> {
+    pub(crate) async fn similarity_download_info(
+        &self,
+        file_id: &str,
+        parent_id: &str,
+    ) -> Result<(DownloadInfo, Option<String>)> {
         if self.content_mode.tries_guest() {
-            if let Some((download, file)) = self.content_mode.guest_result(self.guest_download_info(file_id, Some(parent_id)).await)? {
+            if let Some((download, file)) = self
+                .content_mode
+                .guest_result(self.guest_download_info(file_id, Some(parent_id)).await)?
+            {
                 return Ok((download, file.info.hash));
             }
         }
         let body = self.get_file_detail(file_id).await?;
-        if body.trashed { return Err(Error::Api { status:404, message:"The original is in Trash".into() }); }
-        let revision = body.hash.filter(|s| !s.trim().is_empty())
+        if body.trashed {
+            return Err(Error::Api {
+                status: 404,
+                message: "The original is in Trash".into(),
+            });
+        }
+        let revision = body
+            .hash
+            .filter(|s| !s.trim().is_empty())
             .or_else(|| body.modified_time.filter(|s| !s.trim().is_empty()));
-        Ok((DownloadInfo { web_content_link: body.web_content_link, name: body.name, size: body.size }, revision))
+        Ok((
+            DownloadInfo {
+                web_content_link: body.web_content_link,
+                name: body.name,
+                size: body.size,
+                source_revision: download_revision(revision.as_deref(), None),
+            },
+            revision,
+        ))
     }
 
     /// Get a download URL for a file by its id.
     pub async fn get_download_url(&self, file_id: &str) -> Result<DownloadInfo> {
         if self.content_mode.tries_guest() {
-            if let Some((download, _)) = self.content_mode.guest_result(self.guest_download_info(file_id, None).await)? {
+            if let Some((download, _)) = self
+                .content_mode
+                .guest_result(self.guest_download_info(file_id, None).await)?
+            {
                 return Ok(download);
             }
         }
         let body = self.get_file_detail(file_id).await?;
 
+        let source_revision =
+            download_revision(body.hash.as_deref(), body.modified_time.as_deref());
         Ok(DownloadInfo {
             web_content_link: body.web_content_link,
             name: body.name,
             size: body.size,
+            source_revision,
         })
     }
 
@@ -1219,10 +1903,20 @@ impl Client {
         self.get_preview_info_in_parent(file_id, None).await
     }
 
-    pub async fn get_preview_info_in_parent(&self, file_id: &str, parent_id: Option<&str>) -> Result<PreviewInfo> {
+    pub async fn get_preview_info_in_parent(
+        &self,
+        file_id: &str,
+        parent_id: Option<&str>,
+    ) -> Result<PreviewInfo> {
         if self.content_mode.tries_guest() {
-            if let Some((download, file)) = self.content_mode.guest_result(self.guest_download_info(file_id, parent_id).await)? {
-                return Ok(crate::share::original_preview(&file.info, download.web_content_link));
+            if let Some((download, file)) = self
+                .content_mode
+                .guest_result(self.guest_download_info(file_id, parent_id).await)?
+            {
+                return Ok(crate::share::original_preview(
+                    &file.info,
+                    download.web_content_link,
+                ));
             }
         }
         let body = self.get_file_detail(file_id).await?;
@@ -1252,53 +1946,104 @@ impl Client {
     }
 
     /// Resolve in the known account folder even when the quota blocks the
-    /// account file-details endpoint. A saved ID alone cannot identify a share.
+    /// account file-details endpoint. Downloads with a missing or unavailable
+    /// original share create and reuse an account-owned link before User access.
     pub async fn get_download_url_for_file(&self, file: &FileInfo) -> Result<DownloadInfo> {
+        let _stage = crate::download_waits::Stage::enter(crate::download_waits::Kind::DownloadUrl);
         if self.content_mode.tries_guest() {
-            if let Some((download, _)) = self.content_mode.guest_result(self.guest_download_info(&file.id, file.parent_id.as_deref()).await)? {
+            if let Some(download) = self.content_mode.guest_result(
+                async {
+                    let metadata = self.guest_metadata(&file.id, file.parent_id.as_deref(), false).await?;
+                    self.guest.download_task(&metadata, self).await
+                }.await,
+            )? {
                 return Ok(download);
             }
+            tracing::warn!(file_id = %file.id, "A usable download share is unavailable; continuing with account access.");
         }
         // Use the saved account ID after a failed guest lookup, never an
         // unverified original-share ID. Do not repeat the guest attempt here.
         let body = self.get_file_detail(&file.id).await?;
-        Ok(DownloadInfo { web_content_link: body.web_content_link, name: body.name, size: body.size })
+        let source_revision =
+            download_revision(body.hash.as_deref(), body.modified_time.as_deref());
+        Ok(DownloadInfo {
+            web_content_link: body.web_content_link,
+            name: body.name,
+            size: body.size,
+            source_revision,
+        })
     }
 
-    async fn guest_download_info(&self, file_id: &str, parent_id: Option<&str>) -> Result<(DownloadInfo, crate::guest::GuestFile)> {
+    async fn guest_download_info(
+        &self,
+        file_id: &str,
+        parent_id: Option<&str>,
+    ) -> Result<(DownloadInfo, crate::guest::GuestFile)> {
         let file = self.guest_metadata(file_id, parent_id, false).await?;
         let download = self.guest.download(&file, self).await?;
         Ok((download, file))
     }
 
-    async fn guest_metadata(&self, file_id: &str, parent_id: Option<&str>, fresh: bool) -> Result<crate::guest::GuestFile> {
+    async fn guest_metadata(
+        &self,
+        file_id: &str,
+        parent_id: Option<&str>,
+        fresh: bool,
+    ) -> Result<crate::guest::GuestFile> {
         if !fresh {
-            if let Some(file) = self.guest.cached(file_id, parent_id) { return Ok(file); }
+            if let Some(file) = self.guest.cached(file_id, parent_id) {
+                return Ok(file);
+            }
         }
-        let parent = parent_id.ok_or(Error::Guest("The file's folder is unknown. Refresh its folder and try again."))?;
+        let parent = parent_id.ok_or(Error::Guest(
+            "The file's folder is unknown. Refresh its folder and try again.",
+        ))?;
         let url = format!("{}/drive/v1/files", self.api_base.trim_end_matches('/'));
         let mut token: Option<String> = None;
         let mut seen = HashSet::new();
         loop {
-            let mut query = vec![("parent_id", parent.to_string()), ("limit", "500".into()),
-                ("filters", serde_json::json!({"id":{"eq":file_id},"trashed":{"eq":false},
-                    "phase":{"eq":"PHASE_TYPE_COMPLETE"}}).to_string())];
-            if let Some(token) = &token { query.push(("page_token", token.clone())); }
+            let mut query = vec![
+                ("parent_id", parent.to_string()),
+                ("limit", "500".into()),
+                (
+                    "filters",
+                    serde_json::json!({"id":{"eq":file_id},"trashed":{"eq":false},
+                    "phase":{"eq":"PHASE_TYPE_COMPLETE"}})
+                    .to_string(),
+                ),
+            ];
+            if let Some(token) = &token {
+                query.push(("page_token", token.clone()));
+            }
             let raw = self.drive_get(&url, "GET:/drive/v1/files", &query).await?;
             #[derive(Deserialize)]
-            struct Page { files: Vec<crate::guest::GuestFile>, #[serde(default)] next_page_token: Option<String> }
+            struct Page {
+                files: Vec<crate::guest::GuestFile>,
+                #[serde(default)]
+                next_page_token: Option<String>,
+            }
             let page: Page = serde_json::from_str(&raw)?;
             self.guest.remember_listing(&raw);
-            if let Some(file) = page.files.into_iter().find(|file| file.info.id == file_id
-                && file.info.parent_id.as_deref().unwrap_or("") == parent) { return Ok(file); }
+            if let Some(file) = page.files.into_iter().find(|file| {
+                file.info.id == file_id && file.info.parent_id.as_deref().unwrap_or("") == parent
+            }) {
+                return Ok(file);
+            }
             match validated_next_page_token(page.next_page_token, &mut seen)? {
                 Some(next) => token = Some(next),
-                None => return Err(Error::Api { status: 404, message: "The file is no longer in this folder. Refresh it and try again.".into() }),
+                None => {
+                    return Err(Error::Api {
+                        status: 404,
+                        message: "The file is no longer in this folder. Refresh it and try again."
+                            .into(),
+                    })
+                }
             }
         }
     }
 
     async fn get_file_detail(&self, file_id: &str) -> Result<FileDetailResponse> {
+        let cache_generation = self.duplicate_cache_generation().await;
         let action = "GET:/drive/v1/files/:id";
         let url = format!(
             "{}/drive/v1/files/{}",
@@ -1315,7 +2060,273 @@ impl Client {
             ("usage", "FETCH".to_string()),
         ];
         let resp = self.drive_get(&url, action, &query).await?;
-        Ok(serde_json::from_str(&resp)?)
+        let detail = serde_json::from_str(&resp)?;
+        if let Some((cache, generation)) = cache_generation {
+            if let Ok(value) = serde_json::from_str::<Value>(&resp) {
+                if let Err(error) = Self::observe_duplicate_metadata(&cache, generation, &value) {
+                    tracing::warn!(%error, "could not cache completed file metadata");
+                }
+            }
+        }
+        Ok(detail)
+    }
+}
+
+fn upload_metadata_is_missing(error: &Error) -> bool {
+    match error {
+        Error::Api { status: 404, .. } => true,
+        Error::Api {
+            status: 400,
+            message,
+        } => serde_json::from_str::<ApiError>(message)
+            .is_ok_and(|error| error.error == "file_not_found"),
+        _ => false,
+    }
+}
+
+fn known_created_file(
+    id: &str,
+    parent: &str,
+    name: &str,
+    kind: crate::types::FileKind,
+    size: u64,
+    hash: Option<String>,
+) -> FileInfo {
+    FileInfo {
+        id: id.into(),
+        parent_id: Some(parent.into()),
+        name: name.into(),
+        kind,
+        size,
+        hash,
+        mime_type: None,
+        created_time: None,
+        modified_time: None,
+        file_extension: None,
+        icon_link: None,
+        thumbnail_link: None,
+        file_category: None,
+        md5_checksum: None,
+    }
+}
+
+#[cfg(test)]
+mod duplicate_cache_client_tests {
+    use super::Client;
+    use std::io::{Read, Write};
+
+    /// Fixed response sequences also prove warm cache reads make no requests:
+    /// any unexpected request consumes the next assertion and fails the test.
+    fn server(
+        responses: Vec<(&'static str, u16, String)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            for (prefix, status, response) in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let header_end = loop {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                assert!(headers.starts_with(prefix), "unexpected request: {headers}");
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+            }
+        });
+        (address, worker)
+    }
+
+    fn file(id: &str, parent: &str) -> serde_json::Value {
+        serde_json::json!({"id":id,"name":format!("{id}.bin"),"size":"42","kind":"drive#file",
+            "parent_id":parent,"hash":"0123456789012345678901234567890123456789",
+            "phase":"PHASE_TYPE_COMPLETE","trashed":false})
+    }
+
+    fn fixture_client(address: &str, directory: &std::path::Path) -> Client {
+        Client::builder()
+            .personal_access_token("fixture-pat")
+            .auth_base_url(address)
+            .api_base_url(address)
+            .build()
+            .unwrap()
+            .with_duplicate_cache_directory(directory.to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn account_inventory_tracks_successful_mutations_only() {
+        let root = serde_json::json!({"files":[file("a",""),file("b",""),
+            {"id":"destination","name":"Destination","kind":"drive#folder","parent_id":""}]});
+        let (address, worker) = server(vec![
+            ("GET /v1/user/me ", 200, r#"{"sub":"cache-user"}"#.into()),
+            ("GET /drive/v1/files?", 200, root.to_string()),
+            ("GET /drive/v1/files?", 200, r#"{"files":[]}"#.into()),
+            ("PATCH /drive/v1/files/a ", 200, "{}".into()),
+            ("POST /drive/v1/files:batchMove ", 200, "{}".into()),
+            (
+                "POST /drive/v1/files:batchTrash ",
+                403,
+                r#"{"error":"forbidden"}"#.into(),
+            ),
+            ("POST /drive/v1/files:batchTrash ", 200, "{}".into()),
+            ("POST /drive/v1/files:batchUntrash ", 200, "{}".into()),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let client = fixture_client(&address, directory.path());
+        assert_eq!(client.list_folder("").await.unwrap().len(), 3);
+        assert!(client.list_folder("destination").await.unwrap().is_empty());
+        let cache = client.duplicate_cache().await.unwrap();
+        client.rename_file("a", "renamed.bin").await.unwrap();
+        let warm = cache.folder("").unwrap().unwrap();
+        assert_eq!(warm.iter().find(|file| file.id == "a").unwrap().name, "renamed.bin");
+        client.move_files(&["a".into()], "destination").await.unwrap();
+        assert_eq!(cache.folder("").unwrap().unwrap().len(), 2);
+        assert_eq!(cache.folder("destination").unwrap().unwrap()[0].id, "a");
+        let generation = cache.generation().unwrap();
+        assert!(client.trash_files(&["b".into()]).await.is_err());
+        assert_eq!(cache.generation().unwrap(), generation);
+        assert!(cache.folder("").unwrap().unwrap().iter().any(|file| file.id == "b"));
+        client.trash_files(&["a".into()]).await.unwrap();
+        assert!(cache.folder("destination").unwrap().unwrap().is_empty());
+        client.untrash_files(&["a".into()]).await.unwrap();
+        assert_eq!(cache.folder("destination").unwrap().unwrap()[0].id, "a");
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn paged_browsing_requires_a_complete_snapshot_for_account_inventory() {
+        let first =
+            serde_json::json!({"files":[file("a", "")],"next_page_token":"next"}).to_string();
+        let last = serde_json::json!({"files":[file("b", "")]}).to_string();
+        let (address, worker) = server(vec![
+            ("GET /v1/user/me ", 200, r#"{"sub":"cache-user"}"#.into()),
+            ("GET /drive/v1/files?", 200, first.clone()),
+            ("GET /drive/v1/files?", 200, last.clone()),
+            ("GET /drive/v1/files?", 200, first),
+            ("GET /drive/v1/files?", 200, last),
+            ("GET /drive/v1/files?", 200, r#"{"files":[]}"#.into()),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let client = fixture_client(&address, directory.path());
+        let cache = client.duplicate_cache().await.unwrap();
+        let obsolete = serde_json::from_value(file("externally-removed", "")).unwrap();
+        cache.replace_folder("", &[obsolete]).unwrap();
+        assert!(cache.folder("").unwrap().is_some());
+        client.list_folder_page("", None, 1).await.unwrap();
+        assert!(cache.folder("").unwrap().is_none());
+        client.list_folder_page("", Some("next"), 1).await.unwrap();
+        assert!(cache.folder("").unwrap().is_none());
+        assert_eq!(client.list_folder("").await.unwrap().len(), 2);
+        assert!(cache.file("externally-removed").unwrap().is_none());
+        assert_eq!(cache.folder("").unwrap().unwrap().len(), 2);
+        assert!(client.list_folder("").await.unwrap().is_empty());
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn restoring_an_uncached_file_updates_a_complete_parent_snapshot() {
+        let (address, worker) = server(vec![
+            ("GET /v1/user/me ", 200, r#"{"sub":"cache-user"}"#.into()),
+            ("GET /drive/v1/files?", 200, r#"{"files":[]}"#.into()),
+            ("POST /drive/v1/files:batchUntrash ", 200, "{}".into()),
+            (
+                "GET /drive/v1/files/restored ",
+                200,
+                file("restored", "").to_string(),
+            ),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let client = fixture_client(&address, directory.path());
+        client.list_folder("").await.unwrap();
+        client.untrash_files(&["restored".into()]).await.unwrap();
+        assert_eq!(
+            client.duplicate_cache().await.unwrap().folder("").unwrap().unwrap()[0].id,
+            "restored"
+        );
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unfinished_upload_stays_out_of_duplicates_until_a_complete_listing_observes_it() {
+        let upload = serde_json::json!({"file":{"id":"upload","phase":"PHASE_TYPE_RUNNING"},
+            "resumable":{"params":{"access_key_id":"fixture","access_key_secret":"fixture",
+                "bucket":"fixture","endpoint":"fixture","key":"fixture","security_token":"fixture"}}});
+        let completed = serde_json::json!({"files":[file("upload", "")]}).to_string();
+        let (address, worker) = server(vec![
+            ("GET /v1/user/me ", 200, r#"{"sub":"cache-user"}"#.into()),
+            ("GET /drive/v1/files?", 200, r#"{"files":[]}"#.into()),
+            ("POST /drive/v1/files ", 200, upload.to_string()),
+            ("GET /drive/v1/files?", 200, completed.clone()),
+            ("GET /drive/v1/files?", 200, completed),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let client = fixture_client(&address, directory.path());
+        client.list_folder("").await.unwrap();
+        client
+            .create_upload_task(
+                "",
+                "upload.bin",
+                42,
+                "0123456789012345678901234567890123456789",
+            )
+            .await
+            .unwrap();
+        let cache = client.duplicate_cache().await.unwrap();
+        assert!(cache.file("upload").unwrap().is_none());
+        assert!(cache.folder("").unwrap().is_none());
+        assert_eq!(cache.pending_task_ids().unwrap(), vec!["upload"]);
+        assert_eq!(
+            client.list_folder("").await.unwrap()[0].id,
+            "upload"
+        );
+        assert!(cache.pending_task_ids().unwrap().is_empty());
+        // One complete listing after observing completion updates the account inventory.
+        assert_eq!(
+            client.list_folder("").await.unwrap()[0].id,
+            "upload"
+        );
+        assert_eq!(
+            cache.folder("").unwrap().unwrap()[0].id,
+            "upload"
+        );
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unusable_cache_does_not_fail_an_accepted_cloud_mutation() {
+        let (address, worker) = server(vec![
+            ("POST /drive/v1/files:batchTrash ", 200, "{}".into()),
+            ("GET /v1/user/me ", 200, r#"{"sub":"cache-user"}"#.into()),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let occupied_path = directory.path().join("occupied");
+        std::fs::write(&occupied_path, b"not a directory").unwrap();
+        let client = fixture_client(&address, &occupied_path);
+        client.trash_files(&["a".into()]).await.unwrap();
+        assert!(client.duplicate_cache().await.is_none());
+        worker.join().unwrap();
     }
 }
 
@@ -1359,6 +2370,20 @@ pub struct DownloadInfo {
     pub name: String,
     /// File size in bytes.
     pub size: u64,
+    /// Content revision returned with this original URL; absent revisions cannot
+    /// establish that an existing local file is the selected cloud source.
+    pub source_revision: Option<String>,
+}
+
+/// The revision a download is bound to: the content hash when the cloud supplies one, else its modified time.
+pub fn download_revision(hash: Option<&str>, modified: Option<&str>) -> Option<String> {
+    hash.filter(|value| !value.trim().is_empty())
+        .map(|value| format!("gcid:{}", value.trim().to_uppercase()))
+        .or_else(|| {
+            modified
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("modified:{value}"))
+        })
 }
 
 /// Result of creating a PikPak upload task.
@@ -1756,10 +2781,15 @@ pub(crate) fn preview_sources(
 /// original and quota flags instead of reusing the transcode-first menu.
 pub(crate) fn original_download_url(medias: &[MediaResponse], direct: &str) -> Option<String> {
     let usable = |url: &str| !url.trim().is_empty() && preview_link_is_fresh(url);
-    if usable(direct) { return Some(direct.trim().to_string()); }
-    medias.iter().filter(|media| media.is_origin && !media.need_more_quota)
+    if usable(direct) {
+        return Some(direct.trim().to_string());
+    }
+    medias
+        .iter()
+        .filter(|media| media.is_origin && !media.need_more_quota)
         .filter_map(|media| media.link.as_ref().map(|link| link.url.trim()))
-        .find(|url| usable(url)).map(str::to_string)
+        .find(|url| usable(url))
+        .map(str::to_string)
 }
 
 /// Inspect only the bounded AVI header when PikPak has not supplied codec
@@ -1881,17 +2911,27 @@ mod preview_tests {
     async fn account_profile_uses_authenticated_user_service_and_minimal_fields() {
         use std::io::{Read, Write};
         for (body, success, name) in [
-            (r#"{"sub":"profile-user","name":"  Taylor Chen  ","email":"private@example.test"}"#, true, "Taylor Chen"),
+            (
+                r#"{"sub":"profile-user","name":"  Taylor Chen  ","email":"private@example.test"}"#,
+                true,
+                "Taylor Chen",
+            ),
             (r#"{"sub":"profile-user","name":null}"#, true, ""),
             (r#"{"sub":"profile-user"}"#, true, ""),
-            (r#"{"sub":"wrong-account","name":"Someone Else"}"#, false, ""),
+            (
+                r#"{"sub":"wrong-account","name":"Someone Else"}"#,
+                false,
+                "",
+            ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
                 for index in 0..2 {
                     let (mut socket, _) = listener.accept().unwrap();
-                    socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
                     let mut request = String::new();
                     let mut buffer = [0_u8; 4096];
                     while !request.contains("\r\n\r\n") {
@@ -1904,15 +2944,23 @@ mod preview_tests {
                         r#"{"access_token":"fixture-access","refresh_token":"fixture-next","expires_in":3600,"sub":"profile-user"}"#
                     } else {
                         assert!(request.starts_with("GET /v1/user/me "));
-                        assert!(request.to_lowercase().contains("authorization: bearer fixture-access"));
-                        assert!(request.to_lowercase().contains("x-device-id: fixture-device"));
+                        assert!(request
+                            .to_lowercase()
+                            .contains("authorization: bearer fixture-access"));
+                        assert!(request
+                            .to_lowercase()
+                            .contains("x-device-id: fixture-device"));
                         body
                     };
                     write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
                 }
             });
-            let client = Client::builder().refresh_token("fixture-refresh").device_id("fixture-device")
-                .auth_base_url(format!("http://{address}")).build().unwrap();
+            let client = Client::builder()
+                .refresh_token("fixture-refresh")
+                .device_id("fixture-device")
+                .auth_base_url(format!("http://{address}"))
+                .build()
+                .unwrap();
             let result = client.account_profile().await;
             assert_eq!(result.is_ok(), success);
             if let Ok(profile) = result {

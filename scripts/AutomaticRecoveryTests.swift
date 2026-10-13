@@ -7,12 +7,17 @@ import Foundation
         precondition(AutomaticRecovery.delay(attempt: 10, schedule: []) == 300)
         precondition(AutomaticRecovery.nextAttempt(Int.max) == 1_000_001)
         var attempts = 0
-        let result: Int = try await AutomaticRecovery.read(backoff: [0, 0, 0]) {
+        var retryCallbacks = 0
+        let result: Int = try await AutomaticRecovery.read(backoff: [0, 0, 0], onRetry: { _, _ in
+            precondition(Thread.isMainThread, "UI retry callbacks must run on the main thread")
+            MainActor.preconditionIsolated()
+            retryCallbacks += 1
+        }) {
             attempts += 1
             if attempts < 10 { throw URLError(.networkConnectionLost) }
             return 42
         }
-        precondition(result == 42 && attempts == 10, "An outage must outlast the backoff schedule without losing the request")
+        precondition(result == 42 && attempts == 10 && retryCallbacks == 9, "An outage must outlast the backoff schedule without losing the request")
 
         var cancelledAttempts = 0
         let cancelled = Task { @MainActor in

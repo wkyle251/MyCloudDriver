@@ -207,6 +207,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == '/error':
             self.send_error(403); return
         body = mp4 if self.path.startswith('/mp4') else avi
+        if self.path.startswith('/range-') or self.path == '/mp4.chunks':
+            total = len(body)
+            content_range = f'bytes 0-{total-1}/{total}'
+            if self.path in ['/range-chunked','/mp4.chunks']:
+                match = re.fullmatch(r'bytes=(\d+)-(\d*)', self.headers.get('Range', ''))
+                start = int(match[1]) if match else 0
+                end = min(start+8191,total-1)
+                body = body[start:end+1]; content_range = f'bytes {start}-{end}/{total}'
+                if start: assert self.headers.get('If-Range') == '"fixture-media"'
+            if self.path == '/range-short':
+                body = body[:total//2]; content_range = f'bytes 0-{len(body)-1}/{total}'
+            if self.path == '/range-suffix':
+                body = body[1:]; content_range = f'bytes 1-{total-1}/{total}'
+            if self.path == '/range-unknown': content_range = f'bytes 0-{total-1}/*'
+            self.send_response(206)
+            self.send_header('ETag', '"fixture-media"')
+            if self.path != '/range-missing': self.send_header('Content-Range', content_range)
+            self.send_header('Content-Length', len(body))
+            self.end_headers(); self.wfile.write(body); return
         match = re.fullmatch(r'bytes=(\d+)-(\d*)', self.headers.get('Range', ''))
         if self.path.startswith('/mp4') and match:
             if self.path.endswith('.repair'): body = bytes(len(body))
@@ -218,12 +237,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = body[start:end+1]
         else: self.send_response(200)
         self.send_header('Content-Type', 'application/octet-stream')
-        self.send_header('Content-Length', len(body))
+        if 'no-length' not in self.path: self.send_header('Content-Length', len(body))
         self.end_headers()
         try:
             for start in range(0, len(body), 4096):
                 self.wfile.write(body[start:start+4096]); self.wfile.flush()
                 if self.path == '/slow': time.sleep(0.15)
+                if self.path.endswith('.progress'): time.sleep(2 if start == 0 else 0.15)
         except (BrokenPipeError, ConnectionResetError): pass
 server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
 print(server.server_port, flush=True)
@@ -237,6 +257,30 @@ server.serve_forever()
         copy = try await VideoPreviewPreparation.prepare(source: remote, expectedSize: UInt64(originalBytes.count)) { _ in }
         try await verifyVideo(copy!.url, audio: true)
         copy = nil
+        copy = try await VideoPreviewPreparation.prepare(source: remote.deletingLastPathComponent().appendingPathComponent("range-full"),
+            expectedSize: UInt64(originalBytes.count)) { _ in }
+        try await verifyVideo(copy!.url, audio: true)
+        copy = nil
+        copy = try await VideoPreviewPreparation.prepare(source: remote.deletingLastPathComponent().appendingPathComponent("range-chunked"),
+            expectedSize: UInt64(originalBytes.count)) { _ in }
+        try await verifyVideo(copy!.url, audio: true)
+        copy = nil
+        copy = try await VideoPreviewPreparation.prepare(source: remote.deletingLastPathComponent().appendingPathComponent("mp4.chunks"),
+            format: .mp4, expectedSize: UInt64(mp4Bytes.count)) { _ in }
+        try await verifyVideo(copy!.url, audio: true)
+        copy = nil
+        print("PASS capped HTTP 206 AVI/MP4 responses join into complete inputs and produce decoded video/audio")
+        for path in ["range-short", "range-suffix", "range-unknown", "range-missing", "error"] {
+            do {
+                _ = try await VideoPreviewPreparation.prepare(source: remote.deletingLastPathComponent().appendingPathComponent(path)) { _ in }
+                preconditionFailure("An incomplete or refused response must not produce a preview")
+            } catch {
+                let detail = error as NSError
+                precondition(detail.domain == "PikPakPreviewTransport" && detail.code == (path == "error" ? 403 : 206))
+                precondition(detail.localizedDescription.contains("HTTP \(detail.code)"), "Keep the actual HTTP status visible")
+            }
+        }
+        print("PASS full HTTP 206 video decodes; partial, suffix, unknown and missing ranges fail with their HTTP codes")
         for (path, expectedSize) in [("avi", UInt64(originalBytes.count + 1)), ("error", UInt64(0))] {
             do {
                 _ = try await VideoPreviewPreparation.prepare(source: remote.deletingLastPathComponent().appendingPathComponent(path), expectedSize: expectedSize) { _ in }
@@ -256,6 +300,8 @@ server.serve_forever()
         print("PASS cloud download headers, real AVI playback, size/status validation and download cancellation")
         try await DownloaderModel.testAVIPreviewRouting(defaults: defaults, original: original)
         try await DownloaderModel.testMP4PreviewRecovery(defaults: defaults,
+            remote: URL(string: "http://127.0.0.1:\(port)/mp4")!, bytes: mp4Bytes)
+        try await DownloaderModel.testPreviewPreparationProgress(defaults: defaults,
             remote: URL(string: "http://127.0.0.1:\(port)/mp4")!, bytes: mp4Bytes)
         check(try Data(contentsOf: mp4) == mp4Bytes)
         check(try previewDirectories() == baseline)

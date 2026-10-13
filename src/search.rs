@@ -158,7 +158,10 @@ where
             Err(error) => {
                 let fatal = matches!(
                     error,
-                    Error::Auth(_) | Error::SessionRejected(_) | Error::TokenExpired | Error::NotConfigured(_)
+                    Error::Auth(_)
+                        | Error::SessionRejected(_)
+                        | Error::TokenExpired
+                        | Error::NotConfigured(_)
                 ) || matches!(error, Error::Api { status: 401, .. });
                 let (code, message) = search_error(error);
                 progress.failed_folders += 1;
@@ -240,7 +243,10 @@ fn search_error(error: Error) -> (String, String) {
     match error {
         // Auth failures can embed token responses; never expose those in a
         // searchable metadata stream or in selectable diagnostic text.
-        Error::Auth(_) | Error::SessionRejected(_) | Error::TokenExpired | Error::NotConfigured(_) => (
+        Error::Auth(_)
+        | Error::SessionRejected(_)
+        | Error::TokenExpired
+        | Error::NotConfigured(_) => (
             "SEARCH_SESSION_UNAVAILABLE".into(),
             "The app's PikPak session could not be refreshed. Sign in again and retry the scan."
                 .into(),

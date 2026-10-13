@@ -45,10 +45,12 @@ import SwiftUI
 @main @MainActor struct SettingsIconStabilityUITestApp: App {
     @StateObject private var hub: CloudDriveHub
     @StateObject private var stress = SettingsIconStress()
+    private let fixtureDirectory: URL
     init() {
-        let defaults = UserDefaults(suiteName: "MyCloudDriver-SettingsIcons-UI-Fixture")!
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("MyCloudSettingsIconsFixture", isDirectory: true)
-        try! FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let defaults = UserDefaults(suiteName: "MyCloudDriver-SettingsIcons-UI-Fixture-\(UUID().uuidString)")!
+        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("MyCloudSettingsIconsFixture-\(UUID().uuidString)", isDirectory: true)
+        fixtureDirectory = root
+        try! FileManager.default.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         _hub = StateObject(wrappedValue: CloudDriveHub(
             pikpak: DownloaderModel.finderWorkspaceFixture(defaults: defaults), defaults: defaults,
             restoreConnections: false,
@@ -62,6 +64,9 @@ import SwiftUI
                 Text("Generated progress updates · no cloud access")
                 FinderSettingsButton()
             }.padding(30)
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+                    hub.close(); hub.pikpak.stopForWindowClose(); try? FileManager.default.removeItem(at: fixtureDirectory)
+                }
         }.defaultSize(width: 420, height: 180)
         Settings {
             FinderSettingsView(settings: hub.pikpak.finderSettings, model: hub.pikpak, hub: hub)

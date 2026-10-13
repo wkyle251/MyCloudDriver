@@ -23,6 +23,46 @@ struct CloudExtractionTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: root) }
         let model = DownloaderModel(archiveTestEngineURL: engine, directory: root)
+        let token = SavedPikPakAccount(id: UUID(), profile: .init(sub: "fixture-owner", name: nil), needsSignIn: false,
+            lastChecked: nil, credentialKind: .personalAccessToken)
+        let normal = SavedPikPakAccount(id: UUID(), profile: token.profile, needsSignIn: false,
+            lastChecked: nil, credentialKind: .desktopOAuth)
+        let other = SavedPikPakAccount(id: UUID(), profile: .init(sub: "different-owner", name: nil), needsSignIn: false,
+            lastChecked: nil, credentialKind: .desktopOAuth)
+        let permission = DownloaderModel(archiveTestEngineURL: engine, directory: root)
+        defer { permission.stopArchiveTestHelpers() }
+        permission.setArchiveTestConnections([token, normal], activeID: token.id)
+        permission.openArchiveExtraction(item("permission"))
+        try await waitFor { permission.archiveTasks.first?.error != nil }
+        let denied = permission.archiveTasks.first!
+        precondition(denied.needsNormalLogin && permission.canRetryArchiveWithNormalLogin(denied),
+            "Permission fixture: \(denied.error?.displayText ?? "no error"), connection: \(denied.connectionKind?.rawValue ?? "none"), account captured: \(denied.accountID == token.id)")
+        precondition(denied.error?.code == "HTTP 403 • API 7" && !permission.hasActiveArchiveTasks)
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+        precondition(permission.archiveTasks.first?.generation == denied.generation,
+            "a permission failure must not automatically retry or change credentials")
+        permission.setArchiveTestConnections([token, other], activeID: token.id)
+        precondition(!permission.canRetryArchiveWithNormalLogin(denied))
+        permission.retryArchiveWithNormalLogin(denied.id)
+        precondition(!permission.hasActiveArchiveTasks && permission.archiveTasks.first?.connectionAccountID == nil)
+        var expiredNormal = normal; expiredNormal.needsSignIn = true
+        permission.setArchiveTestConnections([token, expiredNormal], activeID: token.id)
+        precondition(!permission.canRetryArchiveWithNormalLogin(denied))
+        permission.setArchiveTestConnections([token, normal], activeID: token.id)
+        permission.retryArchiveWithNormalLogin(denied.id)
+        try await waitFor { permission.archiveTasks.first?.result != nil }
+        precondition(permission.archiveTasks.count == 1 && permission.archiveTasks.first?.id == denied.id)
+        precondition(permission.archiveTasks.first?.connectionAccountID == normal.id)
+        precondition(permission.activeAccountID == token.id && permission.activeCredentialKind == .personalAccessToken)
+        permission.openArchiveExtraction(item("permission-always"))
+        try await waitFor { permission.archiveTasks.last?.error != nil }
+        let stillDenied = permission.archiveTasks.last!
+        permission.retryArchiveWithNormalLogin(stillDenied.id)
+        try await waitFor { permission.archiveTasks.last?.error != nil }
+        precondition(permission.archiveTasks.last?.needsNormalLogin == false && !permission.hasActiveArchiveTasks)
+        precondition(permission.activeAccountID == token.id && !permission.requiresDedicatedSignIn)
+        permission.stopArchiveTestHelpers()
+        print("PASS: permission denial waits for explicit Normal login retry, same-account checks, selected Token login retained, persistent 403 stays failed")
         // An enabled-looking button must never silently ignore a request that
         // cannot start. Keep the archive and its selection available to retry.
         let feedbackDirectory = root.appendingPathComponent("feedback")

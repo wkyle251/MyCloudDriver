@@ -246,23 +246,46 @@ impl MatrixWriter {
     }
     pub fn resume(directory: &Path, checkpoint: &Path) -> Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
-        let id = checkpoint.file_name().and_then(|s| s.to_str()).filter(|id| super::checkpoint::valid_id(id))
+        let id = checkpoint
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|id| super::checkpoint::valid_id(id))
             .context("Invalid comparison checkpoint")?;
-        let id = format!("mcd2-{}",id.replace('-',""));
-        let runs=directory.join("runs"); private_dir(&runs)?;
-        let path=checkpoint.join("matrix.sqlite3");
-        std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32).open(&path)?;
-        let db=Connection::open(&path)?;
+        let id = format!("mcd2-{}", id.replace('-', ""));
+        let runs = directory.join("runs");
+        private_dir(&runs)?;
+        let path = checkpoint.join("matrix.sqlite3");
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+            .open(&path)?;
+        let db = Connection::open(&path)?;
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS run(id TEXT PRIMARY KEY,revision INTEGER,summary TEXT);
             CREATE TABLE IF NOT EXISTS files(ordinal INTEGER PRIMARY KEY,id TEXT UNIQUE,digest TEXT,family TEXT,profile TEXT,available INTEGER,payload TEXT,extraction TEXT,diagnostic TEXT);
             CREATE TABLE IF NOT EXISTS scores(a INTEGER,b INTEGER,score REAL,PRIMARY KEY(a,b)) WITHOUT ROWID;
             BEGIN IMMEDIATE;")?;
-        Ok(Self {db,temporary:None,working:Some(path),destination:runs.join(format!("{id}.sqlite3")),id})
+        Ok(Self {
+            db,
+            temporary: None,
+            working: Some(path),
+            destination: runs.join(format!("{id}.sqlite3")),
+            id,
+        })
     }
-    pub fn saved_scores(&self) -> Result<u64> { Ok(self.db.query_row("SELECT COUNT(*) FROM scores",[],|r| r.get::<_,i64>(0))? as u64) }
+    pub fn saved_scores(&self) -> Result<u64> {
+        Ok(self
+            .db
+            .query_row("SELECT COUNT(*) FROM scores", [], |r| r.get::<_, i64>(0))?
+            as u64)
+    }
     pub fn checkpoint(&self) -> Result<()> {
-        if self.working.is_some() { self.db.execute_batch("COMMIT; BEGIN IMMEDIATE;")?; }
+        if self.working.is_some() {
+            self.db.execute_batch("COMMIT; BEGIN IMMEDIATE;")?;
+        }
         Ok(())
     }
     pub fn file(
@@ -309,10 +332,15 @@ impl MatrixWriter {
         self.db.close().map_err(|(_, e)| e)?;
         let temporary = if let Some(path) = &self.working {
             // The immutable snapshot and checkpoint have separate lifetimes.
-            if self.destination.exists() { return Ok(()); }
-            let temp=tempfile::NamedTempFile::new_in(self.destination.parent().unwrap())?;
-            std::fs::copy(path,temp.path())?; temp
-        } else { self.temporary.unwrap() };
+            if self.destination.exists() {
+                return Ok(());
+            }
+            let temp = tempfile::NamedTempFile::new_in(self.destination.parent().unwrap())?;
+            std::fs::copy(path, temp.path())?;
+            temp
+        } else {
+            self.temporary.unwrap()
+        };
         temporary.as_file().sync_all()?;
         temporary.persist_noclobber(self.destination)?;
         Ok(())
@@ -324,33 +352,74 @@ mod checkpoint_tests {
     use super::*;
     #[test]
     fn large_saved_inventory_can_be_reviewed_and_grouped() {
-        let root=tempfile::tempdir().unwrap();
-        let writer=MatrixWriter::new(root.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let writer = MatrixWriter::new(root.path()).unwrap();
         for i in 0..101_137 {
-            writer.file(i,&MatchedFile { id:format!("file-{i}"),name:format!("{i}.bin"),path:format!("/{i}.bin"),
-                bytes:1,family:"other".into(),local_path:None,cloud_id:None,ancestors:vec![],
-                engine_index:Some(i as u64),state:"ready".into() },None).unwrap();
+            writer
+                .file(
+                    i,
+                    &MatchedFile {
+                        id: format!("file-{i}"),
+                        name: format!("{i}.bin"),
+                        path: format!("/{i}.bin"),
+                        bytes: 1,
+                        family: "other".into(),
+                        local_path: None,
+                        cloud_id: None,
+                        ancestors: vec![],
+                        engine_index: Some(i as u64),
+                        state: "ready".into(),
+                    },
+                    None,
+                )
+                .unwrap();
         }
-        let id=writer.id.clone(); writer.publish(&json!({"status":"completed"})).unwrap();
-        let saved=SavedMatrix::open(root.path(),&id,1).unwrap();
-        assert_eq!(saved.files.len(),101_137); assert_eq!(saved.files.last().unwrap().id,"file-101136");
-        let groups=grouping::group_scores(GroupQuery {data_dir:root.path().into(),run_id:id,result_revision:1,
-            minimum_score:0.9,include_identical:true},&AtomicBool::new(false)).unwrap();
+        let id = writer.id.clone();
+        writer.publish(&json!({"status":"completed"})).unwrap();
+        let saved = SavedMatrix::open(root.path(), &id, 1).unwrap();
+        assert_eq!(saved.files.len(), 101_137);
+        assert_eq!(saved.files.last().unwrap().id, "file-101136");
+        let groups = grouping::group_scores(
+            GroupQuery {
+                data_dir: root.path().into(),
+                run_id: id,
+                result_revision: 1,
+                minimum_score: 0.9,
+                include_identical: true,
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(groups.groups.is_empty());
     }
     #[test]
     fn comparison_resumes_committed_scores_and_discards_an_interrupted_transaction() {
-        let root=tempfile::tempdir().unwrap();
-        let checkpoint=root.path().join("12345678-1234-1234-1234-123456789abc"); private_dir(&checkpoint).unwrap();
-        let writer=MatrixWriter::resume(root.path(),&checkpoint).unwrap();
-        writer.score(0,1,0.9).unwrap(); writer.checkpoint().unwrap();
-        writer.score(0,2,0.7).unwrap(); drop(writer);
-        let writer=MatrixWriter::resume(root.path(),&checkpoint).unwrap();
-        assert_eq!(writer.saved_scores().unwrap(),1);
-        writer.score(0,2,0.7).unwrap(); writer.score(1,2,0.8).unwrap(); writer.checkpoint().unwrap();
-        let id=writer.id.clone(); writer.publish(&json!({"status":"completed"})).unwrap();
-        let db=Connection::open(root.path().join("runs").join(format!("{id}.sqlite3"))).unwrap();
-        assert_eq!(db.query_row("SELECT COUNT(*) FROM scores",[],|r|r.get::<_,i64>(0)).unwrap(),3);
-        assert_eq!(db.query_row("SELECT score FROM scores WHERE a=0 AND b=1",[],|r|r.get::<_,f64>(0)).unwrap(),0.9);
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint = root.path().join("12345678-1234-1234-1234-123456789abc");
+        private_dir(&checkpoint).unwrap();
+        let writer = MatrixWriter::resume(root.path(), &checkpoint).unwrap();
+        writer.score(0, 1, 0.9).unwrap();
+        writer.checkpoint().unwrap();
+        writer.score(0, 2, 0.7).unwrap();
+        drop(writer);
+        let writer = MatrixWriter::resume(root.path(), &checkpoint).unwrap();
+        assert_eq!(writer.saved_scores().unwrap(), 1);
+        writer.score(0, 2, 0.7).unwrap();
+        writer.score(1, 2, 0.8).unwrap();
+        writer.checkpoint().unwrap();
+        let id = writer.id.clone();
+        writer.publish(&json!({"status":"completed"})).unwrap();
+        let db = Connection::open(root.path().join("runs").join(format!("{id}.sqlite3"))).unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM scores", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            db.query_row("SELECT score FROM scores WHERE a=0 AND b=1", [], |r| r
+                .get::<_, f64>(0))
+                .unwrap(),
+            0.9
+        );
     }
 }

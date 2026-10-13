@@ -108,6 +108,37 @@ import Foundation
         precondition(!fetched && inventory.inventoryExternalSources == nil && inventory.resolveExternalSource == nil)
         print("PASS explicit Clear stops inventory without fetching an original and removes pending provider callbacks")
 
+        let cancelRoot = FileManager.default.temporaryDirectory.appendingPathComponent("SimilarityEarlyCancel-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: cancelRoot) }
+        let cancelConfiguration = SimilarityConfiguration(executable: unused, models: unused, worker: unused,
+            dataDirectory: cancelRoot.appendingPathComponent("data"), temporaryDirectory: cancelRoot.appendingPathComponent("temp"), environment: [:])
+        let earlyCancel = SimilarityScanModel(source: .local, activity: FinderTaskActivityStore())
+        earlyCancel.externalTitle = "Test Drive"; earlyCancel.externalScopeNames = ["Test Folder"]
+        var cancelCleanup = false, cancelFetched = false
+        earlyCancel.cleanupExternalScope = { cancelCleanup = true }
+        earlyCancel.inventoryExternalSources = {
+            try await Task.sleep(nanoseconds: 10_000_000_000)
+            return [.init(id: "one", name: "one.txt", path: "Test/one.txt", size: 1, localPath: nil)]
+        }
+        earlyCancel.resolveExternalSource = { _, _, _ in cancelFetched = true; return unused }
+        earlyCancel.start(cancelConfiguration)
+        let earlyID = earlyCancel.savedSession!.id
+        earlyCancel.cancel()
+        let earlyDeadline = Date().addingTimeInterval(3)
+        while earlyCancel.isRunning && Date() < earlyDeadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        precondition(!earlyCancel.isRunning && !earlyCancel.isPaused && cancelCleanup && !cancelFetched)
+        precondition(earlyCancel.report?.status == "cancelled" && earlyCancel.report?.analysedFiles == 0)
+        precondition(earlyCancel.report?.coverage.contains("No files were analysed") == true && earlyCancel.error == nil)
+        precondition(earlyCancel.savedSession?.state == "cancelled" && earlyCancel.processIdentifier == nil)
+        precondition(earlyCancel.activity.tasks.first?.state == .cancelled && earlyCancel.autoResumeDeadline == nil)
+        precondition(SimilaritySessionStore.loadReport(cancelConfiguration,id:earlyID)?.status == "cancelled")
+        let cancelledDuration = earlyCancel.report!.elapsedSeconds
+        earlyCancel.cancel()
+        precondition(earlyCancel.report?.elapsedSeconds == cancelledDuration, "Repeated Cancel must not replace the report")
+        earlyCancel.clearSession()
+        precondition(earlyCancel.report == nil && !FileManager.default.fileExists(atPath:SimilaritySessionStore.directory(cancelConfiguration,id:earlyID).path))
+        print("PASS Cancel during inventory opens and saves an empty cancelled report, stops providers and obeys Clear")
+
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("SourceRequest-\(UUID())")
         let content = root.appendingPathComponent("similarity-test/source-one/content")
         try FileManager.default.createDirectory(at: content, withIntermediateDirectories: true)

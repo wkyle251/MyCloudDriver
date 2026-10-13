@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 @preconcurrency import Photos
 
@@ -9,6 +10,7 @@ struct DriveConnectionFeedback {
 
 @MainActor final class CloudDriveHub: ObservableObject {
     @Published var selected: CloudDriveKind?
+    @Published private(set) var selectedExternalDisk: ExternalDisk?
     @Published var connectionError: String?
     @Published private(set) var connectingPhotos = false
     @Published private(set) var photosAuthorization: PHAuthorizationStatus
@@ -19,8 +21,19 @@ struct DriveConnectionFeedback {
     let icloud: NativeDriveModel
     let photos: NativeDriveModel
     let local: NativeDriveModel
+    let externalDisks: ExternalDiskCatalog
+    private var localBaseProvider: ICloudDriveProvider?
+    private var externalDiskObservation: AnyCancellable?
+    var selectedDriveTitle: String {
+        selected == .local ? selectedExternalDisk?.name ?? CloudDriveKind.local.title : selected?.title ?? "All Drives"
+    }
+    var selectedDriveSymbol: String {
+        if selected == .local, let selectedExternalDisk { return selectedExternalDisk.symbol }
+        return selected?.symbol ?? "square.grid.2x2"
+    }
     var nativeDrives: [NativeDriveModel] { [icloud, photos, local] }
     let icloudStorage: ICloudStorageModel
+    let localStorage = LocalVolumeStorageModel()
     private let defaults: UserDefaults
     private let photosAccess: PhotosAccessClient
     private var photosConnectionTask: Task<Void, Never>?
@@ -29,12 +42,14 @@ struct DriveConnectionFeedback {
     private var scopedICloudURL: URL?
     private var scopedLocalURL: URL?
     init(pikpak: DownloaderModel, defaults: UserDefaults = .standard, restoreConnections: Bool = true,
-         photosAccess: PhotosAccessClient? = nil, icloudStorage: ICloudStorageModel? = nil, localRootURL: URL? = nil) {
+         photosAccess: PhotosAccessClient? = nil, icloudStorage: ICloudStorageModel? = nil, localRootURL: URL? = nil,
+         externalDisks: ExternalDiskCatalog? = nil) {
         let photosAccess = photosAccess ?? .system
         self.pikpak = pikpak; self.defaults = defaults; self.photosAccess = photosAccess
         icloud = NativeDriveModel(kind: .icloud, playbackSettings: pikpak.finderSettings.playback)
         photos = NativeDriveModel(kind: .photos, playbackSettings: pikpak.finderSettings.playback)
         local = NativeDriveModel(kind: .local, playbackSettings: pikpak.finderSettings.playback)
+        self.externalDisks = externalDisks ?? (restoreConnections ? ExternalDiskCatalog() : ExternalDiskCatalog(snapshotLoader: { [] }))
         self.photosAuthorization = photosAccess.status()
         self.icloudStorage = icloudStorage ?? ICloudStorageModel()
         for drive in [icloud, photos, local] {
@@ -82,6 +97,15 @@ struct DriveConnectionFeedback {
                 photos.connect(photosAccess.provider())
             }
         }
+        localBaseProvider = local.provider as? ICloudDriveProvider
+        externalDiskObservation = self.externalDisks.$disks.sink { [weak self] disks in
+            guard let self else { return }
+            if let selectedExternalDisk,
+               let updated = disks.first(where: { $0.id == selectedExternalDisk.id }), updated != selectedExternalDisk {
+                self.selectedExternalDisk = updated
+            }
+            self.objectWillChange.send()
+        }
     }
     func nativeDrive(for kind: CloudDriveKind) -> NativeDriveModel? {
         switch kind { case .icloud: return icloud; case .photos: return photos; case .local: return local; case .pikpak: return nil }
@@ -98,7 +122,24 @@ struct DriveConnectionFeedback {
     func presentSimilarity() {
         pikpak.fileSimilarity.presentDrive(similarityEntryDrive.rawValue)
     }
+    func presentCrossDriveDuplicates() {
+        guard pikpak.canCheckCrossDriveDuplicates else { return }
+        let folders = selected == .local ? local.location.url.map { [$0] } ?? [] : []
+        open(.pikpak)
+        pikpak.presentCrossDriveDuplicateScope(localFolders: folders)
+    }
     func open(_ kind: CloudDriveKind) {
+        if kind == .local, selectedExternalDisk != nil, let localBaseProvider {
+            guard !local.isBusy else { connectionError = "Finish or cancel local work before changing its disk."; return }
+            local.connect(localBaseProvider)
+            selectedExternalDisk = nil
+            scopedLocalURL?.stopAccessingSecurityScopedResource(); scopedLocalURL = nil
+        }
+        showCurrentDrive(kind)
+    }
+    /// Internal navigation keeps the connected local, external or network root. Explicit
+    /// Local Disk menu selection uses `open` to return to the saved Mac folder.
+    func showCurrentDrive(_ kind: CloudDriveKind) {
         if selected != kind {
             pikpak.fileSimilarity.browserRevealTask?.cancel()
             pikpak.previewPlayer?.pause(); nativeDrives.forEach { $0.mediaPreview.clear() }
@@ -108,6 +149,42 @@ struct DriveConnectionFeedback {
         pikpakNavigation.showImmediately(0)
         nativeDrive(for: kind)?.section = 0
         selected = kind
+    }
+    func openExternalDisk(_ disk: ExternalDisk) {
+        externalDisks.refresh()
+        guard let mounted = externalDisks.disks.first(where: { $0.id == disk.id }) else {
+            connectionError = "This disk is no longer mounted. Reconnect it and select it again."
+            return
+        }
+        if selectedExternalDisk?.id == mounted.id, local.provider?.root.url == mounted.url.standardizedFileURL.resolvingSymlinksInPath() {
+            local.refreshAvailability()
+            showCurrentDrive(.local)
+            return
+        }
+        guard setLocalFolder(mounted.url, remember: false, volumeID: mounted.volumeID, preserveBase: true) else { return }
+        selectedExternalDisk = mounted
+        showCurrentDrive(.local)
+    }
+    /// Copy the starting disk, while retaining a separate provider and folder history.
+    func inheritLocalBrowser(from source: CloudDriveHub) {
+        guard let provider = source.local.provider as? ICloudDriveProvider, let url = provider.root.url else { return }
+        if let base = source.localBaseProvider, let baseURL = base.root.url {
+            localBaseProvider = ICloudDriveProvider(rootURL: baseURL, kind: .local, volumeID: base.volumeID)
+        }
+        local.connect(ICloudDriveProvider(rootURL: url, kind: .local, volumeID: provider.volumeID))
+        selectedExternalDisk = source.selectedExternalDisk
+    }
+    private func reconcileLocalDiskSelection() {
+        guard let provider = local.provider as? ICloudDriveProvider, let root = provider.root.url else {
+            selectedExternalDisk = nil; return
+        }
+        let matches: (ExternalDisk) -> Bool = { disk in
+            let path = disk.url.standardizedFileURL.path
+            return (root.path == path || root.path.hasPrefix(path + "/"))
+                && (disk.volumeID == nil || disk.volumeID == provider.volumeID)
+        }
+        if let selectedExternalDisk, matches(selectedExternalDisk) { return }
+        selectedExternalDisk = externalDisks.disks.filter(matches).max { $0.url.path.count < $1.url.path.count }
     }
     private func configureSimilarityDrives() {
         let options = CloudDriveKind.allCases.map { kind in
@@ -123,9 +200,9 @@ struct DriveConnectionFeedback {
         }
         host.revealInBrowser = { [weak self] source, file in
             guard let self else { return }
-            self.open(source == .cloud ? .pikpak : .local)
+            self.showCurrentDrive(source == .cloud ? .pikpak : .local)
             if source == .cloud { self.pikpak.revealSimilarityInBrowser(file) }
-            else { self.local.revealSimilarityFile(file) }
+            else { self.local.revealSimilarityFile(file); self.reconcileLocalDiskSelection() }
             WorkspaceSessionManager.current?.activateBrowser(in: self)
         }
         for drive in nativeDrives {
@@ -146,15 +223,16 @@ struct DriveConnectionFeedback {
             }
             drive.similarity.revealInBrowser = { [weak self, weak drive] _, file in
                 guard let self, let drive else { return }
-                self.open(drive.kind); drive.revealSimilarityFile(file)
+                self.showCurrentDrive(drive.kind); drive.revealSimilarityFile(file)
+                if drive.kind == .local { self.reconcileLocalDiskSelection() }
                 WorkspaceSessionManager.current?.activateBrowser(in: self)
             }
         }
     }
     func connectLocal() {
         guard !local.isBusy else { connectionError = "Finish or cancel local work before changing its connected folder."; return }
-        let panel = NSOpenPanel(); panel.title = "Choose a Local Folder or Disk"; panel.prompt = "Open Folder"
-        panel.message = "Choose a folder on this Mac or an external disk. This becomes the Local Disk browser’s starting location."
+        let panel = NSOpenPanel(); panel.title = "Choose a Folder or Disk"; panel.prompt = "Open Folder"
+        panel.message = "Choose a folder on this Mac, an external disk or a network disk connected in Finder. This becomes the Local Disk browser’s starting location."
         panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
         panel.directoryURL = local.provider?.root.url
         panel.begin { [weak self] response in
@@ -162,11 +240,14 @@ struct DriveConnectionFeedback {
             Task { @MainActor in self?.connectLocalFolder(url) }
         }
     }
-    func connectLocalFolder(_ url: URL, remember: Bool = true) {
-        guard !local.isBusy else { connectionError = "Finish or cancel local work before changing its connected folder."; return }
+    @discardableResult func connectLocalFolder(_ url: URL, remember: Bool = true, volumeID: String? = nil) -> Bool {
+        setLocalFolder(url, remember: remember, volumeID: volumeID, preserveBase: false)
+    }
+    private func setLocalFolder(_ url: URL, remember: Bool, volumeID: String?, preserveBase: Bool) -> Bool {
+        guard !local.isBusy else { connectionError = "Finish or cancel local work before changing its connected folder."; return false }
         let scoped = url.startAccessingSecurityScopedResource()
         do {
-            try LocalFileAccess.validate(url, directory: true)
+            try LocalFileAccess.validate(url, volumeID: volumeID, directory: true)
             if remember {
                 let data = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: [.pathKey, .volumeUUIDStringKey], relativeTo: nil)
                 defaults.set(data, forKey: "myCloudDriver.localBookmark")
@@ -175,11 +256,15 @@ struct DriveConnectionFeedback {
             }
             scopedLocalURL?.stopAccessingSecurityScopedResource()
             scopedLocalURL = scoped ? url : nil
-            local.connect(ICloudDriveProvider(rootURL: url, kind: .local)); local.section = 0
+            let provider = ICloudDriveProvider(rootURL: url, kind: .local, volumeID: volumeID)
+            local.connect(provider); local.section = 0
+            if !preserveBase { localBaseProvider = provider; selectedExternalDisk = nil }
             connectionError = nil
+            return true
         } catch {
             if scoped { url.stopAccessingSecurityScopedResource() }
             connectionError = error.localizedDescription
+            return false
         }
     }
     private func restoreLocalFolder(_ data: Data) {
@@ -217,6 +302,9 @@ struct DriveConnectionFeedback {
             guard response == .OK, let url = panel.url else { return }
             Task { @MainActor in
                 guard let self else { return }
+                guard !self.icloud.isBusy else {
+                    self.connectionError = "Finish or cancel iCloud Drive work before reconnecting."; return
+                }
                 do {
                     let data = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
                     self.scopedICloudURL?.stopAccessingSecurityScopedResource()
@@ -307,8 +395,9 @@ struct DriveConnectionFeedback {
         scopedICloudURL?.stopAccessingSecurityScopedResource(); scopedICloudURL = nil
     }
     func close() {
+        externalDiskObservation?.cancel(); externalDiskObservation = nil; externalDisks.close(); localBaseProvider = nil
         photosConnectionID = UUID(); photosConnectionTask?.cancel(); photosConnectionTask = nil; connectingPhotos = false
-        icloudStorage.clear()
+        icloudStorage.clear(); localStorage.clear()
         nativeDrives.forEach { $0.close() }; scopedICloudURL?.stopAccessingSecurityScopedResource(); scopedLocalURL?.stopAccessingSecurityScopedResource()
     }
 }
@@ -325,7 +414,23 @@ struct MyCloudDriverRootView: View {
                     Divider().frame(height: 18)
                     Menu {
                         ForEach(CloudDriveKind.allCases) { kind in Button { hub.open(kind) } label: { Label(kind.title, systemImage: kind.symbol) } }
-                    } label: { Label(selected.title, systemImage: selected.symbol).font(.headline) }
+                        if !hub.externalDisks.externalDisks.isEmpty {
+                            Divider()
+                            Section("External Disks") {
+                                ForEach(hub.externalDisks.externalDisks) { disk in
+                                    Button { hub.openExternalDisk(disk) } label: { Label(disk.name, systemImage: disk.symbol) }
+                                }
+                            }
+                        }
+                        if !hub.externalDisks.networkDisks.isEmpty {
+                            Divider()
+                            Section("Network Disks") {
+                                ForEach(hub.externalDisks.networkDisks) { disk in
+                                    Button { hub.openExternalDisk(disk) } label: { Label(disk.name, systemImage: disk.symbol) }
+                                }
+                            }
+                        }
+                    } label: { Label(hub.selectedDriveTitle, systemImage: hub.selectedDriveSymbol).font(.headline) }
                     .menuStyle(.borderlessButton).fixedSize()
                     Spacer()
                     Text("MyCloudDriver").font(.caption.weight(.medium)).foregroundStyle(.secondary)
@@ -349,6 +454,7 @@ struct MyCloudDriverRootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             hub.refreshPhotosAuthorization()
+            hub.externalDisks.refresh()
             if hub.icloud.isConnected { hub.icloudStorage.refresh(force: true) }
         }
         .alert("Drive connection", isPresented: Binding(get: { hub.connectionError != nil }, set: { if !$0 { hub.connectionError = nil } })) {
@@ -368,10 +474,10 @@ struct CloudDriveHome: View {
         if pikpak.isCheckingAccount || pikpak.isChangingAccount {
             return ("Checking account…", FinderAppearance.accent)
         }
-        switch pikpak.accountLoginStatus {
+        switch pikpak.accountConnectionStatus {
         case .signedIn: return ("Signed in", .green)
         case .checking: return (pikpak.accountLoginStatus.title, FinderAppearance.accent)
-        case .needsSignIn, .unavailable: return (pikpak.accountLoginStatus.title, .orange)
+        case .needsSignIn, .unavailable, .verificationRequired: return (pikpak.accountConnectionStatus.title, .orange)
         case .unverified, .signedOut:
             return pikpak.hasAccountSession ? ("Account saved", .green) : ("Sign in to connect", .orange)
         }
@@ -403,7 +509,15 @@ struct CloudDriveHome: View {
                     card(.icloud, state: icloud.isConnected ? "Folder connected" : "Connect a folder",
                          statusColor: icloud.isConnected ? .green : .orange, compact: compact)
                     card(.photos, state: photosStatus.title, statusColor: photosStatus.color, compact: compact)
-                    card(.local, state: local.isConnected ? "Ready on this Mac" : "Choose a folder", statusColor: local.isConnected ? .green : .orange, compact: compact)
+                    card(.local, state: local.isConnected ? "Folder available" : "Choose a folder", statusColor: local.isConnected ? .green : .orange, compact: compact)
+                }
+                if !hub.externalDisks.externalDisks.isEmpty {
+                    Text("External Disks").font(.title2.weight(.semibold))
+                    diskGrid(hub.externalDisks.externalDisks, columnCount: columnCount, compact: compact)
+                }
+                if !hub.externalDisks.networkDisks.isEmpty {
+                    Text("Network Disks").font(.title2.weight(.semibold))
+                    diskGrid(hub.externalDisks.networkDisks, columnCount: columnCount, compact: compact)
                 }
                 let featureLayout = viewport.size.width < 700 ? AnyLayout(VStackLayout(alignment: .leading, spacing: 18)) : AnyLayout(HStackLayout(alignment: .top, spacing: 24))
                 featureLayout {
@@ -419,26 +533,40 @@ struct CloudDriveHome: View {
         }
     }
     private func card(_ kind: CloudDriveKind, state: String, statusColor: Color, compact: Bool) -> some View {
-        Button { hub.open(kind) } label: {
+        driveCard(title: kind.title, symbol: kind.symbol, subtitle: kind.subtitle, state: state, statusColor: statusColor, compact: compact) { hub.open(kind) }
+    }
+    private func diskGrid(_ disks: [ExternalDisk], columnCount: Int, compact: Bool) -> some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 18, alignment: .top), count: columnCount), alignment: .leading, spacing: 18) {
+            ForEach(disks) { disk in
+                driveCard(title: disk.name, symbol: disk.symbol, subtitle: disk.url.path,
+                          state: disk.isReadOnly ? "Connected · Read-only" : "Connected", statusColor: .green, compact: compact) {
+                    hub.openExternalDisk(disk)
+                }
+            }
+        }
+    }
+    private func driveCard(title: String, symbol: String, subtitle: String, state: String, statusColor: Color, compact: Bool,
+                           open: @escaping () -> Void) -> some View {
+        Button(action: open) {
             VStack(alignment: .leading, spacing: compact ? 14 : 18) {
-                Image(systemName: kind.symbol).font(.system(size: 28)).foregroundStyle(FinderAppearance.accent)
+                Image(systemName: symbol).font(.system(size: 28)).foregroundStyle(FinderAppearance.accent)
                     .frame(width: compact ? 54 : 62, height: compact ? 54 : 62).background(FinderAppearance.accent.opacity(0.09), in: RoundedRectangle(cornerRadius: 16))
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(kind.title).font(.title2.weight(.semibold))
-                    Text(kind.subtitle).font(.callout).foregroundStyle(.secondary).frame(height: 54, alignment: .top)
+                    Text(title).font(.title2.weight(.semibold))
+                    Text(subtitle).font(.callout).foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle).frame(height: 54, alignment: .top)
                 }
                 Label {
                     Text(state).foregroundStyle(.secondary)
                 } icon: {
                     Circle().fill(statusColor).frame(width: 9, height: 9).accessibilityHidden(true)
                 }.font(.caption)
-                HStack { Text("Open \(kind.title)").fontWeight(.medium); Spacer(); Image(systemName: "arrow.right") }
+                HStack { Text("Open \(title)").fontWeight(.medium); Spacer(); Image(systemName: "arrow.right") }
                     .foregroundStyle(FinderAppearance.accent)
             }.padding(compact ? 18 : 24).frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 16))
                 .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.primary.opacity(0.09)))
                 .contentShape(RoundedRectangle(cornerRadius: 16))
-        }.buttonStyle(.plain).pointingHandCursor().help("Open \(kind.title)")
+        }.buttonStyle(.plain).pointingHandCursor().help("Open \(title)")
     }
     private func feature(_ title: String, _ description: String, _ symbol: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -457,10 +585,10 @@ struct CloudDriveConnectionsView: View {
     var body: some View {
         Form {
             Section("Local Disk") {
-                CloudDriveIdentityRow(kind: .local, detail: "Folders and external disks on this Mac", status: local.isConnected ? "Available" : "Choose a folder", connected: local.isConnected)
+                CloudDriveIdentityRow(kind: .local, detail: "Folders, external disks and network shares", status: local.isConnected ? "Available" : "Choose a folder", connected: local.isConnected)
                 if let root = local.provider?.root.url { Text(root.path).font(.caption).textSelection(.enabled) }
                 Button("Choose Folder or Disk…") { hub.connectLocal() }.disabled(local.isBusy)
-                Text("Local files stay on this Mac unless you explicitly copy or upload them. macOS controls access to protected folders.").font(.caption).foregroundStyle(.secondary)
+                Text("Connect shared disks in Finder (Go → Connect to Server), then choose the disk or one of its folders here.").font(.caption).foregroundStyle(.secondary)
             }
             Section("iCloud Drive") {
                 CloudDriveIdentityRow(kind: .icloud, detail: "Folder access on this Mac",

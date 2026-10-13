@@ -42,6 +42,13 @@ import SwiftUI
     var peerDetail: [LocalTorrentPeer] = []
     var networkState: LocalTorrentNetworkDiagnostics?
     var networkChecks = 0
+    var peerCensusInterval: TimeInterval = 30
+    var peerChecks = 0
+    var peerFailures = 0
+    var statusChecks = 0
+    var fileStatusChecks = 0
+    var delayStatusFailure = false
+    var statusFailureGate: CheckedContinuation<Void, Never>?
     /// Status replies to drop before answering again, as a busy local RPC does.
     var statusFailures = 0
     var statusFailureError: Error = LocalTorrentError.message("Lost local RPC reply")
@@ -49,7 +56,9 @@ import SwiftUI
     var checkingOnFileCensus = false
     func start() async throws { running = true }
     func peerCensus(_ id: String, attempted: Int) async throws -> LocalTorrentPeerCensus {
-        .init(connected: connectedPeers ?? attempted, attempted: attempted, peers: peerDetail)
+        peerChecks += 1
+        if peerFailures > 0 { peerFailures -= 1; throw URLError(.networkConnectionLost) }
+        return .init(connected: connectedPeers ?? attempted, attempted: attempted, peers: peerDetail)
     }
     func networkDiagnostics(_ id: String) async throws -> LocalTorrentNetworkDiagnostics? {
         networkChecks += 1; return networkState
@@ -71,6 +80,13 @@ import SwiftUI
         return id
     }
     func status(_ id: String, files: Bool) async throws -> LocalTorrentStatus {
+        statusChecks += 1
+        if files { fileStatusChecks += 1 }
+        if delayStatusFailure {
+            delayStatusFailure = false
+            await withCheckedContinuation { statusFailureGate = $0 }
+            throw URLError(.networkConnectionLost)
+        }
         if statusFailures > 0 { statusFailures -= 1; throw statusFailureError }
         guard var value = states[id] else { throw LocalTorrentError.message("Missing fixture torrent") }
         if files, checkingOnFileCensus { value["verifiedLength"] = "0" }
@@ -134,6 +150,17 @@ import SwiftUI
             window.makeKeyAndOrderFront(nil); app.activate(ignoringOtherApps: true); app.run(); return
         }
         if CommandLine.arguments.contains("--ram-volume") { try await ramVolume(); return }
+        if CommandLine.arguments.contains("--peer-rate-tests") {
+            try peerRatePolicies()
+            try await peerRatesFollowStatusCadence()
+            try await peerHonesty()
+            try await networkDiagnosticsCadence()
+            try await localStatusHiccup()
+            try await relayDrainTelemetry()
+            try await relaySpeeds()
+            try await relayStatusHiccup()
+            return
+        }
         if CommandLine.arguments.contains("--ui") { try launchUI(); return }
         if let index = CommandLine.arguments.firstIndex(of: "--reconnect-fixture") { try await actualPeerReconnect(URL(fileURLWithPath: CommandLine.arguments[index + 1])); return }
         if let index = CommandLine.arguments.firstIndex(of: "--relay-fixture") { try await actualRelay(URL(fileURLWithPath: CommandLine.arguments[index + 1])); return }
@@ -178,6 +205,8 @@ import SwiftUI
         try checkingProgress()
         try upnpDiscovery()
         try peerTuningDefaults()
+        try peerRatePolicies()
+        try await peerRatesFollowStatusCadence()
         try await peerHonesty()
         try await networkDiagnosticsCadence()
         peerListParsing()
@@ -338,7 +367,7 @@ import SwiftUI
     @MainActor static func prepared(root: URL, engine: TorrentFixtureEngine) async throws -> (LocalTorrentModel, UUID) {
         let source = root.appendingPathComponent("example.torrent")
         try Data("fixture".utf8).write(to: source)
-        let model = LocalTorrentModel(directory: root.appendingPathComponent("State"), engine: engine)
+        let model = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: root.appendingPathComponent("State"), engine: engine)
         let id = try model.add(torrent: source)
         try await until("file selection") { model.job(id)?.phase == .choosing || model.job(id)?.phase == .failed }
         return (model, id)
@@ -367,16 +396,16 @@ import SwiftUI
         await model.stop(id); precondition(model.job(id)?.phase == .stopped && FileManager.default.fileExists(atPath: partial.path))
         await model.resume(id); precondition(model.job(id)?.phase == .downloading)
         model.shutdown()
-        let second = LocalTorrentModel(directory: model.store.directory, engine: TorrentFixtureEngine()); defer { second.shutdown() }
+        let second = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: model.store.directory, engine: TorrentFixtureEngine()); defer { second.shutdown() }
         precondition(second.job(id)?.phase == .paused && !second.engine.running && second.job(id)?.selected == [2])
         await second.remove(id)
         precondition(second.jobs.isEmpty && FileManager.default.fileExists(atPath: partial.path))
     }
     @MainActor static func metadataAndCancellation() async throws {
         let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
-        let engine = TorrentFixtureEngine(), model = LocalTorrentModel(directory: root, engine: TorrentFixtureEngine())
+        let engine = TorrentFixtureEngine(), model = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: root, engine: TorrentFixtureEngine())
         model.shutdown()
-        let actual = LocalTorrentModel(directory: root.appendingPathComponent("Other"), engine: engine); defer { actual.shutdown() }
+        let actual = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: root.appendingPathComponent("Other"), engine: engine); defer { actual.shutdown() }
         let id = try actual.add(magnet: magnet)
         let duplicate = try actual.add(magnet: magnet + "&tr=http://127.0.0.1/announce")
         precondition(id == duplicate)
@@ -439,7 +468,7 @@ import SwiftUI
     @MainActor static func metadataStats() async throws {
         let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
         let engine = TorrentFixtureEngine()
-        let actual = LocalTorrentModel(directory: root.appendingPathComponent("Stats"), engine: engine)
+        let actual = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: root.appendingPathComponent("Stats"), engine: engine)
         // Connected peers are normally censused every few seconds; this test
         // drives refresh() by hand, so every call must re-read the engine.
         actual.censusInterval = 0
@@ -745,11 +774,135 @@ import SwiftUI
         print("PASS stalls: quiet downloads name the cause without losing the batch they belong to.")
     }
 
+    /// Peer payload cost controls cadence without launching either backend.
+    @MainActor static func peerRatePolicies() throws {
+        let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let executable = URL(fileURLWithPath: "/usr/bin/true")
+        let native = LibtorrentEngine(executable: executable, directory: root.appendingPathComponent("NativeEngine"),
+                                      trackers: [], mapsPorts: false)
+        let legacy = Aria2TorrentEngine(executable: executable, directory: root.appendingPathComponent("LegacyEngine"),
+                                       trackers: [], mapsPorts: false)
+        let nativeModel = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: root.appendingPathComponent("Native"), engine: native)
+        let legacyModel = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: root.appendingPathComponent("Legacy"), engine: legacy)
+        defer { nativeModel.shutdown(); legacyModel.shutdown() }
+        precondition(native.peerCensusInterval == 0 && nativeModel.censusInterval == 0)
+        precondition(legacy.peerCensusInterval == 30 && legacyModel.censusInterval == 30)
+        precondition(nativeModel.relayFileCensusInterval == 30 && legacyModel.relayFileCensusInterval == 30,
+                     "Faster peer rates must not increase expensive file inventory polling")
+        precondition(TorrentFixtureEngine().peerCensusInterval == 30)
+        precondition(!native.running && !legacy.running, "Reading engine policies must not start a process")
+        print("PASS peer-rate policies: native follows status; legacy keeps 30-second census; file polling unchanged; no engine started")
+    }
+
+    /// Counter-only jobs exercise refresh without loading any torrent metadata,
+    /// starting a real torrent process, or inspecting downloaded files.
+    @MainActor static func peerRatesFollowStatusCadence() async throws {
+        let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        for interval in [TimeInterval(0), TimeInterval(30)] {
+            let engine = TorrentFixtureEngine(); engine.running = true
+            engine.peerCensusInterval = interval
+            let model = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: root.appendingPathComponent("Counters-\(Int(interval))"), engine: engine)
+            defer { model.shutdown() }
+            let id = UUID(), gid = "counter-only"
+            model.jobs = [LocalTorrentJob(id: id, name: "Synthetic counters", phase: .downloading)]
+            model.gids[id] = gid
+            precondition(model.censusInterval == interval)
+            func report(_ down: UInt64, _ up: UInt64, state: String = "active", sockets: Int = 3) {
+                engine.states[gid] = ["status":state, "connections":"\(sockets)", "numSeeders":"1",
+                    "totalLength":"1000000", "completedLength":"100", "downloadSpeed":"\(down)", "uploadSpeed":"\(up)"]
+                engine.connectedPeers = 3
+                engine.peerDetail = [
+                    .init(address:"203.0.113.1:6881", downloadSpeed:down, uploadSpeed:0, seeder:true),
+                    .init(address:"203.0.113.2:6881", downloadSpeed:0, uploadSpeed:up / 2, seeder:false),
+                    .init(address:"203.0.113.3:6881", downloadSpeed:0, uploadSpeed:up - up / 2, seeder:false),
+                ]
+            }
+            func assertRates(_ down: UInt64, _ up: UInt64) {
+                let peers = model.connectedPeers(id)
+                precondition(model.job(id)?.downloadSpeed == down && model.job(id)?.uploadSpeed == up)
+                precondition(peers.reduce(UInt64(0)) { $0 + $1.downloadSpeed } == down)
+                precondition(peers.reduce(UInt64(0)) { $0 + $1.uploadSpeed } == up)
+            }
+            report(571_000, 224_000); await model.refresh(); assertRates(571_000, 224_000)
+            let checks = engine.peerChecks, networkChecks = engine.networkChecks
+            report(128_000, 64_000); await model.refresh()
+            precondition(model.job(id)?.downloadSpeed == 128_000 && model.job(id)?.uploadSpeed == 64_000)
+            if interval == 30 {
+                precondition(engine.peerChecks == checks, "Legacy bitfield replies must remain throttled")
+                precondition(model.connectedPeers(id)[0].downloadSpeed == 571_000)
+                continue
+            }
+            assertRates(128_000, 64_000)
+            precondition(engine.peerChecks == checks + 1, "Native peer rows must refresh with each successful status sample")
+
+            engine.statusFailures = 1
+            let attempts = model.job(id)?.attempted
+            await model.refresh()
+            precondition(model.connectedPeers(id).isEmpty && model.job(id)?.downloadSpeed == 0 && model.job(id)?.uploadSpeed == 0)
+            precondition(model.job(id)?.peers == 3 && model.job(id)?.seeders == 1 && model.job(id)?.attempted == attempts,
+                         "Lost status expires rates without inventing a peer disconnection")
+            report(32_000, 16_000); await model.refresh(); assertRates(32_000, 16_000)
+
+            engine.peerFailures = 1
+            report(256_000, 96_000); await model.refresh()
+            precondition(model.job(id)?.downloadSpeed == 256_000 && model.job(id)?.uploadSpeed == 96_000,
+                         "A failed peer read must not discard valid aggregate rates")
+            precondition(model.connectedPeers(id).isEmpty && model.job(id)?.peers == 3 && model.job(id)?.seeders == 1)
+            let failedChecks = engine.peerChecks
+            report(384_000, 48_000); await model.refresh(); assertRates(384_000, 48_000)
+            precondition(engine.peerChecks == failedChecks + 1, "The next status poll must retry an expired peer sample")
+
+            report(0, 0, state:"waiting"); await model.refresh()
+            precondition(model.connectedPeers(id).isEmpty && model.job(id)?.peers == 0)
+            report(512_000, 128_000); await model.refresh(); assertRates(512_000, 128_000)
+            let connectedChecks = engine.peerChecks
+            report(0, 0, sockets:0); engine.connectedPeers = 0; engine.peerDetail = []
+            await model.refresh()
+            precondition(model.connectedPeers(id).isEmpty && model.job(id)?.peers == 0)
+            precondition(engine.peerChecks == connectedChecks,
+                         "A zero-socket status must expire peer rows without reviving an older peer snapshot")
+            report(64_000, 8_000); await model.refresh(); assertRates(64_000, 8_000)
+
+            let relayIdentity = UUID()
+            model.relayContextProvider = {
+                .init(identity: relayIdentity, accountID: "synthetic",
+                      engineURL: URL(fileURLWithPath: "/unused-counter-fixture"), environment: [:], credentialKind: .desktopOAuth)
+            }
+            model.edit(id) {
+                $0.phase = .uploading
+                $0.relay = TorrentRelayState(identity: relayIdentity, accountID: "synthetic", credentialKind: .desktopOAuth,
+                    accountName: "Synthetic", parentID: "", parentName: "Synthetic", rootName: "Synthetic",
+                    memoryBytes: 256 * 1024 * 1024, batches: [])
+            }
+            model.relayFileCensusAt[id] = Date()
+            report(768_000, 192_000); await model.refresh(); assertRates(768_000, 192_000)
+            precondition(model.job(id)?.phase == .uploading, "Peer sampling must also follow a live relay drain")
+            precondition(engine.networkChecks == networkChecks, "Frequent peer samples must leave diagnostics at 30 seconds")
+            precondition(engine.fileStatusChecks == 0, "Counter samples must never trigger a file inventory")
+            precondition(engine.statusChecks > checks && engine.metadataRequests == 0 && engine.begun.isEmpty)
+
+            // A late failure from a previous run must not expire a resumed
+            // run's known peers, even at the stale-telemetry failure threshold.
+            engine.delayStatusFailure = true
+            model.statusFailures[id] = model.statusRetries - 1
+            let oldRead = Task { try await model.pollStatus(id, gid: gid, files: false) }
+            try await until("synthetic delayed status failure") { engine.statusFailureGate != nil }
+            model.gids[id] = "counter-restarted"
+            engine.statusFailureGate?.resume(); engine.statusFailureGate = nil
+            let oldReply = try await oldRead.value
+            precondition(oldReply == nil && model.job(id)?.peers == 3 && model.job(id)?.seeders == 1)
+            precondition(model.statusFailures[id] == model.statusRetries - 1,
+                         "A previous run must not change the current run's status failure count")
+            precondition(model.job(id)?.downloadSpeed == 768_000 && !model.connectedPeers(id).isEmpty)
+        }
+        print("PASS native peer rates: successive download/upload samples align; failed reads expire rates, retain counts and recover; waiting/disconnected samples clear rows; relay drain and slower diagnostics preserved")
+    }
+
     /// aria2's `connections` counts sockets it opened, not peers that answered.
     @MainActor static func peerHonesty() async throws {
         let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
         let engine = TorrentFixtureEngine()
-        let model = LocalTorrentModel(directory: root.appendingPathComponent("Peers"), engine: engine)
+        let model = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: root.appendingPathComponent("Peers"), engine: engine)
         model.censusInterval = 0
         defer { model.shutdown() }
         let id = try model.add(magnet: magnet)
@@ -795,7 +948,7 @@ import SwiftUI
         engine.networkState = .init(["knownPeers": 42, "trackerCount": 4, "trackersResponding": 1,
                                     "trackersFailed": 3, "lastPeerError": "Connection timed out"],
                                    dht: ["enabled": true, "snapshotReady": true, "nodes": 9])
-        let model = LocalTorrentModel(directory: root, engine: engine)
+        let model = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: root, engine: engine)
         model.censusInterval = 0
         defer { model.shutdown() }
         let id = try model.add(magnet: magnet)
@@ -960,7 +1113,7 @@ import SwiftUI
     @MainActor static func metadataRetries() async throws {
         let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
         let engine = TorrentFixtureEngine()
-        let actual = LocalTorrentModel(directory: root.appendingPathComponent("Retries"), engine: engine)
+        let actual = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: root.appendingPathComponent("Retries"), engine: engine)
         defer { actual.shutdown() }
         let id = try actual.add(magnet: magnet)
         try await until("persistent metadata wait") { engine.metadataRequests == 1 && !actual.busy.contains(id) }
@@ -1018,7 +1171,7 @@ import SwiftUI
                        "listen-port":"\(config["leecher_port"] as! Int)","max-overall-download-limit":"64K","bt-tracker-interval":"2"]
         let executable = URL(fileURLWithPath: config["engine"] as! String)
         let state = root.appendingPathComponent("GrowQueue")
-        let model = LocalTorrentModel(directory: state, engine: fixtureEngine(executable: executable, directory: state.appendingPathComponent("Engine"), extraOptions: options, trackers: [], mapsPorts: false))
+        let model = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: state, engine: fixtureEngine(executable: executable, directory: state.appendingPathComponent("Engine"), extraOptions: options, trackers: [], mapsPorts: false))
         defer { model.shutdown() }
         let id = try model.add(magnet: config["magnet"] as! String)
         try await until("real magnet file list", seconds: 45) { model.job(id)?.phase != .metadata }
@@ -1089,7 +1242,7 @@ import SwiftUI
         let state = root.appendingPathComponent("Queue")
         func makeModel() -> LocalTorrentModel {
             // Loopback fixtures must reach no network but their own.
-            LocalTorrentModel(directory: state, engine: fixtureEngine(executable: executable, directory: state.appendingPathComponent("Engine"), extraOptions: options, trackers: [], mapsPorts: false))
+            LocalTorrentModel(dnsProbe: { _ in .clean }, directory: state, engine: fixtureEngine(executable: executable, directory: state.appendingPathComponent("Engine"), extraOptions: options, trackers: [], mapsPorts: false))
         }
         let model = makeModel(); defer { model.shutdown() }
         precondition(!FileManager.default.fileExists(atPath: state.appendingPathComponent("Engine/dht.dat").path), "Discovery test must start without cached DHT nodes")
@@ -1137,7 +1290,7 @@ import SwiftUI
     @MainActor static func launchUI() throws {
         let root = try temporary(), engine = TorrentFixtureEngine()
         engine.files = (1...7105).map { ("Sample collection/Photo \($0).jpg", UInt64(150_000 + $0)) }
-        let model = LocalTorrentModel(directory: root, engine: engine, ram: RelayFixtureRAM())
+        let model = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: root, engine: engine, ram: RelayFixtureRAM())
         let account = try DownloaderModel.finderAccountsFixture()
         let context = relayContext(identity: account.activeAccountID!, account: account.accountProfile!.sub, kind: .desktopOAuth)
         account.pikpakManagement.configure(context)
@@ -1382,7 +1535,7 @@ extension LocalTorrentTests {
         let uploaded = model.job(id)!.relay!.uploaded
         await model.pauseRelay(id, automatic: true); model.shutdown()
         let nextEngine = TorrentFixtureEngine(); nextEngine.files = files
-        let next = LocalTorrentModel(directory: model.store.directory, engine: nextEngine, ram: ram)
+        let next = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: model.store.directory, engine: nextEngine, ram: ram)
         defer { next.shutdown() }
         next.relayContextProvider = { context }; next.relayUploaderFactory = { RelayFixtureUpload(cloud) }
         await next.resumeRestoredTransfers()
@@ -1415,7 +1568,7 @@ extension LocalTorrentTests {
                      "Sharing must retain verified bytes and the active peer session while space is available")
         await model.pauseRelay(id, automatic: true); model.shutdown()
         let nextEngine = TorrentFixtureEngine(); nextEngine.files = files
-        let next = LocalTorrentModel(directory: model.store.directory, engine: nextEngine, ram: ram)
+        let next = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: model.store.directory, engine: nextEngine, ram: ram)
         defer { next.shutdown() }
         next.relayContextProvider = { context }; next.relayUploaderFactory = { RelayFixtureUpload(cloud) }
         next.relayFileCensusInterval = 0
@@ -1510,7 +1663,7 @@ extension LocalTorrentTests {
         }
         try model.save(); model.shutdown()
         let engine = TorrentFixtureEngine(); engine.files = files
-        let next = LocalTorrentModel(directory: model.store.directory, engine: engine, ram: ram)
+        let next = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: model.store.directory, engine: engine, ram: ram)
         defer { next.shutdown() }
         next.relayContextProvider = { context }; next.relayUploaderFactory = { RelayFixtureUpload(cloud) }
         await next.resumeRestoredTransfers()
@@ -1546,7 +1699,7 @@ extension LocalTorrentTests {
         let engine = TorrentFixtureEngine(); engine.files = [
             ("Examples/one", 104_857_600), ("Examples/two", 104_857_600), ("Examples/three", 104_857_600)
         ]
-        let next = LocalTorrentModel(directory: root.appendingPathComponent("State"), engine: engine, ram: ram)
+        let next = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: root.appendingPathComponent("State"), engine: engine, ram: ram)
         defer { next.shutdown() }
         next.relayContextProvider = { context }; next.relayUploaderFactory = { RelayFixtureUpload(cloud) }
         await next.resumeRestoredTransfers()
@@ -1574,7 +1727,7 @@ extension LocalTorrentTests {
         precondition(FileManager.default.fileExists(atPath: storage.payload.appendingPathComponent(files[0].0).path))
         model.shutdown()
         let engine = TorrentFixtureEngine(); engine.files = files
-        let next = LocalTorrentModel(directory: root.appendingPathComponent("State"), engine: engine, ram: ram)
+        let next = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: root.appendingPathComponent("State"), engine: engine, ram: ram)
         defer { next.shutdown() }
         next.relayContextProvider = { context }; next.relayUploaderFactory = { RelayFixtureUpload(cloud) }
         next.relayFlushWait = 0; next.relayFileCensusInterval = 0
@@ -1715,7 +1868,7 @@ extension LocalTorrentTests {
         let uuid = first.job(id)?.relay?.volume?.uuid
         first.shutdown()
         let nextEngine = TorrentFixtureEngine(); nextEngine.files = engine.files
-        let next = LocalTorrentModel(directory: first.store.directory, engine: nextEngine, ram: ram)
+        let next = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: first.store.directory, engine: nextEngine, ram: ram)
         defer { next.shutdown() }
         next.relayUploaderFactory = { RelayFixtureUpload(cloud) }
         next.relayContextProvider = { relayContext(account: "different-account") }
@@ -1733,13 +1886,13 @@ extension LocalTorrentTests {
         precondition(next.job(id)?.relay?.volume?.uuid == uuid && next.job(id)?.downloadedBytes == 4096)
         await next.pause(id); await next.resumeRestoredTransfers()
         precondition(next.job(id)?.phase == .paused, "A new pause must hold for the rest of this app session")
-        let held = LocalTorrentModel(directory: next.store.directory, engine: TorrentFixtureEngine(), ram: ram)
+        let held = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: next.store.directory, engine: TorrentFixtureEngine(), ram: ram)
         await held.resumeRestoredTransfers()
         precondition(held.job(id)?.automaticallyResume == false && held.restoredResumeIDs.isEmpty,
                      "An explicit pause must also survive an app restart")
         held.shutdown()
         await next.stop(id); next.shutdown()
-        let stopped = LocalTorrentModel(directory: first.store.directory, engine: TorrentFixtureEngine(), ram: ram)
+        let stopped = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: first.store.directory, engine: TorrentFixtureEngine(), ram: ram)
         defer { stopped.shutdown() }
         stopped.relayContextProvider = { context }
         await stopped.resumeRestoredTransfers()
@@ -1820,7 +1973,7 @@ extension LocalTorrentTests {
         // then discards all RAM. Only file 3 must be fetched again.
         cloud.receipts.insert(2); ram.volumes.removeAll()
         let nextEngine=TorrentFixtureEngine();nextEngine.files=engine.files
-        let next=LocalTorrentModel(directory:first.store.directory,engine:nextEngine,ram:ram)
+        let next=LocalTorrentModel(dnsProbe: { _ in .clean }, directory:first.store.directory,engine:nextEngine,ram:ram)
         next.relayContextProvider={context};next.relayUploaderFactory={RelayFixtureUpload(cloud)}
         await next.resume(id)
         try await until("recover cloud receipts before redownloading") { next.job(id)?.phase == .downloading && !next.busy.contains(id) }
@@ -2229,7 +2382,7 @@ extension LocalTorrentTests {
         let ram = TorrentRAMDisk(), context = relayContext()
         let engine = fixtureEngine(executable: URL(fileURLWithPath: config["engine"] as! String),
                                        directory: state.appendingPathComponent("Engine"), extraOptions: options, trackers: [], mapsPorts: false)
-        let model = LocalTorrentModel(directory: state, engine: engine, ram: ram)
+        let model = LocalTorrentModel(dnsProbe: { _ in .clean }, directory: state, engine: engine, ram: ram)
         let uploader = RelayHashFixtureUpload(original: root.appendingPathComponent("Seed"), ram: ram)
         model.relayContextProvider = { context }; model.relayUploaderFactory = { uploader }
         model.censusInterval = 0.5; model.relayFileCensusInterval = 0.5; model.relayFlushWait = 0
@@ -2287,7 +2440,7 @@ extension LocalTorrentTests {
         let uploader=RelayHashFixtureUpload(original:root.appendingPathComponent("Seed"),ram:ram)
         uploader.offline = uploadOutage
         func makeModel() -> LocalTorrentModel {
-            let model=LocalTorrentModel(directory:state,engine:fixtureEngine(executable:executable,directory:state.appendingPathComponent("Engine"),extraOptions:options,trackers:[],mapsPorts:false),ram:ram)
+            let model=LocalTorrentModel(dnsProbe: { _ in .clean }, directory:state,engine:fixtureEngine(executable:executable,directory:state.appendingPathComponent("Engine"),extraOptions:options,trackers:[],mapsPorts:false),ram:ram)
             model.relayContextProvider={context};model.relayUploaderFactory={uploader}
             // The fixture torrent is far too small to reach the 3-minute or
             // 256 MB flush triggers, so upload every completed file at once.

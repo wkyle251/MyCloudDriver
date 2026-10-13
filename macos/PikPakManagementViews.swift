@@ -6,14 +6,28 @@ struct PikPakShareDraft: Identifiable {
     var files: [PikPakManagedFile] = []
 }
 
-private struct PikPakManagementConfirmation: Identifiable {
+struct PikPakManagementConfirmation: Identifiable {
     let id = UUID()
+    let revision: UUID
     let title: String
     let message: String
     let button: String
     let operation: String
     let ids: [String]
     let section: Int
+
+    @MainActor @discardableResult
+    static func submit(_ value: Self, confirmation: inout Self?, management: PikPakManagementModel) -> Task<PikPakManagementResponse?, Never>? {
+        // Some native hosts clear the binding before invoking the button.
+        // Never consume a newer dialog; the model claims this dialog ID once.
+        guard confirmation == nil || confirmation?.id == value.id else { return nil }
+        // Dismiss before publishing mutation state to the native alert host.
+        confirmation = nil
+        return management.submitConfirmedMutation(value.operation,
+            values: ["ids":value.ids, "id":value.ids.first ?? "", "confirmed":true], section: value.section,
+            success: value.operation == "empty_trash" ? "Trash emptied." : value.operation == "remove_task" ? "Task removed." : "Changes saved.",
+            expectedRevision: value.revision, confirmationID: value.id)
+    }
 }
 
 struct PikPakManagementWorkspace: View {
@@ -49,7 +63,7 @@ struct PikPakManagementWorkspace: View {
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 if let error = management.error { feedback(error, error: true) }
-                if let notice = management.notice { feedback(notice, error: false) }
+                if let notice = management.notice { feedback(notice, error: false, pending: management.noticeIsPending) }
                 if section == 6 { trashToolbar }
                 if section == 4 { cloudInformation }
                 content
@@ -57,7 +71,8 @@ struct PikPakManagementWorkspace: View {
                     .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
                     .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.08)) }
                 HStack {
-                    if management.isMutating { ProgressView().controlSize(.mini); Text("Saving changes…") }
+                    if management.isConfirmingEmptyTrash { ProgressView().controlSize(.mini); Text("Checking Trash…") }
+                    else if management.isMutating { ProgressView().controlSize(.mini); Text("Saving changes…") }
                     else if management.isLoading { ProgressView().controlSize(.mini); Text("Refreshing…") }
                     else if let updated = management.updatedAt {
                         Text("Updated \(updated.formatted(date: .omitted, time: .shortened))")
@@ -100,11 +115,7 @@ struct PikPakManagementWorkspace: View {
         .alert(item: $confirmation) { value in
             Alert(title: Text(value.title), message: Text(value.message),
                 primaryButton: .destructive(Text(value.button)) {
-                    Task {
-                        _ = await management.mutate(value.operation,
-                            values: ["ids":value.ids, "id":value.ids.first ?? "", "confirmed":true],
-                            section: value.section, success: value.operation == "empty_trash" ? "Trash emptied." : "Changes saved.")
-                    }
+                    PikPakManagementConfirmation.submit(value, confirmation: &confirmation, management: management)
                 }, secondaryButton: .cancel())
         }
     }
@@ -132,7 +143,7 @@ struct PikPakManagementWorkspace: View {
                     .buttonStyle(.borderedProminent).disabled(busy || !management.connected)
             } else {
                 Button("Empty Trash…", role: .destructive) {
-                    confirmation = .init(title: "Empty PikPak Trash?",
+                    confirmation = .init(revision: management.revision, title: "Empty PikPak Trash?",
                         message: "All files and folders in Trash for \(model.accountDisplayName ?? "this account") will be permanently deleted. This cannot be undone.",
                         button: "Empty Trash", operation: "empty_trash", ids: [], section: 6)
                 }.disabled(busy || !management.canPermanentlyDelete || management.trash.isEmpty)
@@ -176,7 +187,7 @@ struct PikPakManagementWorkspace: View {
                 }.disabled(busy || selectedFiles.isEmpty)
                 Button("Delete Permanently…", role: .destructive) {
                     let files = selectedFiles
-                    confirmation = .init(title: "Permanently delete \(files.count) item(s)?",
+                    confirmation = .init(revision: management.revision, title: "Permanently delete \(files.count) item(s)?",
                         message: files.prefix(5).map(\.name).joined(separator: "\n") + (files.count > 5 ? "\n…and \(files.count - 5) more" : "") + "\n\nThis cannot be undone.",
                         button: "Delete Permanently", operation: "delete_trash", ids: files.map(\.id), section: 6)
                 }.disabled(busy || selectedFiles.isEmpty || !management.canPermanentlyDelete)
@@ -192,7 +203,13 @@ struct PikPakManagementWorkspace: View {
             if management.shares.isEmpty { empty("No shared links", "Create a link for files or folders in your PikPak drive.") }
             else { ScrollView { LazyVStack(spacing: 0) { ForEach(management.shares) { share in shareRow(share); Divider() } } } }
         } else {
-            if management.trash.isEmpty { empty("Trash is empty", "Files you move to PikPak Trash will appear here.") }
+            if management.trash.isEmpty {
+                if management.isConfirmingEmptyTrash || management.hasPendingEmptyTrash || management.hasMore(6) {
+                    empty("Checking Trash", "PikPak has not confirmed that Trash is empty yet. Refresh to check again.")
+                } else {
+                    empty("Trash is empty", "Files you move to PikPak Trash will appear here.")
+                }
+            }
             else {
                 ScrollView { LazyVStack(spacing: 0) { ForEach(management.trash) { file in
                     HStack(spacing: 12) {
@@ -245,7 +262,7 @@ struct PikPakManagementWorkspace: View {
             }
             Menu {
                 Button("Remove Task…", role: .destructive) {
-                    confirmation = .init(title: "Remove this cloud task?", message: "\(task.title)\n\nAny file already saved in PikPak will be kept.",
+                    confirmation = .init(revision: management.revision, title: "Remove this cloud task?", message: "\(task.title)\n\nAny file already saved in PikPak will be kept.",
                         button: "Remove Task", operation: "remove_task", ids: [task.id], section: 4)
                 }
             } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).fixedSize().disabled(busy)
@@ -272,7 +289,7 @@ struct PikPakManagementWorkspace: View {
                 Button("Change Expiry…") { editShare = share }
                 Divider()
                 Button("Revoke Link…", role: .destructive) {
-                    confirmation = .init(title: "Revoke this shared link?",
+                    confirmation = .init(revision: management.revision, title: "Revoke this shared link?",
                         message: "The link for “\(share.displayTitle)” will stop working. Your files in PikPak will be kept.",
                         button: "Revoke Link", operation: "remove_shares", ids: [share.id], section: 5)
                 }
@@ -289,9 +306,10 @@ struct PikPakManagementWorkspace: View {
         }.foregroundStyle(.secondary).multilineTextAlignment(.center).padding(30).frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func feedback(_ message: String, error: Bool) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: error ? "exclamationmark.circle" : "checkmark.circle")
+    private func feedback(_ message: String, error: Bool, pending: Bool = false) -> some View {
+        let color: Color = error ? .orange : pending ? FinderAppearance.accent : .green
+        return HStack(alignment: .top, spacing: 8) {
+            Image(systemName: error ? "exclamationmark.circle" : pending ? "clock" : "checkmark.circle")
             // Bound the banner's minimum height. An unbounded fixed-size text
             // can make the hosting window grow by thousands of points while a
             // sheet is open. Full recovery details stay in the task dialog.
@@ -299,8 +317,8 @@ struct PikPakManagementWorkspace: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             Spacer()
             if !error { Button { management.dismissNotice() } label: { Image(systemName: "xmark") }.buttonStyle(.borderless) }
-        }.font(.callout).foregroundStyle(error ? .orange : .green).padding(10)
-            .background((error ? Color.orange : Color.green).opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
+        }.font(.callout).foregroundStyle(color).padding(10)
+            .background(color.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 

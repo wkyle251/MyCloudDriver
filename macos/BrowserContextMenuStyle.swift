@@ -7,8 +7,11 @@ extension View {
     /// entering it then rebuilds the NSMenu while AppKit is opening its child.
     @ViewBuilder
     func browserContextMenu<Items: View>(nativeMenu: (() -> NSMenu)? = nil,
+                                        usesNativeCanvas: Bool = false,
                                         @ViewBuilder _ items: () -> Items) -> some View {
-        if let nativeMenu {
+        if usesNativeCanvas {
+            self
+        } else if let nativeMenu {
             overlay { BrowserNativeContextMenu(makeMenu: nativeMenu) }
         } else {
             contextMenu { items().buttonStyle(.automatic) }

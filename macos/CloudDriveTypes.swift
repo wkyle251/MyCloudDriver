@@ -11,7 +11,7 @@ enum CloudDriveKind: String, CaseIterable, Identifiable, Codable {
     case .pikpak: return "Your cloud files, shared links and transfers."
     case .icloud: return "Your iCloud files and folders, together on this Mac."
     case .photos: return "Your photos, videos and albums, including iCloud Photos."
-    case .local: return "Files and folders on this Mac and external disks."
+    case .local: return "Folders on this Mac, external disks and network shares."
     } }
     var containerName: String { self == .photos ? "Album" : "Folder" }
 }
@@ -34,6 +34,8 @@ struct CloudDriveItem: Hashable, Identifiable, Sendable, Codable {
     var isDownloaded = true
     var canRename = true
     var canDelete = true
+    /// Storage identity and revision captured by discovery, retained in scan reports.
+    var revision: String? = nil
     var symbol: String {
         if isFolder { return "folder.fill" }
         switch mediaType { case "image": return "photo"; case "video": return "film"; case "audio": return "waveform"; default: return "doc" }
@@ -50,23 +52,33 @@ struct CloudDrivePage: Sendable {
 }
 
 struct CloudDriveProgress: Sendable {
+    /// Media preparation can download a source and then process it. Processing has no network transfer rate.
+    enum Activity: Sendable, Equatable { case transferring, processing }
     var message: String
     var completed: Int = 0
     var total: Int = 0
     var fraction: Double? = nil
     var bytes: UInt64 = 0
     var fileSize: UInt64 = 0
+    var activity: Activity? = nil
 }
 typealias CloudDriveProgressHandler = @Sendable (CloudDriveProgress) -> Void
 
 struct CloudDriveMeasurement: Sendable, Equatable {
     var files = 0
     var bytes: UInt64 = 0
+    /// Total bytes under every folder the walk visited, by item ID. Calculate on
+    /// a parent sizes its subfolders from the same pass. Empty for drives
+    /// without folders, and not part of equality: totals are what callers compare.
+    var folders: [String: UInt64] = [:]
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.files == rhs.files && lhs.bytes == rhs.bytes }
 }
 
 struct CloudDriveUndo: @unchecked Sendable {
     let id = UUID()
     let title: String
+    var diskTrashEntryIDs: Set<UUID> = []
     let apply: @Sendable () async throws -> CloudDriveUndo
 }
 
@@ -89,6 +101,7 @@ protocol NativeCloudDrive: AnyObject, Sendable {
     func relocate(_ items: [CloudDriveItem], from: CloudDriveLocation, to: CloudDriveLocation, copy: Bool, progress: @escaping CloudDriveProgressHandler) async throws -> CloudDriveUndo?
     func importFiles(_ urls: [URL], into: CloudDriveLocation, progress: @escaping CloudDriveProgressHandler) async throws -> CloudDriveUndo?
     func delete(_ items: [CloudDriveItem], progress: @escaping CloudDriveProgressHandler) async throws -> CloudDriveUndo?
+    func deleteVerified(_ items: [CloudDriveItem], progress: @escaping CloudDriveProgressHandler) async throws -> CloudDriveUndo?
     func refreshedItems(_ items: [CloudDriveItem]) async throws -> [CloudDriveItem]
     func streamForSimilarity(_ item: CloudDriveItem, pipe: URL, capacity: UInt64,
                              progress: @escaping CloudDriveProgressHandler) async throws -> URL
@@ -118,6 +131,13 @@ extension NativeCloudDrive {
     }
     func refreshedItems(_ items: [CloudDriveItem]) async throws -> [CloudDriveItem] {
         throw CloudDriveError.message("This drive cannot verify the files to keep. No files were moved to Trash.")
+    }
+    func deleteVerified(_ items: [CloudDriveItem], progress: @escaping CloudDriveProgressHandler) async throws -> CloudDriveUndo? {
+        let fresh = try await refreshedItems(items)
+        guard fresh.count == items.count, zip(fresh, items).allSatisfy({ $0.id == $1.id && $0.revision != nil && $0.revision == $1.revision }) else {
+            throw CloudDriveError.message("A file changed after comparison. No files were moved to Trash. Scan the group again.")
+        }
+        return try await delete(items, progress: progress)
     }
     /// A scan asks for an original in RAM whenever the drive published no local
     /// path for it. A drive that cannot read its own storage directly still

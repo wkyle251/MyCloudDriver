@@ -17,6 +17,13 @@ enum PreviewTransport {
         "Accept-Encoding": "identity",
     ]
 
+    /// A whole-object GET can arrive as HTTP 206. Prove that it includes every
+    /// byte before passing the file to a decoder or another application.
+    @discardableResult
+    static func completeDownloadSize(at file: URL, response: URLResponse?, purpose: String) throws -> UInt64 {
+        try MediaFileDownload.completeSize(at: file, response: response, purpose: purpose)
+    }
+
     /// PikPak can issue HTTP original-file links even though its download CDN
     /// serves the same signed resource over HTTPS. Promote only that CDN; the
     /// native image, player and Open/Quick Look transports still require TLS.
@@ -191,10 +198,17 @@ final class PreviewResourceCache {
         supportsByteRanges: false
     )
     private var isClosed = false
+    private let maximumBytes: Int64
+    private let minimumFreeDiskBytes: Int64
+    private var reachedBudget = false
+    private var lastCapacityCheck = Date.distantPast
+    private var availableDiskBytes: Int64 = .max
 
-    init() throws {
+    init(maximumBytes: Int64 = 2 << 30, minimumFreeDiskBytes: Int64 = 256 << 20, directory: URL? = nil) throws {
+        self.maximumBytes = max(1, maximumBytes)
+        self.minimumFreeDiskBytes = max(0, minimumFreeDiskBytes)
         let manager = FileManager.default
-        let directory = manager.temporaryDirectory
+        let directory = directory ?? manager.temporaryDirectory
             .appendingPathComponent("MyPikPak-MediaPreviewCache", isDirectory: true)
         try manager.createDirectory(
             at: directory,
@@ -251,7 +265,7 @@ final class PreviewResourceCache {
     }
 
     @discardableResult
-    func store(_ data: Data, at offset: Int64) -> PreviewResourceCacheSnapshot? {
+    func store(_ data: Data, at offset: Int64, allowsEviction: Bool = true) -> PreviewResourceCacheSnapshot? {
         guard !data.isEmpty, offset >= 0 else { return snapshot }
         let (endOffset, overflow) = offset.addingReportingOverflow(Int64(data.count))
         guard !overflow else { return nil }
@@ -260,13 +274,40 @@ final class PreviewResourceCache {
         defer { lock.unlock() }
         guard !isClosed, let fileHandle else { return nil }
         do {
+            guard Int64(data.count) <= maximumBytes else { return nil }
+            if Date().timeIntervalSince(lastCapacityCheck) >= 1 {
+                availableDiskBytes = (try? fileURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+                    .volumeAvailableCapacityForImportantUsage) ?? .max
+                lastCapacityCheck = Date()
+            }
+            guard availableDiskBytes >= minimumFreeDiskBytes,
+                  Int64(data.count) <= availableDiskBytes - minimumFreeDiskBytes else { reachedBudget = true; return nil }
+            let incoming = offset..<endOffset
+            let overlap = cachedRanges.reduce(Int64(0)) { total, range in
+                total + max(0, min(range.upperBound, incoming.upperBound) - max(range.lowerBound, incoming.lowerBound))
+            }
+            let retained = snapshotLocked().cachedBytes
+            if retained + Int64(data.count) - overlap > maximumBytes {
+                reachedBudget = true
+                guard allowsEviction else { return nil }
+                // Keep playback usable by replacing old cache ranges. A later
+                // backwards seek can fetch them again; prefetch stops here.
+                try fileHandle.truncate(atOffset: 0)
+                cachedRanges.removeAll()
+            }
             try fileHandle.seek(toOffset: UInt64(offset))
             try fileHandle.write(contentsOf: data)
+            availableDiskBytes = max(0, availableDiskBytes - Int64(data.count))
             insertCachedRange(offset ..< endOffset)
             return snapshotLocked()
         } catch {
             return nil
         }
+    }
+
+    var permitsBackgroundPrefetch: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !isClosed && !reachedBudget && snapshotLocked().cachedBytes < maximumBytes
     }
 
     func read(at offset: Int64, maximumLength: Int) -> Data? {
@@ -306,6 +347,26 @@ final class PreviewResourceCache {
             return nil
         }
         return cursor
+    }
+
+    /// Transfer a complete cached object to preparation without downloading it
+    /// again. A same-volume rename keeps large videos off the main-thread I/O
+    /// path. Sparse or unknown-length caches never become local input files.
+    func takeCompleteFile(expectedSize: UInt64 = 0) throws -> VideoPreviewCopy? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed, let length = metadata.contentLength, length > 0,
+              cachedRanges == [0..<length], expectedSize == 0 || UInt64(length) == expectedSize,
+              let fileHandle, try fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize == Int(exactly: length) else { return nil }
+        let directory = fileURL.deletingLastPathComponent()
+            .appendingPathComponent("Prepared-\(UUID().uuidString)", isDirectory: true)
+        try CloudDriveFiles.privateDirectory(directory)
+        let input = directory.appendingPathComponent("source")
+        do { try FileManager.default.moveItem(at: fileURL, to: input) }
+        catch { try? FileManager.default.removeItem(at: directory); throw error }
+        isClosed = true; self.fileHandle = nil; cachedRanges = []
+        try? fileHandle.close()
+        return VideoPreviewCopy(url: input, directory: directory)
     }
 
     func removeFromDisk() {
@@ -506,7 +567,7 @@ private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate 
     }
 
     private func startTaskIfNeeded() {
-        guard !isInvalidated, task == nil,
+        guard !isInvalidated, task == nil, cache.permitsBackgroundPrefetch,
               let offset = cache.firstMissingOffset() else {
             publishCacheProgress(cache.snapshot)
             return
@@ -612,7 +673,7 @@ private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate 
             Int64(data.count)
         )
         guard !offsetOverflow, !countOverflow,
-              let snapshot = cache.store(data, at: offset) else {
+              let snapshot = cache.store(data, at: offset, allowsEviction: false) else {
             taskCanRetry = false
             dataTask.cancel()
             return

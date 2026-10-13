@@ -295,3 +295,62 @@ pub(crate) fn with_model(
         Ok(encoded)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+    fn request(path: std::path::PathBuf, memory_bytes: u64) -> Request {
+        Request {
+            version: filetwin_core::worker_protocol::VERSION,
+            path,
+            memory_input: None,
+            format: "png".into(),
+            profile_id: profile::image_profile_v1().profile_id,
+            profiles: Default::default(),
+            model_dir: Default::default(),
+            runtime: Default::default(),
+            memory_bytes,
+            parent_pid: 0,
+            inference_cache_dir: None,
+        }
+    }
+
+    fn png(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        PngEncoder::new(&mut bytes)
+            .write_image(pixels, width, height, ExtendedColorType::Rgba8)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn generated_raster_decoding_obeys_dimensions_memory_and_malformed_input_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fixture.png");
+        let bytes = png(2, 1, &[255, 20, 0, 255, 200, 100, 50, 128]);
+        std::fs::write(&path, &bytes).unwrap();
+        let (rgb, extraction) = read_rgb(&request(path.clone(), 8 << 20)).unwrap();
+        assert_eq!(rgb.dimensions(), (2, 1));
+        assert_eq!(rgb.get_pixel(0, 0).0, [255, 20, 0]);
+        assert_eq!(rgb.get_pixel(1, 0).0, [100, 50, 25]);
+        assert_eq!(extraction["source_width"], 2);
+
+        std::fs::write(&path, png(32769, 1, &vec![255; 32769 * 4])).unwrap();
+        assert_eq!(
+            read_rgb(&request(path.clone(), 256 << 20)).unwrap_err().code,
+            ErrorCode::ResourceBudgetTooSmall
+        );
+        std::fs::write(&path, png(256, 256, &vec![255; 256 * 256 * 4])).unwrap();
+        assert_eq!(
+            read_rgb(&request(path.clone(), 4096)).unwrap_err().code,
+            ErrorCode::ResourceBudgetTooSmall
+        );
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        assert_eq!(
+            read_rgb(&request(path, 8 << 20)).unwrap_err().code,
+            ErrorCode::DecodeFailed
+        );
+    }
+}

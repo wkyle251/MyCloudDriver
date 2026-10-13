@@ -68,6 +68,8 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
     static weak var current: WorkspaceSessionManager?
     let initialHub: CloudDriveHub
     let settings: FinderSettings
+    private let makeHub: (String, FinderSettings) -> CloudDriveHub
+    private var currentRunStorageSessions = Set<String>()
     @Published private(set) var activeHub: CloudDriveHub
     @Published private(set) var workspaceCount = 0
     private struct Entry {
@@ -81,12 +83,15 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
     private let closedWindows = NSHashTable<NSWindow>.weakObjects()
     private let tornDownHubs = NSHashTable<CloudDriveHub>.weakObjects()
     private var closingAll = false
+    private var didFinishAllWindows = false
     private weak var focusedWindow: NSWindow?
     #if FINDER_WORKSPACE_TESTS
     var presentsWindows = true
     var lastWindowClosedForTesting: (() -> Void)?
+    var relayAccountNeededForTesting: ((DownloaderModel) -> Bool)?
     private(set) var tearDownCountForTesting = 0
     func windowForTesting(_ id: String) -> NSWindow? { entries[id]?.window }
+    func hubForTesting(_ id: String) -> CloudDriveHub? { entries[id]?.hub }
     #endif
     private var shouldPresentWindows: Bool {
         #if FINDER_WORKSPACE_TESTS
@@ -100,8 +105,10 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
         let settings = initialHub?.pikpak.finderSettings ?? FinderSettings()
         self.settings = settings
         let factory = makeHub ?? { id, settings in CloudDriveHub(pikpak: DownloaderModel(workspaceSessionID: id, settings: settings)) }
+        self.makeHub = factory
         let hub = initialHub ?? factory("primary", settings)
         self.initialHub = hub; activeHub = hub
+        configureTransferImports(in: hub)
         Self.current = self
         observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { [weak self] note in
             MainActor.assumeIsolated { if let window = note.object as? NSWindow { self?.focus(window) } }
@@ -111,6 +118,18 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
         })
     }
     deinit { observers.forEach(NotificationCenter.default.removeObserver) }
+    private func configureTransferImports(in hub: CloudDriveHub) {
+        hub.pikpak.transferWorkspaceSessionsToExclude = { [weak self] in self?.currentRunStorageSessions ?? [] }
+        #if !FINDER_WORKSPACE_TESTS
+        LocalTorrentModel.shared.configureRelayAccount(hub.pikpak)
+        #endif
+    }
+    private var managedHubs: [CloudDriveHub] {
+        var seen = Set<ObjectIdentifier>()
+        return ([initialHub] + entries.values.map(\.hub)).filter {
+            !tornDownHubs.contains($0) && seen.insert(ObjectIdentifier($0)).inserted
+        }
+    }
     private func similarityCoordinators(in hub: CloudDriveHub) -> [FileSimilarityCoordinator] {
         [hub.pikpak.fileSimilarity] + hub.nativeDrives.map(\.similarity)
     }
@@ -135,7 +154,7 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
         guard let drive = searchDrive, !activeHub.pikpak.isLoginPresented,
               NSApp.keyWindow?.isSheet != true, scope != .root || drive == .pikpak else { return }
         let owner = activeHub
-        owner.open(drive)
+        owner.showCurrentDrive(drive)
         // A scan can outlive its browser. Search must restore and raise the
         // owning browser instead of presenting an overlay in a closed view.
         activateBrowser(in: owner)
@@ -149,7 +168,7 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
     var resourceActivities: [Int32: TaskResourceActivity] {
         var activities: [Int32: TaskResourceActivity] = [:]
         var appDetails: [String] = []
-        for hub in [initialHub] {
+        for hub in managedHubs {
             for (pid, activity) in hub.pikpak.resourceActivities {
                 if pid == getpid() { appDetails.append(activity.detail) }
                 else { activities[pid] = activity }
@@ -163,7 +182,10 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
     func register(_ window: NSWindow, hub: CloudDriveHub) {
         guard !closedWindows.contains(window) else { return }
         if let owner = entries.values.first(where: { $0.window === window }), owner.hub !== hub { return }
-        guard hub === initialHub, !tornDownHubs.contains(hub) else { reject(window); return }
+        guard !tornDownHubs.contains(hub), hub === initialHub || entries.values.contains(where: { $0.hub === hub }) else { reject(window); return }
+        // A browser model belongs to one window. A delayed scene registration
+        // must not attach an existing workspace to another browser window.
+        guard !entries.values.contains(where: { $0.hub === hub && $0.window != nil && $0.window !== window }) else { reject(window); return }
         let id: String
         if let existing = entries.first(where: { $0.value.window === window }) { id = existing.key }
         else { id = nextWindowID() }
@@ -175,15 +197,18 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
             coordinator.onWindowClosed = { [weak self, weak hub] in
                 guard let self, let hub else { return }
                 self.retireIfNoWindows(hub)
+                // A paused helper keeps its workspace busy, so retirement can
+                // defer. Closing the final window must still save and stop it.
+                self.finishIfNoWindows()
             }
         }
         window.identifier = NSUserInterfaceItemIdentifier("MyCloudDriver.workspace.\(id)")
         window.tabbingMode = .disallowed
         window.isExcludedFromWindowsMenu = false
         if entries[id]?.titleObservation == nil {
-            entries[id]?.titleObservation = hub.$selected.combineLatest(hub.pikpak.$accountProfile)
-                .map { kind, profile in
-                    let drive = kind?.title ?? "All Drives"
+            entries[id]?.titleObservation = hub.$selected.combineLatest(hub.pikpak.$accountProfile, hub.$selectedExternalDisk)
+                .map { kind, profile, disk in
+                    let drive = kind == .local ? disk?.name ?? CloudDriveKind.local.title : kind?.title ?? "All Drives"
                     let account = kind == .pikpak ? profile?.displayName.map { " · \($0)" } ?? "" : ""
                     return "\(drive)\(account) — MyCloudDriver"
                 }
@@ -211,15 +236,25 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
         FinderCommandRouter.shared.focus(window)
     }
     func newWindow() {
-        guard !tornDownHubs.contains(initialHub) else { return }
+        guard !closingAll, !didFinishAllWindows, let source = managedHubs.first(where: { $0 === activeHub }) ?? managedHubs.first else { return }
         let anchor = entries.values.first(where: { $0.window === focusedWindow })?.window
             ?? entries.values.compactMap(\.window).first
-        // A window is another view of the same account, queues, browser and
-        // scans. Its identifier is only for AppKit, never a storage namespace.
-        openBrowser(hub: initialHub, id: nextWindowID(), anchor: anchor)
+        // AppKit slots may be reused, but persisted queues must never reuse a
+        // namespace already imported by the primary workspace on this launch.
+        let storageID = PikPakWorkspaceStorage.newSessionID()
+        currentRunStorageSessions.insert(storageID)
+        let hub = makeHub(storageID, settings)
+        configureTransferImports(in: hub)
+        hub.pikpak.inheritWindowAccount(from: source.pikpak)
+        if source.selected == .local {
+            hub.inheritLocalBrowser(from: source)
+            hub.selected = .local
+        } else if let drive = source.selected { hub.open(drive) }
+        openBrowser(hub: hub, id: nextWindowID(), anchor: anchor)
     }
     private func nextWindowID() -> String {
-        let occupied = Set(entries.filter { $0.value.window != nil }.keys)
+        // A closed browser retained for its work or scan still owns its slot.
+        let occupied = Set(entries.keys)
         var slot = 1
         while occupied.contains(PikPakWorkspaceStorage.sessionID(for: slot)) { slot += 1 }
         return PikPakWorkspaceStorage.sessionID(for: slot)
@@ -247,10 +282,10 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
         entry.hub.open(.pikpak)
         activateBrowser(in: entry.hub)
     }
-    /// Reuse a browser for the shared session, restoring one if only an
-    /// auxiliary window remains open.
+    /// Restore the browser belonging to this workspace when only its work or
+    /// an auxiliary window remains. Never reveal another workspace's folder.
     func activateBrowser(in hub: CloudDriveHub) {
-        guard hub === initialHub, !tornDownHubs.contains(hub) else { return }
+        guard !tornDownHubs.contains(hub) else { return }
         let available = entries.filter { $0.value.hub === hub }
         guard let entry = available.first(where: { $0.value.window != nil && $0.value.window === focusedWindow })
             ?? available.sorted(by: { $0.key < $1.key }).first(where: { $0.value.window != nil })
@@ -275,23 +310,40 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
         entries[match.key]?.controller = nil
         entries[match.key]?.titleObservation = nil
         updateWorkspaceCount()
-        if entries.values.contains(where: { $0.window != nil }) { entries[match.key] = nil }
-        // Closing one view must never stop the session used by other windows.
         retireIfNoWindows(match.value.hub)
+        if activeHub === match.value.hub, let available = entries.values.first(where: { $0.window != nil }) { activeHub = available.hub }
+        finishIfNoWindows()
     }
     private func retireIfNoWindows(_ hub: CloudDriveHub) {
         guard !closingAll, !tornDownHubs.contains(hub),
-              !entries.values.contains(where: { $0.window != nil }),
+              !entries.values.contains(where: { $0.hub === hub && $0.window != nil }),
               similarityWindows(in: hub).isEmpty else { return }
+        guard !hub.pikpak.keepsWorkspaceAlive, !hub.nativeDrives.contains(where: { $0.isBusy }),
+              !needsRelayAccount(in: hub) else { return }
+        entries = entries.filter { $0.value.hub !== hub }
+        tearDown(hub)
+        updateWorkspaceCount()
+        finishIfNoWindows()
+    }
+    private func needsRelayAccount(in hub: CloudDriveHub) -> Bool {
+        #if FINDER_WORKSPACE_TESTS
+        return relayAccountNeededForTesting?(hub.pikpak) ?? false
+        #else
+        return LocalTorrentModel.shared.needsRelayAccount(hub.pikpak)
+        #endif
+    }
+    private func finishIfNoWindows() {
+        guard !closingAll, !didFinishAllWindows, !entries.values.contains(where: { $0.window != nil }),
+              managedHubs.allSatisfy({ similarityWindows(in: $0).isEmpty }) else { return }
+        didFinishAllWindows = true
+        #if FINDER_WORKSPACE_TESTS
+        closeAll()
         entries.removeAll()
         updateWorkspaceCount()
-        tearDown(hub)
-        if entries.isEmpty && !closingAll {
-            #if FINDER_WORKSPACE_TESTS
-            if let lastWindowClosedForTesting { lastWindowClosedForTesting(); return }
-            #endif
-            NSApp.terminate(nil)
-        }
+        if let lastWindowClosedForTesting { lastWindowClosedForTesting(); return }
+        #endif
+        // AppDelegate must drain download RAM before closeAll terminates helpers.
+        NSApp.terminate(nil)
     }
     private func tearDown(_ hub: CloudDriveHub) {
         guard !tornDownHubs.contains(hub) else { return }
@@ -306,7 +358,16 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
         // Snapshot the hubs before any event can change the registry.
         closingAll = true
         defer { closingAll = false }
-        tearDown(initialHub)
+        for hub in managedHubs { tearDown(hub) }
+    }
+    func prepareDownloadsForApplicationTermination() async -> Bool {
+        let hubs = managedHubs
+        return await withTaskGroup(of: Bool.self) { group in
+            for hub in hubs { group.addTask { await hub.pikpak.prepareDownloadsForApplicationTermination() } }
+            var saved = true
+            for await result in group { saved = result && saved }
+            return saved
+        }
     }
 }
 

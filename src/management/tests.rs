@@ -14,10 +14,19 @@ impl Drop for Fixture {
 }
 impl Fixture {
     async fn new(fail_mutation: bool, restored: bool) -> Self {
+        Self::with_responses(fail_mutation, restored, None, Vec::new()).await
+    }
+    async fn with_responses(
+        fail_mutation: bool,
+        restored: bool,
+        mutation_response: Option<Value>,
+        file_pages: Vec<Value>,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = requests.clone();
+        let mut file_pages = std::collections::VecDeque::from(file_pages);
         let worker = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -78,7 +87,7 @@ impl Fixture {
                 } else if line.starts_with("GET /drive/v1/files?") {
                     (
                         200,
-                        json!({"files":[{"id":"item","name":"Example","kind":"drive#file","size":"42","thumbnail_link":"secret-preview"}],"next_page_token":"next"}),
+                        file_pages.pop_front().unwrap_or_else(|| json!({"files":[{"id":"item","name":"Example","kind":"drive#file","size":"42","thumbnail_link":"secret-preview"}],"next_page_token":"next"})),
                     )
                 } else if line.starts_with("GET /drive/v1/share/list?") {
                     (
@@ -90,6 +99,9 @@ impl Fixture {
                         200,
                         json!({"tasks":[{"id":"task","name":"Example","file_size":"32","progress":40,"params":{"url":"secret-source"}}],"next_page_token":""}),
                     )
+                } else if is_mutation && line.contains(" /drive/v1/") && mutation_response.is_some()
+                {
+                    (200, mutation_response.clone().unwrap())
                 } else if line.starts_with("POST /drive/v1/files ") {
                     (
                         200,
@@ -180,6 +192,10 @@ async fn management_pages_always_use_current_account_in_all_content_modes() {
             serde_json::from_str::<Value>(&query["filters"]).unwrap()["trashed"]["eq"],
             true
         );
+        assert!(serde_json::from_str::<Value>(&query["filters"])
+            .unwrap()
+            .get("phase")
+            .is_none());
     }
 }
 
@@ -314,10 +330,12 @@ async fn management_oauth_permanent_delete_is_confirmed_and_preflighted() {
             .map(|(h, _)| h.lines().next().unwrap())
             .collect::<Vec<_>>()
     );
-    client
+    let accepted = client
         .manage(request(ManagementAction::EmptyTrash { confirmed: true }))
         .await
         .unwrap();
+    assert_eq!(accepted["ok"], true);
+    assert_eq!(accepted["trash_empty_confirmed"], false);
     let requests = fixture.requests.lock().unwrap();
     let deletes: Vec<_> = requests
         .iter()
@@ -334,6 +352,164 @@ async fn management_oauth_permanent_delete_is_confirmed_and_preflighted() {
             .filter(|(h, _)| h.starts_with("PATCH /drive/v1/files/trash:empty "))
             .count(),
         1
+    );
+}
+
+#[tokio::test]
+async fn empty_trash_does_not_claim_completion_or_purge_cache_before_a_complete_empty_read() {
+    let fixture = Fixture::with_responses(false, false,
+        Some(json!({"task":{"id":"accepted-task","phase":"PHASE_TYPE_RUNNING"}})),
+        vec![
+            json!({"files":[{"id":"pending","name":"Pending upload","kind":"drive#file","size":"0","phase":"PHASE_TYPE_RUNNING"}]}),
+            json!({"files":[],"next_page_token":"next"}),
+            json!({"files":[]}),
+            json!({"files":[],"next_page_token":42}),
+            json!({"files":[],"next_page_token":""}),
+        ]).await;
+    let directory = tempfile::tempdir().unwrap();
+    let cache = crate::duplicate_cache::DuplicateCache::open(directory.path(), "owner").unwrap();
+    let cached = |id: &str| {
+        serde_json::from_value::<crate::FileInfo>(json!({
+            "id":id,"name":id,"kind":"drive#file","size":"42","parent_id":""
+        }))
+        .unwrap()
+    };
+    cache
+        .replace_folder("", &[cached("live"), cached("tombstone")])
+        .unwrap();
+    cache.remove(&["tombstone".into()]).unwrap();
+    let client = Client::builder()
+        .refresh_token("fixture-refresh")
+        .device_id("fixture-device")
+        .auth_base_url(&fixture.base)
+        .api_base_url(&fixture.base)
+        .build()
+        .unwrap()
+        .with_duplicate_cache_directory(directory.path().to_path_buf());
+    let accepted = client
+        .manage(request(ManagementAction::EmptyTrash { confirmed: true }))
+        .await
+        .unwrap();
+    assert_eq!(accepted["trash_empty_confirmed"], false);
+    assert!(cache.contains_file("tombstone").unwrap());
+
+    let remaining = client
+        .manage(request(ManagementAction::ListTrash {
+            page_token: "".into(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(remaining["files"][0]["id"], "pending");
+    assert!(cache.contains_file("tombstone").unwrap());
+    let continued = client
+        .manage(request(ManagementAction::ListTrash {
+            page_token: "".into(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(continued["next_page_token"], "next");
+    assert!(cache.contains_file("tombstone").unwrap());
+    client
+        .manage(request(ManagementAction::ListTrash {
+            page_token: "last".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(cache.contains_file("tombstone").unwrap());
+    assert!(client
+        .manage(request(ManagementAction::ListTrash {
+            page_token: "".into()
+        }))
+        .await
+        .is_err());
+    assert!(cache.contains_file("tombstone").unwrap());
+    let empty = client
+        .manage(request(ManagementAction::ListTrash {
+            page_token: "".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(empty["files"].as_array().unwrap().is_empty());
+    assert!(!cache.contains_file("tombstone").unwrap());
+    assert!(cache.contains_file("live").unwrap());
+    let requests = fixture.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(headers, _)| headers.starts_with("PATCH /drive/v1/files/trash:empty "))
+            .count(),
+        1
+    );
+    for (headers, _) in requests
+        .iter()
+        .filter(|(headers, _)| headers.starts_with("GET /drive/v1/files?"))
+    {
+        let url = reqwest::Url::parse(&format!(
+            "{}{}",
+            fixture.base,
+            headers.split_whitespace().nth(1).unwrap()
+        ))
+        .unwrap();
+        let query = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        let filters = serde_json::from_str::<Value>(&query["filters"]).unwrap();
+        assert_eq!(filters, json!({"trashed":{"eq":true}}));
+    }
+}
+
+#[tokio::test]
+async fn empty_trash_rejects_http_200_service_errors_without_retrying_the_delete() {
+    for body in [
+        json!({"error_code":8,"error_description":"Permission denied."}),
+        json!({"error_code":"8","error_description":"Permission denied."}),
+        json!({"error":{"code":"permission_denied","message":"Deletion was rejected."}}),
+        json!({"result":{"error":{"message":"Deletion was rejected."}}}),
+    ] {
+        let fixture = Fixture::with_responses(false, false, Some(body), Vec::new()).await;
+        let client = Client::builder()
+            .refresh_token("fixture-refresh")
+            .device_id("fixture-device")
+            .auth_base_url(&fixture.base)
+            .api_base_url(&fixture.base)
+            .build()
+            .unwrap();
+        let error = client
+            .manage(request(ManagementAction::EmptyTrash { confirmed: true }))
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains("Permission denied") || text.contains("Deletion was rejected"),
+            "{text}"
+        );
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(headers, _)| headers.starts_with("PATCH /drive/v1/files/trash:empty "))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn service_error_descriptions_are_whitelisted_and_credentials_are_hidden() {
+    let error = management_response_error(&json!({"error":{"code":"permission_denied",
+        "message":"Denied Bearer private-token https://example.test/file?signature=private token=private refresh_token: private"},
+        "access_token":"never-forward-this"})).unwrap().to_string();
+    assert!(error.contains("permission_denied"));
+    assert!(error.contains("Denied"));
+    assert!(!error.contains("private"));
+    assert!(!error.contains("never-forward-this"));
+    assert!(management_response_error(&json!({"error_code":0,"error":null})).is_none());
+    assert!(management_response_error(&json!({"error_code":"0","error":""})).is_none());
+    assert!(management_response_error(&json!({"error_code":"0.0","error":""})).is_none());
+    assert!(
+        management_response_error(&json!({"tasks":[{"id":"task","error":"failed"}]})).is_none()
     );
 }
 

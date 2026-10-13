@@ -25,13 +25,21 @@ tokens, create an `.env` file, or configure account credentials manually.
 [First use](#first-use) · [Troubleshooting](#troubleshooting) ·
 [Development](#development)
 
-## Guest Mode
+## PikPak download modes
 
-**Settings → General → PikPak · Advanced → Guest Mode** uses anonymous original-share
-URLs for PikPak downloads, previews, and similarity scans. It is off by default;
-files need an accessible original public share and never fall back to account
-downloads. PikPak's guest limits still apply. See [Guest Mode](docs/PIKPAK_GUEST_MODE.md)
-for supported files and when the setting takes effect.
+PikPak **Transfers → Download** always uses **Dynamic Mode**. Downloads try
+Guest access first; if only part is accessible, they retain verified Guest bytes
+and fetch the remaining ranges through your selected account connection.
+For account files whose original share is missing, expired or unavailable,
+downloads reuse an existing public link or create one for the saved copy in
+My Shares, then resolve its content anonymously. Activity Log shows the reason
+and the share recovery step as Info entries. These
+links remain available until you revoke them.
+Choose **User**, **Guest**, or **Dynamic** under **Preview & Scan Mode** in the
+PikPak sidebar for previews and similarity scans. Guest uses anonymous
+original-share URLs and never falls back to account content. PikPak's guest
+limits still apply. See
+[Download modes](docs/PIKPAK_GUEST_MODE.md) for supported files and when changes take effect.
 
 ## Features
 
@@ -86,6 +94,9 @@ support session Undo. Existing PikPak Undo coverage is described below.
 
 - **Finder-style file actions:** right-click for **Open**, **Open With**, and
   **Other…**. Opening a cloud file fetches a local copy for the selected app.
+  File menus keep their native application submenu stable while previews and transfers update.
+  After deleting a selected file or folder, Up/Down selects the previous/next surviving row
+  from its former position, including when an expanded folder's children were removed.
 - **Bookmarks:** right-click a file or folder in Browser and choose **Add to
   Bookmarks**. Open the **Bookmarks** sidebar tab to search saved items, open a
   folder, or show a file in Browser. **Remove from Bookmarks** removes the saved
@@ -111,11 +122,18 @@ support session Undo. Existing PikPak Undo coverage is described below.
   search fields keep the system's own ⌘A.
 - **Quick Look:** press Space to open a preview immediately. A loading indicator
   appears while the file is fetched; Up/Down changes the previewed item.
-- **Arrow keys in the preview pane:** click anywhere in the pane, including the
+- **Native-drive thumbnails:** List, Thumbnails and the preview pane share a
+  memory cache on Local Disk, external disks, iCloud Drive and Photos. Browsing
+  warms thumbnails for the current folder, including remaining metadata pages;
+  selecting an expanded file warms its actual parent folder. Navigation cancels
+  obsolete work. A video keeps its thumbnail visible while its preview buffers.
+  Thumbnail prefetch does not fetch iCloud originals that are only placeholders.
+- **Keyboard controls in the preview pane:** click anywhere in the pane, including the
   header, video, playback buttons, timeline or volume slider. Left/Right seek
   backward/forward **5 seconds**; Up/Down step to the previous/next item, one at
-  a time in both List and Thumbnails. Clicking the file list returns keyboard
-  control to the list.
+  a time in both List and Thumbnails. **Space** pauses or resumes playback;
+  holding it counts as one press. Clicking the file list returns keyboard
+  control to the list, where Space opens Quick Look.
 - **File type filter:** choose **Filter** in the Browser toolbar, then Images,
   Videos, Audio, Documents, Archives, Other Files, or a specific **File Extension**
   from the loaded files. Only matching files appear; folders stay visible so you
@@ -124,6 +142,20 @@ support session Undo. Existing PikPak Undo coverage is described below.
   The filter applies to loaded items, including new pages added with **Load More**;
   it does not scan unopened folders. Choose **All Types** or **Clear Filter** to
   restore the view. Available in PikPak Browser, iCloud Drive, Photos and Local Disk.
+  **Hide Empty Folders** (in the same Filter menu, on by default and remembered) removes
+  folders that the filter has left with nothing to show: a folder goes only when its contents
+  are already loaded and nothing in it or below it matches. Folders you have not opened, that
+  are still loading, failed to load or have more pages stay visible, so nothing is fetched to
+  decide. The filter bar reports how many empty folders are hidden. To tidy a large tree,
+  run **Expand All Levels** first, then filter. It has no effect while no type filter is active.
+- **Folder sizes:** a folder's **Size** cell reads **Calculate** until it is measured. Click it
+  (or choose **Recalculate Folder Size**) and the cell shows a spinner while the folder is walked.
+  The task card shows what has been counted so far ("1,204,331 files · 412 GB so far"). When
+  several folders are selected it also shows a bar that advances as each one finishes. A single
+  folder has no honest percentage, because its total is unknown until the walk ends.
+  One pass sizes that folder and every subfolder below it, including folders you expand later,
+  on iCloud Drive, Local Disk and external disks. Several selected folders are measured together.
+  Sizes belong to the listing they were measured from, so a refresh or a file change clears them.
 - **Preview placement and sizing:** choose **Settings → General → Preview placement**
   for **Right** (default) or **Bottom**, shared across drives. The media preview
   always fills its pane's width. Drag the
@@ -135,12 +167,47 @@ support session Undo. Existing PikPak Undo coverage is described below.
 - **Media player:** video and audio previews use MyCloudDriver's playback bar:
   play/pause, seek, skip 10 seconds, mute, volume and 0.5–2× speed. Volume, mute
   and speed are remembered across files, drives and app restarts. Reset Layout
-  keeps these playback preferences. iCloud and Photos show loading progress
-  while the selected original is prepared; PikPak streams as data arrives.
+  keeps these playback preferences. Every drive except the Mac's internal Local Disk has a
+  buffering panel for media previews. iCloud Drive and Apple Photos show preparation
+  progress, transferred bytes and speed when the provider reports them, then the completed
+  preview's size and **Fully buffered** status once it is available on this Mac. Unknown
+  progress stays indeterminate and unknown speed shows **—**. PikPak and Link show their
+  transfer speed, buffering percentage and retained ranges below the player, with further
+  information in **Buffering details**; they stream as data arrives. Loading overlays also show
+  percentage, received bytes and transfer speed before playback starts, including full MP4/AVI
+  downloads for compatible previews. Unknown-length downloads still show bytes and speed;
+  conversion clears the completed download's percentage and transfer rate. The panel also remains available when an external
+  disk or network-share video needs a compatible preview copy.
+  **A video or audio file on an external disk or network share is read into memory** and played from there:
+  the start and end of the file load first ("Buffering from external disk…" or "Buffering from network share…" with progress),
+  then a bounded window is read ahead once playback starts. Reading ahead pauses with playback.
+  A file that fits in that window is held completely; a larger one keeps a window around
+  the playhead, so seeking elsewhere moves the window. The preview's buffering status shows
+  read speed, bytes in RAM, the percentage of the file held in memory and cyan segments for
+  the retained ranges. **Buffering details** adds the RAM limit and total bytes read, including
+  rereads after seeking. Speed returns to zero when reads stop or stall. The seek
+  bar's lighter shading also shows what is in memory, and its tooltip gives the amount. The
+  buffer is automatic (one sixteenth of the Mac's RAM, between 64 MB and 1 GB), is never
+  written to storage, and is released when the selection changes or the preview closes. If
+  the disk is unplugged, playback continues from memory until it runs out, then offers to
+  retry. Internal disks, iCloud and Photos are read as before.
   The seek bar shows played content in solid color and AVPlayer's buffered
   ranges in a lighter shade on the same track. Gaps after seeking stay visible;
   buffering is media time available to the player, not a disk-cache percentage.
-  Expand **Streaming details** for PikPak's buffer and network information.
+  Expand **Buffering details** for the buffer and network information in PikPak and Link.
+  **Preparing a copy is fast where it can be.** A file macOS cannot play is first
+  *repackaged*: its video is copied untouched into an MP4 and only the audio is
+  re-encoded, which is limited by how fast the file can be read (seconds, even for 4K),
+  and covers most AVI files (Xvid or H.264 video) and damaged or mislabelled streams.
+  Only when that copy cannot play is the video re-encoded, with hardware encoding and at
+  most 1920 pixels on its long side, falling back to software encoding. A transport
+  stream that Apple's player never finishes opening is abandoned after eight seconds.
+  A file already in an MP4 or QuickTime container (for example VP9 video) skips the
+  copy, because a copy keeps the same unplayable stream, and is converted straight away.
+  **Play in IINA.** When a file cannot be played in the pane, or while a copy is still
+  being prepared, **Play in IINA** opens the original file in [IINA](https://iina.io),
+  which plays most formats directly. The file is handed over where it is, read-only: it
+  is not copied, moved or converted. The button appears only when IINA is installed.
   **AVI previews** play inside this same pane using a temporary H.264/AAC copy
   prepared with FFmpeg. PikPak's compatible cloud streams are preferred; when
   only the original AVI is usable, it downloads and converts before playback.
@@ -153,17 +220,44 @@ support session Undo. Existing PikPak Undo coverage is described below.
   sources or prepares a compatible copy, instead of staying on a QuickTime logo.
   Progress appears during preparation. Changing the selection cancels the work
   and removes the temporary copy; original files stay unchanged.
+  A video is opened by what its bytes are, not by its name. An MPEG transport
+  stream saved as `.MOV` plays as the stream it is, natively and without being
+  moved or renamed (a private link with the right extension lives only as long as
+  the preview), and the FFmpeg fallback reads the container it detected. When a
+  preview still cannot be prepared, the message says why, for example that the
+  file ends before its movie index and looks incomplete, or that its data is not
+  a known video format, instead of one generic sentence.
 - **Drag and drop:** drop local files onto a cloud folder to upload them, or
   drag cloud items between folders to move them.
 - **Expand folders:** choose **Expand All Levels** from a PikPak folder's
   context menu to open every nested folder directly. Expansion progress can be
-  cancelled; folders already opened remain visible.
+  cancelled; folders already opened remain visible. In Local Disk (this Mac,
+  external disks and network shares alike), select several folders in List view,
+  right-click and choose **Expand All Levels in N Folders** to open them all in one
+  pass; files in the selection are ignored, and closing one expanding folder stops
+  only that folder.
+- **Gentle on external disks:** downloads to an external disk or a network share save their
+  progress every 20 seconds (or per 512 MiB) instead of every second, and a resumed large download
+  does not read the whole saved file back while the file is exactly as it was left. Previewing a
+  video on those volumes reads only its start and end until playback begins, then a bounded window
+  ahead. The download speed monitor stops while downloads are paused.
 - **Downloads:** open the footer's Status control or **File → Show Transfers…**
   to manage work. Temporary connection/server failures retry automatically with
-  a delay; missing files, denied access and storage errors stay failed until
-  corrected and explicitly retried. Pause and
+  a delay. An unavailable destination waits for its original disk and write
+  access to return; another disk at the same path cannot take its place on its own.
+  If a download disk was backed up and reformatted (for example ExFAT to APFS) and its
+  unfinished files were restored to the same folder, the downloads continue by themselves
+  from their saved progress: this app's own `.part`, `.part.resume.json` or
+  `.part.ranges.json` files for the queued items prove the disk is the one you restored.
+  A different or empty disk waits instead, and the downloads panel offers **Use This Disk**
+  to continue there anyway. Finished files you restored are recognized by their content (the saved
+  receipt's checksum, or the cloud's own content hash) and skipped instead of downloaded
+  again. Conflicting regular destination files are deleted automatically and retried;
+  damaged staging files and their stale checkpoints are reset, while verified partial bytes are retained. Pause and
   Cancel are available for active and queued items; Resume retains partial data,
-  while Cancel removes that transfer's incomplete download. Each active file
+  while Cancel removes that transfer's incomplete download. Cancel All clears
+  active, waiting and saved download requests immediately, including retries;
+  partial cleanup waits if the original disk is disconnected. Each active file
   shows its own network speed; existing partial data is excluded from speed.
   PikPak account and shared-link downloads start up to four files, then keep
   extra connections only when measured total throughput improves by at least
@@ -184,6 +278,11 @@ support session Undo. Existing PikPak Undo coverage is described below.
   longer `Retry-After` delays. Standalone CLI transfers allow five attempts.
   The app also restarts interrupted helpers and keeps retrying unavailable
   storage with delays capped at five minutes. Pause and Cancel remain respected.
+  Download folders on disconnected disks are never recreated under `/Volumes`.
+  Partial byte checkpoints are saved after flushing and syncing their data.
+  Broken connections and read timeouts resume the saved prefix; expired Guest
+  URLs are refreshed before account fallback. Folder recovery preserves the
+  original identifiers of paused roots and files.
   See [automatic recovery](docs/AUTOMATIC_RECOVERY.md) for coverage and exceptions.
 - **Batch selection:** use checkboxes, Command-click, or Shift-click. Selected
   folders include their contents. In Links, right-click a selected item and
@@ -203,7 +302,7 @@ support session Undo. Existing PikPak Undo coverage is described below.
   window forward, opens its folder and selects it. **Move to Trash** is available
   for the reference file and each match, with confirmation before deletion.
   Minimise the window to keep a scan running. Closing pauses and saves it;
-  Cancel also keeps progress for Resume. Only **Clear** removes the saved scan
+  Cancel opens a partial report and keeps derived progress for **Resume Scan**. Only **Clear** removes the saved scan
   and its results. Completed results remain available under **Saved scans**.
   FileTwin reports file and vector-reuse progress; the app reports compatible-pair comparisons.
   Unknown totals use an activity indicator.
@@ -463,6 +562,24 @@ process.
 3. In PikPak, select items and choose **Add Selected Items to Download Queue**.
    Open **Status → Transfers** or **File → Show Transfers…** to check the download
    destination and manage progress. Transfers continue while you browse.
+   The download-speed graph sits below the transfer lists; its header collapses
+   or expands it and remembers your choice. Hover anywhere in its
+   plot to see the time and speed on the line, without needing to point at the
+   line itself. It retains the current app session in bounded RAM and clears when
+   the app restarts. Its ETA and local completion date/time use the known or
+   estimated remaining bytes divided by overall average speed (actual network
+   bytes divided by active time, including stalls and excluding pauses). Existing
+   partial files and skipped files do not inflate the measured speed. While
+   discovering files, a known whole-size estimate also shows an approximate
+   percentage and progress bar; exact progress replaces it when discovery finishes.
+   Activity Log and current status share one footer row. Expand the log to read
+   timestamped Debug, Info, Warning and Error entries, or select a single level
+   from its filter. Download errors appear in the log with an error count in the
+   footer. Errors remain available across automatic retries and routine output;
+   **Clear Activity** clears this session's history.
+   Remote names too long for local files are shortened with a stable suffix,
+   preserving normal file extensions. Partial/resume metadata uses bounded
+   sibling names, so filenames near the limit can complete and resume correctly.
 4. In iCloud Drive, Photos or Local Disk, use **Import…** or drop files into the open
    location. Use **Export…** to save selected items to a folder on this Mac or a writable external disk.
    In PikPak, use **File → Upload Files or Folders…** or drop onto a destination folder.
@@ -474,6 +591,51 @@ process.
    becomes available again automatically when its saved folder returns.
 5. In **Links**, add a share URL and an access code if needed. Expand the link,
    select its files or folders, and right-click to save or download them.
+   **Calculate** runs each folder-size calculation independently, including
+   multiple links with the same root ID, while browsing and transfers continue.
+
+Duplicate checks fetch current PikPak folder metadata on every run. Local Disk,
+external disks, network shares, iCloud Drive and Apple Photos checks read candidate
+files again each time. Files are first grouped by size, and only files whose size
+matches another file are hashed. Duplicate checks do not save or reuse folder
+snapshots or file hashes.
+
+Saving files selected directly from **Links** skips exact hash-and-size matches
+already in the account inventory collected while browsing. Only matching cached
+files are verified against PikPak before being skipped; filenames alone never cause
+a skip. Files without hashes
+are saved normally. Shared folders continue to save intact, with folder-level
+duplicate skipping deferred. Uploads use their existing behavior.
+
+Use **File → Check Duplicates Across Drives…** to compare several PikPak folders
+with folders on one or more external disks. Disk copies are kept; recommended
+deletions prefer redundant PikPak files in newer folders (by folder creation
+date). Disk contents are hashed locally only when their size could match another
+selected file. PikPak's content hash and an MD5 are computed together in one read
+on every check. Before Trash, the app checks that any disk copy being kept is still
+connected and unchanged. The CLI
+accepts repeated `--local-path` arguments. Run `pikpak duplicates` with optional
+`--parent-id` and `--root-path` to check PikPak folders using current metadata.
+If PikPak reports a shared save is still processing, check for duplicates again
+after the save finishes.
+
+**Bookmarks** opens as a Finder-style virtual folder, with sortable Name, Kind,
+Location and Date Added columns, thumbnails, search and item zoom. Double-click a
+folder or press Return to browse its contents in Bookmarks. **Back to Bookmarks**
+returns to the saved items. Removing a bookmark keeps the file or folder.
+
+Downloads record source identity and local completion receipts in the hidden
+`.myclouddriver-downloads` directory alongside the output. Resume skips only a
+verified completion for the same source and revision. Existing files can also be
+recognized by the cloud's content hash. A conflicting regular file is deleted and
+retried under the output's transfer lease. Descendant symlinks cannot redirect
+download writes outside the selected folder.
+
+When a cloud creation loses its response, the app reports an unknown outcome and
+requires reconciliation before another submission. Uploads retain their creation
+intent; automatic retries cannot silently repeat an uncertain creation. Account
+reauthentication keeps captured worker sessions available until their workspace
+releases its leases.
 
 Use **All Drives** or **Go → All Drives** to return home. Settings → Drives
 manages the saved iCloud/Local Disk folders and Photos access. **Check Access** shows the Photos
@@ -488,7 +650,8 @@ breakdown remain in System Settings; local disk space is not used as iCloud quot
 Uploads and downloads automatically adjust concurrent transfers to measured
 connection speed. They start with up to four files, keep additional connections
 when throughput improves, and reduce concurrency after failures. The internal
-ceiling is 64 files per direction; uploads also bound multipart requests. No
+64-file cap has been removed for downloads; admission continues to grow only
+when measured throughput improves. Uploads retain a 64-file ceiling and bound multipart requests. No
 worker setting is needed. Existing saved limits are ignored by the app.
 Downloads use one continuous queue across selections, destinations and shared
 links. Newly selected files enter the running queue, and folders feed files into
@@ -506,17 +669,22 @@ control.
 
 ### Multiple workspace windows
 
-Choose **File → New Window** (Command-N). Each window shows the same session:
-account, drive, folder, selection, previews, transfer queues and scans. Opening a
-window preserves the current location and does not start another transfer or scan.
-Changing the account or navigating updates every browser window.
+Choose **File → New Window** (Command-N). Each window has its own folder,
+navigation history, selection, previews and sidebar destination, so two PikPak
+windows can browse different folders at the same time. A new window starts with
+the focused workspace's drive and account. Preferences and saved account
+credentials remain shared; browsing in one window does not move another window.
+Each workspace owns its cloud transfer queues and scans. Local torrent jobs
+remain shared across the app and use credentials for their own PikPak account.
+Opening a window does not restore another active workspace's cloud transfer queue.
 
 There is no app-imposed limit on windows, and no Split mode.
 File commands act through the focused window.
 Use the **Window** menu to switch windows; each title includes its drive,
 PikPak account name when available.
-Closing one browser keeps shared work running in the remaining browser, scan or
-Transfers windows. Closing the last window saves unfinished work and exits.
+Closing one browser leaves other workspaces usable and retains its unfinished
+work while another browser or scan window remains. Closing the last window saves
+unfinished work from every workspace and exits.
 Move and resize each window independently.
 Narrow windows temporarily tuck the sidebar behind the left edge without changing
 your saved sidebar preference. The home screen and short sidebars scroll as needed.
@@ -681,8 +849,13 @@ interruption, open **Find Similar Files** in the original drive/account and choo
 the unfinished scan to resume. Unfinished downloads restart in RAM; completed
 unchanged files reuse their saved analysis. If the scan had already reached the
 comparison stage, it continues using its saved vectors without fetching originals.
-Closing the similarity window pauses and retains the scan. Cancel stops work
-without removing saved progress; Resume continues it. Completed scans can be
+Closing the similarity window pauses and retains the scan. Cancel stops the helper,
+opens its incomplete report and retains saved analysis; **Resume Scan** continues it.
+Processing progress tracks finished files independently from download bytes.
+Processing speed shows files/s during analysis and pairs/s during comparison,
+with stage averages, a speed chart and time remaining when the total is known.
+Pauses are excluded, waits are included, and restored counts do not inflate speed.
+Completed scans can be
 opened from Saved Scans after restarting. Only **Clear** deletes a saved scan
 and its comparison matrix, leaving original files and the shared vector cache
 intact. Scans stay with their original drive/account when switching accounts.
@@ -767,14 +940,15 @@ files are plaintext and readable by processes running as your macOS user. The
 login window uses a disposable Web session; it does not import Safari's cookies
 or saved credentials.
 
-All windows share the selected PikPak account and its token-refresh lock.
-Switching accounts changes the shared session; saved transfers remain separated
-by verified account. New windows use the primary state locations and do not
-create session directories. On restoring an account, unfinished queues from old
-`Transfers/Sessions/<session>` directories are imported once into its shared
-queue, with upload journals and partial-file ownership preserved. Atomic import
-receipts prevent completed work from returning on another launch. Legacy files
-remain intact for recovery; imported queues wait for an explicit resume.
+Windows share saved credentials and each account's token-refresh lock, while
+keeping their selected account and navigation independent. Transfers stay
+separated by verified account and workspace. New windows use fresh
+`Transfers/Sessions/window-<UUID>` namespaces so they cannot repeat work already
+restored elsewhere. After relaunch, the primary workspace recovers unfinished
+queues once, including upload journals and pause state. It excludes workspaces
+created during the current app run from imports. Atomic receipts prevent
+completed work from returning on another launch; legacy files remain intact for
+recovery.
 
 Do not commit account records, tokens, device IDs, private share links, request
 files, logs, screenshots containing private data, or build artifacts. The
@@ -783,6 +957,12 @@ remove data already committed to Git. Review `git status` and the staged diff
 before pushing. Only placeholder configuration templates belong in Git.
 
 ## Troubleshooting
+
+For a live Terminal dashboard on this Mac while another Mac downloads, run
+`python3 scripts/remote-download-monitor.py` or open **Monitor Remote Downloads.command**.
+It shows download, RAM buffer, read/write pools, disk rates, and setup waits, and saves
+private rotating numeric logs locally. See [Remote download monitor](docs/REMOTE_DOWNLOAD_MONITOR.md)
+for SSH setup, history replay, low-speed summaries, and retention settings.
 
 | Problem | What to check |
 | --- | --- |

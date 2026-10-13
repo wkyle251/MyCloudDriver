@@ -269,7 +269,9 @@ mod tests {
         let server = std::thread::spawn(move || {
             for attempt in 0..3 {
                 let (mut socket, _) = listener.accept().unwrap();
-                socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
                 let mut request = String::new();
                 let mut buffer = [0_u8; 4096];
                 while !request.contains("\r\n\r\n") {
@@ -278,16 +280,28 @@ mod tests {
                     request.push_str(&String::from_utf8_lossy(&buffer[..count]));
                 }
                 assert!(request.starts_with("GET /vip/v1/quantity/list?type=transfer "));
-                assert!(request.to_lowercase().contains("authorization: bearer fixture-pat"));
-                if attempt == 0 { continue; } // A dropped response must be retried.
-                let (status, body) = if attempt == 1 { ("503 Service Unavailable", "{}") } else {
-                    ("200 OK", r#"{"base":{},"transfer":{},"apps_summary":{"download":{"total_assets":1000,"assets":4}}}"#)
+                assert!(request
+                    .to_lowercase()
+                    .contains("authorization: bearer fixture-pat"));
+                if attempt == 0 {
+                    continue;
+                } // A dropped response must be retried.
+                let (status, body) = if attempt == 1 {
+                    ("503 Service Unavailable", "{}")
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"base":{},"transfer":{},"apps_summary":{"download":{"total_assets":1000,"assets":4}}}"#,
+                    )
                 };
                 write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
-        let client = crate::Client::builder().personal_access_token("fixture-pat")
-            .api_base_url(format!("http://{address}")).build().unwrap();
+        let client = crate::Client::builder()
+            .personal_access_token("fixture-pat")
+            .api_base_url(format!("http://{address}"))
+            .build()
+            .unwrap();
         let quotas = client.transfer_quota().await.unwrap();
         assert_eq!(quotas.connected_apps.unwrap().downstream.unwrap().used, 4);
         server.join().unwrap();

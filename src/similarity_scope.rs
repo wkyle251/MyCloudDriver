@@ -8,7 +8,10 @@ use std::{
     path::Component,
 };
 #[cfg(test)]
-use std::{io::{Read, Seek, SeekFrom}, os::unix::fs::OpenOptionsExt};
+use std::{
+    io::{Read, Seek, SeekFrom},
+    os::unix::fs::OpenOptionsExt,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Revision {
@@ -44,11 +47,16 @@ pub(super) struct InputFile {
 
 impl InputFile {
     pub fn is_photos_preview(&self) -> bool {
-        self.external.as_ref().is_some_and(|item| item.content_kind == Some(ExternalContentKind::PhotosPreview))
+        self.external
+            .as_ref()
+            .is_some_and(|item| item.content_kind == Some(ExternalContentKind::PhotosPreview))
     }
     pub fn local_device(&self) -> Option<u64> {
-        if self.cloud.is_none() && self.external.is_none() { self.revision.as_ref().map(|r| r.dev) }
-        else { None }
+        if self.cloud.is_none() && self.external.is_none() {
+            self.revision.as_ref().map(|r| r.dev)
+        } else {
+            None
+        }
     }
     /// Capture discovery metadata before acquisition can wait or update it.
     /// Re-reading it during comparison would hide edits made during analysis.
@@ -56,26 +64,48 @@ impl InputFile {
         self.inventory_version = Some(self.metadata_inventory_version());
     }
     fn metadata_inventory_version(&self) -> String {
-        let external_metadata = self.external.as_ref().and_then(|item| item.local_path.as_ref())
+        let external_metadata = self
+            .external
+            .as_ref()
+            .and_then(|item| item.local_path.as_ref())
             .and_then(|path| resolve_root(path).ok())
-            .and_then(|path| std::fs::symlink_metadata(path).ok()).map(|m| Revision::of(&m));
+            .and_then(|path| std::fs::symlink_metadata(path).ok())
+            .map(|m| Revision::of(&m));
         let mut value = json!({"id":self.display.id,"name":self.display.name,"path":self.display.path,
             "size":self.external.as_ref().map_or(self.display.bytes, |item| item.size),
             "local":if self.external.is_none() { self.revision.as_ref() } else { None },"external_metadata":external_metadata,
             "cloud_revision":self.cloud.as_ref().and_then(|item| item.revision.as_ref()),
             "provider_revision":self.external.as_ref().and_then(|item| item.revision.as_ref())});
-        if self.is_photos_preview() { value["content_kind"] = "photos_preview_1024_v1".into(); }
-        hex::encode(ring::digest::digest(&ring::digest::SHA256, value.to_string().as_bytes()))
+        if self.is_photos_preview() {
+            value["content_kind"] = "photos_preview_1024_v1".into();
+        }
+        hex::encode(ring::digest::digest(
+            &ring::digest::SHA256,
+            value.to_string().as_bytes(),
+        ))
     }
     pub fn checkpoint_revision(&self) -> Option<String> {
-        if let Some(cloud) = &self.cloud { return cloud.revision.as_ref().filter(|r| !r.trim().is_empty()).map(|r| format!("cloud:{}:{}:{r}", cloud.id, cloud.size)); }
+        if let Some(cloud) = &self.cloud {
+            return cloud
+                .revision
+                .as_ref()
+                .filter(|r| !r.trim().is_empty())
+                .map(|r| format!("cloud:{}:{}:{r}", cloud.id, cloud.size));
+        }
         if let Some(external) = &self.external {
             if self.is_photos_preview() {
-                return external.revision.as_ref().filter(|r| !r.trim().is_empty())
+                return external
+                    .revision
+                    .as_ref()
+                    .filter(|r| !r.trim().is_empty())
                     .map(|r| format!("photos-preview-1024-v1:{}:{r}", external.id));
             }
             if let Some(path) = &external.local_path {
-                if self.inventory_version.as_ref().is_some_and(|version| version != &self.metadata_inventory_version()) {
+                if self
+                    .inventory_version
+                    .as_ref()
+                    .is_some_and(|version| version != &self.metadata_inventory_version())
+                {
                     return None;
                 }
                 // Provider URLs may use /var while the reader uses
@@ -83,27 +113,76 @@ impl InputFile {
                 // resolved(), retaining NOFOLLOW for the original itself.
                 // Metadata only: opening an iCloud original can cause the OS
                 // to hydrate it before the cache has even been checked.
-                return resolve_root(path).ok().and_then(|p| std::fs::symlink_metadata(p).ok()).filter(|m| m.is_file())
+                return resolve_root(path)
+                    .ok()
+                    .and_then(|p| std::fs::symlink_metadata(p).ok())
+                    .filter(|m| m.is_file())
                     .and_then(|m| serde_json::to_string(&Revision::of(&m)).ok());
             }
-            return external.revision.as_ref().filter(|r| !r.trim().is_empty()).map(|r| format!("provider:{}:{}:{r}",external.id,external.size));
+            return external
+                .revision
+                .as_ref()
+                .filter(|r| !r.trim().is_empty())
+                .map(|r| format!("provider:{}:{}:{r}", external.id, external.size));
         }
-        self.revision.as_ref().filter(|r| std::fs::symlink_metadata(&self.path)
-            .is_ok_and(|m| m.is_file() && Revision::of(&m) == **r))
+        self.revision
+            .as_ref()
+            .filter(|r| {
+                std::fs::symlink_metadata(&self.path)
+                    .is_ok_and(|m| m.is_file() && Revision::of(&m) == **r)
+            })
             .and_then(|r| serde_json::to_string(r).ok())
     }
     pub(super) fn cloud(item: CloudItem) -> Self {
-        let id = format!("file-{}", hex::encode(ring::digest::digest(&ring::digest::SHA256, item.id.as_bytes())));
-        Self { path: PathBuf::new(), revision: None, inventory_version: None, record: None, external: None,
-            display: MatchedFile { id, name: item.name.clone(), path: item.path.clone(), bytes: item.size,
-                family: "other".into(), local_path: None, cloud_id: Some(item.id.clone()), ancestors: item.ancestors.clone(),
-                engine_index: None, state: "pending".into() }, cloud: Some(item) }
+        let id = format!(
+            "file-{}",
+            hex::encode(ring::digest::digest(
+                &ring::digest::SHA256,
+                item.id.as_bytes()
+            ))
+        );
+        Self {
+            path: PathBuf::new(),
+            revision: None,
+            inventory_version: None,
+            record: None,
+            external: None,
+            display: MatchedFile {
+                id,
+                name: item.name.clone(),
+                path: item.path.clone(),
+                bytes: item.size,
+                family: "other".into(),
+                local_path: None,
+                cloud_id: Some(item.id.clone()),
+                ancestors: item.ancestors.clone(),
+                engine_index: None,
+                state: "pending".into(),
+            },
+            cloud: Some(item),
+        }
     }
     pub(super) fn external(item: ExternalSource) -> Self {
-        Self { path: PathBuf::new(), revision: None, inventory_version: None, record: None, cloud: None,
-            display: MatchedFile { id: item.id.clone(), name: item.name.clone(), path: item.path.clone(), bytes: item.size,
-                family: "other".into(), local_path: item.local_path.as_ref().map(|p| p.to_string_lossy().into()),
-                cloud_id: None, ancestors: vec![], engine_index: None, state: "pending".into() }, external: Some(item) }
+        Self {
+            path: PathBuf::new(),
+            revision: None,
+            inventory_version: None,
+            record: None,
+            cloud: None,
+            display: MatchedFile {
+                id: item.id.clone(),
+                name: item.name.clone(),
+                path: item.path.clone(),
+                bytes: item.size,
+                family: "other".into(),
+                local_path: item.local_path.as_ref().map(|p| p.to_string_lossy().into()),
+                cloud_id: None,
+                ancestors: vec![],
+                engine_index: None,
+                state: "pending".into(),
+            },
+            external: Some(item),
+        }
     }
 }
 
@@ -156,14 +235,23 @@ pub(super) fn inventory(
     report: &mut ScanReport,
 ) -> Result<Vec<InputFile>> {
     let mut files = Vec::new();
-    discover(request, staged, cancel, report, &mut |mut file| { file.capture_inventory_version(); files.push(file); Ok(()) })?;
+    discover(request, staged, cancel, report, &mut |mut file| {
+        file.capture_inventory_version();
+        files.push(file);
+        Ok(())
+    })?;
     files.sort_by(|a, b| a.display.id.cmp(&b.display.id));
-    for (i, file) in files.iter_mut().enumerate() { file.display.engine_index = Some(i as u64); }
+    for (i, file) in files.iter_mut().enumerate() {
+        file.display.engine_index = Some(i as u64);
+    }
     Ok(files)
 }
 
 pub(super) fn discover(
-    request: &ScanRequest, staged: &StagedCloud, cancel: &AtomicBool, report: &mut ScanReport,
+    request: &ScanRequest,
+    staged: &StagedCloud,
+    cancel: &AtomicBool,
+    report: &mut ScanReport,
     next: &mut dyn FnMut(InputFile) -> Result<()>,
 ) -> Result<()> {
     if request.source == ScanSource::Cloud || !request.external_sources.is_empty() {
@@ -230,7 +318,9 @@ pub(super) fn discover(
         if request.source == ScanSource::Local {
             report.scanned_files = files.len() as u64;
         }
-        for file in files { next(file)?; }
+        for file in files {
+            next(file)?;
+        }
         return Ok(());
     }
     let mut pending = VecDeque::new();
@@ -294,7 +384,11 @@ pub(super) fn discover(
                     report,
                     &display_path(&path, staged, request.source),
                     "Could not read this item. Symlinks are not followed.",
-                    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) { "unsupported" } else { "failed" },
+                    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+                        "unsupported"
+                    } else {
+                        "failed"
+                    },
                 );
                 continue;
             }
@@ -388,9 +482,14 @@ pub(super) fn discover(
 }
 
 pub(super) fn is_missing(error: &anyhow::Error) -> bool {
-    error.chain().any(|error| error.downcast_ref::<std::io::Error>()
-        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        || error.downcast_ref::<rustix::io::Errno>().is_some_and(|error| *error == rustix::io::Errno::NOENT))
+    error.chain().any(|error| {
+        error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            || error
+                .downcast_ref::<rustix::io::Errno>()
+                .is_some_and(|error| *error == rustix::io::Errno::NOENT)
+    })
 }
 
 fn display_path(path: &Path, staged: &StagedCloud, source: ScanSource) -> String {
@@ -413,11 +512,23 @@ pub(super) fn issue(report: &mut ScanReport, path: &str, reason: &str) {
 
 pub(super) fn classified_issue(report: &mut ScanReport, path: &str, reason: &str, category: &str) {
     report.skipped_files += 1;
-    if category == "unsupported" { report.unsupported_files += 1; } else { report.failed_files += 1; }
-    if let Some(summary) = report.issue_summary.iter_mut().find(|s| s.reason == reason && s.category == category) {
+    if category == "unsupported" {
+        report.unsupported_files += 1;
+    } else {
+        report.failed_files += 1;
+    }
+    if let Some(summary) = report
+        .issue_summary
+        .iter_mut()
+        .find(|s| s.reason == reason && s.category == category)
+    {
         summary.count += 1;
     } else {
-        report.issue_summary.push(IssueSummary { category: category.into(), reason: reason.into(), count: 1 });
+        report.issue_summary.push(IssueSummary {
+            category: category.into(),
+            reason: reason.into(),
+            count: 1,
+        });
     }
     if report.issues.len() < MAX_ISSUES {
         report.issues.push(ScanIssue {

@@ -6,10 +6,20 @@ use tokio::io::AsyncReadExt;
 #[test]
 fn disk_downloads_expand_during_live_bodies_and_preserve_resumed_contents() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "disk_download_tests::disk_throughput_child", "--ignored"])
+        .args([
+            "--exact",
+            "disk_download_tests::disk_throughput_child",
+            "--ignored",
+        ])
         .env_remove("MYCLOUDDRIVER_DOWNLOAD_CONNECTIONS")
-        .output().unwrap();
-    assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]
@@ -25,8 +35,12 @@ async fn disk_throughput_child() {
             vec![id as u8; EXISTING],
         )
         .unwrap();
-        download_transport::seed_resume(&directory.path().join(format!("{id}.part")),
-            &format!("disk-throughput-{id}"), SIZE as u64, "\"fixture\"");
+        download_transport::seed_resume(
+            &directory.path().join(format!("{id}.part")),
+            &format!("disk-throughput-{id}"),
+            SIZE as u64,
+            "\"fixture\"",
+        );
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

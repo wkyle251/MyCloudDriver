@@ -13,7 +13,10 @@ to full-resolution originals; thumbnails are still not used for matching.
   entry with zero file size; content is held in memory, not in the filesystem.
   Cancellation interrupts backpressure and closes both ends.
 - Local Disk/iCloud: read the selected file through a verified descriptor.
-  Native readers get a stable RAM copy, with revision checks on the source.
+  Supported originals, including text, get a stable RAM copy, with revision
+  checks on the source. At most four files are copied concurrently. Hashing
+  runs separately after acquisition, in Analysis RAM, so slow disk/network
+  reads cannot occupy every analysis worker.
 - FileTwin: memory sources bypass temporary-file staging. Images, PDF and DOCX
   use memory readers. Audio, video and HEIF/AVIF use a private read-only loopback
   endpoint with HTTP range support, so seeking needs no media scratch file.
@@ -26,22 +29,23 @@ to full-resolution originals; thumbnails are still not used for matching.
   stops before the final original reference is released. Decoders cannot use
   playlist demuxers or FFmpeg's disk cache protocol.
 
-**Download RAM** reserves incoming and queued original buffers. At decoder/text
-dispatch, **Analysis RAM** reserves the original plus reader/decoder working
+**Download/Read RAM** reserves incoming and queued original buffers. Before
+hashing starts, **Analysis RAM** reserves the original plus calculation/decoder working
 memory before returning the original's Download RAM reservation. This handoff
 keeps the same buffer and frees download capacity immediately. The original's
 analysis lease stays with the buffer until its last reader drops. Their calculated total accepts the Mac's full
 physical RAM (64 GB on a 64 GB Mac). A 64 GB total with 12 GB Download RAM leaves
 52 GB for analysis. Downloads reserve small windows as bytes arrive. Native
-reader copies are reserved from the analysis pool only while encoding runs.
+reader copies are included in the prepaid analysis allowance.
 Images and documents that use `open_input()` need a complete worker-side copy;
 FFmpeg video/audio and HEIF/AVIF readers seek the shared original and need no
 second full-file copy allowance. Plain UTF-8 also reads the original directly.
-Memory-based admission starts reading at 1 MiB, text/documents at 128 MiB, and
+Memory-based admission starts text/documents at 128 MiB, and
 visual/media decoders at 512 MiB. These stable initial decoder allowances preserve
 model reuse across slightly different input sizes. A decoder requesting more
 memory retries with a larger allowance; original and reader-copy bytes remain
-exact. The read reservation is released before waiting for decoder admission.
+exact. The read reservation is released before hashing. Decoder retries retain
+their original in Analysis RAM rather than moving it back into Read RAM.
 Known sizes and recent speed predict new starts; every window also passes a
 Banker's safety check under the original-buffer limit. Unknown-size Photos
 originals start with one eighth of Download RAM as their enforced capacity, so
@@ -73,18 +77,27 @@ count. A 100,000-entry ready queue applies backpressure while the encoder is
 busy; it never skips files or truncates discovery. Pending cloud/provider
 metadata is spooled to a private temporary file, with no scan file-count cap.
 Path-based providers keep a small metadata queue without pre-reading files.
+Those paths are counted as waiting to read, not ready for analysis.
 Waiting originals remain in Download RAM. Originals already being analysed
 belong to Analysis RAM, alongside that file's decoder and required copies. No batch must
 finish or fill before analysis starts. Native decoder admission selects the
 oldest ready file that fits available memory, so a large waiting file does not
 hold up smaller inputs that fit.
 
+For path-based scans, **Read RAM reserved** includes each native file's full
+size reserved before the read begins. A full reservation does not mean the file
+has already arrived in RAM. Reading and hashing have separate counters.
+Completed originals move to Analysis RAM before their first hash read.
+**Download speed** measures bytes arriving from the source (including external
+and network disks), excluding hashing RAM, decoder reads and file completions.
+It remains visible when the processed-file counter has not increased.
+
 Progress shows reserved Download RAM in GB, its configured capacity, free
 capacity, the remaining analysis budget, and a separate downloading-file count.
 Reserved Download RAM covers incoming/queued originals and small receive windows, not measured
 process RSS or cumulative bytes transferred. The Downloads to RAM list shows
-individual progress, speed, remaining time and wait/retry states. Progress also separates ready for analysis, reading/hashing, actual
-analysis, connecting, retries, and RAM waits. **Analysing** counts encoding work
+individual progress, speed, remaining time and wait/retry states. Progress also separates waiting to read, fully acquired originals ready for analysis, reading, hashing,
+analysis, connecting, retries, and RAM waits. **Analysing** counts hashing and encoding work
 only, without a worker quota. **Analysis RAM reserved** includes handed-off
 originals and admitted processing allowances; source throughput, hashing, cache hits and decoder RAM can all lower
 the active count. These are estimates for admission, not a hard RSS ceiling;
@@ -92,11 +105,13 @@ cached models and shared pages may use additional memory. The general queued tot
 and other waiting files; the ready count is a subset of that total.
 
 Buffers and their reservations are released after encoding, vector-cache reuse,
-unsupported content, terminal failure, or explicit Clear. Pause/Cancel and
+unsupported content, terminal failure, Finish or Delete Scan. Pause and
 transient retries keep originals alive. Duplicate result waiters
 retain metadata only. Native workers and their descendants stop before their
-originals are released. A cancelled helper exiting cannot leave an orphaned
-memory server process or disk original behind.
+originals are released. Finish drains already analysing files and abandons unfinished acquisitions.
+Blocked OS reads are not joined indefinitely; their workers retain private
+inputs/directories until they return, or the helper exits. A stopped helper
+cannot leave an orphaned memory server process or disk original behind.
 
 The promise is about application-owned **content copies**, not zero system I/O:
 macOS can swap memory, and iCloud/Photos can materialize or cache originals within

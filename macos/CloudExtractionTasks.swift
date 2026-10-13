@@ -59,6 +59,12 @@ struct CloudExtractionTask: Identifiable {
     var extractWhenReady = false
     var passwordWasAttempted = false
     var passwordPromptDeferred = false
+    /// A permission retry uses a separate connection for this task only.
+    /// Keep the original account identity so a retry cannot cross accounts.
+    var accountID: UUID?
+    var connectionAccountID: UUID?
+    var connectionKind: PikPakCredentialKind?
+    var needsNormalLogin = false
 
     var isBusy: Bool { isInspecting || isExtracting || queuedAction != nil }
     var needsPassword: Bool { !isBusy && !isComplete && inspection?.requiredPassword == true }

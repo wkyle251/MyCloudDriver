@@ -122,6 +122,19 @@ impl Client {
                         None,
                     )
                     .await?;
+                if let Some(tasks) = value["tasks"].as_array() {
+                    self.update_duplicate_cache(|cache| {
+                        for task in tasks {
+                            if ["PHASE_TYPE_COMPLETE", "PHASE_TYPE_ERROR"]
+                                .contains(&task["phase"].as_str().unwrap_or(""))
+                            {
+                                cache.complete_pending_task(&text(task, "id"))?;
+                            }
+                        }
+                        Ok(())
+                    })
+                    .await;
+                }
                 page(&value, "tasks", "tasks", normalize_task)?
             }
             ManagementAction::CreateTask { url, parent_id } => {
@@ -134,21 +147,52 @@ impl Client {
                     .await?;
                 let task = value.get("task").unwrap_or(&value);
                 if text(task, "id").is_empty() {
+                    self.update_duplicate_cache(|cache| cache.invalidate_folder(&parent_id))
+                        .await;
                     return Err(unrecognized(
                         "task creation result; refresh Cloud Downloads before submitting again",
                     ));
                 }
+                let task_id = text(task, "id");
+                self.update_duplicate_cache(|cache| {
+                    cache.mark_pending_folder(&parent_id, &task_id)
+                })
+                .await;
                 json!({"task":normalize_task(task)?})
             }
             ManagementAction::RetryTask { id } => {
                 validate_id(&id)?;
-                self.management_request(
-                    Method::POST,
-                    "/task",
-                    &[],
-                    Some(json!({"id":id,"create_type":"RETRY","type":"offline"})),
-                )
-                .await?;
+                let value = self
+                    .management_request(
+                        Method::POST,
+                        "/task",
+                        &[],
+                        Some(json!({"id":id,"create_type":"RETRY","type":"offline"})),
+                    )
+                    .await?;
+                let task = value.get("task").unwrap_or(&value);
+                let parent = task["reference_resource"]["parent_id"]
+                    .as_str()
+                    .or_else(|| task["parent_id"].as_str())
+                    .map(str::to_owned);
+                self.update_duplicate_cache(|cache| {
+                    if cache
+                        .pending_task_ids()?
+                        .iter()
+                        .any(|task_id| task_id == &id)
+                    {
+                        return Ok(());
+                    }
+                    if let Some(parent) = parent.as_deref() {
+                        cache.mark_pending_folder(parent, &id)
+                    } else {
+                        // A task created in another client can omit its target
+                        // from the retry response. A full refresh is then the
+                        // only safe way to discover its eventual output.
+                        cache.mark_pending_folder("", &id)
+                    }
+                })
+                .await;
                 json!({"ok":true})
             }
             ManagementAction::RemoveTask { id, confirmed } => {
@@ -158,10 +202,12 @@ impl Client {
                 self.management_request(
                     Method::DELETE,
                     "/tasks",
-                    &[("task_ids", id), ("delete_files", "false".into())],
+                    &[("task_ids", id.clone()), ("delete_files", "false".into())],
                     None,
                 )
                 .await?;
+                self.update_duplicate_cache(|cache| cache.complete_pending_task(&id))
+                    .await;
                 json!({"ok":true})
             }
             ManagementAction::ListShares { page_token } => {
@@ -228,25 +274,33 @@ impl Client {
                 json!({"ok":true})
             }
             ManagementAction::ListTrash { page_token } => {
+                let first_page = page_token.is_empty();
                 let query = page_query(
                     page_token,
                     vec![
                         ("parent_id", "*".into()),
                         ("with_audit", "true".into()),
-                        (
-                            "filters",
-                            json!({"trashed":{"eq":true},"phase":{"eq":"PHASE_TYPE_COMPLETE"}})
-                                .to_string(),
-                        ),
+                        ("filters", json!({"trashed":{"eq":true}}).to_string()),
                     ],
                 );
                 let value = self
                     .management_request(Method::GET, "/files", &query, None)
                     .await?;
-                page(&value, "files", "files", normalize_file)?
+                let result = page(&value, "files", "files", normalize_file)?;
+                // An accepted Empty Trash request is not proof of deletion.
+                // Only a complete first-page read with no items or continuation
+                // proves that no trashed entries remain, including uploads.
+                if first_page
+                    && result["files"].as_array().is_some_and(Vec::is_empty)
+                    && text(&result, "next_page_token").is_empty()
+                {
+                    self.update_duplicate_cache(|cache| cache.purge_trash())
+                        .await;
+                }
+                result
             }
             ManagementAction::RestoreTrash { ids } => {
-                self.validate_trashed_ids(&ids).await?;
+                let restored = self.validate_trashed_ids(&ids).await?;
                 self.management_request(
                     Method::POST,
                     "/files:batchUntrash",
@@ -254,6 +308,25 @@ impl Client {
                     Some(json!({"ids":ids})),
                 )
                 .await?;
+                self.update_duplicate_cache(|cache| {
+                    let files = restored
+                        .into_iter()
+                        .filter_map(|value| serde_json::from_value::<crate::FileInfo>(value).ok())
+                        .collect::<Vec<_>>();
+                    for file in &files {
+                        if !cache.contains_file(&file.id)? {
+                            let parent = file.parent_id.as_deref().unwrap_or("");
+                            cache.upsert_files(parent, std::slice::from_ref(file))?;
+                        }
+                    }
+                    cache.untrash(&ids)?;
+                    for file in &files {
+                        let parent = file.parent_id.as_deref().unwrap_or("");
+                        cache.upsert_files(parent, std::slice::from_ref(file))?;
+                    }
+                    Ok(())
+                })
+                .await;
                 json!({"ok":true})
             }
             ManagementAction::DeleteTrash { ids, confirmed } => {
@@ -266,13 +339,15 @@ impl Client {
                     Some(json!({"ids":ids})),
                 )
                 .await?;
+                self.update_duplicate_cache(|cache| cache.remove(&ids))
+                    .await;
                 json!({"ok":true})
             }
             ManagementAction::EmptyTrash { confirmed } => {
                 self.require_permanent_delete(confirmed)?;
                 self.management_request(Method::PATCH, "/files/trash:empty", &[], None)
                     .await?;
-                json!({"ok":true})
+                json!({"ok":true, "trash_empty_confirmed":false})
             }
             ManagementAction::PickFiles {
                 parent_id,
@@ -302,7 +377,7 @@ impl Client {
         Ok(result)
     }
 
-    async fn management_request(
+    pub(crate) async fn management_request(
         &self,
         method: Method,
         path: &str,
@@ -320,17 +395,8 @@ impl Client {
             return Ok(json!({}));
         }
         let value: Value = serde_json::from_str(&response)?;
-        if value
-            .get("error")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty())
-        {
-            return Err(Error::Api {
-                status: 200,
-                message:
-                    "PikPak did not complete this operation. Refresh the workspace before retrying."
-                        .into(),
-            });
+        if let Some(error) = management_response_error(&value) {
+            return Err(error);
         }
         Ok(value)
     }
@@ -349,7 +415,7 @@ impl Client {
         Ok(())
     }
 
-    async fn validate_trashed_ids(&self, ids: &[String]) -> Result<()> {
+    async fn validate_trashed_ids(&self, ids: &[String]) -> Result<Vec<Value>> {
         validate_ids(ids)?;
         // Complete all preflight checks before changing any file. A stale
         // selection can never permanently delete an item that was restored.
@@ -358,14 +424,14 @@ impl Client {
             .buffered(8)
             .try_collect()
             .await?;
-        for (id, file) in states {
-            if text(&file, "id") != *id || file["trashed"] != true {
+        for (id, file) in &states {
+            if text(file, "id") != id.as_str() || file["trashed"] != true {
                 return Err(Error::InvalidPath(
                     "the selection changed; refresh Trash and select the items again",
                 ));
             }
         }
-        Ok(())
+        Ok(states.into_iter().map(|(_, file)| file).collect())
     }
 
     fn require_permanent_delete(&self, confirmed: bool) -> Result<()> {
@@ -422,6 +488,126 @@ fn management_error(error: Error) -> Error {
         return Error::Auth("PikPak denied this action. Check this connection’s permissions in Settings > Accounts.".into());
     }
     error
+}
+
+/// Some Drive endpoints report service failures inside an HTTP 200 envelope.
+/// Examine response envelopes only; a failed item within a task list is still
+/// a valid list response and must not be mistaken for a request failure.
+fn management_response_error(value: &Value) -> Option<Error> {
+    fn failure(value: &Value, depth: usize) -> Option<&Value> {
+        if depth > 4 {
+            return None;
+        }
+        let code_failed = value.get("error_code").is_some_and(|code| match code {
+            Value::Null => false,
+            Value::Number(number) => number.as_f64().is_some_and(|number| number != 0.0),
+            Value::String(code) => {
+                !code.trim().is_empty()
+                    && code
+                        .trim()
+                        .parse::<f64>()
+                        .map(|code| code != 0.0)
+                        .unwrap_or(true)
+            }
+            Value::Bool(failed) => *failed,
+            _ => true,
+        });
+        let has_error = value.get("error").is_some_and(|error| match error {
+            Value::Null => false,
+            Value::String(error) => !error.trim().is_empty(),
+            Value::Bool(failed) => *failed,
+            Value::Number(number) => number.as_f64().is_some_and(|number| number != 0.0),
+            _ => true,
+        });
+        if code_failed || has_error {
+            return Some(value);
+        }
+        ["data", "result", "response"].into_iter().find_map(|key| {
+            value
+                .get(key)
+                .filter(|nested| nested.is_object())
+                .and_then(|nested| failure(nested, depth + 1))
+        })
+    }
+
+    let payload = failure(value, 0)?;
+    let nested = &payload["error"];
+    let code = payload["error"]
+        .as_str()
+        .or_else(|| nested["code"].as_str())
+        .or_else(|| nested["error"].as_str())
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 120
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+        });
+    let description = [payload, nested].into_iter().find_map(|value| {
+        ["error_description", "message", "description"]
+            .into_iter()
+            .find_map(|key| value[key].as_str().filter(|text| !text.trim().is_empty()))
+    });
+    let description = description
+        .map(sanitized_management_description)
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| {
+            "PikPak did not complete this operation. Refresh the workspace before retrying.".into()
+        });
+    // Whitelist text and the stable service code, never return the full server
+    // error object, which may include credentials or signed request URLs.
+    let mut safe = json!({"error_description":description});
+    if let Some(code) = code {
+        safe["error"] = json!(code);
+    }
+    Some(Error::Api {
+        status: 200,
+        message: safe.to_string(),
+    })
+}
+
+fn sanitized_management_description(description: &str) -> String {
+    let mut hide_next = false;
+    description
+        .split_whitespace()
+        .take(250)
+        .map(|word| {
+            if hide_next {
+                hide_next = false;
+                return "[credential hidden]";
+            }
+            let lower = word.to_ascii_lowercase().replace('"', "");
+            if lower == "bearer" {
+                hide_next = true;
+                return "[credential hidden]";
+            }
+            if word.contains("://") {
+                return "[URL hidden]";
+            }
+            if word.contains("eyJ") && word.contains('.')
+                || [
+                    "token=",
+                    "token:",
+                    "secret=",
+                    "secret:",
+                    "password=",
+                    "password:",
+                    "authorization=",
+                    "authorization:",
+                ]
+                .iter()
+                .any(|marker| lower.contains(marker))
+            {
+                hide_next = lower.ends_with(':') || lower.ends_with('=');
+                return "[credential hidden]";
+            }
+            word
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(1200)
+        .collect()
 }
 
 fn confirm(confirmed: bool) -> Result<()> {
@@ -519,7 +705,12 @@ fn page(
         .as_array()
         .ok_or_else(|| unrecognized("list response"))?;
     let normalized = items.iter().map(normalize).collect::<Result<Vec<_>>>()?;
-    Ok(json!({key:normalized, "next_page_token":text(value, "next_page_token")}))
+    let next_page_token = match value.get("next_page_token") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(token)) => token,
+        _ => return Err(unrecognized("pagination token")),
+    };
+    Ok(json!({key:normalized, "next_page_token":next_page_token}))
 }
 fn normalize_task(v: &Value) -> Result<Value> {
     let id = text(v, "id");

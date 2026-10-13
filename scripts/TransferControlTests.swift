@@ -7,6 +7,7 @@ import Darwin
     @MainActor static func main() async throws {
         try DownloaderModel.testDownloadRetries()
         try DownloaderModel.testTransferControls()
+        try DownloaderModel.testRestoredDownloadControlsStayCheapForLargeCancelledFolders()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("MyCloudDriver-TransferControl-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -59,6 +60,25 @@ import Darwin
         precondition(!FileManager.default.fileExists(atPath: other.path + ".part.ranges.data"))
         precondition(FileManager.default.fileExists(atPath: unrelated.path) && FileManager.default.fileExists(atPath: outside.appendingPathExtension("part").path))
         print("PASS imported partial cleanup: previous session owners are accepted only for the imported account and exact destination")
+
+        let finalizing = tree.appendingPathComponent("finalizing.bin")
+        _ = try claimed(finalizing, owner: "session-A", fileID: "finalizing")
+        let publication = URL(fileURLWithPath: finalizing.path + ".part.publication.json")
+        try Data("saved publication fixture".utf8).write(to: publication)
+        try Data("incomplete owned copy".utf8).write(to: finalizing)
+        do {
+            try TransferPartialCleanup.remove(finalizing.appendingPathExtension("part"), owner:"session-A", fileID:"finalizing", locksDirectory:locks)
+            preconditionFailure("Native cleanup must defer to the publication journal")
+        } catch let error as NSError { precondition(error.domain == "MyCloudDriver.Transfer" && error.code == 2) }
+        precondition(FileManager.default.fileExists(atPath: finalizing.path + ".part"))
+        precondition(FileManager.default.fileExists(atPath: publication.path))
+        let finalizingBytes = try Data(contentsOf: finalizing)
+        precondition(finalizingBytes == Data("incomplete owned copy".utf8))
+        try FileManager.default.removeItem(at: publication)
+        try TransferPartialCleanup.remove(finalizing.appendingPathExtension("part"), owner:"session-A", fileID:"finalizing", locksDirectory:locks)
+        precondition(!FileManager.default.fileExists(atPath: finalizing.path + ".part"))
+        precondition(FileManager.default.fileExists(atPath: finalizing.path))
+        print("PASS interrupted publication cleanup: original and owned-copy journal remain recoverable until the helper reconciles them")
 
         let source = root.appendingPathComponent("original.bin"), destination = root.appendingPathComponent("copy.bin")
         try Data(repeating: 0x5a, count: 8 * 1024 * 1024).write(to: source)

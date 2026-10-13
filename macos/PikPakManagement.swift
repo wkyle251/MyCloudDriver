@@ -148,11 +148,13 @@ final class PikPakManagementModel: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var hasListError = false
     @Published private(set) var isMutating = false
+    @Published private(set) var isConfirmingEmptyTrash = false
     @Published private(set) var isLoadingAccount = false
     @Published private(set) var accountError: String?
     @Published private(set) var error: String?
     @Published private(set) var cloudTaskFailure: PikPakCloudTaskFailure?
     @Published private(set) var notice: String?
+    @Published private(set) var noticeIsPending = false
     @Published private(set) var updatedAt: Date?
     @Published private(set) var revision = UUID()
     private(set) var context: PikPakManagementContext?
@@ -161,8 +163,14 @@ final class PikPakManagementModel: ObservableObject {
     private var readers: [UUID: PikPakAccountVerifier] = [:]
     private var generation = UUID()
     private var trashReadRevision = UUID()
+    private var taskReadRevision = UUID()
+    private var removedTaskIDs = Set<String>()
+    private var pendingConfirmationID: UUID?
+    private var handledConfirmationIDs = Set<UUID>()
     private var loadingSection: Int?
     private var trashRefreshTask: Task<Void, Never>?
+    private var pendingEmptyTrash: (revision: UUID, success: String)?
+    private var confirmedEmptyTrashNotice: String?
     var onFilesChanged: (() -> Void)?
     var onMutationState: ((Bool) -> Void)?
     #if FINDER_WORKSPACE_TESTS
@@ -171,6 +179,7 @@ final class PikPakManagementModel: ObservableObject {
     var connected: Bool { context != nil }
     var canPermanentlyDelete: Bool { context?.credentialKind == .desktopOAuth }
     var hasActiveCloudTasks: Bool { tasks.contains(where: \.isActive) }
+    var hasPendingEmptyTrash: Bool { pendingEmptyTrash != nil }
     var processIdentifiers: [Int32] { readers.values.compactMap(\.processIdentifier) }
 
     func configure(_ context: PikPakManagementContext?) {
@@ -187,6 +196,10 @@ final class PikPakManagementModel: ObservableObject {
         context = nil; tasks = []; shares = []; trash = []; details = nil; profile = nil
         pageTokens = [:]; seenTokens = [:]; isLoading = false; isMutating = false; isLoadingAccount = false; accountError = nil
         error = nil; hasListError = false; cloudTaskFailure = nil; notice = nil; updatedAt = nil
+        pendingEmptyTrash = nil; confirmedEmptyTrashNotice = nil
+        taskReadRevision = UUID(); removedTaskIDs = []; pendingConfirmationID = nil
+        handledConfirmationIDs = []
+        isConfirmingEmptyTrash = false; noticeIsPending = false
         onMutationState?(false)
     }
 
@@ -198,6 +211,13 @@ final class PikPakManagementModel: ObservableObject {
         let changes = changes.filter { $0.kind == .trash }
         guard !changes.isEmpty else { return }
         trashReadRevision = UUID()
+        if pendingEmptyTrash != nil {
+            pendingEmptyTrash = nil
+            notice = "Empty Trash requested. Refresh to check the current Trash."
+            noticeIsPending = true
+        } else if notice == confirmedEmptyTrashNotice {
+            dismissNotice()
+        }
         let restored = Set(changes.filter { $0.after == "false" }.map(\.fileId))
         trash.removeAll { restored.contains($0.id) }
         guard connected, pageTokens[6] != nil || loadingSection == 6 else { return }
@@ -219,7 +239,7 @@ final class PikPakManagementModel: ObservableObject {
         let operation: String
         switch section { case 4: operation = "list_tasks"; case 5: operation = "list_shares"; case 6: operation = "list_trash"; default: return }
         if more && !hasMore(section) { return }
-        let current = generation, trashRevision = trashReadRevision
+        let current = generation, trashRevision = trashReadRevision, taskRevision = taskReadRevision
         isLoading = true
         loadingSection = section
         if !quietly { error = nil; hasListError = false }
@@ -228,10 +248,19 @@ final class PikPakManagementModel: ObservableObject {
             let token = more ? pageTokens[section] ?? "" : ""
             let result = try await AutomaticRecovery.read {
                 guard current == self.generation else { throw PikPakAccountError.accountMismatch }
-                return try await self.request(["operation":operation, "page_token":token])
+                guard section != 4 || taskRevision == self.taskReadRevision else { throw PikPakAccountError.accountMismatch }
+                do {
+                    return try await self.request(["operation":operation, "page_token":token])
+                } catch {
+                    // A superseded read must not keep retrying an outage after
+                    // a confirmed task removal has made its result obsolete.
+                    guard section != 4 || taskRevision == self.taskReadRevision else { throw PikPakAccountError.accountMismatch }
+                    throw error
+                }
             }
             guard current == generation else { return }
             guard section != 6 || trashRevision == trashReadRevision else { return }
+            guard section != 4 || taskRevision == taskReadRevision else { return }
             let next = result.nextPageToken ?? ""
             let seen = more ? seenTokens[section] ?? [] : []
             guard next.isEmpty || (next != token && !seen.contains(next)) else {
@@ -240,17 +269,24 @@ final class PikPakManagementModel: ObservableObject {
             switch section {
             case 4: guard let rows = result.tasks else { throw PikPakAccountError.unavailable }
                 let previous = Dictionary(uniqueKeysWithValues: tasks.map { ($0.id, $0.isComplete) })
-                if rows.contains(where: { $0.isComplete && previous[$0.id] == false }) { onFilesChanged?() }
-                tasks = merge(more ? tasks : [], rows)
+                let visibleRows = rows.filter { !removedTaskIDs.contains($0.id) }
+                if visibleRows.contains(where: { $0.isComplete && previous[$0.id] == false }) { onFilesChanged?() }
+                tasks = merge(more ? tasks : [], visibleRows)
             case 5: guard let rows = result.shares else { throw PikPakAccountError.unavailable }
                 shares = merge(more ? shares : [], rows)
             default: guard let rows = result.files else { throw PikPakAccountError.unavailable }
                 trash = merge(more ? trash : [], rows)
             }
             pageTokens[section] = next; seenTokens[section] = seen.union(next.isEmpty ? [] : [next])
+            if section == 6 && !more { reconcileEmptyTrash(rows: trash, next: next) }
             updatedAt = Date(); error = nil; hasListError = false
         } catch is CancellationError { }
-        catch { if current == generation { self.error = error.localizedDescription; hasListError = true } }
+        catch {
+            if current == generation && (section != 6 || trashRevision == trashReadRevision)
+                && (section != 4 || taskRevision == taskReadRevision) {
+                self.error = error.localizedDescription; hasListError = true
+            }
+        }
     }
 
     func loadAccount() async {
@@ -278,15 +314,36 @@ final class PikPakManagementModel: ObservableObject {
     }
 
     @discardableResult
+    func submitConfirmedMutation(_ operation: String, values: [String: Any], section: Int, success: String,
+                                 expectedRevision: UUID, confirmationID: UUID) -> Task<PikPakManagementResponse?, Never>? {
+        guard connected, revision == expectedRevision, !handledConfirmationIDs.contains(confirmationID) else { return nil }
+        handledConfirmationIDs.insert(confirmationID)
+        guard !isMutating, pendingConfirmationID == nil else { return nil }
+        pendingConfirmationID = confirmationID
+        return Task { [weak self] in
+            guard let self, self.revision == expectedRevision, self.pendingConfirmationID == confirmationID else { return nil }
+            self.pendingConfirmationID = nil
+            return await self.mutate(operation, values: values, section: section, success: success)
+        }
+    }
+
+    @discardableResult
     func mutate(_ operation: String, values: [String: Any], section: Int, success: String) async -> PikPakManagementResponse? {
-        guard connected, !isMutating else { return nil }
+        guard connected, !isMutating, pendingConfirmationID == nil else { return nil }
         if operation == "create_task", let failure = cloudTaskFailure, failure.requiresDifferentLink,
            failure.applies(to: values["url"] as? String ?? "") {
             error = failure.summary
             return nil
         }
         let current = generation
-        isMutating = true; onMutationState?(true); error = nil; notice = nil
+        if ["create_task", "retry_task", "remove_task"].contains(operation) { taskReadRevision = UUID() }
+        if ["restore_trash", "delete_trash", "empty_trash"].contains(operation) {
+            trashReadRevision = UUID()
+            pendingEmptyTrash = nil
+            trashRefreshTask?.cancel(); trashRefreshTask = nil
+        }
+        let trashRevision = trashReadRevision
+        isMutating = true; onMutationState?(true); error = nil; dismissNotice()
         if operation == "create_task" { cloudTaskFailure = nil }
         var input = values; input["operation"] = operation
         var response: PikPakManagementResponse?
@@ -295,7 +352,25 @@ final class PikPakManagementModel: ObservableObject {
             guard current == generation else { return nil }
             // Do not display success for an incomplete/unknown helper reply.
             guard result.ok == true || result.task != nil || result.share != nil else { throw PikPakAccountError.unavailable }
-            response = result; notice = success
+            response = result
+            if operation == "remove_task" {
+                let ids = values["ids"] as? [String] ?? [values["id"] as? String ?? ""]
+                removedTaskIDs.formUnion(ids.filter { !$0.isEmpty })
+                tasks.removeAll { removedTaskIDs.contains($0.id) }
+            }
+            if operation == "empty_trash" {
+                notice = "Empty Trash requested. Checking PikPak…"
+                noticeIsPending = true
+                if trashRevision == trashReadRevision {
+                    pendingEmptyTrash = (trashRevision, success)
+                    isConfirmingEmptyTrash = true
+                    await confirmEmptyTrash(generation: current, revision: trashRevision)
+                } else {
+                    notice = "Empty Trash requested. Refresh to check the current Trash."
+                }
+            } else {
+                notice = success
+            }
             if ["create_task", "restore_trash", "delete_trash", "empty_trash"].contains(operation) { onFilesChanged?() }
         } catch is CancellationError { }
         catch {
@@ -312,12 +387,63 @@ final class PikPakManagementModel: ObservableObject {
             }
         }
         guard current == generation else { return nil }
+        isConfirmingEmptyTrash = false
         isMutating = false; onMutationState?(false)
-        if response != nil { await load(section, quietly: true) }
+        if response != nil && operation != "empty_trash" { await load(section, quietly: true) }
         return response
     }
 
-    func dismissNotice() { notice = nil }
+    /// Empty Trash acknowledges a request before its deletion/listing settles.
+    /// Retry reads only, and preserve current rows until PikPak confirms empty.
+    private func confirmEmptyTrash(generation current: UUID, revision: UUID) async {
+        let delays: [UInt64] = [0, 250_000_000, 750_000_000, 1_500_000_000, 2_500_000_000]
+        do {
+            for delay in delays {
+                if delay > 0 { try await Task.sleep(nanoseconds: delay) }
+                try Task.checkCancellation()
+                guard current == generation, revision == trashReadRevision,
+                      pendingEmptyTrash?.revision == revision else { return }
+                // AutomaticRecovery.read retries indefinitely; confirmation
+                // needs a bounded number of reads and an explicit pending state.
+                let result = try await request(["operation":"list_trash", "page_token":""])
+                guard current == generation, revision == trashReadRevision else { return }
+                guard let rows = result.files else { throw PikPakAccountError.unavailable }
+                let next = result.nextPageToken ?? ""
+                trash = merge([], rows)
+                pageTokens[6] = next; seenTokens[6] = next.isEmpty ? [] : [next]
+                updatedAt = Date(); error = nil; hasListError = false
+                reconcileEmptyTrash(rows: rows, next: next)
+                if pendingEmptyTrash == nil { return }
+            }
+        } catch is CancellationError { }
+        catch {
+            if current == generation, revision == trashReadRevision {
+                self.error = "PikPak accepted the Empty Trash request, but its completion could not be checked. "
+                    + PikPakManagementError.safeMessage(error.localizedDescription)
+                    + " Refresh Trash to check again."
+                hasListError = true
+            }
+        }
+        if current == generation, revision == trashReadRevision, pendingEmptyTrash != nil {
+            notice = "Empty Trash requested. PikPak has not confirmed completion yet. Refresh to check again."
+            noticeIsPending = true
+        }
+    }
+
+    private func reconcileEmptyTrash(rows: [PikPakManagedFile], next: String) {
+        let empty = rows.isEmpty && next.isEmpty
+        if let pending = pendingEmptyTrash, pending.revision == trashReadRevision {
+            if empty {
+                pendingEmptyTrash = nil
+                notice = pending.success; confirmedEmptyTrashNotice = pending.success
+                noticeIsPending = false
+            }
+        } else if !empty, notice == confirmedEmptyTrashNotice {
+            dismissNotice()
+        }
+    }
+
+    func dismissNotice() { notice = nil; noticeIsPending = false; confirmedEmptyTrashNotice = nil }
 
     private func request(_ values: [String: Any]) async throws -> PikPakManagementResponse {
         guard let context else { throw PikPakAccountError.needsSignIn }

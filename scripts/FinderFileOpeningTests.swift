@@ -104,11 +104,23 @@ struct FinderFileOpeningTests {
             try Data("error".utf8).write(to: file)
             return (file, HTTPURLResponse(url: url, statusCode: 403, httpVersion: nil, headerFields: nil)!)
         }
+        // A refused signed link expires on its own, so the opener fetches a fresh one and retries with a visible
+        // status instead of reporting a failure; the refused body must never reach an app and is removed at once.
+        var retryStatus: String?
+        opener.onStatus = { message, error in
+            precondition(Thread.isMainThread, "A retry must not publish UI updates from the background executor")
+            MainActor.preconditionIsolated()
+            if error { failed = true }
+            else if message.hasPrefix("Retrying the download to open Readme.txt in ") { retryStatus = message }
+        }
         opener.open(identity: "denied", name: "Readme.txt", application: nil, configuration: configuration)
-        try await finish()
-        precondition(failed && launched.count == 3)
+        for _ in 0..<300 where retryStatus == nil { try await Task.sleep(nanoseconds: 10_000_000) }
+        precondition(retryStatus != nil, "an HTTP error is retried automatically and says so")
+        precondition(!failed && launched.count == 3 && opener.activeNames["denied"] == "Readme.txt")
         precondition(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("server-error.part").path))
-        print("PASS failures: incomplete and HTTP-error files never reach external apps; temporary data removed")
+        opener.cancelAll()
+        precondition(opener.activeNames.isEmpty, "cancelling stops the waiting retry")
+        print("PASS failures: incomplete files fail at once, HTTP-error files are retried visibly; neither reaches external apps and temporary data is removed")
 
         failed = false
         var resume: CheckedContinuation<PreviewInfo, Never>?
@@ -120,6 +132,31 @@ struct FinderFileOpeningTests {
         try await Task.sleep(nanoseconds: 30_000_000)
         precondition(opener.activeNames.isEmpty && launched.count == 3 && !failed)
         print("PASS cancellation: stale metadata after cancel/account reset cannot download or open a file")
+
+        opener.resolve = { _ in info() }
+        opener.download = { url, _ in
+            let file = directory.appendingPathComponent("range-\(UUID().uuidString).part")
+            try Data("hello".utf8).write(to: file)
+            return (file, HTTPURLResponse(url: url, statusCode: 206, httpVersion: nil,
+                headerFields: ["Content-Range": "bytes 0-4/5"])!)
+        }
+        opener.launch = { file, _ in
+            precondition(try! Data(contentsOf: file) == Data("hello".utf8))
+            launched.append((file, nil))
+        }
+        opener.open(identity: "whole-range", name: "Readme.txt", application: application, configuration: configuration)
+        try await finish()
+        precondition(launched.count == 4 && !failed, "A verified whole-object 206 must reach the chosen app")
+        opener.download = { url, _ in
+            let file = directory.appendingPathComponent("short-range.part")
+            try Data("he".utf8).write(to: file)
+            return (file, HTTPURLResponse(url: url, statusCode: 206, httpVersion: nil,
+                headerFields: ["Content-Range": "bytes 0-1/5"])!)
+        }
+        opener.open(identity: "short-range", name: "Readme.txt", application: application, configuration: configuration)
+        try await finish()
+        precondition(failed && launched.count == 4, "An incomplete 206 must fail visibly without endless Opening or launch")
+        print("PASS Open With range responses: whole-object HTTP 206 opens, truncated ranges fail and never reach IINA")
 
         #if FINDER_WORKSPACE_TESTS
         let suite = "PikPak-Open-Model-Tests-\(UUID().uuidString)"

@@ -7,6 +7,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var transfers: DownloaderModel?
     weak var fileSearch: FileSearchModel?
     weak var drives: CloudDriveHub?
+    private var terminationInProgress = false
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !terminationInProgress else { return .terminateLater }
+        terminationInProgress = true
+        Task { @MainActor in
+            let saved: Bool
+            if let sessions { saved = await sessions.prepareDownloadsForApplicationTermination() }
+            else if let transfers { saved = await transfers.prepareDownloadsForApplicationTermination() }
+            else { saved = true }
+            terminationInProgress = false
+            sender.reply(toApplicationShouldTerminate: saved)
+        }
+        return .terminateLater
+    }
 
     func applicationWillTerminate(_ notification: Notification) {
         LocalTorrentModel.shared.shutdown()
@@ -36,6 +51,10 @@ struct PikPakDownloaderApp: App {
                     appDelegate.transfers = model
                     appDelegate.fileSearch = model.fileSearch
                     appDelegate.drives = hub
+                    // The Home screen does not browse PikPak. Verify the saved
+                    // account here too, so its unpaused durable queue resumes
+                    // without requiring the user to open that drive first.
+                    model.refreshQuota()
                 }
         }
         .defaultSize(width: 1240, height: 900)

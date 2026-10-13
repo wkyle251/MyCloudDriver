@@ -1,4 +1,12 @@
+import Darwin
 import Foundation
+
+private final class TorrentCommandCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+}
 
 struct TorrentRAMVolume: Codable, Equatable {
     let device: String
@@ -44,20 +52,62 @@ extension TorrentRAMDriving {
 /// A real RAM-backed, case-sensitive APFS volume. The unmounted mountpoint is
 /// read-only, so a vanished volume can never turn into an on-disk payload cache.
 @MainActor final class TorrentRAMDisk: TorrentRAMDriving {
-    static func command(_ executable: String, _ arguments: [String]) async throws -> Data {
-        try await Task.detached(priority: .utility) {
+    static func command(_ executable: String, _ arguments: [String], timeout: TimeInterval = 30,
+                        maximumOutput: Int = 16 * 1024 * 1024) async throws -> Data {
+        let cancellation = TorrentCommandCancellation()
+        let worker = Task.detached(priority: .utility) {
+            guard timeout.isFinite, timeout > 0, maximumOutput > 0 else { throw CocoaError(.coderInvalidValue) }
+            if cancellation.isCancelled { throw CancellationError() }
             let child = Process(), pipe = Pipe()
             child.executableURL = URL(fileURLWithPath: executable); child.arguments = arguments
             child.standardInput = FileHandle.nullDevice; child.standardOutput = pipe; child.standardError = FileHandle.nullDevice
             child.environment = ["PATH":"/usr/bin:/bin:/usr/sbin:/sbin", "LANG":"en_US.UTF-8"]
             try child.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            try? pipe.fileHandleForWriting.close()
+            let descriptor = pipe.fileHandleForReading.fileDescriptor
+            defer { try? pipe.fileHandleForReading.close() }
+            let flags = fcntl(descriptor, F_GETFL)
+            _ = fcntl(descriptor, F_SETFL, flags | O_NONBLOCK)
+            let deadline = ProcessInfo.processInfo.systemUptime + timeout
+            var data = Data(), failure: Error?, stoppedAt: TimeInterval?
+            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+            func signal(_ value: Int32) {
+                guard child.isRunning else { return }
+                let pid = child.processIdentifier
+                // Signal a private process group only when the command owns it.
+                // Never send a negative PID into the app's inherited group.
+                Darwin.kill(getpgid(pid) == pid ? -pid : pid, value)
+            }
+            while true {
+                let now = ProcessInfo.processInfo.systemUptime
+                if failure == nil {
+                    if cancellation.isCancelled { failure = CancellationError() }
+                    else if now >= deadline { failure = LocalTorrentError.message("macOS took too long to prepare or release the RAM buffer. Try again after closing apps using it.") }
+                }
+                if failure != nil, stoppedAt == nil { stoppedAt = now; signal(SIGTERM) }
+                if let stoppedAt, now - stoppedAt >= 1, child.isRunning { signal(SIGKILL) }
+                if failure != nil && !child.isRunning { break }
+                let count = Darwin.read(descriptor, &buffer, buffer.count)
+                if count > 0 {
+                    if count > maximumOutput - data.count {
+                        failure = LocalTorrentError.message("The RAM buffer command returned too much output.")
+                    } else if failure == nil { data.append(contentsOf: buffer.prefix(count)) }
+                    continue
+                }
+                if count < 0, errno != EAGAIN && errno != EINTR, failure == nil { failure = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                if !child.isRunning { break }
+                var event = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
+                _ = poll(&event, 1, 20)
+            }
             child.waitUntilExit()
-            guard child.terminationStatus == 0, data.count < 16 * 1024 * 1024 else {
+            if cancellation.isCancelled { throw CancellationError() }
+            if let failure { throw failure }
+            guard child.terminationStatus == 0 else {
                 throw LocalTorrentError.message("macOS could not prepare or release the RAM buffer (\(URL(fileURLWithPath: executable).lastPathComponent), code \(child.terminationStatus)). Close apps using the buffer and try again.")
             }
             return data
-        }.value
+        }
+        return try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { cancellation.cancel() })
     }
     static func plist(_ executable: String, _ arguments: [String]) async throws -> [String: Any] {
         let data = try await command(executable, arguments)
@@ -146,8 +196,7 @@ extension TorrentRAMDriving {
     }
     func clear(_ volume: TorrentRAMVolume) async throws {
         try await validate(volume)
-        if FileManager.default.fileExists(atPath: volume.payload.path) { try FileManager.default.removeItem(at: volume.payload) }
-        try LocalTorrentStore.protect(volume.payload)
+        try TorrentRelayStorage.clearPayload(volume.payload)
     }
     func release(_ volume: TorrentRAMVolume) async throws {
         if try await !imageExists(volume) { return } // RAM was lost after a Mac restart.

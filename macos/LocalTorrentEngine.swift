@@ -143,6 +143,9 @@ struct LocalTorrentNetworkDiagnostics: Equatable {
 @MainActor protocol LocalTorrentDriving: AnyObject {
     var running: Bool { get }
     var portMapping: TorrentPortMapState { get }
+    /// Zero samples peer rates with every successful status poll. Legacy
+    /// engines can keep a slower cadence when their replies carry bitfields.
+    var peerCensusInterval: TimeInterval { get }
     func start() async throws
     func addMagnet(_ magnet: String, directory: URL) async throws -> String
     func addTorrent(_ data: Data, directory: URL, selection: [Int]?) async throws -> String
@@ -161,6 +164,7 @@ struct LocalTorrentNetworkDiagnostics: Equatable {
 
 extension LocalTorrentDriving {
     var portMapping: TorrentPortMapState { .idle }
+    var peerCensusInterval: TimeInterval { 30 }
     func releaseFiles(_ id: String, directory: URL, indexes: [Int]) async throws -> Set<Int> {
         throw LocalTorrentError.message("This torrent engine does not support live storage cleanup.")
     }
@@ -293,6 +297,7 @@ extension LocalTorrentDriving {
     private var cachedPeerAddresses: [String: Set<String>] = [:]
     private var peerCache: TorrentPeerCache { .init(directory: directory.appendingPathComponent("Peers", isDirectory: true)) }
     var running: Bool { child?.isRunning == true }
+    var peerCensusInterval: TimeInterval { backend == .libtorrent ? 0 : 30 }
 
     init(executable: URL? = nil, directory: URL, extraOptions: [String: String] = [:],
          trackers: [String]? = nil, mapsPorts: Bool = true, backend: Backend) {
@@ -324,7 +329,7 @@ extension LocalTorrentDriving {
             throw LocalTorrentError.message("The local torrent engine is missing. Reinstall this version of MyCloudDriver.")
         }
         try LocalTorrentStore.protect(directory)
-        let ports = reservedPorts()
+        let ports = try reservedPorts()
         for _ in 0..<3 {
             try Task.checkCancellation()
             let port = Int.random(in: 49_152...65_000)
@@ -389,11 +394,11 @@ extension LocalTorrentDriving {
 
     /// The BitTorrent and DHT ports, kept stable across launches so the router
     /// mapping and the peers that learned this Mac's address stay valid.
-    private func reservedPorts() -> (listen: UInt16, dht: UInt16) {
+    private func reservedPorts() throws -> (listen: UInt16, dht: UInt16) {
         let file = directory.appendingPathComponent("ports.json")
         let saved = (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode([String: UInt16].self, from: $0) } ?? [:]
-        let listen = available(saved["listen"], in: 49_160...49_260)
-        let dht = available(saved["dht"], in: 49_261...49_360)
+        let listen = try available(saved["listen"], in: 49_160...49_260, tcp: true, udp: backend == .libtorrent)
+        let dht = try available(saved["dht"], in: 49_261...49_360, tcp: false, udp: true)
         if saved["listen"] != listen || saved["dht"] != dht,
            let data = try? JSONEncoder().encode(["listen": listen, "dht": dht]) {
             try? LocalTorrentStore.write(data, to: file)
@@ -402,28 +407,36 @@ extension LocalTorrentDriving {
     }
 
     /// Reuses the saved port when it is still free, otherwise finds another.
-    private func available(_ saved: UInt16?, in range: ClosedRange<UInt16>) -> UInt16 {
-        if let saved, range.contains(saved), bindable(saved) { return saved }
-        for candidate in range.shuffled() where bindable(candidate) { return candidate }
-        return saved ?? range.lowerBound
+    private func available(_ saved: UInt16?, in range: ClosedRange<UInt16>, tcp: Bool, udp: Bool) throws -> UInt16 {
+        if let saved, range.contains(saved), Self.bindable(saved, tcp: tcp, udp: udp) { return saved }
+        for candidate in range.shuffled() where Self.bindable(candidate, tcp: tcp, udp: udp) { return candidate }
+        throw LocalTorrentError.message("No free torrent listen ports were found. Close another torrent tool and try again.")
     }
 
-    private func bindable(_ port: UInt16) -> Bool {
-        let handle = socket(AF_INET, SOCK_STREAM, 0)
-        guard handle >= 0 else { return false }
-        defer { close(handle) }
-        var reuse: Int32 = 1
-        setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+    static func bindable(_ port: UInt16, tcp: Bool = true, udp: Bool = true) -> Bool {
+        var handles: [Int32] = []
+        defer { for handle in handles { close(handle) } }
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)
         address.sin_port = port.bigEndian
         address.sin_addr.s_addr = INADDR_ANY
-        return withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(handle, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+        for kind in (tcp ? [SOCK_STREAM] : []) + (udp ? [SOCK_DGRAM] : []) {
+            let handle = socket(AF_INET, kind, 0)
+            guard handle >= 0 else { return false }
+            handles.append(handle)
+            if kind == SOCK_STREAM {
+                var reuse: Int32 = 1
+                setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
             }
+            let bound = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    bind(handle, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+                }
+            }
+            if !bound { return false }
         }
+        return !handles.isEmpty
     }
 
     private func beginMapping(_ ports: (listen: UInt16, dht: UInt16)) {

@@ -318,4 +318,23 @@ mod tests {
         assert!(docx_xml("<!DOCTYPE x [<!ENTITY e SYSTEM 'file:///tmp/x'>]><x/>").is_err());
         assert!(docx_xml("<x>").is_err());
     }
+    #[test]
+    fn generated_zip_and_xml_boundary_limits_fail_before_document_allocation() {
+        fn directory(entries: u16, bytes: u32) -> std::io::Cursor<Vec<u8>> {
+            let mut record = vec![0; 22];
+            record[..4].copy_from_slice(b"PK\x05\x06");
+            record[10..12].copy_from_slice(&entries.to_le_bytes());
+            record[12..16].copy_from_slice(&bytes.to_le_bytes());
+            std::io::Cursor::new(record)
+        }
+        zip_preflight(&mut directory(4096, 8 << 20)).unwrap();
+        assert_eq!(zip_preflight(&mut directory(4097, 8 << 20)).unwrap_err().code, ErrorCode::ResourceBudgetTooSmall);
+        assert_eq!(zip_preflight(&mut directory(4096, (8 << 20) + 1)).unwrap_err().code, ErrorCode::ResourceBudgetTooSmall);
+        assert_eq!(zip_preflight(&mut directory(u16::MAX, 0)).unwrap_err().code, ErrorCode::UnsupportedFormat);
+        assert_eq!(zip_preflight(&mut std::io::Cursor::new(b"PK\x05\x06".to_vec())).unwrap_err().code, ErrorCode::DecodeFailed);
+        let root = "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>";
+        let xml = |nesting: usize| format!("{root}{}{}</w:body></w:document>", "<w:p>".repeat(nesting), "</w:p>".repeat(nesting));
+        docx_xml(&xml(254)).unwrap();
+        assert_eq!(docx_xml(&xml(255)).unwrap_err().code, ErrorCode::ResourceBudgetTooSmall);
+    }
 }

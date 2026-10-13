@@ -62,7 +62,7 @@ enum FinderFileOpenStorage {
 @MainActor
 final class FinderFileOpener: ObservableObject {
     @Published private(set) var activeNames: [String: String] = [:]
-    var onStatus: (String, Bool) -> Void = { _, _ in }
+    var onStatus: @MainActor (String, Bool) -> Void = { _, _ in }
     private var tasks: [String: Task<Void, Never>] = [:]
     private var processes: [String: Process] = [:]
     private var localCopies: [String: URL] = [:]
@@ -121,23 +121,34 @@ final class FinderFileOpener: ObservableObject {
                         throw NSError(domain: "PikPakOpen", code: 2,
                                       userInfo: [NSLocalizedDescriptionKey: "PikPak has not provided an original file to open."])
                     }
-                    let session = URLSession(configuration: PreviewTransport.configuration(proxyURL: configuration.proxyURL))
-                    defer { session.invalidateAndCancel() }
-                    let result: (URL, URLResponse)
-                    if let download = self.download { result = try await download(source, configuration.proxyURL) }
-                    else {
-                        var request = URLRequest(url: source)
-                        for (field, value) in PreviewTransport.mediaHeaders { request.setValue(value, forHTTPHeaderField: field) }
-                        request.setValue("*/*", forHTTPHeaderField: "Accept")
-                        result = try await session.download(for: request)
+                    var temporary: URL?
+                    defer { if let temporary { try? FileManager.default.removeItem(at: temporary) } }
+                    do {
+                        if let download = self.download {
+                            let result = try await download(source, configuration.proxyURL)
+                            temporary = result.0
+                            try PreviewTransport.completeDownloadSize(at: result.0, response: result.1, purpose: "file")
+                        } else {
+                            let target = configuration.exchangeDirectory.appendingPathComponent(UUID().uuidString + ".part")
+                            temporary = target
+                            try await MediaFileDownload.download(from: source, to: target, expectedSize: info.size,
+                                configuration: PreviewTransport.configuration(proxyURL: configuration.proxyURL), purpose: "file")
+                        }
+                    } catch {
+                        // Refresh an expired signed URL or recover a server
+                        // outage, while keeping permanent/truncated responses
+                        // visible instead of endlessly saying Opening.
+                        let detail = error as NSError
+                        if detail.domain == "PikPakPreviewTransport",
+                           [401, 403, 408, 425, 429].contains(detail.code) || (500...599).contains(detail.code) {
+                            throw NSError(domain: "PikPakOpen", code: 3,
+                                userInfo: [NSLocalizedDescriptionKey: detail.localizedDescription, NSUnderlyingErrorKey: detail])
+                        }
+                        throw error
                     }
-                    defer { try? FileManager.default.removeItem(at: result.0) }
                     try Task.checkCancellation()
-                    guard let response = result.1 as? HTTPURLResponse, response.statusCode == 200 else {
-                        throw NSError(domain: "PikPakOpen", code: 3,
-                                      userInfo: [NSLocalizedDescriptionKey: "PikPak's file server could not return the complete file. Try Open again."])
-                    }
-                    return try FinderFileOpenStorage.preserveDownload(result.0, name: name, expectedSize: info.size,
+                    guard let temporary else { throw URLError(.badServerResponse) }
+                    return try FinderFileOpenStorage.preserveDownload(temporary, name: name, expectedSize: info.size,
                                                                        directory: configuration.copiesDirectory)
                     }
                     unopenedCopy = file
@@ -280,6 +291,29 @@ enum FinderFileApplications {
         }
         if let window = NSApp.keyWindow ?? NSApp.mainWindow { panel.beginSheetModal(for: window, completionHandler: finish) }
         else { panel.begin(completionHandler: finish) }
+    }
+
+    /// Resolve the application list once when the context menu opens. AppKit owns the entire submenu
+    /// while it tracks the pointer, so preview/progress redraws cannot replace a child during hover.
+    static func addOpenActions(to menu: BrowserNativeMenu, item: BrowserItem, enabled: Bool,
+                               open: @escaping (URL?) -> Void, chooseApplication: @escaping () -> Void) {
+        menu.addAction("Open", symbol: "arrow.up.forward.app", enabled: enabled) { open(nil) }
+        let submenu = BrowserNativeMenu(title: "Open With")
+        let applications = applications(for: item)
+        var addedOtherApplications = false
+        for application in applications {
+            if !application.isDefault && !addedOtherApplications {
+                if submenu.items.contains(where: { !$0.isSeparatorItem }) { submenu.addItem(.separator()) }
+                addedOtherApplications = true
+            }
+            let entry = submenu.addAction(application.name + (application.isDefault ? " (default)" : ""),
+                enabled: enabled) { open(application.id) }
+            entry.image = application.icon; entry.toolTip = application.id.path
+        }
+        if !submenu.items.isEmpty { submenu.addItem(.separator()) }
+        submenu.addAction("Other…", enabled: enabled, action: chooseApplication)
+        menu.addSubmenu("Open With", symbol: "app.dashed", enabled: enabled, submenu: submenu)
+        menu.addItem(.separator())
     }
 }
 

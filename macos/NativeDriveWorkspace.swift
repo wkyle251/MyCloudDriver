@@ -7,13 +7,18 @@ struct NativeDriveWorkspace: View {
     @ObservedObject var hub: CloudDriveHub
     @ObservedObject var settings: FinderSettings
     @ObservedObject private var navigation: FinderWorkspaceNavigation
-    @ObservedObject private var bookmarks = FinderBookmarkStore.shared
+    @ObservedObject private var sharedBookmarks = FinderBookmarkStore.shared
+    @Environment(\.finderBookmarkStore) private var injectedBookmarks
+    private var bookmarks: FinderBookmarkStore { injectedBookmarks ?? sharedBookmarks }
     @AppStorage("browserViewMode") private var browserViewMode = 0
     @AppStorage("browserListItemZoom") private var listZoom = 1.0
     @AppStorage("browserThumbnailItemZoom") private var thumbnailZoom = 1.0
     @AppStorage("selectedTransferMode") private var transferDirection = 0
     @State private var showsSearch = false
     @State private var previewExpanded = false
+    @State private var bookmarkBrowserIsOpen = false
+    @AppStorage("bookmarkViewMode") private var bookmarkViewMode = 0
+    @AppStorage("bookmarkItemZoom") private var bookmarkZoom = 1.0
 
     init(model: NativeDriveModel, hub: CloudDriveHub, settings: FinderSettings) {
         self.model = model; self.hub = hub; self.settings = settings
@@ -26,6 +31,7 @@ struct NativeDriveWorkspace: View {
         model.zoom = value
     }
     private func selectSection(_ section: Int) {
+        if section == FinderWorkspaceSection.bookmarks.rawValue { bookmarkBrowserIsOpen = false }
         navigation.showImmediately(section)
         model.section = navigation.section
     }
@@ -44,45 +50,61 @@ struct NativeDriveWorkspace: View {
         } workspace: {
             FinderWorkspaceBody {
                 switch navigation.section {
+                case FinderWorkspaceSection.trash.rawValue where model.usesDiskTrash:
+                    NativeDiskTrashView(model: model)
                 case 1:
                     NativeDriveTransfers(model: model, store: model.activity, direction: $transferDirection,
                         showBrowser: { selectSection(0) }, showStatus: { showsStatus = true }, pikpak: hub.pikpak)
-                case 3:
-                    FinderUnavailableLinks(kind: model.kind) {
-                        hub.open(.pikpak); hub.pikpakNavigation.showImmediately(3)
-                    }
                 case FinderWorkspaceSection.bookmarks.rawValue:
-                    FinderBookmarksWorkspace(store: bookmarks, provider: model.kind.rawValue, scope: model.bookmarkScope,
+                    if bookmarkBrowserIsOpen {
+                        VStack(spacing: 10) {
+                            HStack {
+                                Button { bookmarkBrowserIsOpen = false; model.closePreview(); model.mediaPreview.clear() } label: {
+                                    Label("Bookmarks", systemImage: "chevron.left")
+                                }.help("Back to bookmarked files and folders")
+                                Spacer()
+                            }
+                            browser
+                        }
+                    } else { FinderBookmarksWorkspace(store: bookmarks, provider: model.kind.rawValue, scope: model.bookmarkScope,
                         sourceTitle: model.kind.title, canOpen: model.isConnected && !model.isMutating,
                         open: { bookmark in
-                            if model.openBookmark(bookmark, store: bookmarks) { selectSection(0) }
-                        }, showBrowser: { selectSection(0) })
+                            if model.openBookmark(bookmark, store: bookmarks) { bookmarkBrowserIsOpen = true }
+                        }, showBrowser: { selectSection(0) }) }
                 default:
                     browser
                 }
             } footer: {
                 NativeDriveFooter(model: model, store: model.activity, scan: model.similarity.local,
-                    section: navigation.section, showsStatus: $showsStatus)
+                    section: navigation.section, bookmarkCount: bookmarkBrowserIsOpen ? nil : bookmarks.items(provider: model.kind.rawValue, scope: model.bookmarkScope).count, showsStatus: $showsStatus)
             }
         }
         .focusedSceneValue(\.finderWindowActions, actions)
         .background(FinderWindowActionRegistration(actions: actions))
         .onChange(of: model.query) { _ in model.reload() }
         .onChange(of: model.selection) { _ in
-            model.selectionChanged()
             if model.selection.isEmpty { previewExpanded = false }
         }
-        .onAppear { model.section = navigation.section; model.viewMode = browserViewMode; model.zoom = zoom }
+        .onChange(of: model.inspectorPreviewIdentity) { _ in model.selectionChanged() }
+        .onAppear {
+            model.section = navigation.section; model.viewMode = browserViewMode; model.zoom = zoom
+            model.setThumbnailPrefetchActive(navigation.section == 0 || (navigation.section == 7 && bookmarkBrowserIsOpen))
+        }
         .onChange(of: navigation.section) { value in
             model.section = value
-            if value != 0 { model.closePreview(); model.mediaPreview.clear() }
+            let browsing = value == 0 || (value == 7 && bookmarkBrowserIsOpen)
+            model.setThumbnailPrefetchActive(browsing)
+            if !browsing { model.closePreview(); model.mediaPreview.clear() }
         }
+        .onChange(of: bookmarkBrowserIsOpen) { open in model.setThumbnailPrefetchActive(navigation.section == 0 || (navigation.section == 7 && open)) }
+        .onChange(of: model.bookmarkScope) { _ in bookmarkBrowserIsOpen = false }
         .onChange(of: model.section) { value in
             if navigation.section != value { navigation.showImmediately(value) }
         }
         .onChange(of: settings.showsPreviewPane) { if !$0 { model.mediaPreview.clear() } }
         .onChange(of: model.isBusy) { busy in
             if !busy && model.kind == .icloud && model.isConnected { hub.icloudStorage.refresh(force: true) }
+            if !busy && model.kind == .local && model.isConnected { hub.localStorage.refresh(for: model.provider?.root.url) }
         }
         .onChange(of: browserViewMode) { model.viewMode = $0; model.zoom = zoom }
         .onChange(of: listZoom) { _ in model.zoom = zoom }
@@ -92,7 +114,7 @@ struct NativeDriveWorkspace: View {
             guard let target = note.object as? CloudDriveHub, target === hub else { return }
             selectSection(0); showsSearch = true; searchFocused = true
         }
-        .onDisappear { model.closePreview(); model.mediaPreview.clear() }
+        .onDisappear { model.closePreview(); model.mediaPreview.clear(); model.setThumbnailPrefetchActive(false) }
         .sheet(item: $prompt) { prompt in
             NativeNameSheet(prompt: prompt) { name in
                 if let item = prompt.item { model.rename(item, name: name) }
@@ -108,7 +130,9 @@ struct NativeDriveWorkspace: View {
         } message: {
             Text(model.kind == .photos
                  ? "Delete \(pendingDelete.count) selected item(s)? Deleting an album keeps its media in the library. Deleted photos and videos can be restored in Photos → Recently Deleted."
-                 : "Move \(pendingDelete.count) selected item(s) to Finder’s Trash? \(model.kind == .icloud ? "This change will sync to iCloud. " : "")You can undo it with Command-Z.")
+                 : model.usesDiskTrash
+                    ? "Move \(pendingDelete.count) selected item(s) to the Trash folder on this disk? Use Put Back in the Trash tab or Command-Z to restore them."
+                    : "Move \(pendingDelete.count) selected item(s) to Finder’s Trash? \(model.kind == .icloud ? "This change will sync to iCloud. " : "")You can undo it with Command-Z.")
         }
         .alert("\(model.kind.title)", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("OK") { model.error = nil }
@@ -116,19 +140,18 @@ struct NativeDriveWorkspace: View {
     }
     private var sidebar: some View {
         FinderDriveSidebar(navigation: navigation, settings: settings,
-            accountSubtitle: model.kind.title, accountPane: 3, select: selectSection) {
+            accountSubtitle: model.kind == .local ? hub.selectedDriveTitle : model.kind.title, accountPane: 3,
+            sections: model.workspaceSections, select: selectSection) {
             if model.kind == .icloud {
                 FinderICloudStorage(storage: hub.icloudStorage, connected: model.isConnected)
+            } else if model.kind == .local {
+                FinderLocalStorage(storage: hub.localStorage, rootURL: model.provider?.root.url, connected: model.isConnected,
+                    message: model.availabilityMessage, busy: model.isBusy) { hub.connectLocal() }
             } else { VStack(alignment: .leading, spacing: 6) {
                 Text("Storage").font(.caption.weight(.semibold))
-                Text(model.kind == .local ? "This Mac or external disk" : "Managed by Apple Photos")
-                    .font(.caption2).foregroundStyle(.secondary)
+                Text("Managed by Apple Photos").font(.caption2).foregroundStyle(.secondary)
                 Text(model.availabilityMessage ?? (model.isConnected ? "Available" : "Connect to get started"))
                     .font(.caption2).foregroundStyle(.secondary)
-                if model.kind == .local {
-                    Text(model.provider?.root.url?.path ?? "Choose a folder").font(.caption2).foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle)
-                    Button("Choose Folder or Disk…") { hub.connectLocal() }.font(.caption).disabled(model.isBusy)
-                }
             }.padding(12) }
         }
     }
@@ -159,7 +182,7 @@ struct NativeDriveWorkspace: View {
                     resetRevision: settings.layoutResetRevision) {
                 VStack(spacing: 0) {
                     if model.fileTypeFilter.isActive {
-                        BrowserFileFilterBar(filter: $model.fileTypeFilter, count: model.visibleFileCount)
+                        BrowserFileFilterBar(filter: $model.fileTypeFilter, count: model.visibleFileCount, hiddenFolders: model.visibleHiddenFolderCount)
                         Divider()
                     }
                     if model.viewMode == 0 { table }
@@ -181,7 +204,8 @@ struct NativeDriveWorkspace: View {
                     }
                 }
                 } preview: {
-                    NativeDriveInspector(model: model, expanded: $previewExpanded, resetRevision: settings.layoutResetRevision)
+                    NativeDriveInspector(model: model, mediaPreview: model.mediaPreview,
+                        expanded: $previewExpanded, resetRevision: settings.layoutResetRevision)
                 }
             .background(NativeDriveKeys(model: model))
             .onDrop(of: [.fileURL], isTargeted: $dropTarget) { providers in
@@ -219,8 +243,9 @@ struct NativeDriveWorkspace: View {
             containerName: model.kind.containerName,
             importHelp: model.kind == .photos ? "Import images or videos into this album or library" : "Copy files or folders into this \(model.kind.title) location",
             exportHelp: "Export selected originals to a folder on this Mac",
-            trashHelp: model.kind == .photos ? "Delete selected items from Photos" : "Move selected items to Finder’s Trash",
+            trashHelp: model.kind == .photos ? "Delete selected items from Photos" : model.usesDiskTrash ? "Move selected items to this disk’s Trash" : "Move selected items to Finder’s Trash",
             fileTypeFilter: $model.fileTypeFilter, fileExtensions: model.availableFileExtensions,
+            hidesEmptyFolders: $model.hidesEmptyFolders,
             back: { model.back() }, search: { showsSearch = true; searchFocused = true },
             importFiles: { transferDirection = 1; model.chooseImport() },
             exportFiles: { transferDirection = 0; model.chooseExport(model.selectedItems) },
@@ -245,16 +270,20 @@ struct NativeDriveWorkspace: View {
             }
     }
     private var table: some View {
-        NativeDriveFileList(model: model, resetRevision: settings.layoutResetRevision, menu: contextMenu, empty: { emptyState })
+        NativeDriveFileList(model: model, resetRevision: settings.layoutResetRevision, menu: contextMenu,
+            nativeFileMenu: nativeFileMenu, empty: { emptyState })
     }
     private var thumbnails: some View {
-        NativeDriveFileGrid(model: model, menu: contextMenu)
+        NativeDriveFileGrid(model: model, menu: contextMenu, nativeFileMenu: nativeFileMenu)
     }
     private var emptyState: some View {
         VStack(spacing: 14) {
             if model.isLoading { ProgressView("Loading \(model.location.title)…") }
             else if model.fileTypeFilter.isActive {
                 BrowserFileFilterEmptyState(filter: $model.fileTypeFilter, hasMore: model.nextOffset != nil)
+            }
+            else if model.visibleHiddenFolderCount > 0 {
+                BrowserEmptyFoldersEmptyState(hidesEmptyFolders: $model.hidesEmptyFolders)
             }
             else {
                 Image(systemName: model.query.isEmpty ? "folder" : "magnifyingglass").font(.system(size: 38)).foregroundStyle(.tertiary)
@@ -274,6 +303,7 @@ struct NativeDriveWorkspace: View {
                 if first.isFolder {
                     if browserViewMode == 0 {
                         Button(model.isExpanded(first) ? "Collapse \(model.kind.containerName)" : "Expand \(model.kind.containerName)") { model.toggleExpansion(first) }
+                        expandAllLevelsEntry([first])
                     }
                     Button("Open \(model.kind.containerName)") { model.enter(first) }
                 }
@@ -284,6 +314,8 @@ struct NativeDriveWorkspace: View {
                 }
                 Button("Rename…") { prompt = .init(title: "Rename \(model.kind.containerName.lowercased())", name: first.name, item: first) }
                     .disabled(!first.canRename || model.isMutating)
+            } else {
+                expandAllLevelsEntry(selected.filter(\.isFolder))
             }
             Divider()
             Button("Export \(selected.count == 1 ? "Item" : "\(selected.count) Items")…") { model.chooseExport(selected) }
@@ -316,6 +348,60 @@ struct NativeDriveWorkspace: View {
             Button("Find Similar Files…") { model.findSimilar() }
         }
     }
+    private func nativeFileMenu(_ item: CloudDriveItem) -> NSMenu {
+        let menu = BrowserNativeMenu(title: "File actions")
+        let selected = [item]
+        menu.addAction(bookmarks.contains(provider: model.kind.rawValue, scope: model.bookmarkScope, itemID: item.id)
+            ? "Remove from Bookmarks" : "Add to Bookmarks", symbol: "bookmark", enabled: model.bookmarkScope != nil) {
+            model.toggleBookmarks(selected, store: bookmarks)
+        }
+        menu.addItem(.separator())
+        FinderFileApplications.addOpenActions(to: menu, item: item.browserItem, enabled: !model.isMutating,
+            open: { model.open(item, application: $0) },
+            chooseApplication: { FinderFileApplications.chooseApplication(for: item.name) { model.open(item, application: $0) } })
+        menu.addAction("Quick Look", symbol: "eye") { model.selection = [item.id]; model.togglePreview(in: NSApp.keyWindow) }
+        menu.addAction("Rename…", symbol: "pencil", enabled: item.canRename && !model.isMutating) {
+            prompt = .init(title: "Rename \(model.kind.containerName.lowercased())", name: item.name, item: item)
+        }
+        menu.addItem(.separator())
+        menu.addAction("Export Item…") { model.chooseExport(selected) }
+        if model.kind == .local {
+            menu.addAction("Upload to PikPak", enabled: model.isConnected && hub.pikpak.canUploadFiles) { model.sendToPikPak(selected) }
+        }
+        menu.addAction(model.kind == .photos ? "Add to Album…" : "Copy to Folder…", enabled: !model.isMutating) {
+            chooseDestination(selected, copy: true)
+        }
+        menu.addAction(model.kind == .photos ? "Move to Album…" : "Move to Folder…",
+            enabled: !model.isMutating && (model.kind != .photos || model.location.id.hasPrefix("album:"))) {
+            chooseDestination(selected, copy: false)
+        }
+        menu.addItem(.separator())
+        menu.addAction("Find Similar Files…") { model.findSimilar(selected) }
+        menu.addAction("Check for Duplicates…") { model.findSimilar(selected, exactOnly: true) }
+        menu.addAction(model.kind == .photos ? "Calculate Original Size" : "Recalculate Folder Size") { model.measure(selected) }
+        if model.kind != .photos, item.browserItem.isCloudExtractableArchive {
+            menu.addAction("Extract Archive…") { model.extract(item) }
+        }
+        menu.addItem(.separator())
+        menu.addAction(model.kind == .photos ? "Delete from Photos…" : "Move to Trash…", symbol: "trash",
+            enabled: !model.isMutating && item.canDelete) { requestDelete(selected) }
+        return menu
+    }
+
+    /// Local Disk, external disks and network shares are one model, so they share this entry. Over a
+    /// selection it opens every selected folder; files in the selection are left alone.
+    @ViewBuilder private func expandAllLevelsEntry(_ folders: [CloudDriveItem]) -> some View {
+        if model.kind == .local, browserViewMode == 0, !folders.isEmpty {
+            if model.isExpandingAllLevels(folders) {
+                Button("Stop Expanding All Levels") { model.stopExpandingAllLevels() }
+            } else {
+                Button(BrowserFolderExpansionAction.title(folderCount: folders.count)) { model.expandAllLevels(folders) }
+                    .disabled(!model.canExpandAllLevels || model.isMutating)
+                    .help(folders.count > 1 ? "Expand every selected folder and all of their nested subfolders."
+                                            : "Expand this folder and every nested subfolder.")
+            }
+        }
+    }
     private func newContainer() { prompt = .init(title: "New \(model.kind.containerName)", name: "", item: nil) }
     private func requestDelete(_ items: [CloudDriveItem]) { pendingDelete = items; showsDelete = !items.isEmpty }
     private func chooseDestination(_ items: [CloudDriveItem], copy: Bool) {
@@ -330,13 +416,15 @@ struct NativeDriveWorkspace: View {
         }
     }
     private var actions: FinderWindowActions {
-        let selected = model.selectedItems, connected = model.isConnected && navigation.section == 0, available = connected && !model.isMutating
-        return .init(section: navigation.section, viewMode: browserViewMode, zoom: zoom,
+        let isBookmarkRoot = navigation.section == 7 && !bookmarkBrowserIsOpen
+        let selected = model.selectedItems, connected = model.isConnected && (navigation.section == 0 || (navigation.section == 7 && bookmarkBrowserIsOpen)), available = connected && !model.isMutating
+        return .init(section: navigation.section, viewMode: isBookmarkRoot ? bookmarkViewMode : browserViewMode, zoom: isBookmarkRoot ? bookmarkZoom : zoom,
             undoTitle: model.undoStack.last.map { "Undo \($0.title)" } ?? "Undo",
             redoTitle: model.redoStack.last.map { "Redo \($0.title)" } ?? "Redo",
-            canUndo: available && !model.undoStack.isEmpty, canRedo: available && !model.redoStack.isEmpty,
+            canUndo: model.isConnected && !model.isMutating && !model.undoStack.isEmpty,
+            canRedo: model.isConnected && !model.isMutating && !model.redoStack.isEmpty,
             undo: { model.undo() }, redo: { model.undo(redo: true) },
-            canRefresh: connected, canGoBack: model.history.count > 1, canUpload: available,
+            canRefresh: connected || (navigation.section == 6 && model.usesDiskTrash), canGoBack: connected && model.history.count > 1, canUpload: available,
             canDownload: connected && !selected.isEmpty, canCreateFolder: available,
             canTrash: available && !selected.isEmpty && selected.allSatisfy(\.canDelete),
             canCheckDuplicates: connected, canReviewDuplicates: model.similarity.local.report != nil,
@@ -346,14 +434,16 @@ struct NativeDriveWorkspace: View {
             reviewDuplicates: { model.similarity.present(source: .local) },
             removeEmptyFolders: { model.reviewCleanup(empty: true) }, removeDSStoreFiles: { model.reviewCleanup(empty: false) },
             mergeFolders: { model.reviewMerge(selected) }, showStatus: { showsStatus = true },
-            selectSection: selectSection, setViewMode: { browserViewMode = $0 },
-            adjustZoom: { setZoom(zoom + $0) }, resetZoom: { setZoom(1) },
-            refresh: { model.reload() }, goBack: { model.back() }, upload: { model.chooseImport() },
+            selectSection: selectSection, setViewMode: { if isBookmarkRoot { bookmarkViewMode = $0 } else { browserViewMode = $0 } },
+            adjustZoom: { if isBookmarkRoot { bookmarkZoom = min(1.8, max(0.75, bookmarkZoom + $0)) } else { setZoom(zoom + $0) } },
+            resetZoom: { if isBookmarkRoot { bookmarkZoom = 1 } else { setZoom(1) } },
+            refresh: { if navigation.section == 6 && model.usesDiskTrash { model.refreshDiskTrash(prepare: true) } else { model.reload() } }, goBack: { model.back() }, upload: { model.chooseImport() },
             download: { model.chooseExport(selected) }, newFolder: newContainer, trash: { requestDelete(selected) },
             containerTitle: "New \(model.kind.containerName)…", importTitle: "Import Files or Folders…", exportTitle: "Export Selected Items…",
             trashTitle: model.kind == .photos ? "Delete Selected Items from Photos…" : "Move Selected Items to Trash",
             emptyTitle: "Remove Empty \(model.kind == .photos ? "Albums" : "Folders")…",
-            mergeTitle: "Merge Selected \(model.kind == .photos ? "Albums" : "Folders")…", supportsLinks: true,
+            mergeTitle: "Merge Selected \(model.kind == .photos ? "Albums" : "Folders")…",
+            supportsDiskTrash: model.usesDiskTrash,
             canToggleFolder: connected && model.canToggleFocusedFolder,
             toggleFolderTitle: model.focusedFolderToggleTitle,
             toggleFolder: { model.toggleFocusedFolder() })
@@ -414,12 +504,13 @@ private struct NativeAlbumPicker: View {
 
 private struct NativeDriveInspector: View {
     @ObservedObject var model: NativeDriveModel
+    @ObservedObject var mediaPreview: NativeMediaPreviewModel
     @Binding var expanded: Bool
     let resetRevision: Int
     var body: some View {
-        if let item = model.selectedItems.first {
+        if let item = model.inspectorItem {
             FinderPreviewPane(resetRevision: resetRevision,
-                mediaPlayback: item.mediaType == "video" || item.mediaType == "audio" ? model.mediaPreview.playback : nil,
+                mediaPlayback: previewPlayback(for: item),
                 onPreviewMove: { model.moveSelection($0) }) {
                 HStack(spacing: 11) {
                     Image(systemName: item.symbol).font(.system(size: 18, weight: .semibold))
@@ -445,9 +536,10 @@ private struct NativeDriveInspector: View {
                         Button("Show Preview") { model.showBookmarkPreview() }
                     }.frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if !item.isFolder, item.mediaType == "video" || item.mediaType == "audio", let provider = model.provider {
-                    NativeMediaPreview(item: item, provider: provider, model: model.mediaPreview)
+                    NativeMediaPreview(item: item, provider: provider, model: model.mediaPreview, thumbnailCache: model.thumbnailCache)
                 } else {
-                    NativeMediaThumbnail(item: item, kind: model.kind).frame(maxWidth: .infinity, maxHeight: .infinity)
+                    NativeMediaThumbnail(item: item, kind: model.kind, rootID: model.provider?.root.id, cache: model.thumbnailCache)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             } details: {
                 VStack(alignment: .leading, spacing: 12) {
@@ -467,6 +559,11 @@ private struct NativeDriveInspector: View {
                 }
             }
         } else { FinderPreviewEmptyState() }
+    }
+    private func previewPlayback(for item: CloudDriveItem) -> MediaPlaybackController? {
+        guard item.mediaType == "video" || item.mediaType == "audio", let provider = model.provider,
+              mediaPreview.matches(item, provider: provider) else { return nil }
+        return mediaPreview.playback
     }
 }
 
@@ -563,6 +660,7 @@ private struct NativeDriveFooter: View {
     @ObservedObject var store: CloudDriveActivityStore
     @ObservedObject var scan: SimilarityScanModel
     let section: Int
+    var bookmarkCount: Int? = nil
     @Binding var showsStatus: Bool
     private var message: String {
         model.error ?? (scan.isRunning || scan.isPaused ? scan.message : store.latest?.progress.message ??
@@ -576,11 +674,12 @@ private struct NativeDriveFooter: View {
                     Menu {
                         ForEach(model.history) { location in Button(location.title) { model.navigate(to: location) } }
                     } label: {
-                        Label(section == 3 ? "Links" : model.location.title, systemImage: section == 3 ? "link" : "folder")
+                        Label(section == 6 ? "Trash" : section == 7 && bookmarkCount != nil ? "Bookmarks" : model.location.title,
+                              systemImage: section == 6 ? "trash" : section == 7 && bookmarkCount != nil ? "bookmark" : "folder")
                             .lineLimit(1).truncationMode(.middle)
                     }.menuStyle(.borderlessButton).frame(maxWidth: .infinity, alignment: .leading)
-                        .disabled(!model.isConnected || section == 3)
-                    Text(section == 3 ? "0 links" : model.selection.isEmpty ? "\(model.visibleRows.count.formatted()) shown" : "\(model.selection.count.formatted()) selected")
+                        .disabled(!model.isConnected || section == 6 || (section == 7 && bookmarkCount != nil))
+                    Text(section == 6 ? "\(model.diskTrashItems.count.formatted()) items" : section == 7 && bookmarkCount != nil ? "\(bookmarkCount!) bookmarks" : model.selection.isEmpty ? "\(model.visibleRows.count.formatted()) shown" : "\(model.selection.count.formatted()) selected")
                         .font(.caption).foregroundStyle(.secondary).lineLimit(1).layoutPriority(1)
                     Divider().frame(height: 14)
                 }
@@ -623,7 +722,7 @@ private struct NativeDriveKeys: NSViewRepresentable {
                 guard let self, let model = self.model, let window = self.window,
                       NSApp.keyWindow === window, event.window === window, window.attachedSheet == nil,
                       !(window.firstResponder is NSTextView), !(window.firstResponder is NSTextField),
-                      !(window.firstResponder is MediaSliderControl) else { return event }
+                      !(window.firstResponder is MediaSliderControl && PreviewKeyRouting.sliderOwns(keyCode: event.keyCode)) else { return event }
                 let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
                 if modifiers.isEmpty || modifiers == .shift {
                     if event.keyCode == 125 || event.keyCode == 126 {

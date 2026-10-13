@@ -75,7 +75,8 @@ struct Job {
     std::string resumeSource = "check", saveError, savedManifest, lastPeerError;
     std::map<std::string, int> peerFailures;
     bool metadataOnly = false, metadataDone = false, paused = true, started = false, saving = false;
-    bool relay = false, finished = false;
+    bool relay = false, finished = false, queued = false;
+    uint64_t queueOrder = 0;
     unsigned flushed = 0, pauses = 0, saves = 0, priorities = 0;
     /// Pieces currently carrying a completion deadline. Tracked so each one can
     /// be handed back its ordinary priority when the focused set moves on:
@@ -132,6 +133,7 @@ class Engine {
     fs::path state;
     std::unique_ptr<lt::session> session;
     std::map<std::string, std::unique_ptr<Job>> jobs;
+    uint64_t nextQueueOrder = 0;
     Clock::time_point sessionSaved = Clock::now();
     struct DHTSnapshot { int nodes = 0, replacements = 0, requests = 0, timeouts = 0, responses = 0; };
     std::map<std::string, DHTSnapshot> dhtSnapshots;
@@ -294,6 +296,7 @@ public:
         }
     }
     void pause(Job& j) {
+        j.queued = false;
         if (j.handle.is_valid()) {
             if (!(j.handle.status().flags & lt::torrent_flags::paused)) {
                 auto before = j.pauses; j.handle.pause(); wait([&] { return j.pauses != before; });
@@ -355,6 +358,7 @@ public:
             auto index = lt::file_index_t(i);
             auto offset = f.file_offset(index), size = f.file_size(index);
             for (int64_t piece = offset / j.ti->piece_length(); piece <= (offset + size - 1) / j.ti->piece_length(); ++piece) {
+                if (next.size() >= size_t(pieceTarget)) break;
                 auto n = lt::piece_index_t(int(piece));
                 if (int(piece) < have.size() && have[n]) continue;
                 if (next.insert(int(piece)).second) ordered.push_back(int(piece));
@@ -368,7 +372,10 @@ public:
         // before the new deadlines go on. Released files must never come back.
         j.handle.prioritize_pieces(piecePriorities(j));
         int rank = 0;
-        for (int piece : ordered) j.handle.set_piece_deadline(lt::piece_index_t(piece), ++rank * 1000);
+        for (int piece : ordered) {
+            int const milliseconds = int(std::min<int64_t>(int64_t(++rank) * 1000, INT_MAX));
+            j.handle.set_piece_deadline(lt::piece_index_t(piece), milliseconds);
+        }
         j.deadlined = std::move(next);
     }
     void unfocus(Job& j) {
@@ -377,13 +384,43 @@ public:
         j.deadlined.clear();
         if (j.ti) j.handle.prioritize_pieces(piecePriorities(j));
     }
+    /// Payload admission is explicit: manually managed torrents do not honor
+    /// libtorrent's active_downloads setting. Metadata and finished seed work
+    /// do not consume a payload download slot.
+    size_t activeDownloads() const {
+        size_t active = 0;
+        for (auto const& [id, j] : jobs)
+            if (j->handle.is_valid() && !j->paused && !j->queued && !j->finished && !j->metadataOnly
+                && !j->handle.status({}).is_finished) ++active;
+        return active;
+    }
+    void admit(Job* requested = nullptr) {
+        while (activeDownloads() < 3) {
+            Job* next = nullptr;
+            for (auto& [id, j] : jobs)
+                if (j->queued && (!next || j->queueOrder < next->queueOrder)) next = j.get();
+            if (!next) break;
+            try { startNow(*next); }
+            catch (std::exception const& error) {
+                next->queued = false; next->paused = true; next->saveError = error.what();
+                if (next == requested) throw;
+            }
+        }
+    }
     void start(Job& j) {
+        if (j.handle.is_valid() && !j.paused && !j.queued && !j.finished && !j.handle.status({}).errc) return;
+        if (!j.queued) { j.queued = true; j.queueOrder = ++nextQueueOrder; }
+        j.finished = false;
+        if (j.metadataOnly) startNow(j);
+        else admit(&j);
+    }
+    void startNow(Job& j) {
         if (j.handle.is_valid()) {
             if (j.paused && j.ti && !j.savedManifest.empty() && manifest(*j.ti, j.root) != j.savedManifest) {
                 j.complete.clear(); j.released.clear(); j.resumeSource = "check";
                 j.handle.force_recheck(); prioritize(j);
             }
-            j.handle.clear_error(); j.handle.resume(); j.paused = false; j.finished = false; return;
+            j.handle.clear_error(); j.handle.resume(); j.paused = false; j.finished = false; j.queued = false; j.saveError.clear(); return;
         }
         lt::add_torrent_params p;
         if (j.metadataOnly) p = j.magnet;
@@ -413,7 +450,7 @@ public:
         p.upload_limit = integer(j.options["max-upload-limit"], 0);
         lt::error_code error; j.handle = session->add_torrent(std::move(p), error);
         if (error) throw std::runtime_error("Could not start torrent: " + error.message());
-        j.paused = false; j.started = true; j.finished = false;
+        j.paused = false; j.started = true; j.finished = false; j.queued = false; j.saveError.clear();
     }
     NSMutableArray* files(Job& j, std::vector<int64_t> const& p) {
         auto result = [NSMutableArray array]; if (!j.ti) return result;
@@ -438,7 +475,7 @@ public:
         }
         bool done = j.ti && !j.metadataOnly && !checking && verified == total && !j.selected.empty();
         if (done && !j.relay && !j.finished && j.started) { pause(j); j.finished = true; }
-        NSString* stateName = s.errc || !j.saveError.empty() ? @"error" : (j.finished || j.metadataDone ? @"complete" : (j.paused ? @"paused" : @"active"));
+        NSString* stateName = s.errc || !j.saveError.empty() ? @"error" : (j.finished || j.metadataDone ? @"complete" : (j.queued ? @"waiting" : (j.paused ? @"paused" : @"active")));
         NSMutableDictionary* d = [@{@"gid":ns(j.gid), @"status":stateName, @"infoHash":j.ti ? ns(infoHash(*j.ti)) : @"",
             @"bittorrent":@{@"info":@{@"name":j.ti ? ns(j.ti->name()) : @"Torrent"}},
             @"totalLength":countString(checking && j.ti ? j.ti->total_size() : total),
@@ -615,7 +652,7 @@ public:
             session->apply_settings(s); for (auto const& [k,v] : o) config[k] = v; return @"OK";
         }
         if (method == "tellActive") {
-            auto a = [NSMutableArray array]; for (auto& [id, j] : jobs) if (!j->paused && !j->finished) [a addObject:status(*j, args.count ? args[0] : nil)]; return a;
+            auto a = [NSMutableArray array]; for (auto& [id, j] : jobs) if (!j->paused && !j->queued && !j->finished) [a addObject:status(*j, args.count ? args[0] : nil)]; return a;
         }
         if (method == "addTorrent" || method == "addUri") {
             auto j = std::make_unique<Job>(); j->gid = str([[NSUUID.UUID.UUIDString stringByReplacingOccurrencesOfString:@"-" withString:@""] substringToIndex:16]);
@@ -648,7 +685,7 @@ public:
         if (method == "getOption") return dictionary(j.options);
         if (method == "changeOption") { change(j, options(arg(1))); return @"OK"; }
         if (method == "unpause") { start(j); return ns(j.gid); }
-        if (method == "pause" || method == "forcePause") { pause(j); return ns(j.gid); }
+        if (method == "pause" || method == "forcePause") { pause(j); admit(); return ns(j.gid); }
         if (method == "releaseFiles") return release(j, arg(1), str(arg(2)));
         if (method == "addPeers") {
             if (!j.handle.is_valid() || (j.ti && j.ti->priv())) throw std::runtime_error("Peer hints are unavailable for this torrent.");
@@ -671,12 +708,13 @@ public:
         if (method == "forceRemove" || method == "remove" || method == "removeDownloadResult") {
             pause(j); auto id = j.gid;
             if (j.handle.is_valid()) session->remove_torrent(j.handle);
-            jobs.erase(id); return method == "removeDownloadResult" ? @"OK" : ns(id);
+            jobs.erase(id); admit(); return method == "removeDownloadResult" ? @"OK" : ns(id);
         }
         throw std::runtime_error("Unsupported torrent RPC method.");
     }
     void tick() {
         alerts();
+        admit();
         if (dhtRequested == Clock::time_point::min() || Clock::now() - dhtRequested > std::chrono::seconds(30)) {
             session->post_dht_stats(); dhtRequested = Clock::now();
         }

@@ -164,7 +164,7 @@ final class QuickLookPreviewCoordinator: NSResponder, @preconcurrency QLPreviewP
         guard let action = FinderQuickLookKeyboard.action(keyCode: event.keyCode,
             modifiers: event.modifierFlags, isRepeat: event.isARepeat,
             isFileWindow: false, isOwnedPreviewPanel: owns(window),
-            hasSheet: window.attachedSheet != nil,
+            hasSheet: window.attachedSheet != nil || ownerWindow?.attachedSheet != nil,
             isTextInput: (window.firstResponder as? NSTextView)?.isEditable == true) else { return false }
         switch action {
         case .previous: onMove?(-1)

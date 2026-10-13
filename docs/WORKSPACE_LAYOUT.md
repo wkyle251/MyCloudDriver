@@ -45,11 +45,12 @@ General → Preview placement chooses Right (default) or Bottom across drives.
 The resizable preview has the same minimum width, header arrangement and empty
 state. Small windows scroll the file/preview pair along its layout direction
 instead of clipping either pane. Bottom placement gives the preview 55% of the
-default split and puts metadata/actions in an information popover beside the
-header. Its media area reserves no fixed metadata strip; the height grip remains
-available below the image/player. Right placement retains scrollable metadata. Name, Size, Kind and Date Modified columns occupy the file region. The
-preview canvas always fills the pane's width, stays inside the available height
-and reserves space for scrollable details. A bottom grip adjusts height only;
+default split. In both placements, and for every drive (PikPak, This Mac, external
+disks, network shares, iCloud Drive and Photos), metadata and actions are in an
+information popover beside the header, so the media area reserves no metadata
+strip; the height grip remains available below the image/player. Name, Size, Kind and Date Modified columns occupy the file region. The
+preview canvas always fills the pane's width and stays inside the available height.
+A bottom grip adjusts height only;
 double-click it to fit the available height. Dragging uses global coordinates so
 the handle follows the pointer. Shrinking a window temporarily clamps the height
 without losing the preferred height. All providers share these controls, and
@@ -94,11 +95,10 @@ transfers release their worker slot. Unknown progress uses an activity indicator
 
 ## Links and settings
 
-Links remains reachable for all providers. iCloud Drive, Photos and Local Disk show the same
-input-card/list framing with a disabled input and an explanation that shared-link
-browsing is available in PikPak. Open PikPak Links changes drive while retaining
-the Links tab. It never lists another provider's files or pretends that a shared
-link was imported.
+Links exists only in PikPak, where it browses shared links and saves their files. iCloud Drive,
+Photos and Local Disk (this Mac, external disks and network shares) have no Links tab in the
+sidebar and no Links item in the Go menu, so there is nothing to open and no placeholder page.
+`FinderWorkspaceSection.standard` is the list every non-PikPak drive shows; PikPak lists `allCases`.
 
 Settings is the same window and tab set across drives. The Account shortcut goes
 to PikPak accounts or native drive connections as appropriate.

@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 enum PikPakCredentialKind: String, Codable, CaseIterable, Identifiable {
     case desktopOAuth = "desktop-oauth"
@@ -90,6 +91,11 @@ struct PikPakAccountsDocument: Codable, Equatable {
 struct PikPakWorkspaceAccountSelection: Codable, Equatable { var activeID: UUID? }
 
 enum PikPakWorkspaceStorage {
+    /// Never reuse a closed window's queue namespace for another window.
+    static func newSessionID() -> String {
+        "window-\(UUID().uuidString.lowercased())"
+    }
+
     static func sessionID(for slot: Int) -> String {
         precondition(slot > 0)
         switch slot {
@@ -101,6 +107,9 @@ enum PikPakWorkspaceStorage {
 
     static func isValidSessionID(_ id: String) -> Bool {
         if id == "primary" || id == "secondary" { return true }
+        if id.hasPrefix("window-"), let uuid = UUID(uuidString: String(id.dropFirst("window-".count))) {
+            return id == "window-\(uuid.uuidString.lowercased())"
+        }
         guard id.hasPrefix("workspace-"), let slot = Int(id.dropFirst("workspace-".count)), slot >= 3 else { return false }
         return id == sessionID(for: slot)
     }
@@ -182,6 +191,7 @@ final class PikPakAccountStore {
     // Store mutations are synchronous and performed on the app's main actor.
     // Protect unfinished logins from cleanup when a second workspace opens.
     private static var stagedSessionPaths = Set<String>()
+    private var workerSessionLeases: [UUID: Int32] = [:]
     static let didChange = Notification.Name("MyCloudDriver.PikPakAccountsDidChange")
     let directory: URL
     private var indexURL: URL { directory.appendingPathComponent("accounts.json") }
@@ -198,6 +208,55 @@ final class PikPakAccountStore {
                 try? discard(files(for: id))
             }
         }
+    }
+
+    deinit {
+        for descriptor in workerSessionLeases.values { Darwin.close(descriptor) }
+        workerSessionLeases.removeAll()
+        try? cleanupRetiredSessions()
+    }
+
+    /// Keep captured helper credentials alive across a replacement login. Each
+    /// store owns its own shared descriptor, so another app/workspace cannot
+    /// remove the directory until all owners have released it.
+    func retainWorkerSession(_ files: PikPakAccountSessionFiles) throws {
+        guard files.directory == self.files(for: files.id).directory else { throw PikPakAccountError.invalidStorage }
+        guard workerSessionLeases[files.id] == nil else { return }
+        let descriptor = try sessionLeaseDescriptor(files.id)
+        guard flock(descriptor, LOCK_SH | LOCK_NB) == 0 else {
+            Darwin.close(descriptor); throw PikPakAccountError.missingSession
+        }
+        do { _ = try files.load() }
+        catch { Darwin.close(descriptor); throw error }
+        workerSessionLeases[files.id] = descriptor
+    }
+
+    /// Call only after every helper owned by this store has stopped. Keeping a
+    /// lease until store teardown is also safe for workers with captured paths.
+    func releaseWorkerSessions() {
+        for descriptor in workerSessionLeases.values { Darwin.close(descriptor) }
+        workerSessionLeases.removeAll()
+        try? cleanupRetiredSessions()
+    }
+
+    func cleanupRetiredSessions() throws {
+        let retained = Set(try load().accounts.filter { !$0.needsSignIn }.map(\.id))
+        for child in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
+            if let id = UUID(uuidString: child.lastPathComponent), !retained.contains(id),
+               !Self.stagedSessionPaths.contains(child.standardizedFileURL.path) {
+                try? discard(files(for: id))
+            }
+        }
+    }
+
+    private func sessionLeaseDescriptor(_ id: UUID) throws -> Int32 {
+        // Outside the retired directory: removing/recreating a session must
+        // never create a second lock inode for the same account identifier.
+        let root = directory.appendingPathComponent("Session Leases", isDirectory: true)
+        try Self.prepareDirectory(root)
+        let descriptor = Darwin.open(root.appendingPathComponent(id.uuidString).path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw PikPakAccountError.invalidStorage }
+        return descriptor
     }
 
     func load() throws -> PikPakAccountsDocument {
@@ -224,6 +283,19 @@ final class PikPakAccountStore {
             document.select(document.activeID, for: workspaceSessionID)
             try save(document)
         }
+        return document
+    }
+
+    /// Copy a window's account choice without verifying or changing its session.
+    @discardableResult
+    func selectWorkspaceAccount(_ accountID: UUID?, workspaceSessionID: String) throws -> PikPakAccountsDocument {
+        guard PikPakWorkspaceStorage.isValidSessionID(workspaceSessionID) else { throw PikPakAccountError.invalidStorage }
+        var document = try load()
+        if let accountID, !document.accounts.contains(where: { $0.id == accountID }) {
+            throw PikPakAccountError.missingSession
+        }
+        document.select(accountID, for: workspaceSessionID)
+        try save(document)
         return document
     }
 
@@ -323,6 +395,10 @@ final class PikPakAccountStore {
         guard files.directory == self.files(for: files.id).directory else { throw PikPakAccountError.invalidStorage }
         Self.stagedSessionPaths.remove(files.directory.standardizedFileURL.path)
         guard FileManager.default.fileExists(atPath: files.directory.path) else { return }
+        let descriptor = try sessionLeaseDescriptor(files.id)
+        defer { Darwin.close(descriptor) }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else { return }
+        defer { flock(descriptor, LOCK_UN) }
         try Self.validateDirectory(files.directory)
         try FileManager.default.removeItem(at: files.directory)
     }
@@ -378,7 +454,7 @@ final class PikPakAccountStore {
 }
 
 enum PikPakLoginStatus: Equatable {
-    case signedOut, unverified, checking, signedIn, needsSignIn, unavailable
+    case signedOut, unverified, checking, signedIn, verificationRequired, needsSignIn, unavailable
 
     var title: String {
         switch self {
@@ -386,6 +462,7 @@ enum PikPakLoginStatus: Equatable {
         case .unverified: return "Ready to check"
         case .checking: return "Checking login status…"
         case .signedIn: return "Signed in"
+        case .verificationRequired: return "Verification required"
         case .needsSignIn: return "Sign-in required"
         case .unavailable: return "Could not check status"
         }

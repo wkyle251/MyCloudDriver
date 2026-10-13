@@ -144,7 +144,7 @@ struct SimilarityDownloadsView: View {
                         if progress.downloadForecastSeconds > 0 {
                             Text("\(SimilarityScanProgress.memoryGB(progress.downloadForecastBytes)) projected over the next \(Int(progress.downloadForecastSeconds)) seconds · \(SimilarityScanProgress.memoryGB(progress.originalMemoryLimit)) limit")
                         } else {
-                            Text("Files release their download buffers after analysis.")
+                            Text("Complete originals move to Analysis RAM before hashing.")
                         }
                         Spacer(minLength: 0)
                         if progress.omittedDownloads > 0 { Text("+\(progress.omittedDownloads) waiting") }

@@ -1,7 +1,9 @@
 import Foundation
+import Darwin
 
 enum SimilarityNetworkFailure {
     static func isTemporary(_ error: Error, depth: Int = 0) -> Bool {
+        guard !TransferFailure.hasUncertainMutation(error) else { return false }
         let value=error as NSError
         if value.domain == NSURLErrorDomain && [NSURLErrorTimedOut,NSURLErrorCannotFindHost,NSURLErrorCannotConnectToHost,
             NSURLErrorNetworkConnectionLost,NSURLErrorDNSLookupFailed,NSURLErrorNotConnectedToInternet,
@@ -84,6 +86,7 @@ extension SimilarityScanProgress {
     func afterHelperRestart() -> Self {
         var next = self
         next.activeFiles = 0; next.fetchingFiles = 0; next.readingFiles = 0; next.encodingFiles = 0
+        next.hashingFiles = 0; next.waitingReadFiles = 0; next.originalBytesRead = 0
         next.acceleratorActive = 0; next.waitingAcceleratorFiles = 0; next.waitingProcessingFiles = 0
         next.waitingMemoryFiles = 0; next.waitingReuseFiles = 0; next.waitingDownloadFiles = 0
         next.retryingDownloadFiles = 0; next.readyFiles = 0; next.resolvingFiles = 0
@@ -137,6 +140,17 @@ enum SimilaritySessionStore {
         try Data().write(to:file,options:.atomic)
         try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:file.path)
     }
+    static func finish(_ value: SimilaritySavedSession, configuration: SimilarityConfiguration) throws {
+        try save(value, configuration: configuration)
+        let file = directory(configuration, id: value.id).appendingPathComponent("finish")
+        try Data().write(to: file, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        try removePause(configuration, id: value.id)
+    }
+    static func removeFinish(_ configuration: SimilarityConfiguration, id: String) throws {
+        let file = directory(configuration, id: id).appendingPathComponent("finish")
+        if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+    }
     static func updateLiveResources(_ resources: SimilarityResourceLimits, configuration: SimilarityConfiguration, id: String) throws {
         let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
         let file = directory(configuration, id: id).appendingPathComponent("live-resources.json")
@@ -150,23 +164,28 @@ enum SimilaritySessionStore {
     static func discard(_ configuration: SimilarityConfiguration, id: String, report: SimilarityReport? = nil) {
         guard UUID(uuidString:id) != nil else { return }
         let root=directory(configuration,id:id)
-        if let report=report ?? loadReport(configuration,id:id), let run=report.runId,
-           run.hasPrefix("mcd2-"), run.count == 37, run.dropFirst(5).allSatisfy({ $0.isHexDigit }) {
-            try? FileManager.default.removeItem(at:configuration.dataDirectory.appendingPathComponent("runs").appendingPathComponent(run+".sqlite3"))
+        for report in [report, loadReport(configuration, id: id)].compactMap({ $0 }) {
+            removeMatrix(report.runId, configuration: configuration)
         }
         release(configuration,id:id)
         // Called only after the owning helper has stopped.
         try? FileManager.default.removeItem(at:root)
     }
     static func saveReport(_ report: SimilarityReport, configuration: SimilarityConfiguration, id: String) throws {
+        let previous = loadReport(configuration, id: id)
         let path=directory(configuration,id:id).appendingPathComponent("report.json")
         try JSONEncoder().encode(report).write(to:path,options:.atomic)
         try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:path.path)
+        if previous?.runId != report.runId { removeMatrix(previous?.runId, configuration: configuration) }
+    }
+    private static func removeMatrix(_ run: String?, configuration: SimilarityConfiguration) {
+        guard let run, run.hasPrefix("mcd2-"), run.count == 37,
+              run.dropFirst(5).allSatisfy({ $0.isHexDigit }) else { return }
+        try? FileManager.default.removeItem(at: configuration.dataDirectory.appendingPathComponent("runs").appendingPathComponent(run + ".sqlite3"))
     }
     static func loadReport(_ configuration: SimilarityConfiguration, id: String) -> SimilarityReport? {
         let path=directory(configuration,id:id).appendingPathComponent("report.json")
-        guard (try? path.resourceValues(forKeys:[.isSymbolicLinkKey]).isSymbolicLink) != true,
-              let data=try? Data(contentsOf:path), data.count <= 256 * 1_024 * 1_024 else { return nil }
+        guard let data = readBoundedFile(path, maximumBytes: 256 * 1_024 * 1_024) else { return nil }
         return try? JSONDecoder().decode(SimilarityReport.self,from:data)
     }
     static func available(_ configuration: SimilarityConfiguration, source: SimilaritySource) -> [SimilaritySavedSession] {
@@ -175,11 +194,30 @@ enum SimilaritySessionStore {
         return children.compactMap { directory in
             guard !claimed.contains(directory.standardizedFileURL.resolvingSymlinksInPath()), UUID(uuidString:directory.lastPathComponent) != nil,
                   (try? directory.resourceValues(forKeys:[.isSymbolicLinkKey]).isSymbolicLink) != true,
-                  let bytes=try? Data(contentsOf:directory.appendingPathComponent("session.json")), bytes.count <= 4 * 1_024 * 1_024,
+                  let bytes = readBoundedFile(directory.appendingPathComponent("session.json"), maximumBytes: 4 * 1_024 * 1_024),
                   let value=try? JSONDecoder().decode(SimilaritySavedSession.self,from:bytes),
                   value.id == directory.lastPathComponent, value.source == source,
-                  ["running","paused","interrupted","cancelled","completed","partial","failed"].contains(value.state) else { return nil }
+                  ["running","paused","interrupted","cancelled","completed","partial","failed","finished"].contains(value.state) else { return nil }
             return value
         }.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    static func readBoundedFile(_ url: URL, maximumBytes: Int) -> Data? {
+        guard maximumBytes >= 0 else { return nil }
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else { return nil }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+              info.st_size >= 0, info.st_size <= maximumBytes else { return nil }
+        var data = Data()
+        do {
+            while let chunk = try handle.read(upToCount: min(1 << 20, maximumBytes - data.count + 1)), !chunk.isEmpty {
+                guard chunk.count <= maximumBytes - data.count else { return nil }
+                data.append(chunk)
+            }
+            return data
+        } catch { return nil }
     }
 }

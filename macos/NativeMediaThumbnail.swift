@@ -3,35 +3,71 @@ import SwiftUI
 @preconcurrency import QuickLookThumbnailing
 @preconcurrency import Photos
 
-/// Thumbnails are requested only for visible grid cells and the inspector.
-/// The list uses inexpensive symbols and never decodes media while scrolling.
-struct NativeMediaThumbnail: View {
+/// A snapshot belongs to an exact file revision and provider root, including
+/// when a reused view receives a late thumbnail from the previous selection.
+struct NativeMediaThumbnailSnapshot {
+    let identity: NativeMediaSourceIdentity
+    let image: NSImage
+    func image(for identity: NativeMediaSourceIdentity) -> NSImage? {
+        self.identity == identity ? image : nil
+    }
+}
+
+@MainActor final class NativeMediaThumbnailModel: ObservableObject {
+    @Published private(set) var snapshot: NativeMediaThumbnailSnapshot?
+    private var generation = UUID()
+
+    func load(identity: NativeMediaSourceIdentity, operation: () async -> NSImage?) async {
+        let request = UUID(); generation = request
+        snapshot = nil
+        let image = await operation()
+        guard generation == request, !Task.isCancelled, let image else { return }
+        snapshot = NativeMediaThumbnailSnapshot(identity: identity, image: image)
+    }
+    func clear() {
+        generation = UUID(); snapshot = nil
+    }
+}
+
+@MainActor struct NativeMediaThumbnail: View {
     let item: CloudDriveItem
     let kind: CloudDriveKind
-    @State private var image: NSImage?
+    var rootID: String? = nil
+    var cache: NativeThumbnailCache = .shared
+    var compact = false
+    @StateObject private var model = NativeMediaThumbnailModel()
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.025))
-            if let image { Image(nsImage: image).resizable().scaledToFit().padding(4) }
-            else { Image(systemName: item.symbol).font(.system(size: 42)).foregroundStyle(FinderAppearance.accent.opacity(0.8)) }
+        let identity = NativeMediaSourceIdentity(item: item, kind: kind, rootID: rootID)
+        return ZStack {
+            if !compact { RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.025)) }
+            if let image = model.snapshot?.image(for: identity) ?? cache.cachedImage(for: identity) {
+                Image(nsImage: image).resizable().scaledToFit().padding(compact ? 0 : 4)
+            } else { Image(systemName: item.symbol).font(.system(size: compact ? 14 : 42)).foregroundStyle(FinderAppearance.accent.opacity(0.8)) }
         }
-        .task(id: item.id) {
-            image = nil
-            guard !item.isFolder else { return }
-            if let url = item.url, item.isDownloaded {
-                let request = QLThumbnailGenerator.Request(fileAt: url, size: .init(width: 360, height: 360), scale: 1, representationTypes: .thumbnail)
-                let result = await withTaskCancellationHandler(operation: {
-                    try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request)
-                }, onCancel: { QLThumbnailGenerator.shared.cancel(request) })
-                if !Task.isCancelled { image = result?.nsImage }
-            } else if kind == .photos, item.id.hasPrefix("asset:"), PhotosDriveProvider.authorized {
-                let request = PhotosThumbnailTransfer()
-                let result = await withTaskCancellationHandler(operation: {
-                    await withCheckedContinuation { request.start(id: String(item.id.dropFirst(6)), continuation: $0) }
-                }, onCancel: { request.cancel() })
-                if !Task.isCancelled { image = result }
-            }
+        .task(id: identity) {
+            await model.load(identity: identity) { await cache.image(for: identity) }
         }
+        .onDisappear { model.clear() }
+        .accessibilityLabel("Thumbnail for \(item.name)")
+    }
+}
+
+@MainActor enum NativeThumbnailGenerator {
+    static func load(_ identity: NativeMediaSourceIdentity) async -> NSImage? {
+        guard NativeThumbnailCache.canLoad(identity), !Task.isCancelled else { return nil }
+        if let url = identity.url, identity.isDownloaded {
+            let request = QLThumbnailGenerator.Request(fileAt: url, size: .init(width: 360, height: 360), scale: 1, representationTypes: .thumbnail)
+            let result = await withTaskCancellationHandler(operation: {
+                try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request)
+            }, onCancel: { QLThumbnailGenerator.shared.cancel(request) })
+            return result?.nsImage
+        } else if identity.kind == .photos, PhotosDriveProvider.authorized {
+            let request = PhotosThumbnailTransfer()
+            return await withTaskCancellationHandler(operation: {
+                await withCheckedContinuation { request.start(id: String(identity.itemID.dropFirst(6)), continuation: $0) }
+            }, onCancel: { request.cancel() })
+        }
+        return nil
     }
 }
 

@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum FinderTaskKind: String, CaseIterable, Identifiable {
-    case duplicates, emptyFolders, dsStore, folderMerge, similarityCloud, similarityLocal
+    case duplicates, emptyFolders, dsStore, folderMerge, similarityCloud, similarityLocal, downloads
     var id: Self { self }
     var title: String {
         switch self {
@@ -11,6 +11,7 @@ enum FinderTaskKind: String, CaseIterable, Identifiable {
         case .folderMerge: return "Merge Folders"
         case .similarityCloud: return "Similar Files · PikPak Cloud"
         case .similarityLocal: return "Similar Files · This Mac"
+        case .downloads: return "Downloads"
         }
     }
     var symbol: String {
@@ -20,6 +21,7 @@ enum FinderTaskKind: String, CaseIterable, Identifiable {
         case .dsStore: return "doc.badge.minus"
         case .folderMerge: return "arrow.triangle.merge"
         case .similarityCloud, .similarityLocal: return "doc.text.magnifyingglass"
+        case .downloads: return "arrow.down.circle"
         }
     }
 }
@@ -151,14 +153,16 @@ struct FinderTaskActivityRows: View {
                             model.fileSimilarity.present(source: task.kind == .similarityCloud ? .cloud : .local)
                         }
                         if scan.canPause { Button("Pause") { scan.pause() } }
-                        if scan.isRunning { Button("Clear") { scan.clearSession() }.disabled(scan.isCancelling) }
-                        if scan.isPaused { Button("Resume") { model.fileSimilarity.resume(scan) }; Button("Cancel") { scan.cancel() } }
+                        if scan.isRunning { Button("Delete Scan") { scan.clearSession() }.disabled(scan.isCancelling) }
+                        if scan.isPaused { Button("Resume") { model.fileSimilarity.resume(scan) } }
+                        if scan.canFinish { Button("Finish Scan") { scan.finishScan() } }
+                        if scan.canResumeReport { Button("Resume Scan") { model.fileSimilarity.resume(scan) } }
                     }
-                    if task.state.isActive {
+                    if task.state.isActive && task.kind != .similarityCloud && task.kind != .similarityLocal {
                         Button("Cancel") { cancel(task.kind) }
                             .disabled(task.state == .stopping)
                             .help("Cancel \(task.kind.title.lowercased())")
-                    } else {
+                    } else if !task.state.isActive {
                         if task.kind == .duplicates, model.duplicateScan != nil {
                             Button("Review Results…") {
                                 activity.showsDetails = false
@@ -171,7 +175,7 @@ struct FinderTaskActivityRows: View {
                         }
                         Spacer()
                         if task.kind == .similarityCloud || task.kind == .similarityLocal {
-                            Button("Clear") { (task.kind == .similarityCloud ? model.fileSimilarity.cloud : model.fileSimilarity.local).clearSession() }
+                            Button(task.state.isActive || task.state == .paused ? "Delete Scan" : "Delete Report") { (task.kind == .similarityCloud ? model.fileSimilarity.cloud : model.fileSimilarity.local).clearSession() }
                         } else { Button("Dismiss") { activity.dismiss(task.kind) }.help("Dismiss this status") }
                     }
                 }
@@ -199,6 +203,7 @@ struct FinderTaskActivityRows: View {
         case .folderMerge: model.cancelFolderMerge()
         case .similarityCloud: model.fileSimilarity.cloud.cancel()
         case .similarityLocal: model.fileSimilarity.local.cancel()
+        case .downloads: break
         }
     }
 }

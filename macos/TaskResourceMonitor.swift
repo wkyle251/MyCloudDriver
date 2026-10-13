@@ -10,6 +10,8 @@ struct TaskProcessSample: Sendable {
     let residentBytes: UInt64
     let threads: Int
     var parentPID: Int32 = 0
+    var diskReadBytes: UInt64? = nil
+    var diskWrittenBytes: UInt64? = nil
 }
 
 struct TaskResourceRow: Identifiable, Sendable {
@@ -19,6 +21,8 @@ struct TaskResourceRow: Identifiable, Sendable {
     let residentBytes: UInt64
     let threads: Int
     var parentPID: Int32 = 0
+    var diskReadBytesPerSecond: Double? = nil
+    var diskWrittenBytesPerSecond: Double? = nil
     var id: Int32 { pid }
 }
 
@@ -35,6 +39,8 @@ struct TaskResourceGroup: Identifiable, Sendable {
     let processIDs: [Int32]
     let cpuPercent: Double?
     let residentBytes: UInt64
+    var diskReadBytesPerSecond: Double? = nil
+    var diskWrittenBytesPerSecond: Double? = nil
 
     var processDescription: String {
         "\(processIDs.count == 1 ? "PID" : "PIDs") \(processIDs.map(String.init).joined(separator: ", "))"
@@ -68,7 +74,11 @@ enum TaskResourceAttribution {
                 processIDs: members.map(\.pid).sorted(),
                 cpuPercent: members.allSatisfy { $0.cpuPercent != nil }
                     ? members.reduce(0) { $0 + ($1.cpuPercent ?? 0) } : nil,
-                residentBytes: members.reduce(0) { $0 + $1.residentBytes })
+                residentBytes: members.reduce(0) { $0 + $1.residentBytes },
+                diskReadBytesPerSecond: members.allSatisfy { $0.diskReadBytesPerSecond != nil }
+                    ? members.reduce(0) { $0 + ($1.diskReadBytesPerSecond ?? 0) } : nil,
+                diskWrittenBytesPerSecond: members.allSatisfy { $0.diskWrittenBytesPerSecond != nil }
+                    ? members.reduce(0) { $0 + ($1.diskWrittenBytesPerSecond ?? 0) } : nil)
         }.sorted {
             if $0.cpuPercent != $1.cpuPercent { return ($0.cpuPercent ?? -1) > ($1.cpuPercent ?? -1) }
             if $0.residentBytes != $1.residentBytes { return $0.residentBytes > $1.residentBytes }
@@ -87,14 +97,20 @@ struct TaskResourceAccumulator {
         let elapsed = previousTime.map { time - $0 }
         let rows = samples.map { sample -> TaskResourceRow in
             var cpu: Double?
+            var diskRead: Double?
+            var diskWritten: Double?
             if let old = previous[sample.pid], old.started == sample.started,
-               let elapsed, elapsed > 0, elapsed <= 10,
-               sample.cpuNanoseconds >= old.cpuNanoseconds {
-                cpu = Double(sample.cpuNanoseconds - old.cpuNanoseconds) / (elapsed * 1_000_000_000) * 100
+               let elapsed, elapsed.isFinite, elapsed > 0, elapsed <= 10 {
+                if sample.cpuNanoseconds >= old.cpuNanoseconds {
+                    cpu = Double(sample.cpuNanoseconds - old.cpuNanoseconds) / (elapsed * 1_000_000_000) * 100
+                }
+                diskRead = TaskDiskRate.bytesPerSecond(sample.diskReadBytes, previous: old.diskReadBytes, elapsed: elapsed)
+                diskWritten = TaskDiskRate.bytesPerSecond(sample.diskWrittenBytes, previous: old.diskWrittenBytes, elapsed: elapsed)
             }
             return TaskResourceRow(pid: sample.pid, name: sample.name, cpuPercent: cpu,
                                    residentBytes: sample.residentBytes, threads: sample.threads,
-                                   parentPID: sample.parentPID)
+                                   parentPID: sample.parentPID, diskReadBytesPerSecond: diskRead,
+                                   diskWrittenBytesPerSecond: diskWritten)
         }
         previous = Dictionary(samples.map { ($0.pid, $0) }, uniquingKeysWith: { _, new in new })
         previousTime = time
@@ -136,12 +152,20 @@ enum TaskResourceSampler {
                proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, bsdSize) == bsdSize {
                 var name = [CChar](repeating: 0, count: 256)
                 _ = proc_name(pid, &name, UInt32(name.count))
+                var usage = rusage_info_v2()
+                let hasDiskUsage = withUnsafeMutablePointer(to: &usage) {
+                    $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+                        proc_pid_rusage(pid, RUSAGE_INFO_V2, $0) == 0
+                    }
+                }
                 samples.append(TaskProcessSample(pid: pid,
                     name: pid == rootPID ? "MyCloudDriver" : String(cString: name),
                     started: bsd.pbi_start_tvsec &* 1_000_000 &+ bsd.pbi_start_tvusec,
                     cpuNanoseconds: nanoseconds(fromMachTicks: info.pti_total_user &+ info.pti_total_system,
                                                 numerator: timebase.numer, denominator: timebase.denom),
-                    residentBytes: info.pti_resident_size, threads: Int(info.pti_threadnum), parentPID: Int32(bsd.pbi_ppid)))
+                    residentBytes: info.pti_resident_size, threads: Int(info.pti_threadnum), parentPID: Int32(bsd.pbi_ppid),
+                    diskReadBytes: hasDiskUsage ? usage.ri_diskio_bytesread : nil,
+                    diskWrittenBytes: hasDiskUsage ? usage.ri_diskio_byteswritten : nil))
             }
             let count = max(Int(proc_listchildpids(pid, nil, 0)), 0)
             var children = [Int32](repeating: 0, count: min(count + 32, 4096))
@@ -156,30 +180,73 @@ enum TaskResourceSampler {
     }
 }
 
+typealias TaskResourceSnapshot = (processes: [TaskProcessSample], gpus: [TaskGPUUsage], disks: [TaskDiskSample])
+
 @MainActor
 final class TaskResourceMonitor: ObservableObject {
     @Published private(set) var rows: [TaskResourceRow] = []
     @Published private(set) var tasks: [TaskResourceGroup] = []
     @Published private(set) var sampledAt: Date?
     @Published private(set) var gpus: [TaskGPUUsage] = []
+    @Published private(set) var disks: [TaskDiskUsage] = []
+    @Published private(set) var diskTemperatures: [UInt64: TaskDiskTemperature] = [:]
+    @Published private(set) var temperaturesSampledAt: Date?
     private var generation = UUID()
+    private let sample: @Sendable () -> TaskResourceSnapshot
+    private let sampleTemperatures: @Sendable () -> [UInt64: TaskDiskTemperature]
+
+    init(sample: @escaping @Sendable () -> TaskResourceSnapshot = {
+        (TaskResourceSampler.sample(), TaskGPUSampler.sample(), TaskDiskSampler.sample())
+    }, sampleTemperatures: @escaping @Sendable () -> [UInt64: TaskDiskTemperature] = {
+        TaskDiskTemperatureSampler.sample()
+    }) {
+        self.sample = sample
+        self.sampleTemperatures = sampleTemperatures
+    }
 
     func watch(activities: @MainActor () -> [Int32: TaskResourceActivity] = { [:] }) async {
         let ticket = UUID()
         generation = ticket
         var accumulator = TaskResourceAccumulator()
+        var diskAccumulator = TaskDiskAccumulator()
         rows = []
         tasks = []
         sampledAt = nil
         gpus = []
-        defer { if generation == ticket { rows = []; tasks = []; gpus = []; sampledAt = nil } }
+        disks = []
+        diskTemperatures = [:]
+        temperaturesSampledAt = nil
+        let sample = sample
+        let sampleTemperatures = sampleTemperatures
+        // SMART queries are independent of the fast counter loop: a slow bridge
+        // must not stall the UI or live CPU/disk rates. Poll only while visible.
+        let temperatures = Task { [weak self] in
+            var cache = TaskDiskTemperatureCache()
+            while !Task.isCancelled {
+                let values = await Task.detached(priority: .utility) { sampleTemperatures() }.value
+                guard !Task.isCancelled, let self, self.generation == ticket else { return }
+                cache.update(values, at: Date())
+                self.diskTemperatures = cache.values
+                self.temperaturesSampledAt = Date()
+                do { try await Task.sleep(nanoseconds: TaskDiskTemperatureCache.retryNanoseconds(for: values)) } catch { return }
+            }
+        }
+        defer {
+            temperatures.cancel()
+            if generation == ticket {
+                rows = []; tasks = []; gpus = []; disks = []; diskTemperatures = [:]; sampledAt = nil
+                temperaturesSampledAt = nil
+            }
+        }
         while !Task.isCancelled {
             let descriptions = activities()
-            let snapshot = await Task.detached(priority: .utility) { (TaskResourceSampler.sample(), TaskGPUSampler.sample()) }.value
+            let snapshot = await Task.detached(priority: .utility) { sample() }.value
             guard !Task.isCancelled, generation == ticket else { return }
-            rows = accumulator.update(snapshot.0, at: ProcessInfo.processInfo.systemUptime)
+            let time = ProcessInfo.processInfo.systemUptime
+            rows = accumulator.update(snapshot.processes, at: time)
             tasks = TaskResourceAttribution.group(rows, activities: descriptions)
-            gpus = snapshot.1
+            gpus = snapshot.gpus
+            disks = diskAccumulator.update(snapshot.disks, at: time)
             sampledAt = Date()
             do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return }
         }
@@ -204,13 +271,14 @@ struct TaskResourceMonitorView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 12) {
             Text("App & task resources").font(.title2.weight(.semibold))
             HStack(spacing: 24) {
                 metric("CPU", value: cpu)
                 metric("Resident memory", value: monitor.rows.isEmpty ? "—" : bytes(monitor.rows.reduce(0) { $0 + $1.residentBytes }))
                 metric("Background tasks", value: monitor.rows.isEmpty ? "—" : monitor.tasks.filter { $0.id != getpid() }.count.formatted())
             }
+            diskUsage
             gpuUsage
             Text(activitySummary)
                 .font(.caption).foregroundStyle(.secondary)
@@ -241,8 +309,14 @@ struct TaskResourceMonitorView: View {
                     Text(row.cpuPercent.map { String(format: "%.1f%%", $0) } ?? "—").monospacedDigit()
                 }.width(70)
                 TableColumn("Memory") { row in Text(bytes(row.residentBytes)).monospacedDigit() }.width(90)
+                TableColumn("Disk read") { row in
+                    Text(TaskDiskRate.text(row.diskReadBytesPerSecond)).monospacedDigit()
+                }.width(100)
+                TableColumn("Disk write") { row in
+                    Text(TaskDiskRate.text(row.diskWrittenBytesPerSecond)).monospacedDigit()
+                }.width(100)
             }
-            Text("Updates every 2 seconds. CPU and memory include task helpers; 100% CPU is one core. Memory may include shared pages. CoreML jobs show the scan’s current model activity. Drive servers’ resource usage is not included.")
+            Text("Updates every 2 seconds. CPU, memory and task disk rates include helpers; 100% CPU is one core. Task disk rates are macOS process accounting and may differ from physical drive traffic because of caching. Memory may include shared pages. Drive servers’ resource usage is not included.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let date = monitor.sampledAt {
                 Text("Updated \(date.formatted(date: .omitted, time: .standard))")
@@ -250,6 +324,55 @@ struct TaskResourceMonitorView: View {
             }
         }
         .padding(16)
+    }
+
+    private var diskUsage: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Disks · This Mac", systemImage: "externaldrive").font(.callout.weight(.medium))
+            if monitor.disks.isEmpty {
+                Text(monitor.sampledAt == nil ? "Measuring disk activity…" : "Disk activity is unavailable on this Mac.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                HStack {
+                    Text("Physical drive").frame(maxWidth: .infinity, alignment: .leading)
+                    Text("Read").frame(width: 100, alignment: .trailing)
+                    Text("Write").frame(width: 100, alignment: .trailing)
+                    Text("Temperature").frame(width: 115, alignment: .trailing)
+                }.font(.caption2).foregroundStyle(.secondary)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(monitor.disks) { disk in diskRow(disk) }
+                    }
+                }
+                .frame(height: min(CGFloat(monitor.disks.count) * 40, 160))
+            }
+            Text("Drive rates include all apps on this Mac. Temperatures refresh every 30 seconds; failed requests retry after 5 seconds. Cached readings are marked; hover for the last reading time and sensor status. No files are scanned.")
+                .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12).background(FinderAppearance.accent.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func diskRow(_ disk: TaskDiskUsage) -> some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(disk.sample.name).font(.caption.weight(.medium)).lineLimit(1)
+                Text(disk.detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }.frame(maxWidth: .infinity, alignment: .leading)
+            Text(diskRate(disk.readBytesPerSecond, counter: disk.sample.readBytes))
+                .frame(width: 100, alignment: .trailing)
+            Text(diskRate(disk.writtenBytesPerSecond, counter: disk.sample.writtenBytes))
+                .frame(width: 100, alignment: .trailing)
+            Text(monitor.diskTemperatures[disk.sample.deviceID]?.text()
+                ?? (monitor.temperaturesSampledAt == nil ? "Sampling…" : "Unavailable"))
+                .frame(width: 115, alignment: .trailing)
+                .foregroundStyle(monitor.diskTemperatures[disk.sample.deviceID]?.isLastKnown() == true ? .secondary : .primary)
+                .help(monitor.diskTemperatures[disk.sample.deviceID]?.help ?? "Waiting for the first temperature reading.")
+        }.font(.caption).monospacedDigit()
+    }
+
+    private func diskRate(_ rate: Double?, counter: UInt64?) -> String {
+        guard let rate else { return counter == nil ? "Unavailable" : "Sampling…" }
+        return TaskDiskRate.text(rate)
     }
 
     private var gpuUsage: some View {

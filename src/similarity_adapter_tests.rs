@@ -3,16 +3,25 @@ use std::os::unix::fs::{symlink, MetadataExt};
 
 #[tokio::test]
 async fn cloud_downloads_continue_while_every_analysis_worker_is_busy() {
-    use std::sync::atomic::AtomicUsize;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicUsize;
     use tokio::io::AsyncReadExt;
-    let dir = tempfile::tempdir().unwrap(); let root = dir.path().canonicalize().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
     let mut r = tests::request(&root);
-    r.source = ScanSource::Cloud; r.local_paths.clear(); r.families = vec!["image".into()];
-    r.resources.workers = 2; r.resources.memory_bytes = 2 << 30;
+    r.source = ScanSource::Cloud;
+    r.local_paths.clear();
+    r.families = vec!["image".into()];
+    r.resources.workers = 2;
+    r.resources.memory_bytes = 2 << 30;
     std::fs::create_dir_all(&r.model_dir).unwrap();
-    std::fs::write(r.model_dir.join(filetwin_core::profile::SSCD_MODEL_FILE), []).unwrap();
-    let library = root.join("fixture-library"); std::fs::write(&library, []).unwrap();
+    std::fs::write(
+        r.model_dir.join(filetwin_core::profile::SSCD_MODEL_FILE),
+        [],
+    )
+    .unwrap();
+    let library = root.join("fixture-library");
+    std::fs::write(&library, []).unwrap();
     r.runtime.onnxruntime_path = Some(library);
     let ready = root.join("four-downloads-finished");
     let worker = root.join("fixture-worker");
@@ -33,51 +42,109 @@ for line in sys.stdin:
     r.runtime.worker_path = Some(worker);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let downloads = Arc::new(AtomicUsize::new(0)); let completed = downloads.clone();
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let completed = downloads.clone();
     let server = tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { return; };
-            let ready = ready.clone(); let completed = completed.clone();
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let ready = ready.clone();
+            let completed = completed.clone();
             tokio::spawn(async move {
-                let mut data = Vec::new(); let mut buffer = [0;4096];
+                let mut data = Vec::new();
+                let mut buffer = [0; 4096];
                 let route = loop {
-                    let n = stream.read(&mut buffer).await.unwrap(); if n == 0 { return; }
+                    let n = stream.read(&mut buffer).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
                     data.extend_from_slice(&buffer[..n]);
                     let text = String::from_utf8_lossy(&data);
                     if let Some(end) = text.find("\r\n\r\n") {
-                        let length = text[..end].lines().find_map(|line| line.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap())).unwrap_or(0);
-                        if data.len() >= end + 4 + length { break text.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_owned(); }
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if data.len() >= end + 4 + length {
+                            break text
+                                .lines()
+                                .next()
+                                .unwrap()
+                                .split_whitespace()
+                                .nth(1)
+                                .unwrap()
+                                .to_owned();
+                        }
                     }
                 };
                 let content = route.starts_with("/content/");
                 let body = if route.starts_with("/v1/auth/token") {
                     json!({"access_token":"fixture-access","refresh_token":"fixture-refresh","expires_in":3600,"sub":"fixture-user"}).to_string().into_bytes()
                 } else if route.starts_with("/v1/shield/captcha/init") {
-                    json!({"captcha_token":"fixture-captcha","expires_in":3600}).to_string().into_bytes()
+                    json!({"captcha_token":"fixture-captcha","expires_in":3600})
+                        .to_string()
+                        .into_bytes()
                 } else if route.starts_with("/drive/v1/files/") {
-                    let id = route.trim_start_matches("/drive/v1/files/").split('?').next().unwrap();
+                    let id = route
+                        .trim_start_matches("/drive/v1/files/")
+                        .split('?')
+                        .next()
+                        .unwrap();
                     json!({"id":id,"size":"9","web_content_link":format!("http://{address}/content/{id}")}).to_string().into_bytes()
                 } else if content {
                     let id: u8 = route.trim_start_matches("/content/").parse().unwrap();
                     [b"\x89PNG\r\n\x1a\n".as_slice(), &[id]].concat()
-                } else { panic!("Unexpected fixture route"); };
-                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
-                stream.write_all(header.as_bytes()).await.unwrap(); stream.write_all(&body).await.unwrap();
-                if content && completed.fetch_add(1, Ordering::AcqRel) + 1 >= 4 { std::fs::write(ready, []).unwrap(); }
+                } else {
+                    panic!("Unexpected fixture route");
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+                if content && completed.fetch_add(1, Ordering::AcqRel) + 1 >= 4 {
+                    std::fs::write(ready, []).unwrap();
+                }
             });
         }
     });
-    r.cloud_items = (0..12).map(|i| CloudItem { revision: None, id:i.to_string(), name:format!("{i}.png"), path:format!("/{i}.png"), is_folder:false, size:9, ancestors:vec![] }).collect();
-    let client = Client::builder().refresh_token("fixture-refresh").device_id("fixture-device")
-        .api_base_url(format!("http://{address}")).auth_base_url(format!("http://{address}")).build().unwrap();
-    scan(r.clone(), Some(&client), Arc::new(AtomicBool::new(false))).await.unwrap();
+    r.cloud_items = (0..12)
+        .map(|i| CloudItem {
+            revision: None,
+            id: i.to_string(),
+            name: format!("{i}.png"),
+            path: format!("/{i}.png"),
+            is_folder: false,
+            size: 9,
+            ancestors: vec![],
+        })
+        .collect();
+    let client = Client::builder()
+        .refresh_token("fixture-refresh")
+        .device_id("fixture-device")
+        .api_base_url(format!("http://{address}"))
+        .auth_base_url(format!("http://{address}"))
+        .build()
+        .unwrap();
+    scan(r.clone(), Some(&client), Arc::new(AtomicBool::new(false)))
+        .await
+        .unwrap();
     server.abort();
     let report = read_report(&r);
     assert_eq!(report.analysed_files, 12, "{:?}", report.issues);
     assert_eq!(report.failed_files, 0);
     assert_eq!(downloads.load(Ordering::Acquire), 12);
     assert_eq!(report.scores_retained, 66);
-    assert!(std::fs::read_dir(&r.temp_dir).unwrap().next().is_none(), "No original or source scratch files remain");
+    assert!(
+        std::fs::read_dir(&r.temp_dir).unwrap().next().is_none(),
+        "No original or source scratch files remain"
+    );
 }
 
 fn read_report(r: &ScanRequest) -> ScanReport {
@@ -86,34 +153,78 @@ fn read_report(r: &ScanRequest) -> ScanReport {
 
 #[tokio::test]
 async fn unsupported_binary_coverage_and_diagnostics_are_retained_beyond_the_display_limit() {
-    let dir = tempfile::tempdir().unwrap(); let r = tests::request(dir.path());
+    let dir = tempfile::tempdir().unwrap();
+    let r = tests::request(dir.path());
     std::fs::create_dir_all(&r.local_paths[0]).unwrap();
-    for i in 0..520 { std::fs::write(r.local_paths[0].join(format!("data-{i}.dat")), [0, 255, 3, 4]).unwrap(); }
-    scan(r.clone(), None, Arc::new(AtomicBool::new(false))).await.unwrap();
+    for i in 0..520 {
+        std::fs::write(
+            r.local_paths[0].join(format!("data-{i}.dat")),
+            [0, 255, 3, 4],
+        )
+        .unwrap();
+    }
+    scan(r.clone(), None, Arc::new(AtomicBool::new(false)))
+        .await
+        .unwrap();
     let report = read_report(&r);
     assert_eq!(report.unsupported_files, 520);
     assert_eq!(report.failed_files, 0);
     assert_eq!(report.issues.len(), 500);
-    assert_eq!(report.issue_summary.iter().map(|s| s.count).sum::<u64>(), 520);
-    assert!(report.issue_summary.iter().all(|s| s.category == "unsupported"));
+    assert_eq!(
+        report.issue_summary.iter().map(|s| s.count).sum::<u64>(),
+        520
+    );
+    assert!(report
+        .issue_summary
+        .iter()
+        .all(|s| s.category == "unsupported"));
     assert_eq!(report.status, "partial");
-    assert_eq!(report.groups.len(), 1, "Exact-copy matching remains available for binary inputs");
+    assert_eq!(
+        report.groups.len(),
+        1,
+        "Exact-copy matching remains available for binary inputs"
+    );
     assert_eq!(report.groups[0].member_count, 520);
-    let path = r.data_dir.join("runs").join(format!("{}.sqlite3", report.run_id.unwrap()));
-    let db = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    let stored: i64 = db.query_row("SELECT COUNT(*) FROM files WHERE diagnostic IS NOT NULL AND digest IS NOT NULL", [], |r| r.get(0)).unwrap();
+    let path = r
+        .data_dir
+        .join("runs")
+        .join(format!("{}.sqlite3", report.run_id.unwrap()));
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let stored: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE diagnostic IS NOT NULL AND digest IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(stored, 520);
-    let diagnostic: String = db.query_row("SELECT diagnostic FROM files LIMIT 1", [], |r| r.get(0)).unwrap();
-    assert_eq!(serde_json::from_str::<Value>(&diagnostic).unwrap()["code"], "unsupported_format");
-    assert!(!diagnostic.contains("data-"), "Diagnostics must not contain hidden engine paths");
+    let diagnostic: String = db
+        .query_row("SELECT diagnostic FROM files LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&diagnostic).unwrap()["code"],
+        "unsupported_format"
+    );
+    assert!(
+        !diagnostic.contains("data-"),
+        "Diagnostics must not contain hidden engine paths"
+    );
 }
 
 #[test]
 fn coverage_reasons_distinguish_binary_text_media_duration_memory_and_worker_errors() {
     use filetwin_core::{Error, ErrorCode::*};
-    let reason = |code, stage, message| encoding::error_reason(Some(&Error::new(code, stage, message)));
+    let reason =
+        |code, stage, message| encoding::error_reason(Some(&Error::new(code, stage, message)));
     assert!(reason(InvalidText, "encoding", "Input is not UTF-8").contains("UTF-8"));
-    assert!(reason(InsufficientContent, "media", "A finite positive media duration is required").contains("duration"));
+    assert!(reason(
+        InsufficientContent,
+        "media",
+        "A finite positive media duration is required"
+    )
+    .contains("duration"));
     assert!(reason(WorkerFailed, "worker", "Private diagnostic").contains("worker"));
     assert!(!reason(WorkerFailed, "worker", "Private diagnostic").contains("Private"));
     assert!(reason(ResourceBudgetTooSmall, "image", "Memory limit").contains("RAM"));
@@ -145,20 +256,39 @@ async fn cloud_analysis_starts_before_pagination_finishes_and_listing_recovers()
     let overlapped = Arc::new(AtomicBool::new(false));
     let active_downloads = Arc::new(AtomicUsize::new(0));
     let peak_downloads = Arc::new(AtomicUsize::new(0));
-    let state = (downloads.clone(), attempts.clone(), overlapped.clone(), active_downloads.clone(), peak_downloads.clone());
+    let state = (
+        downloads.clone(),
+        attempts.clone(),
+        overlapped.clone(),
+        active_downloads.clone(),
+        peak_downloads.clone(),
+    );
     let server = tokio::spawn(async move {
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
             let (downloads, attempts, overlapped, active_downloads, peak_downloads) = state.clone();
             tokio::spawn(async move {
-                let mut data = Vec::new(); let mut buffer = [0u8; 4096];
+                let mut data = Vec::new();
+                let mut buffer = [0u8; 4096];
                 let header = loop {
-                    let n = stream.read(&mut buffer).await.unwrap(); if n == 0 { return; }
+                    let n = stream.read(&mut buffer).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
                     data.extend_from_slice(&buffer[..n]);
                     let text = String::from_utf8_lossy(&data);
                     if let Some(end) = text.find("\r\n\r\n") {
-                        let length = text[..end].lines().find_map(|line| line.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap())).unwrap_or(0);
-                        if data.len() >= end + 4 + length { break text[..end].to_string(); }
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if data.len() >= end + 4 + length {
+                            break text[..end].to_string();
+                        }
                     }
                 };
                 let route = header.lines().next().unwrap();
@@ -170,10 +300,13 @@ async fn cloud_analysis_starts_before_pagination_finishes_and_listing_recovers()
                     json!({"captcha_token":"test-captcha", "expires_in":3600}).to_string()
                 } else if route.starts_with("GET /drive/v1/files?") {
                     if attempts.fetch_add(1, Ordering::AcqRel) == 0 {
-                        status = 503; json!({"error":"temporarily_unavailable"}).to_string()
+                        status = 503;
+                        json!({"error":"temporarily_unavailable"}).to_string()
                     } else if route.contains("page_token=second") {
                         let started = Instant::now();
-                        while downloads.load(Ordering::Acquire) == 0 && started.elapsed() < Duration::from_secs(5) {
+                        while downloads.load(Ordering::Acquire) == 0
+                            && started.elapsed() < Duration::from_secs(5)
+                        {
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                         overlapped.store(downloads.load(Ordering::Acquire) > 0, Ordering::Release);
@@ -190,39 +323,83 @@ async fn cloud_analysis_starts_before_pagination_finishes_and_listing_recovers()
                     tokio::time::sleep(Duration::from_millis(150)).await;
                     active_downloads.fetch_sub(1, Ordering::AcqRel);
                     content
-                } else { panic!("Unexpected fixture route: {route}"); };
+                } else {
+                    panic!("Unexpected fixture route: {route}");
+                };
                 let _ = stream.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await;
             });
         }
     });
-    let client = Client::builder().refresh_token("test-refresh").device_id("test-device")
-        .api_base_url(format!("http://{address}")).auth_base_url(format!("http://{address}")).build().unwrap();
-    let dir = tempfile::tempdir().unwrap(); let mut r = tests::request(dir.path());
+    let client = Client::builder()
+        .refresh_token("test-refresh")
+        .device_id("test-device")
+        .api_base_url(format!("http://{address}"))
+        .auth_base_url(format!("http://{address}"))
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = tests::request(dir.path());
     r.resources.memory_bytes = 2 << 30; // Two decoder slots plus RAM originals.
-    r.source = ScanSource::Cloud; r.local_paths.clear();
-    r.cloud_items = vec![CloudItem { revision: None,id:"".into(), name:"PikPak".into(), path:"/".into(), is_folder:true, size:0, ancestors:vec![]}];
-    scan(r.clone(), Some(&client), Arc::new(AtomicBool::new(false))).await.unwrap();
+    r.source = ScanSource::Cloud;
+    r.local_paths.clear();
+    r.cloud_items = vec![CloudItem {
+        revision: None,
+        id: "".into(),
+        name: "PikPak".into(),
+        path: "/".into(),
+        is_folder: true,
+        size: 0,
+        ancestors: vec![],
+    }];
+    scan(r.clone(), Some(&client), Arc::new(AtomicBool::new(false)))
+        .await
+        .unwrap();
     server.abort();
     let report = read_report(&r);
-    assert!(overlapped.load(Ordering::Acquire), "The first page must feed analysis before the second page returns");
-    assert!(attempts.load(Ordering::Acquire) >= 3, "A transient folder listing must retry");
-    assert_eq!(report.status, "completed"); assert_eq!(report.analysed_files, 2);
+    assert!(
+        overlapped.load(Ordering::Acquire),
+        "The first page must feed analysis before the second page returns"
+    );
+    assert!(
+        attempts.load(Ordering::Acquire) >= 3,
+        "A transient folder listing must retry"
+    );
+    assert_eq!(report.status, "completed");
+    assert_eq!(report.analysed_files, 2);
     assert_eq!(downloads.load(Ordering::Acquire), 2);
-    assert_eq!(peak_downloads.load(Ordering::Acquire), 2, "PikPak originals must fetch concurrently inside the two processing slots");
+    assert_eq!(
+        peak_downloads.load(Ordering::Acquire),
+        2,
+        "PikPak originals must fetch concurrently inside the two processing slots"
+    );
     assert_eq!(report.total_groups, 1);
 }
 
 #[tokio::test]
 async fn failed_provider_discovery_surfaces_a_failed_scan_with_its_reason() {
-    let dir = tempfile::tempdir().unwrap(); let mut r = tests::request(dir.path());
-    r.local_paths.clear(); let inventory = dir.path().join("inventory.jsonl");
-    std::fs::write(&inventory, "{\"event\":\"error\",\"message\":\"Library access was removed\"}\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = tests::request(dir.path());
+    r.local_paths.clear();
+    let inventory = dir.path().join("inventory.jsonl");
+    std::fs::write(
+        &inventory,
+        "{\"event\":\"error\",\"message\":\"Library access was removed\"}\n",
+    )
+    .unwrap();
     r.external_source_stream = Some(inventory);
-    scan(r.clone(), None, Arc::new(AtomicBool::new(false))).await.unwrap();
+    scan(r.clone(), None, Arc::new(AtomicBool::new(false)))
+        .await
+        .unwrap();
     let report = read_report(&r);
-    assert_eq!(report.status, "failed"); assert_eq!(report.analysed_files, 0);
-    assert!(report.issues.iter().any(|issue| issue.reason.contains("Library access was removed")));
-    let auth = cloud_listing_error(&crate::Error::Auth("private token must not be displayed".into()).into());
+    assert_eq!(report.status, "failed");
+    assert_eq!(report.analysed_files, 0);
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.reason.contains("Library access was removed")));
+    let auth = cloud_listing_error(
+        &crate::Error::Auth("private token must not be displayed".into()).into(),
+    );
     assert!(auth.contains("Settings") && !auth.contains("private token"));
 }
 
@@ -231,32 +408,58 @@ async fn unavailable_external_originals_report_failure_and_continue_the_queue() 
     let dir = tempfile::tempdir().unwrap();
     let mut r = tests::request(dir.path());
     r.local_paths.clear();
-    r.external_sources = ["one", "two"].into_iter().map(|id| ExternalSource { content_kind: None, revision: None,
-        id: id.into(), name: format!("{id}.png"), path: format!("Photos/{id}.png"),
-        size: 1, local_path: None,
-    }).collect();
+    r.external_sources = ["one", "two"]
+        .into_iter()
+        .map(|id| ExternalSource {
+            content_kind: None,
+            revision: None,
+            id: id.into(),
+            name: format!("{id}.png"),
+            path: format!("Photos/{id}.png"),
+            size: 1,
+            local_path: None,
+        })
+        .collect();
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut running = { let r = r.clone(); let cancel = cancel.clone();
-        tokio::spawn(async move { scan(r, None, cancel).await }) };
+    let mut running = {
+        let r = r.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move { scan(r, None, cancel).await })
+    };
     let responder = async {
         let mut answered = HashSet::new();
         for id in ["one", "two"] {
             loop {
-                let runs = std::fs::read_dir(&r.temp_dir).into_iter().flatten().flatten();
+                let runs = std::fs::read_dir(&r.temp_dir)
+                    .into_iter()
+                    .flatten()
+                    .flatten();
                 let mut target = None;
                 for run in runs {
-                    for source in std::fs::read_dir(run.path()).into_iter().flatten().flatten() {
-                        if !answered.contains(&source.path()) && source.file_name().to_string_lossy().starts_with("source-")
+                    for source in std::fs::read_dir(run.path())
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                    {
+                        if !answered.contains(&source.path())
+                            && source.file_name().to_string_lossy().starts_with("source-")
                             && source.path().join("content").is_dir()
-                            && !source.path().join("source.json").exists() {
-                            target = Some(source.path()); break;
+                            && !source.path().join("source.json").exists()
+                        {
+                            target = Some(source.path());
+                            break;
                         }
                     }
                 }
                 if let Some(target) = target {
                     answered.insert(target.clone());
                     let reply = target.join("reply.tmp");
-                    std::fs::write(&reply, serde_json::to_vec(&json!({"id":id,"error":"Original unavailable"})).unwrap()).unwrap();
+                    std::fs::write(
+                        &reply,
+                        serde_json::to_vec(&json!({"id":id,"error":"Original unavailable"}))
+                            .unwrap(),
+                    )
+                    .unwrap();
                     std::fs::rename(reply, target.join("source.json")).unwrap();
                     break;
                 }
@@ -264,14 +467,25 @@ async fn unavailable_external_originals_report_failure_and_continue_the_queue() 
             }
         }
     };
-    let replied = tokio::time::timeout(Duration::from_secs(5), responder).await.is_ok();
-    if !replied { cancel.store(true, Ordering::SeqCst); }
+    let replied = tokio::time::timeout(Duration::from_secs(5), responder)
+        .await
+        .is_ok();
+    if !replied {
+        cancel.store(true, Ordering::SeqCst);
+    }
     let completed = tokio::time::timeout(Duration::from_secs(5), &mut running).await;
     let finished_in_time = completed.is_ok();
-    if let Ok(result) = completed { result.unwrap().unwrap(); }
-    else { cancel.store(true, Ordering::SeqCst); running.await.unwrap().unwrap(); }
+    if let Ok(result) = completed {
+        result.unwrap().unwrap();
+    } else {
+        cancel.store(true, Ordering::SeqCst);
+        running.await.unwrap().unwrap();
+    }
     assert!(finished_in_time, "Replies must be consumed promptly");
-    assert!(replied, "Every failed original must allow the next queued ID to be requested");
+    assert!(
+        replied,
+        "Every failed original must allow the next queued ID to be requested"
+    );
     let report = read_report(&r);
     assert_eq!(report.status, "failed");
     assert_eq!(report.skipped_files, 2);

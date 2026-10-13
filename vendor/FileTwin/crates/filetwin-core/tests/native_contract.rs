@@ -4,7 +4,7 @@ use filetwin_core::{
     api::*,
     profile,
     worker_protocol::{Encoded, Response, VERSION},
-    write_vectors,
+    write_vectors, read_vectors,
 };
 use serde_json::json;
 use std::{
@@ -209,6 +209,9 @@ fn cancellation_interrupts_deferred_acquisition_and_releases_all_leases() {
         if p.work.as_ref().is_some_and(|w| w.fetching >= 4) { cancel.cancel(); }
     }).unwrap();
     assert!(result.summary.cancelled && result.summary.counts.files_discovered <= 4);
+    let saved = f.root.join("cancelled.json");
+    write_vectors(&saved, &result).unwrap();
+    assert!(read_vectors(&saved).unwrap().summary.cancelled);
     assert_eq!(active.load(Ordering::SeqCst), 0);
     assert!(started.elapsed() < Duration::from_secs(3));
     f.clean();
@@ -257,14 +260,71 @@ for line in sys.stdin:
 }
 
 #[test]
-fn streamed_binary_data_keeps_hashes_without_being_reported_as_a_worker_failure() {
+fn streamed_binary_data_preserves_unsupported_state_and_serialized_counts() {
     let f = Fixture::new(serve);
     let path = f.input.join("encrypted.dat"); fs::write(&path, [0, 255, 0, 3, 4]).unwrap();
     let result = streamed(&f, vec![EncodeSource::new("data", path)], |_| {});
-    assert_eq!(result.summary.counts.files_skipped, 1);
-    assert_eq!(result.summary.counts.files_failed, 0);
+    assert_eq!(result.summary.counts.files_skipped, 0);
+    assert_eq!(result.summary.counts.files_failed, 1);
     assert_eq!(result.files[0].state, FileState::Unsupported);
     assert!(result.files[0].file_id.is_some() && result.files[0].vector.is_none());
+    let saved = f.root.join("unsupported.json");
+    write_vectors(&saved, &result).unwrap();
+    let restored = read_vectors(&saved).unwrap();
+    assert_eq!(restored.files[0].state, FileState::Unsupported);
+    assert_eq!(serde_json::to_value(restored.summary.counts).unwrap(), serde_json::to_value(result.summary.counts).unwrap());
+    f.clean();
+}
+
+#[test]
+fn streamed_high_memory_capacity_round_trips_empty_and_nonempty_vectors() {
+    let mut f = Fixture::new(serve);
+    f.config.memory_scheduling = true;
+    f.config.workers = 65;
+    f.config.memory_bytes = 9 << 30;
+    let text = f.input.join("sample.txt");
+    fs::write(&text, "Generated text with enough words for a stable descriptor. ".repeat(30)).unwrap();
+    for (name, sources) in [("empty", vec![]), ("text", vec![EncodeSource::new("text", text)])] {
+        let result = streamed(&f, sources, |_| {});
+        assert_eq!(result.summary.workers, 65);
+        let saved = f.root.join(format!("{name}.json"));
+        write_vectors(&saved, &result).unwrap();
+        let restored = read_vectors(&saved).unwrap();
+        assert_eq!(restored.summary.workers, 65);
+        assert_eq!(serde_json::to_value(restored.summary.counts).unwrap(), serde_json::to_value(result.summary.counts).unwrap());
+    }
+    f.clean();
+}
+
+#[test]
+fn streamed_media_filters_actual_family_and_worker_profiles() {
+    let f = Fixture::new(|root| {
+        let script = root.join("media.py");
+        fs::write(&script, format!(r#"import json,sys,pathlib
+root=pathlib.Path({root:?})
+for line in sys.stdin:
+ r=json.loads(line)
+ assert len(r['profiles']) == 1
+ if 'audio' in r['profiles']:
+  assert r['profile_id'] == r['profiles']['audio']
+  print((root/'response.json').read_text(),flush=True)
+ else:
+  assert 'video' in r['profiles']
+  print(json.dumps({{'version':r['version'],'result':{{'Err':{{'code':'unselected_family','stage':'media','message':'Detected media family was not selected','details':{{'family':'audio'}}}}}}}}),flush=True)
+"#, root = root.to_str().unwrap())).unwrap();
+        format!("exec /usr/bin/python3 -u '{}'", script.display())
+    });
+    response(&f.root.join("response.json"), "audio", profile::AUDIO_DIMENSIONS);
+    let path = f.input.join("audio.mp4");
+    fs::write(&path, b"\0\0\0\x18ftypisom\0\0\0\0isommp42").unwrap();
+    for (family, state) in [("audio", FileState::Ready), ("video", FileState::Skipped)] {
+        let result = streamed(&f, vec![EncodeSource::new("media", path.clone()).with_families(vec![family.into()])], |_| {});
+        assert_eq!(result.files[0].state, state);
+        if state == FileState::Ready { assert_eq!(result.files[0].family.as_deref(), Some("audio")); }
+        let saved = f.root.join(format!("{family}.json"));
+        write_vectors(&saved, &result).unwrap();
+        read_vectors(&saved).unwrap();
+    }
     f.clean();
 }
 
@@ -1225,5 +1285,134 @@ for line in sys.stdin:
         }).unwrap();
     assert!(draining && checked_wait, "RAM shrink did not preserve active work and gate new admission");
     assert_eq!(result.summary.counts.files_ready,3,"{:?}",result.files);
+    f.clean();
+}
+
+
+#[test]
+fn hashing_owns_analysis_ram_and_finish_completes_its_file() {
+    use filetwin_core::memory_input::MemoryInput;
+    use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+    struct TrackedBuffer {
+        data: Vec<u8>,
+        download: Arc<Mutex<(u64, u64)>>,
+        hashing: Arc<AtomicBool>,
+    }
+    impl AsRef<[u8]> for TrackedBuffer {
+        fn as_ref(&self) -> &[u8] {
+            if self.download.lock().unwrap().0 == 0 && !self.hashing.swap(true, Ordering::SeqCst) {
+                // Hold the first RAM hash read long enough to inspect ownership
+                // and request Finish while hashing is the active analysis job.
+                std::thread::sleep(Duration::from_millis(350));
+            }
+            &self.data
+        }
+    }
+    let mut f = Fixture::new(serve);
+    f.config.memory_scheduling = true; f.config.memory_staging = true;
+    f.config.memory_bytes = 2 << 30; f.config.staging_bytes = 256 << 20;
+    let download = Arc::new(Mutex::new((0, 256 << 20)));
+    let hashing = Arc::new(AtomicBool::new(false));
+    let lease = DownloadReservation::new(&download, 256 << 20);
+    let memory = Arc::new(MemoryInput::from_buffer(TrackedBuffer {
+        data: b"\x89PNG\r\n\x1a\nfixture".to_vec(), download: download.clone(), hashing: hashing.clone(),
+    }).with_reservation(lease));
+    let mut sources = vec![EncodeSource::from_memory("generated.png", memory)].into_iter();
+    let token = CancellationToken::default();
+    let mut checked = false;
+    let result = Encoder::new(f.config.clone()).unwrap().encode_sources(
+        &EncodeRequest::new(&f.input), &token, || Ok(sources.next()), |p| {
+            if let Some(work) = &p.work {
+                if work.hashing > 0 && hashing.load(Ordering::SeqCst) && !checked {
+                    checked = true;
+                    assert_eq!(download.lock().unwrap().0, 0, "Read RAM must be released before hashing");
+                    assert_eq!(work.reading, 0);
+                    assert!(work.memory_in_use >= (256 << 20) + (512 << 20));
+                    assert_eq!(p.counts.bytes_hashed, 0);
+                    assert_eq!(work.original_bytes_read, 0, "Hashing RAM is not source transfer traffic");
+                    token.request_finish();
+                }
+                assert!(work.memory_in_use <= work.memory_limit);
+            }
+        }).unwrap();
+    assert!(checked && !result.complete && !result.summary.cancelled);
+    assert_eq!(result.summary.counts.files_ready, 1, "Finish must run the decoder for the file already hashing");
+    assert_eq!(result.summary.counts.bytes_hashed, 15);
+    assert_eq!(download.lock().unwrap().0, 0);
+    f.clean();
+}
+
+#[test]
+fn source_transfer_counter_excludes_hashing_and_decoder_reads() {
+    let mut f = Fixture::new(serve);
+    f.config.memory_scheduling = true; f.config.memory_staging = true;
+    f.config.memory_bytes = 1 << 30;
+    let mut data = vec![0u8; 32 * 1024];
+    data[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    let path = f.input.join("generated.png"); fs::write(&path, &data).unwrap();
+    let mut acquired = 0;
+    let result = streamed(&f, vec![EncodeSource::new("generated.png", path)], |p| {
+        if let Some(work) = &p.work { acquired = acquired.max(work.original_bytes_read); }
+    });
+    assert_eq!(result.summary.counts.files_ready, 1);
+    assert_eq!(result.summary.counts.bytes_hashed, data.len() as u64);
+    assert_eq!(acquired, data.len() as u64 + 4096, "Only the source sniff and one acquisition pass count");
+    assert!(result.summary.counts.bytes_read > acquired, "The hash reread must be measured separately");
+    f.clean();
+}
+
+#[test]
+fn finish_drains_active_analysis_without_waiting_for_blocked_reads_or_starting_more_files() {
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    let mut f = Fixture::new(|root| {
+        let script = root.join("finish.py");
+        fs::write(&script, format!(r#"import json,sys,time,pathlib
+root=pathlib.Path({root:?})
+for line in sys.stdin:
+ request=json.loads(line)
+ while not (root/'release-analysis').exists(): time.sleep(.01)
+ response=json.loads((root/'response.json').read_text())
+ print(json.dumps(response),flush=True)
+"#, root=root.to_str().unwrap())).unwrap();
+        format!("exec /usr/bin/python3 -u '{}'", script.display())
+    });
+    f.images(1);
+    f.config.workers = 64; f.config.memory_scheduling = true;
+    f.config.memory_staging = true; f.config.memory_bytes = 2 << 30;
+    let release_reads = Arc::new(AtomicBool::new(false));
+    let blocked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut sources = vec![EncodeSource::new("first.png", f.input.join("0.png"))];
+    for i in 0..12 {
+        let release = release_reads.clone(); let blocked = blocked.clone();
+        sources.push(EncodeSource::deferred(format!("blocked-{i}.png"), move |_| {
+            blocked.fetch_add(1, Ordering::AcqRel);
+            // Model a filesystem read that cannot observe cancellation.
+            while !release.load(Ordering::Acquire) { std::thread::sleep(Duration::from_millis(5)); }
+            Err(filetwin_core::Error::invalid("Disposable blocked reader released"))
+        }));
+    }
+    let mut sources = sources.into_iter(); let token = CancellationToken::default();
+    let mut requested = false; let started = Instant::now();
+    let result = Encoder::new(f.config.clone()).unwrap().encode_sources(
+        &EncodeRequest::new(&f.input), &token, || Ok(sources.next()), |p| {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            if let Some(work) = &p.work {
+                assert!(work.fetching + work.reading <= 4, "Too many disk readers: {work:?}");
+                if !requested && work.encoding == 1 && blocked.load(Ordering::Acquire) >= 3 {
+                    requested = true; token.request_finish();
+                    let path = f.root.join("release-analysis");
+                    std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(150)); fs::write(path, []).unwrap(); });
+                }
+            }
+        }).unwrap();
+    assert!(requested && !result.complete && !result.summary.cancelled);
+    assert_eq!(result.summary.counts.files_ready, 1);
+    assert_eq!(result.summary.counts.files_failed, 0);
+    assert!(result.summary.counts.files_discovered <= 5, "Finish admitted new files");
+    assert!(!release_reads.load(Ordering::Acquire));
+    assert!(started.elapsed() < Duration::from_secs(2), "Finish waited for blocked I/O");
+    release_reads.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fs::read_dir(&f.config.temp_dir).unwrap().count() > 0 && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(5)); }
     f.clean();
 }

@@ -4,6 +4,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -82,6 +83,27 @@ class BuildTests(unittest.TestCase):
             build()
             self.assertEqual(output(), "12")
             self.assertEqual(len(list((cache / "objects").glob("*.o"))), 2)
+
+    def test_executable_records_the_sdk_it_was_built_against(self):
+        # The builder runs swiftc by absolute path, so xcrun's SDKROOT is absent.
+        # Without an SDK the linker stamps the deployment target as the SDK
+        # version, and macOS then gives the whole app its legacy appearance.
+        with tempfile.TemporaryDirectory(prefix="mycloud-swift-sdk-") as directory:
+            root = Path(directory)
+            source = root / "Entry.swift"
+            binary = root / "Example"
+            source.write_text("@main struct Entry { static func main() {} }\n")
+            environment = {key: value for key, value in os.environ.items() if key != "SDKROOT"}
+            result = subprocess.run([sys.executable, str(ROOT / "scripts/build-swift-app.py"),
+                                     "--cache-dir", str(root / "cache"), "--jobs", "2", "--", "-O",
+                                     "-swift-version", "5", "-target", "arm64-apple-macos13.0",
+                                     "-parse-as-library", str(source), "-o", str(binary)],
+                                    env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            stamp = subprocess.check_output(["xcrun", "vtool", "-show-build", str(binary)], text=True)
+            recorded = re.search(r"^\s*sdk (\S+)", stamp, re.MULTILINE).group(1)
+            installed = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-version"], text=True).strip()
+            self.assertEqual(recorded, installed, stamp)
 
     def test_installation_and_unchanged_skip(self):
         source = ROOT / "dist/AppBuild.noindex/MyCloudDriver.app"

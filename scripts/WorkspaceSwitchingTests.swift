@@ -43,7 +43,8 @@ struct WorkspaceSwitchingTests {
         navigation.select(2, needsLoading: false) { preconditionFailure("removed Tasks destination") }
         navigation.showImmediately(2)
         precondition(navigation.section == 1, "removed Tasks cannot be presented")
-        precondition(FinderWorkspaceSection.standard.map(\.title) == ["Browser", "Bookmarks", "Transfers", "Links"])
+        precondition(FinderWorkspaceSection.standard.map(\.title) == ["Browser", "Bookmarks", "Transfers"], "Every drive but PikPak omits Links")
+        precondition(FinderWorkspaceSection.allCases.map(\.title).contains("Links"), "PikPak keeps Links")
         precondition(!FinderWorkspaceSection.bookmarks.isPikPakManagement && FinderWorkspaceSection.cloudDownloads.isPikPakManagement)
         navigation.showImmediately(FinderWorkspaceSection.bookmarks.rawValue)
         precondition(navigation.section == 7, "Bookmarks is a valid destination while removed Tasks remains invalid")
