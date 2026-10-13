@@ -143,8 +143,9 @@ async fn shutdown_control_child() {
 }
 
 #[test]
-fn read_turn_has_no_deadline_below_or_at_eighty_percent_pending_writes() {
+fn the_pressure_threshold_stays_unchanged_without_a_local_waiting_writer() {
     let now = Instant::now(); let mut state = busy(now, 40 << 30);
+    state.write_queue.clear();
     state.select(Phase::Read, now);
     for seconds in [10, 60, 900] {
         state.last_received = now + Duration::from_secs(seconds);
@@ -155,6 +156,87 @@ fn read_turn_has_no_deadline_below_or_at_eighty_percent_pending_writes() {
     assert_eq!(state.phase, Phase::Write, "The first byte over 80% requests a safe write handover");
     assert_eq!(state.last_read_handover_reason, 5);
     assert_eq!(state.last_read_remaining_bytes, 40 << 30);
+}
+
+#[test]
+fn a_small_continuous_write_tail_has_a_longer_but_finite_wait() {
+    let now = Instant::now();
+    let mut state = busy(now, 4 << 30); state.select(Phase::Read, now);
+    let before = now + SMALL_WRITE_MAX_WAIT - Duration::from_millis(1);
+    state.last_received = before; state.tick(before, 1 << 20, 8 << 30);
+    assert_eq!(state.phase, Phase::Read, "Small writes allow a longer sequential read run");
+    let mut snapshot = Snapshot::default(); snapshot.include(&mut state, before);
+    assert_eq!(snapshot.turn_target_ms, 30_000);
+    state.last_received = now + SMALL_WRITE_MAX_WAIT;
+    state.tick(now + SMALL_WRITE_MAX_WAIT, 1 << 20, 8 << 30);
+    assert_eq!(state.phase, Phase::Write, "Continuous slow receiving must not strand a sub-64 MiB tail indefinitely");
+    assert_eq!(state.last_read_handover_reason, 7);
+}
+
+#[test]
+fn continuous_receiving_cannot_strand_a_write_batch_below_the_ram_threshold() {
+    let now = Instant::now();
+    let mut state = busy(now, 600 << 30);
+    state.select(Phase::Read, now);
+    let before = now + READ_WRITE_MAX_WAIT - Duration::from_millis(1);
+    state.last_received = before;
+    state.tick(before, 512 << 20, 32 << 30);
+    assert_eq!(state.phase, Phase::Read, "Useful reads retain their sequential ten-second batch");
+    let mut snapshot = Snapshot::default(); snapshot.include(&mut state, before);
+    assert_eq!(snapshot.turn_target_ms, 10_000);
+    state.last_received = now + READ_WRITE_MAX_WAIT;
+    state.tick(now + READ_WRITE_MAX_WAIT, 512 << 20, 32 << 30);
+    assert_eq!(state.phase, Phase::Write, "A 512 MiB write batch must not wait for 25.6 GiB of RAM to fill");
+    assert_eq!((state.last_read_handover_reason, state.read_turn_latency_handoffs), (7, 1));
+    assert_eq!((state.remaining, state.last_read_remaining_bytes), (600 << 30, 600 << 30));
+    assert!(!state.jobs[&0].selected, "Paused reads retain their remaining bytes for the next turn");
+}
+
+#[test]
+fn bounded_read_turns_need_local_writable_work_and_preserve_prefetch_prerequisites() {
+    let now = Instant::now();
+    let mut state = busy(now, 4 << 30);
+    state.select(Phase::Read, now);
+    state.last_received = now + READ_WRITE_MAX_WAIT;
+    state.tick(now + READ_WRITE_MAX_WAIT, READ_WRITE_BATCH_MIN_BYTES - 1, 8 << 30);
+    assert_eq!(state.phase, Phase::Read, "Tiny tails should not force a seek-heavy read/write alternation");
+    state.tick(now + READ_WRITE_MAX_WAIT, 0, writable_limit(8 << 30, 7 << 30));
+    assert_eq!(state.phase, Phase::Read, "Unverified receive-ahead RAM must keep its prerequisite reads running");
+    state.write_queue.clear();
+    state.tick(now + READ_WRITE_MAX_WAIT, 512 << 20, 8 << 30);
+    assert_eq!(state.phase, Phase::Read, "Another drive's buffered writes must not trigger this drive's latency handoff");
+    state.write_queue.push_back(1); state.checkpoints.insert(1, now);
+    state.tick(now + READ_WRITE_MAX_WAIT, 0, 8 << 30);
+    assert_eq!(state.phase, Phase::Write, "A waiting durable checkpoint gets a turn even without payload bytes");
+    assert_eq!(state.last_read_handover_reason, 7);
+}
+
+#[tokio::test]
+async fn write_latency_handover_finishes_active_io_and_resumes_the_same_read() {
+    let gate = Arc::new(Traffic::new());
+    let read = gate.register(8 << 20);
+    let active = read.chunk(1 << 20, "generated-latency-read").await.unwrap();
+    let payload = gate.buffer(Arc::from("generated-latency-write"), 128 << 20);
+    let mut writer = Box::pin(gate.clone().write(false, "generated-latency-write"));
+    assert!(futures_util::poll!(&mut writer).is_pending());
+    {
+        let mut state = gate.state.lock().unwrap();
+        let now = Instant::now();
+        state.since = Some(now - READ_WRITE_MAX_WAIT); state.last_received = now;
+        state.tick(now, 128 << 20, 8 << 30);
+        assert_eq!(state.phase, Phase::Write);
+        assert_eq!(state.readers, 1);
+        assert_eq!(state.writers, 0, "A deadline cannot overlap in-flight disk operations");
+    }
+    assert!(futures_util::poll!(&mut writer).is_pending());
+    drop(active);
+    let writing = tokio::time::timeout(Duration::from_secs(1), writer).await.unwrap();
+    let mut continuation = Box::pin(read.chunk(7 << 20, "generated-latency-read"));
+    assert!(futures_util::poll!(&mut continuation).is_pending());
+    drop(payload); drop(writing);
+    drop(tokio::time::timeout(Duration::from_secs(1), continuation).await.unwrap().unwrap());
+    assert_eq!(gate.state.lock().unwrap().jobs[&read.id].remaining, 0,
+        "The original read continues from its existing progress after the selected writes drain");
 }
 
 #[test]
@@ -410,14 +492,15 @@ fn idle_sides_yield_but_registered_unready_checks_do_not_waste_disk_turns() {
 }
 
 #[test]
-fn unfinished_selected_reads_keep_their_turn_during_preparation_gaps() {
+fn preparation_gaps_keep_selected_reads_when_no_local_writer_can_use_the_disk() {
     let now = Instant::now();let mut state = busy(now, 4 << 30);
+    state.write_queue.clear();
     state.select(Phase::Read, now);state.last_io = now;
     state.runnable_jobs = 0;state.jobs.get_mut(&0).unwrap().ready = false;
     for gap in [IDLE_HANDOFF, Duration::from_secs(10), Duration::from_secs(120)] {
         state.last_received = now + gap;
         state.tick(now + gap, 512 << 20, 8 << 30);
-        assert_eq!(state.phase, Phase::Read, "Preparation retains unfinished reads below the RAM threshold");
+        assert_eq!(state.phase, Phase::Read, "Preparation retains unfinished reads when no local writer can drain them");
     }
     state.tick(now + Duration::from_secs(121), 7 << 30, 8 << 30);
     assert_eq!(state.phase, Phase::Write); assert!(!state.jobs[&0].selected);
@@ -430,6 +513,7 @@ fn unfinished_selected_reads_keep_their_turn_during_preparation_gaps() {
 #[test]
 fn an_emptied_cohort_selects_new_pending_reads_without_a_write_turn_below_threshold() {
     let now = Instant::now(); let mut state = busy(now, 1);
+    state.write_queue.clear();
     state.select(Phase::Read, now); state.jobs.get_mut(&0).unwrap().remaining = 0;
     state.jobs.insert(1, Job { remaining: 1024, queued: now, started: false, ready: true,
         selected: false, active: 0, owner: None });
@@ -650,6 +734,30 @@ fn reading_snapshot_shows_the_whole_selected_pool_between_disk_calls() {
     let mut writing = Snapshot::default(); writing.include(&mut state, now + Duration::from_secs(10));
     assert_eq!(writing.reading_bytes, 0);
     assert_eq!(writing.pending_read_bytes, 65 << 30, "Only the bytes actually read leave the combined pools");
+}
+
+#[test]
+fn selected_checks_remain_waiting_until_their_actual_disk_io_starts() {
+    let now = Instant::now();
+    let mut state = busy(now, 40 << 30);
+    state.jobs.insert(1, Job { remaining: 24 << 30, queued: now - Duration::from_secs(90),
+        started: false, ready: false, selected: false, active: 0, owner: None });
+    state.remaining += 24 << 30;
+    state.select(Phase::Read, now); state.start(now);
+    state.jobs.get_mut(&0).unwrap().active = 1;
+    let mut reading = Snapshot::default(); reading.include(&mut state, now);
+    assert_eq!(reading.reading_tasks, 2, "The legacy selected-cohort counter stays compatible");
+    assert_eq!(reading.active_read_tasks, 1);
+    assert_eq!(reading.active_read_bytes, 40 << 30);
+    assert_eq!(reading.waiting_read_tasks, 1);
+    assert_eq!(reading.waiting_read_bytes, 24 << 30);
+    assert_eq!(reading.oldest_waiting_read_ms, 90_000, "Selection must not hide a deferred check's age");
+    assert_eq!(reading.pending_read_tasks, 0);
+    state.jobs.get_mut(&0).unwrap().active = 0;
+    let mut between = Snapshot::default(); between.include(&mut state, now);
+    assert_eq!(between.active_read_tasks, 0);
+    assert_eq!(between.waiting_read_tasks, 2);
+    assert_eq!(between.waiting_read_bytes, 64 << 30);
 }
 
 #[tokio::test]

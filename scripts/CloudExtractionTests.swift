@@ -31,6 +31,7 @@ struct CloudExtractionTests {
             lastChecked: nil, credentialKind: .desktopOAuth)
         let permission = DownloaderModel(archiveTestEngineURL: engine, directory: root)
         defer { permission.stopArchiveTestHelpers() }
+        permission.finderSettings.contentMode = .user
         permission.setArchiveTestConnections([token, normal], activeID: token.id)
         permission.openArchiveExtraction(item("permission"))
         try await waitFor { permission.archiveTasks.first?.error != nil }
@@ -63,6 +64,71 @@ struct CloudExtractionTests {
         precondition(permission.activeAccountID == token.id && !permission.requiresDedicatedSignIn)
         permission.stopArchiveTestHelpers()
         print("PASS: permission denial waits for explicit Normal login retry, same-account checks, selected Token login retained, persistent 403 stays failed")
+
+        let dynamic = DownloaderModel(archiveTestEngineURL: engine, directory: root)
+        defer { dynamic.stopArchiveTestHelpers() }
+        dynamic.finderSettings.contentMode = .dynamic
+        dynamic.setArchiveTestConnections([token, normal, other], activeID: token.id)
+        dynamic.openArchiveExtraction(item("permission-dynamic"))
+        let dynamicID = dynamic.archiveTasks.first!.id
+        precondition(dynamic.archiveTasks.first?.connectionAccountID == normal.id)
+        precondition(dynamic.archiveTasks.first?.connectionKind == .desktopOAuth)
+        // A later preview/scan preference change cannot send this archive's
+        // extraction or progress requests through Guest or another login.
+        dynamic.finderSettings.contentMode = .guest
+        try await waitFor { dynamic.archiveTasks.first?.result != nil }
+        precondition(dynamic.archiveTasks.first?.id == dynamicID && dynamic.archiveTasks.first?.error == nil)
+        precondition(dynamic.archiveTasks.first?.connectionAccountID == normal.id)
+        precondition(dynamic.activeAccountID == token.id && dynamic.activeCredentialKind == .personalAccessToken)
+        precondition(dynamic.finderSettings.contentMode == .guest)
+        dynamic.finderSettings.contentMode = .dynamic
+        dynamic.openArchiveExtraction(item("permission-always"))
+        try await waitFor { dynamic.archiveTasks.last?.error != nil }
+        let normalDenied = dynamic.archiveTasks.last!
+        precondition(normalDenied.error?.code == "HTTP 403 • API 7" && !normalDenied.needsNormalLogin)
+        precondition(normalDenied.connectionAccountID == normal.id && !dynamic.hasActiveArchiveTasks)
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+        precondition(dynamic.archiveTasks.last?.generation == normalDenied.generation)
+        precondition(dynamic.activeAccountID == token.id && !dynamic.requiresDedicatedSignIn)
+        dynamic.stopArchiveTestHelpers()
+        print("PASS: Dynamic extraction selects same-account Normal login before inspection, retains it through mode changes, keeps Token login selected and stops on a real Normal permission denial")
+
+        for unavailable in [[token, other], [token, expiredNormal]] {
+            let limited = DownloaderModel(archiveTestEngineURL: engine, directory: root)
+            limited.finderSettings.contentMode = .dynamic
+            limited.setArchiveTestConnections(unavailable, activeID: token.id)
+            limited.openArchiveExtraction(item("permission-no-normal"))
+            try await waitFor { limited.archiveTasks.first?.error != nil }
+            let failure = limited.archiveTasks.first!
+            precondition(failure.connectionAccountID == nil && failure.connectionKind == .personalAccessToken)
+            precondition(failure.needsNormalLogin && !limited.canRetryArchiveWithNormalLogin(failure))
+            precondition(limited.activeAccountID == token.id && !limited.hasActiveArchiveTasks)
+            limited.stopArchiveTestHelpers()
+        }
+        let removed = DownloaderModel(archiveTestEngineURL: engine, directory: root)
+        defer { removed.stopArchiveTestHelpers() }
+        removed.finderSettings.contentMode = .dynamic
+        removed.setArchiveTestConnections([token, normal], activeID: token.id)
+        removed.openArchiveExtraction(item("permission-normal-removed"))
+        precondition(removed.archiveTasks.first?.connectionAccountID == normal.id)
+        removed.setArchiveTestConnections([token, other], activeID: token.id)
+        try await waitFor { removed.archiveTasks.first?.error != nil }
+        precondition(removed.archiveTasks.first?.result == nil && !removed.hasActiveArchiveTasks)
+        precondition(removed.activeAccountID == token.id && !removed.requiresDedicatedSignIn)
+        removed.stopArchiveTestHelpers()
+        print("PASS: Dynamic archive routing rejects another account or expired Normal login and revalidates the captured connection before extraction")
+
+        let normalActive = DownloaderModel(archiveTestEngineURL: engine, directory: root)
+        defer { normalActive.stopArchiveTestHelpers() }
+        normalActive.finderSettings.contentMode = .dynamic
+        normalActive.setArchiveTestConnections([token, normal], activeID: normal.id)
+        normalActive.openArchiveExtraction(item("permission-normal-active"))
+        try await waitFor { normalActive.archiveTasks.first?.result != nil }
+        precondition(normalActive.archiveTasks.first?.connectionAccountID == nil)
+        precondition(normalActive.archiveTasks.first?.connectionKind == .desktopOAuth)
+        precondition(normalActive.activeAccountID == normal.id && normalActive.finderSettings.contentMode == .dynamic)
+        normalActive.stopArchiveTestHelpers()
+        print("PASS: an already-selected Normal login remains selected in Dynamic mode; archive helpers always use account authorization")
         // An enabled-looking button must never silently ignore a request that
         // cannot start. Keep the archive and its selection available to retry.
         let feedbackDirectory = root.appendingPathComponent("feedback")

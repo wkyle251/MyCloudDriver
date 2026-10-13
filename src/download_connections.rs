@@ -96,6 +96,14 @@ struct Plateau {
     failures: u32,
 }
 
+/// A completed measurement, never a speculative admission change. Callers may
+/// retain a small warm start only after observing an accepted trial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrialOutcome {
+    Accepted(usize),
+    Rejected,
+}
+
 pub struct Connections {
     pub active: usize,
     pub limit: usize,
@@ -113,6 +121,7 @@ pub struct Connections {
     minimum_gain: MinimumGain,
     coordinator: Option<Participant>,
     generation: Option<u64>,
+    trial_outcome: Option<TrialOutcome>,
 }
 
 impl Connections {
@@ -138,6 +147,7 @@ impl Connections {
             minimum_gain: MinimumGain::TenPercent,
             coordinator: None,
             generation: None,
+            trial_outcome: None,
         }
     }
     /// Normal downloads retain a trial only when aggregate throughput increases
@@ -150,6 +160,9 @@ impl Connections {
     pub fn with_coordinator(mut self, coordinator: Arc<Coordinator>) -> Self {
         self.coordinator = Some(coordinator.register());
         self
+    }
+    pub(crate) fn take_trial_outcome(&mut self) -> Option<TrialOutcome> {
+        self.trial_outcome.take()
     }
     fn invalidate_window(&mut self, now: Instant) {
         self.valid_since = now;
@@ -294,6 +307,7 @@ impl Connections {
                 self.probe = None;
                 self.plateau = None;
                 self.proven_gain = true;
+                self.trial_outcome = Some(TrialOutcome::Accepted(self.limit));
                 // This measured window is valid for the next standalone trial.
                 // Coordinated controllers must first observe the new generation.
                 self.stable_since = None;
@@ -347,6 +361,7 @@ impl Connections {
             return;
         };
         let baseline = probe.baseline_rate;
+        self.trial_outcome = Some(TrialOutcome::Rejected);
         let failures = self
             .plateau
             .as_ref()

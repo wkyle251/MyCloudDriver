@@ -16,7 +16,10 @@ pub struct Fixture {
     pub gone: Arc<AtomicBool>,
     pub share_status: Arc<Mutex<String>>,
     pub user_available: Arc<AtomicBool>,
+    pub user_link_override: Arc<Mutex<Option<String>>>,
     pub guest_denied: Arc<AtomicBool>,
+    pub user_body_failures: Arc<AtomicUsize>,
+    pub user_body_failure_status: Arc<AtomicUsize>,
     pub guest_metadata_failures: Arc<AtomicUsize>,
     pub guest_metadata_failure_status: Arc<AtomicUsize>,
     pub guest_metadata_failure_after_urls: Arc<AtomicUsize>,
@@ -49,7 +52,10 @@ impl Fixture {
         let gone = Arc::new(AtomicBool::new(false));
         let share_status = Arc::new(Mutex::new("OK".to_string()));
         let user_available = Arc::new(AtomicBool::new(false));
+        let user_link_override = Arc::new(Mutex::new(None::<String>));
         let guest_denied = Arc::new(AtomicBool::new(false));
+        let user_body_failures = Arc::new(AtomicUsize::new(0));
+        let user_body_failure_status = Arc::new(AtomicUsize::new(503));
         let guest_metadata_failures = Arc::new(AtomicUsize::new(0));
         let guest_metadata_failure_status = Arc::new(AtomicUsize::new(503));
         let guest_metadata_failure_after_urls = Arc::new(AtomicUsize::new(0));
@@ -66,7 +72,10 @@ impl Fixture {
                 (owned_shares.clone(), share_create_status.clone(), share_create_response.clone(), share_creation_delay_ms.clone(), share_next_page_token.clone());
             let share_inventory_delay_ms = share_inventory_delay_ms.clone();
             let user_available = user_available.clone();
+            let user_link_override = user_link_override.clone();
             let guest_denied = guest_denied.clone();
+            let user_body_failures = user_body_failures.clone();
+            let user_body_failure_status = user_body_failure_status.clone();
             let guest_metadata_failures = guest_metadata_failures.clone();
             let guest_metadata_failure_status = guest_metadata_failure_status.clone();
             let guest_metadata_failure_after_urls = guest_metadata_failure_after_urls.clone();
@@ -88,7 +97,10 @@ impl Fixture {
                             let (mut socket, _) = accepted.unwrap();
                             let trash_status = trash_status.clone();
                             let user_available = user_available.clone();
+                            let user_link_override = user_link_override.clone();
                             let guest_denied = guest_denied.clone();
+                            let user_body_failures = user_body_failures.clone();
+                            let user_body_failure_status = user_body_failure_status.clone();
                             let guest_metadata_failures = guest_metadata_failures.clone();
                             let guest_metadata_failure_status = guest_metadata_failure_status.clone();
                             let guest_metadata_failure_after_urls = guest_metadata_failure_after_urls.clone();
@@ -149,7 +161,7 @@ impl Fixture {
                                         // Null explicitly suppresses the default original URL.
                                         if file.get("web_content_link").is_none() { file["web_content_link"] = json!(format!("{base}/guest-body/{version}")); }
                                         if file["web_content_link"].is_null() { file["web_content_link"] = json!(""); }
-                                        if user { file["web_content_link"] = json!(format!("{base}/user-body/{version}")); }
+                                        if user { file["web_content_link"] = json!(user_link_override.lock().unwrap().clone().unwrap_or_else(|| format!("{base}/user-body/{version}"))); }
                                         let status = if user || created { "OK".into() } else { share_status.lock().unwrap().clone() };
                                         json!({"share_status":status,"file_info":file}).to_string().into_bytes()
                                         }
@@ -201,7 +213,7 @@ impl Fixture {
                                                 status = "400 Bad Request";
                                                 br#"{"error":"file_in_recycle_bin", "error_code":9, "error_url":"", "error_description":"File or folder is already in recycler", "details":[]}"#.to_vec()
                                             } else {
-                                                file["web_content_link"] = json!(format!("{base}/user-body/1"));
+                                                file["web_content_link"] = json!(user_link_override.lock().unwrap().clone().unwrap_or_else(|| format!("{base}/user-body/1")));
                                                 file.to_string().into_bytes()
                                             }
                                         } else {
@@ -210,7 +222,10 @@ impl Fixture {
                                         }
                                     },
                                     path if path.starts_with("/guest-body/") || path.starts_with("/user-body/") => {
-                                        if path.starts_with("/guest-body/") && (guest_denied.load(Ordering::SeqCst) || (expired.load(Ordering::SeqCst) && path.ends_with("/1"))) {
+                                        if path.starts_with("/user-body/") && user_body_failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() {
+                                            status = if user_body_failure_status.load(Ordering::SeqCst) == 403 { "403 Forbidden" } else { "503 Service Unavailable" };
+                                            b"generated body failure".to_vec()
+                                        } else if path.starts_with("/guest-body/") && (guest_denied.load(Ordering::SeqCst) || (expired.load(Ordering::SeqCst) && path.ends_with("/1"))) {
                                             status = "403 Forbidden"; b"expired".to_vec()
                                         } else {
                                             extra.push_str("ETag: \"guest-fixture\"\r\nAccept-Ranges: bytes\r\n");
@@ -240,7 +255,10 @@ impl Fixture {
             gone,
             share_status,
             user_available,
+            user_link_override,
             guest_denied,
+            user_body_failures,
+            user_body_failure_status,
             guest_metadata_failures,
             guest_metadata_failure_status,
             guest_metadata_failure_after_urls,

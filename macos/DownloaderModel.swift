@@ -8613,9 +8613,13 @@ final class DownloaderModel: ObservableObject {
                 accountID: activeAccountID))
         }
         if activate { selectArchiveTask(taskID) }
+        let normalConnection = archiveTasks.first(where: { $0.id == taskID }).flatMap { task in
+            dynamicArchiveConnection(for: task)
+        }
         updateArchiveTask(taskID) {
             $0.inspection = nil; $0.result = nil; $0.error = nil
             $0.needsNormalLogin = false
+            if let normalConnection { $0.connectionAccountID = normalConnection.id }
             $0.password = password; $0.selectedIndices = []
             $0.passwordWasAttempted = !password.isEmpty
             $0.queuedAction = .inspect
@@ -8750,8 +8754,17 @@ final class DownloaderModel: ObservableObject {
         task.needsNormalLogin && !task.isBusy && normalArchiveConnection(for: task, in: savedAccounts) != nil
     }
 
-    /// Permission to use the broader connection is explicit and limited to
-    /// this archive. The window and other workers keep their selected login.
+    /// The cloud extractor needs account authorization. Dynamic mode can use
+    /// a saved Normal connection for this account without changing the window's
+    /// Token connection or any other worker's credentials.
+    private func dynamicArchiveConnection(for task: CloudExtractionTask) -> SavedPikPakAccount? {
+        guard finderSettings.contentMode == .dynamic, task.connectionAccountID == nil,
+              task.accountID == activeAccountID, activeCredentialKind == .personalAccessToken else { return nil }
+        return normalArchiveConnection(for: task, in: savedAccounts)
+    }
+
+    /// Outside Dynamic mode, a permission retry explicitly selects a broader
+    /// connection for this archive. Other workers retain their selected login.
     func retryArchiveWithNormalLogin(_ id: UUID) {
         guard let task = archiveTasks.first(where: { $0.id == id }),
               canRetryArchiveWithNormalLogin(task),
@@ -12506,7 +12519,18 @@ final class DownloaderModel: ObservableObject {
         precondition(legacy.finalFailureReason == DownloadTransfer.missingSourceReason
             && model.visibleFailedDownloadTransfers.map(\.name) == ["Legacy.bin"] && model.downloadPermanentFailedFiles == 1,
             "A row without source details goes to Failed with an explanation instead of waiting for a retry that cannot happen")
-        print("PASS permanent failures: transient causes stay in Retry, three consecutive reports move a file to Failed with its reason, other outcomes and manual retries reset the count, and rows without source details explain themselves")
+
+        let invalidOriginal = "PikPak repeatedly returned no usable original download URL; refresh the file and try again"
+        for attemptNumber in 1...DownloadTransfer.permanentConfirmations {
+            attempt("invalid-url-\(attemptNumber)", "Invalid.bin", permanent: invalidOriginal,
+                    error: "PikPak did not provide a usable original download URL. Refresh the file and try again.")
+        }
+        let invalid = row("Invalid.bin")!
+        precondition(invalid.finalFailureReason == invalidOriginal
+            && !model.retryingDownloadTransfers.contains { $0.id == invalid.id }
+            && model.automaticDownloadRetryStatus(invalid) == nil && model.canRetryFailedDownload(invalid),
+            "Repeated fresh metadata with a malformed original URL stops automatic retries while allowing a manual retry")
+        print("PASS permanent failures: transient causes stay in Retry, three consecutive reports move a file to Failed with its reason, malformed original URLs stop looping, other outcomes and manual retries reset the count, and rows without source details explain themselves")
     }
 
     static func testAutomaticFailedDownloadRecovery() async throws {
@@ -16402,13 +16426,14 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func archiveEngineEnvironment(for task: CloudExtractionTask) throws -> [String: String] {
+        guard task.accountID == activeAccountID else { throw PikPakAccountError.accountMismatch }
         #if ARCHIVE_TASK_TESTS
         if archiveTestEngineURL != nil {
             if let override = task.connectionAccountID {
                 guard normalArchiveConnection(for: task, in: savedAccounts)?.id == override else { throw PikPakAccountError.accountMismatch }
             }
-            return ["PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8",
-                    "MYCLOUD_ARCHIVE_CONNECTION": (task.connectionAccountID == nil ? activeCredentialKind : .desktopOAuth).rawValue]
+            return Self.archiveAccountEnvironment(["PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8",
+                    "MYCLOUD_ARCHIVE_CONNECTION": (task.connectionAccountID == nil ? activeCredentialKind : .desktopOAuth).rawValue])
         }
         #endif
         if let override = task.connectionAccountID {
@@ -16419,10 +16444,17 @@ final class DownloaderModel: ObservableObject {
             let session = try files.load()
             guard session.credentialKind == .desktopOAuth else { throw PikPakAccountError.accountMismatch }
             try accountStore.retainWorkerSession(files)
-            return desktopEngineEnvironment(tokenURL: files.tokenURL, lockURL: files.lockURL,
-                deviceID: session.deviceID, credentialKind: session.credentialKind)
+            return Self.archiveAccountEnvironment(desktopEngineEnvironment(tokenURL: files.tokenURL, lockURL: files.lockURL,
+                deviceID: session.deviceID, credentialKind: session.credentialKind))
         }
-        return try engineEnvironment()
+        return Self.archiveAccountEnvironment(try engineEnvironment())
+    }
+
+    private static func archiveAccountEnvironment(_ source: [String: String]) -> [String: String] {
+        var environment = source
+        environment.removeValue(forKey: "PIKPAK_GUEST_MODE")
+        environment["PIKPAK_CONTENT_MODE"] = PikPakContentMode.user.rawValue
+        return environment
     }
 
     private func handleArchiveStderrLine(_ line: String, taskID: UUID, generation: UUID) {
@@ -19894,6 +19926,9 @@ final class DownloaderModel: ObservableObject {
             values["reading_bytes"] = Double(t.readingBytes)
             values["pending_read_tasks"] = Double(t.pendingReadTasks)
             values["reading_tasks"] = Double(t.readingTasks)
+            values["waiting_read_bytes"] = Double(t.waitingCheckBytes)
+            values["waiting_read_tasks"] = Double(t.waitingCheckCount)
+            values["oldest_waiting_read_ms"] = Double(t.oldestWaitingReadMs ?? t.oldestPendingMs ?? 0)
             values["read_drives"] = Double(t.readDrives)
             values["write_drives"] = Double(t.writeDrives)
             values["oldest_pending_read_ms"] = Double(t.oldestPendingMs ?? 0)
@@ -19912,6 +19947,7 @@ final class DownloaderModel: ObservableObject {
             values["read_work_added_bytes"] = Double(t.readWorkAddedBytes ?? 0)
             values["read_work_processed_bytes"] = Double(t.readWorkProcessedBytes ?? 0)
             values["read_work_removed_bytes"] = Double(t.readWorkRemovedBytes ?? 0)
+            values["read_turn_latency_handoffs"] = Double(t.readTurnLatencyHandoffs ?? 0)
             values["prefetch_bytes"] = Double(t.prefetchBytes ?? 0)
             values["prefetch_tasks"] = Double(t.prefetchTasks ?? 0)
             values["prefetch_discarded_bytes"] = Double(t.prefetchDiscardedBytes ?? 0)
@@ -20011,6 +20047,9 @@ final class DownloaderModel: ObservableObject {
             values["reading_bytes"] = Double(traffic.readingBytes)
             values["pending_read_tasks"] = Double(traffic.pendingReadTasks)
             values["reading_tasks"] = Double(traffic.readingTasks)
+            values["waiting_read_bytes"] = Double(traffic.waitingCheckBytes)
+            values["waiting_read_tasks"] = Double(traffic.waitingCheckCount)
+            values["oldest_waiting_read_ms"] = Double(traffic.oldestWaitingReadMs ?? traffic.oldestPendingMs ?? 0)
             values["read_drives"] = Double(traffic.readDrives)
             values["write_drives"] = Double(traffic.writeDrives)
             values["read_batch_remaining_bytes"] = Double(traffic.batchRemainingBytes)
@@ -20050,6 +20089,7 @@ final class DownloaderModel: ObservableObject {
             values["read_turn_finishes"] = Double(traffic.readTurnFinishes ?? 0)
             values["read_turn_pressure_handoffs"] = Double(traffic.readTurnPressureHandoffs ?? 0)
             values["read_turn_control_handoffs"] = Double(traffic.readTurnControlHandoffs ?? 0)
+            values["read_turn_latency_handoffs"] = Double(traffic.readTurnLatencyHandoffs ?? 0)
             values["last_read_handover_sequence"] = Double(traffic.lastReadHandoverSequence ?? 0)
             values["last_read_handover_reason"] = Double(traffic.lastReadHandoverReason ?? 0)
             values["last_read_turn_ms"] = Double(traffic.lastReadTurnMs ?? 0)

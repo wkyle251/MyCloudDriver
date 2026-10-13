@@ -36,6 +36,9 @@ async fn deferred_receive_rearm_child() {
     assert!(deferred.ready(), "Free receiving capacity must wake known unfinished work despite a large disk-only head");
     let scope = Scope::new(id.into(), Some(deferred.clone()));
     assert_eq!(pool.0.lock().unwrap().receiving_preparing.len(), 1);
+    let competing: Vec<_> = (0..7).map(|_| crate::download_buffer::prefetch_slot(2 << 20, 2 << 20).unwrap()).collect();
+    assert!(crate::download_buffer::prefetch_slot(2 << 20, 2 << 20).is_none(),
+        "The dispatched verifier must reserve its receiving capacity before metadata starts");
     assert!(!deferred.ready(), "A dispatch cannot spin while its preparation is running");
     scope.run(async {
         let permit = crate::download_buffer::prefetch_slot(2 << 20, 2 << 20).unwrap();
@@ -45,6 +48,7 @@ async fn deferred_receive_rearm_child() {
         drop(receiving); drop(permit);
     }).await;
     drop(scope);
+    drop(competing);
     assert!(pool.0.lock().unwrap().receiving_preparing.is_empty());
     drop(deferred);
     // Eligibility is evidence from the current preparation, not a permanent
@@ -63,8 +67,17 @@ async fn deferred_receive_rearm_child() {
     drop(scope);
     *waiting.0.receive_after.lock().unwrap() = Instant::now();
     assert!(!waiting.ready(), "A failed receiving rearm must not repeat metadata with stale eligibility");
+    drop(waiting);
+    let scope = Scope::new(id.into(), None);
+    let probed = scope.run(async {
+        let permit = crate::download_buffer::prefetch_slot(2 << 20, 2 << 20).unwrap();
+        drop(permit); // The request could not produce safe speculative payload.
+        admit(key, id, 2 << 20, 4 << 20).err().unwrap().downcast::<Deferred>().unwrap()
+    }).await;
+    drop(scope);
+    assert!(!probed.ready(), "A completed probe must wait for disk admission instead of rearming forever");
     drop(held);
-    assert!(waiting.ready(), "Disk-only work must retain its FIFO ticket");
+    assert!(probed.ready(), "Disk-only work must retain its FIFO ticket");
 }
 
 #[test]
@@ -205,6 +218,24 @@ async fn metadata_preparation_is_bounded_without_borrowing_disk_bytes() {
         pool.0.lock().unwrap().active.is_empty(),
         "Cancelled preparation releases every reservation"
     );
+}
+
+#[test]
+fn prepared_metadata_reserves_the_remaining_verifier_slots() {
+    let key = Key::Drive(0xed00_0000_0000_00d2);
+    let pool = Arc::new(Pool::default());
+    let active: Vec<_> = (0..MAX_TASKS - 1).map(|_| {
+        let ticket = pool.enqueue(key, 1, 1);
+        pool.claim(&ticket).unwrap()
+    }).collect();
+    let first = pool.enqueue(key, 1, 1);
+    let next = pool.enqueue(key, 1, 1);
+    let prepared = pool.prepare(&first).unwrap();
+    assert!(!pool.ready(&next), "Seven active readers and one metadata preparation fill all eight verifier slots");
+    assert!(pool.prepare(&next).is_none(), "An occupied verifier must not trigger another file-open/setup attempt");
+    drop(prepared);
+    assert!(pool.ready(&next), "Cancellation returns the unused preparation allowance");
+    drop(active);
 }
 
 #[tokio::test]

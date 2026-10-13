@@ -35,7 +35,9 @@ enum DownloadReceiveDiagnostics {
         "payload_deferred_rearm", "payload_http_success", "payload_http_429", "payload_http_5xx", "payload_http_auth",
         "payload_http_416", "payload_http_other", "connection_budget_blocked_polls", "connection_cooldown_blocked_polls",
         "connection_endpoint_blocked_polls", "connection_shared_blocked_polls", "connection_cooldown_events",
-        "connection_known_cooldown_remaining_ms"]
+        "connection_known_cooldown_remaining_ms", "range_active_channels", "range_admission_limit",
+        "range_header_active", "range_header_count", "range_header_total_ms", "range_header_max_ms",
+        "range_header_failed", "range_trial_accepted", "range_trial_rejected", "range_startup_reused"]
     static let keys: Set<String> = Set(counters + waits.flatMap { name in
         ["count", "active", "total_ms", "max_ms", "oldest_ms"].map { name + "_" + $0 }
     })
@@ -48,7 +50,8 @@ enum DownloadReceiveDiagnostics {
         let failures = "payload totals timeout/connection/429/5xx \(count("payload_timeout"))/\(count("payload_connection"))/\(count("payload_http_429"))/\(count("payload_http_5xx"))"
         let recovery = "recovery totals stream/retry/rearm \(count("payload_streaming_fallback"))/\(count("payload_early_empty_retry"))/\(count("payload_deferred_rearm"))"
         let validation = "payload totals range/auth/416 \(count("payload_range_validation"))/\(count("payload_http_auth"))/\(count("payload_http_416"))"
-        return [ram, connection, cooldown, failures, validation, recovery].joined(separator: "; ")
+        let ranges = "range channels \(count("range_active_channels"))/\(count("range_admission_limit")), headers \(count("range_header_count")) (\(count("range_header_failed")) failed), learned starts \(count("range_startup_reused"))"
+        return [ram, connection, cooldown, failures, validation, recovery, ranges].joined(separator: "; ")
     }
 }
 

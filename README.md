@@ -172,8 +172,9 @@ support session Undo. Existing PikPak Undo coverage is described below.
   progress, transferred bytes and speed when the provider reports them, then the completed
   preview's size and **Fully buffered** status once it is available on this Mac. Unknown
   progress stays indeterminate and unknown speed shows **—**. PikPak and Link show their
-  transfer speed, buffering percentage and retained ranges below the player, with further
-  information in **Buffering details**; they stream as data arrives. Loading overlays also show
+  one compact summary in **Buffering details** below the player: status, transfer speed,
+  buffered bytes, percentage and a single retained-range bar. Source information sits below
+  the bar; the information icon explains gaps and buffer lifetime. They stream as data arrives. Loading overlays also show
   percentage, received bytes and transfer speed before playback starts, including full MP4/AVI
   downloads for compatible previews. Unknown-length downloads still show bytes and speed;
   conversion clears the completed download's percentage and transfer rate. The panel also remains available when an external
@@ -261,8 +262,14 @@ support session Undo. Existing PikPak Undo coverage is described below.
   shows its own network speed; existing partial data is excluded from speed.
   PikPak account and shared-link downloads start up to four files, then keep
   extra connections only when measured total throughput improves by at least
-  10%. Successful trials increase capacity faster, within an automatic safety
+  1 MB/s. Successful trials increase capacity faster, within an automatic safety
   ceiling. Reducing new starts lets active partial downloads finish normally.
+  Range downloads may reuse up to four recently proven connections on the same
+  origin for sixty seconds; pressure, failures and cooldowns discard that hint.
+  Dynamic retries can retain a successful account-route choice briefly while
+  fetching a fresh signed URL and checking permission on each new attempt.
+  HDD range writes coalesce within the shared RAM allowance, and sparse resume
+  checks reuse one file handle and read buffers without skipping byte checks.
   An individual expired link or interrupted connection retries without reducing
   capacity for healthy files; service throttling still reduces new starts.
   PikPak downloads, similarity fetching, uploads and managed preview downloads
@@ -292,7 +299,9 @@ support session Undo. Existing PikPak Undo coverage is described below.
   once; the progress count and final result appear above the list.
 - **Background extraction:** extract supported cloud archives while continuing
   to use the app. Password-protected archives prompt for a password; progress
-  appears in the status area.
+  appears in the status area. In Dynamic Mode, cloud extraction uses a saved
+  Normal login for the same account when available. Other tasks keep their
+  selected connection. Cloud extraction always requires account authentication.
 - **Content similarity:** open **File → Find Similar Files…** to compare actual
   content. The command also works on **All Drives**, where you can choose the
   scan drive directly. Results use an expandable file tree and a ranked match pane with actual
@@ -963,6 +972,19 @@ For a live Terminal dashboard on this Mac while another Mac downloads, run
 It shows download, RAM buffer, read/write pools, disk rates, and setup waits, and saves
 private rotating numeric logs locally. See [Remote download monitor](docs/REMOTE_DOWNLOAD_MONITOR.md)
 for SSH setup, history replay, low-speed summaries, and retention settings.
+
+The app's download dashboard separates **Checks waiting** from **Reading now**.
+Selecting a read turn does not make every queued check an active disk reader;
+the waiting count and oldest wait include checks deferred within that turn.
+Receive-ahead setup reserves its HTTP capacity before preparation, and briefly
+reuses range probes for unchanged sources while checks wait for disk admission.
+
+On a coordinated HDD, saved-data checks use 4 MiB read batches and share their
+eight-task allowance with metadata preparation. Waiting writable batches of at
+least 64 MiB get a disk turn after ten seconds of reading; smaller tails can
+wait up to thirty seconds. An idle receiver, memory pressure, Pause or Quit can
+request an earlier handoff. Each selected write batch still drains completely,
+and reads continue from their existing hash state afterwards.
 
 | Problem | What to check |
 | --- | --- |

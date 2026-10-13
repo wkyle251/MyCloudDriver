@@ -49,7 +49,7 @@ impl ContentMode {
 
 /// Temporary Guest metadata failures do not establish that account quota is
 /// necessary. Preserve their error and cooldown for the normal retry queue.
-pub(crate) fn guest_lookup_transient(error: &crate::Error) -> bool {
+pub fn guest_lookup_transient(error: &crate::Error) -> bool {
     match error {
         crate::Error::Http(error) => !error.is_builder(),
         crate::Error::Api { status, .. } | crate::Error::RetryAfter { status, .. } => {
@@ -70,6 +70,9 @@ pub fn content_access_denied(error: &anyhow::Error) -> bool {
         return true;
     }
     error.chain().any(|cause| {
+        if matches!(cause.downcast_ref::<crate::Error>(), Some(crate::Error::InvalidDownloadUrl)) {
+            return true;
+        }
         if cause.is::<crate::download_policy::ContentUnavailable>()
             || cause.is::<crate::download_policy::OriginalSizeMismatch>()
         {

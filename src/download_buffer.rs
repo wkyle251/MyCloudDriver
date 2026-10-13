@@ -60,8 +60,18 @@ pub(crate) fn prefetch_slot(read_bytes: u64, incoming_bytes: u64) -> Option<Pref
     // Fully received pieces may still need an EOF replay. Their few proof
     // bytes must not occupy all slots ahead of genuinely unfinished payloads.
     if read_bytes < 1 << 20 || incoming_bytes < 1 << 20 { return None; }
-    crate::download_verification::receive_ahead_candidate();
-    prefetch_slots().acquire()
+    let permit = crate::download_verification::reserved_prefetch()
+        .or_else(reserve_prefetch);
+    if permit.is_none() {
+        // Only a capacity miss can benefit from another receive-ahead dispatch.
+        // Once a probe gets its slot, an unsupported or changed source must
+        // wait for its disk check instead of probing again every five seconds.
+        crate::download_verification::receive_ahead_candidate();
+    }
+    permit
+}
+pub(crate) fn reserve_prefetch() -> Option<PrefetchPermit> {
+    receive_ahead_available().then(|| prefetch_slots().acquire()).flatten()
 }
 pub(crate) fn receive_ahead_available() -> bool {
     let slots = prefetch_slots();
@@ -214,6 +224,20 @@ pub(crate) async fn write_chunk<T>(bytes: usize, future: impl std::future::Futur
 }
 pub(crate) fn writing_payload() -> usize { WRITING_PAYLOAD.try_with(|bytes| *bytes).unwrap_or(0) }
 
+pub(crate) fn range_write_batch(coordinated: bool) -> usize {
+    if !coordinated { return pikpak::download_network::RECEIVE_WINDOW as usize; }
+    (budget().current().0 / 64).clamp(QUANTUM, 4 << 20)
+}
+pub(crate) fn range_write_pressure() -> bool {
+    let (limit, pressure) = budget().current();
+    range_write_pressure_at(limit, pressure, USED.load(Ordering::Relaxed) * QUANTUM)
+}
+fn range_write_pressure_at(limit: usize, pressure: u32, reserved: usize) -> bool {
+    // macOS reports normal pressure as 1; only warning/critical levels
+    // should force small writes before the coordinated batch is full.
+    pressure >= 2 || reserved.saturating_add(RANGE_BATCH) >= limit
+}
+
 fn physical_memory() -> Option<usize> {
     #[cfg(target_os = "macos")]
     {
@@ -297,6 +321,7 @@ impl Budget {
             pressure.next = now + Duration::from_secs(1);
             pressure.update(now, memory_pressure(), self.policy.limit, USED.load(Ordering::Relaxed) * QUANTUM);
         }
+        pikpak::download_waits::range_memory_pressure(pressure.level);
         (pressure.allowed, pressure.level)
     }
     async fn acquire(&self, quanta: usize) -> OwnedSemaphorePermit {

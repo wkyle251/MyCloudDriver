@@ -633,6 +633,15 @@ pub async fn metadata_async(path: &Path) -> std::io::Result<std::fs::Metadata> {
         .map_err(std::io::Error::other)?
 }
 
+pub async fn validate_open_file_async(path: &Path, opened: &std::fs::Metadata) -> std::io::Result<()> {
+    let _stage = pikpak::download_waits::Stage::enter(pikpak::download_waits::Kind::FsMetadata);
+    let path = path.to_owned();
+    let opened = opened.clone();
+    tokio::task::spawn_blocking(move || validate_open_file(&path, &opened))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 pub async fn rename_async(source: &Path, destination: &Path) -> std::io::Result<()> {
     let source = source.to_owned();
     let destination = destination.to_owned();

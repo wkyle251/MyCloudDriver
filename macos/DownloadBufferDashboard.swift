@@ -106,11 +106,13 @@ struct DownloadBufferDashboard: View {
         }
     }
     @ViewBuilder private func readPools(_ traffic: DownloadDiskTraffic) -> some View {
-        pool("Pending reads", bytes: traffic.pendingReadBytes, symbol: "clock",
-             detail: "\(traffic.pendingReadTasks.formatted()) checks waiting", color: .purple, selected: false)
-        pool("Reading", bytes: traffic.readingBytes, symbol: "doc.text.magnifyingglass",
-             detail: "\(traffic.readingTasks.formatted()) checks in turn", color: .purple, selected: traffic.readDrives > 0)
-            .help("Remaining bytes in checks selected for this turn. New checks can join, so this total can rise while disk reads progress.")
+        pool("Checks waiting", bytes: traffic.waitingCheckBytes, symbol: "clock",
+             detail: "\(traffic.waitingCheckCount.formatted()) checks queued", color: .purple, selected: false)
+            .help("Checks waiting for disk I/O, including checks selected for the current turn that have not started reading.")
+        pool("Reading now", bytes: traffic.activeReadBytes ?? 0, symbol: "doc.text.magnifyingglass",
+             detail: (traffic.activeReadTasks ?? 0) == 1 ? "1 active read" : "\((traffic.activeReadTasks ?? 0).formatted()) active reads",
+             color: .purple, selected: (traffic.activeReadTasks ?? 0) > 0)
+            .help("Remaining bytes in checks currently performing disk I/O. Other checks stay in Checks waiting until the disk reads them.")
     }
     @ViewBuilder private func writePools(_ traffic: DownloadDiskTraffic) -> some View {
         pool("Pending writes", bytes: traffic.pendingWriteBytes ?? 0, symbol: "tray.and.arrow.down",
@@ -135,7 +137,7 @@ struct DownloadBufferDashboard: View {
         Text("Disk I/O: \(traffic.activeReadTasks ?? 0) reading · \(traffic.activeWriteTasks ?? 0) writing")
     }
     @ViewBuilder private func oldestWait(_ traffic: DownloadDiskTraffic) -> some View {
-        if traffic.pendingReadTasks > 0, let wait = traffic.oldestPendingMs {
+        if traffic.waitingCheckCount > 0, let wait = traffic.oldestWaitingReadMs ?? traffic.oldestPendingMs {
             Text("Oldest read wait \(wait / 1_000)s").foregroundStyle(wait >= 60_000 ? Color.orange : .secondary)
         } else if let ready = traffic.readyReadTasks, ready > 0 {
             Text("\(ready) reads ready for disk")

@@ -1074,7 +1074,7 @@ area. Compile **one entry point at a time**; each declares `@main`.
 | `SimilarityTreeExpansionTests.swift` | Expand/collapse 250 groups, visible selection after collapse, search/regroup persistence, individual toggles, repeated commands, mode switches and whole-percent cutoff values. |
 | `BrowserDragDropTests.swift` | Drag targets across full rows, nested/file parents, blank space, thumbnails, clipping, scrolling, spring loading and rejection; Finder providers with native NSURL, async ordering, Unicode paths, atomic failure and root deduplication; release handoff geometry, provider capture and destination capture. Compile with `-D BROWSER_DROP_TESTS`. |
 | `BrowserFolderExpansionTests.swift` | Direct Expand All Levels action with no submenu, correct callbacks and fresh menu instances, cached fixed-size template icons at 1x/2x, and expansion plans covering cycles, duplicate IDs, repeated page tokens and partial-failure totals. Compile with `-D FOLDER_EXPANSION_TESTS`. |
-| `CloudExtractionTests.swift` | Blocked extraction requests that explain themselves and keep the task, parallel inspection/extraction with independent progress and selection, per-archive password prompts kept in memory only, cancellation and API failures isolated to their task, bounded batch inspection, and queued password popups with wrong-password retry. Compile with `-D ARCHIVE_TASK_TESTS` and pass a built `CloudExtractionFixtureEngine` as its first argument. |
+| `CloudExtractionTests.swift` | Dynamic-mode extraction using same-account Normal login while retaining the selected Token connection, account-only helper authorization across mode changes, missing/expired/removed connection rejection, explicit User-mode permission retries, blocked extraction requests, parallel progress/selection, memory-only passwords, cancellation, bounded batch inspection and wrong-password retry. Compile with `-D ARCHIVE_TASK_TESTS` and pass a built `CloudExtractionFixtureEngine` as its first argument. |
 | `FileSearchTests.swift` | Search pagination, Unicode, ranking, limits, paths, navigation, cache replacement and redaction; offline local scope with duplicate link identities; transfer selection layouts and output collisions; Finder drop formats; and a live helper covering progressive root results, scope/cache isolation and cancel/reset races. Compile with `-D FILE_SEARCH_TESTS` and pass a built `FileSearchFixtureEngine` as its first argument to include the live-helper section. |
 | `FolderSizeCacheTests.swift` | Exact and recursive deletion with ancestor updates and sibling preservation, overlapping multiselection, new folder/file insertion, moves across common ancestors, dirty-branch repair with clean-subtree reuse, size seeds limited to clean descendants, and complete-listing reconciliation that stays safe for unknown folders. With `-D FOLDER_SIZE_TESTS` it also checks that opening a folder for the first time during a scan keeps the scan while a changed listing still discards it, and that the saved-size store rereads a file replaced on disk. Compile with `-D FOLDER_SIZE_TESTS`; `cargo test --bin pikpak folder_measurement` covers the bounded concurrent walk. |
 | `GuestModeTests.swift` | Guest Mode behaviour alongside the live download queue and retry suites. Its results appear under the download-queue PASS lines rather than its own. |
@@ -1105,23 +1105,25 @@ test_output="$(mktemp -d)"
 swiftc -swift-version 5 -parse-as-library \
   scripts/CloudExtractionFixtureEngine.swift -o "$test_output/extraction-engine"
 ./scripts/build-native-test.sh scripts/CloudExtractionTests.swift \
-  "$test_output/cloud-extraction-tests"   # add -D ARCHIVE_TASK_TESTS, see below
+  "$test_output/cloud-extraction-tests" -D ARCHIVE_TASK_TESTS
 
 "$test_output/cloud-extraction-tests" "$test_output/extraction-engine"
 ```
 
-`build-native-test.sh` always defines `FINDER_WORKSPACE_TESTS`. A suite needing an
-additional flag has to be compiled directly instead, keeping the same source list
-the helper uses:
+`build-native-test.sh` always defines `FINDER_WORKSPACE_TESTS` and accepts extra
+compiler flags after the output path. For direct compilation, keep the same
+source list and C objects the helper uses:
 
 ```zsh
 sources=(macos/*.swift)
 sources=("${(@)sources:#macos/PikPakDownloaderApp.swift}")
 xcrun clang -target arm64-apple-macos13.0 -O2 -c macos/DriveArchive.c \
   -o "$test_output/archive.o"
+xcrun clang -target arm64-apple-macos13.0 -O2 -c macos/DiskTemperature.c \
+  -o "$test_output/disk-temperature.o"
 swiftc -D FINDER_WORKSPACE_TESTS -D ARCHIVE_TASK_TESTS -swift-version 5 \
   -target arm64-apple-macos13.0 -parse-as-library "${sources[@]}" \
-  scripts/CloudExtractionTests.swift "$test_output/archive.o" \
+  scripts/CloudExtractionTests.swift "$test_output/archive.o" "$test_output/disk-temperature.o" \
   -framework AVKit -larchive.2 -o "$test_output/cloud-extraction-tests"
 ```
 
@@ -1428,7 +1430,10 @@ appearances. Native iCloud/Photos videos use this same bar; expanding their
 preview must preserve playback, and switching to an image must stop the video.
 PikPak and Link show transfer speed, retained-byte progress and ranges inside
 Buffering details below the player. The collapsed panel shows only its disclosure;
-expanding it reveals status, speed, percentage, bytes and further information. The retained-byte buffer
+expanding it reveals one status/speed row, one byte/percentage summary and one retained-range
+bar, followed by source information and a help icon. Check compact widths and both appearances:
+the byte summary wraps rather than truncating, full buffering hides the idle transfer rate,
+conversion clears download metrics, and a failed stream has no animated buffer. The retained-byte buffer
 is separate from the timeline's currently playable ranges. Confirm that iCloud,
 Photos, external disks and network shares also use this disclosure; only the
 internal Local Disk omits it. Provider speed stays unknown until bytes are reported.
@@ -2477,6 +2482,53 @@ unit test fills all 64 retained contexts, requires further admission to fail eve
 with free HTTP slots, and verifies full permit refund after cancellation/drop.
 Existing generated Pause/Quit/restart and damaged-prefix tests remain required.
 
+### Build 287: parked checks and receive-ahead setup
+
+The generated `download_preparation_tests::rejected_prefetch_child` holds a
+physical reader while a sparse checkpoint encounters unsupported ranges or a
+changed validator. Four forced setup attempts must issue one range probe,
+perform no disk reads, leave saved bytes unchanged, and stay parked until disk
+admission becomes available. Both cases then finish with the generated original.
+The admission fixture occupies the other seven receiving slots after dispatch;
+the dispatched job must still own its reserved slot and release it on drop.
+Probe cache tests bind URL, file identity, size, revision and Referer, check
+expiry without extension on hits, and clear cached setup on ordinary exits.
+
+The disk snapshot regression selects two checks but starts only one read. Its
+waiting count must retain the other check and its age even when the legacy
+pending pool is empty. `DownloadReadQueueTests.swift` covers helper decoding,
+legacy fallback, replay readers and bounded byte arithmetic. Run it without
+an account or the app model:
+
+```sh
+swiftc -parse-as-library macos/DownloadBufferPolicy.swift scripts/DownloadReadQueueTests.swift -o /private/tmp/mycloud-read-queue-tests
+/private/tmp/mycloud-read-queue-tests
+```
+
+### Build 288: coordinated HDD read batches and write latency
+
+The read-admission regression fills seven verifier slots and dispatches one
+metadata preparation. Another queued check must stay parked until the reserved
+slot is returned. Existing oversized slow-metadata and receiving tests still
+require an available reader/network lane to progress independently.
+
+The integrity regression uses a generated 12 MiB plus 23-byte original on a
+synthetic coordinated drive. Its four 4 MiB read requests replace thirteen
+1 MiB requests while reading every byte once; proofs cross both old and new
+batch boundaries, and an edited byte must still fail verification. The async
+file's maximum buffer size is set explicitly so it does not split the larger
+requests at its default buffer limit. SSD reads retain their 1 MiB buffers.
+
+Deterministic disk clocks keep receiving active while 512 MiB of writable RAM
+waits below a 32 GiB memory limit. The scheduler must hand over after ten
+seconds, rather than wait for the 80% pressure threshold. A smaller continuous
+tail has a thirty-second bound. No local writer and no writable payload keep
+prerequisite reads running, and unverified prefetch RAM cannot trigger a write
+handoff. The real async gate regression holds a physical read past the handoff,
+requires its I/O to finish before writing, then resumes the original read from
+its existing progress. Selected write cohorts, Pause/Quit, restart and damaged
+checkpoint repair remain required checks.
+
 ```sh
 python3 scripts/with-client-credentials.py cargo test --locked --bin pikpak download_ -- --test-threads=4
 python3 scripts/test-remote-download-monitor.py
@@ -2500,3 +2552,45 @@ unchanged prefix and journal, and holds the physical reader throughout Quit.
 The attempt must exit as resumable before that reader is released. Existing
 nonempty-prefix Pause/Quit tests ensure accepted RAM retains its read/drain
 protection and reaches the checkpoint before shutdown.
+
+### Build 289: retry setup, range startup and HDD locality
+
+Generated account and shared-link fixtures cover both Guest metadata fallback
+and Guest-body fallback. A successful User route survives transient body retries
+for at most sixty seconds, without retaining its signed URL or extending expiry.
+Each retry fetches fresh User metadata; a permission failure, source/account/mode
+change, Pause or completion discards the route preference. Empty, null, relative
+and non-HTTP original URLs use a typed unavailable result, allow a valid original
+media candidate or Dynamic account fallback, and never reach Reqwest's builder.
+Repeated fresh metadata with no valid original URL follows the native app's
+three-confirmation failure policy instead of retrying indefinitely.
+
+Transparent ranged HTTP errors retain their status and Retry-After policy:
+429/5xx responses and truncated bodies stay retryable, while signed-link
+401/403 failures discard User-route preferences. Fixed tests also exercise
+typed errors wrapped in contextual messages, so error-chain representation
+cannot turn a temporary range interruption into a final helper failure.
+
+Range startup tests require accepted throughput evidence before learning up to
+four same-origin channels. They cover expiry without renewal, origin isolation,
+fair sharing, piece limits, resource pressure and HTTP cooldown invalidation.
+Fixed numeric diagnostics expose active range channels, admission targets,
+header latency, trial results and reused starts; privacy fixtures reject strings
+and unexpected keys at both collection boundaries.
+
+Sparse verification fixtures restore independent regions using one descriptor
+and two reusable read buffers, preserve EOF replay contexts, skip holes, and
+reject changed data or replaced paths. A retained reader still yields to the
+existing writer handover. HDD range output keeps RAM leases and the disk turn
+until positional blocking writes actually complete, bounds coalescing by the RAM
+allowance, drains small stalled tails, and retains recovery buffers after errors.
+Checkpoint durability and final read-back remain required.
+
+Run the generated release benchmarks in a quiet session with identical source
+fixtures, filesystem and settings for both versions. Coordinated-drive timings
+on an SSD check regressions; they do not establish real HDD or PikPak gains:
+
+```sh
+python3 scripts/with-client-credentials.py cargo test --release --locked --bin pikpak speed_benchmark -- --ignored --nocapture --test-threads=1
+python3 scripts/test-remote-download-monitor.py
+```

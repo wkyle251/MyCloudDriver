@@ -45,6 +45,7 @@ struct Preparation {
     pool: Arc<Pool>,
     number: u64,
     receiving: bool,
+    prefetch: Option<crate::download_buffer::PrefetchPermit>,
 }
 impl Drop for Preparation {
     fn drop(&mut self) {
@@ -74,6 +75,12 @@ impl Drop for Lease {
     }
 }
 impl State {
+    fn preparation_room(&self) -> bool {
+        // Prepared metadata is the next verifier, not eight extra contenders
+        // for the same occupied slots. Keep the pipeline full without
+        // reopening/checking seven files for every admission that completes.
+        self.active.len().saturating_add(self.preparing.len()) < MAX_TASKS
+    }
     fn first(&mut self) -> Option<Arc<Ticket>> {
         loop {
             let front = self.waiting.front()?;
@@ -126,7 +133,7 @@ impl Pool {
     }
     fn ready(&self, ticket: &Ticket) -> bool {
         let mut state = self.0.lock().unwrap();
-        (state.preparing.len() < MAX_TASKS
+        (state.preparation_room()
             && state
                 .first()
                 .is_some_and(|first| first.number == ticket.number)
@@ -141,15 +148,18 @@ impl Pool {
     fn prepare_receiving(self: &Arc<Self>, ticket: &Ticket) -> Option<Preparation> {
         let mut state = self.0.lock().unwrap();
         if !self.receive_ready(&state, ticket) { return None; }
+        // Eligibility is only a hint. Own the actual receiver/context before
+        // metadata starts so another dispatch cannot take it during setup.
+        let prefetch = crate::download_buffer::reserve_prefetch()?;
         // A missed race gets one bounded retry, not a metadata spin loop.
         *ticket.receive_after.lock().unwrap() = Instant::now() + Duration::from_secs(5);
         state.receiving_preparing.insert(ticket.number);
         pikpak::download_waits::payload_event(pikpak::download_waits::PayloadEvent::DeferredRearm);
-        Some(Preparation { pool: self.clone(), number: ticket.number, receiving: true })
+        Some(Preparation { pool: self.clone(), number: ticket.number, receiving: true, prefetch: Some(prefetch) })
     }
     fn prepare(self: &Arc<Self>, ticket: &Ticket) -> Option<Preparation> {
         let mut state = self.0.lock().unwrap();
-        if state.preparing.len() >= MAX_TASKS
+        if !state.preparation_room()
             || !state
                 .first()
                 .is_some_and(|first| first.number == ticket.number)
@@ -163,6 +173,7 @@ impl Pool {
             pool: self.clone(),
             number: ticket.number,
             receiving: false,
+            prefetch: None,
         })
     }
     fn requeue(&self, ticket: &Arc<Ticket>) {
@@ -464,6 +475,13 @@ pub(crate) fn receive_ahead_candidate() {
         state.receive_ahead = true;
         if let Some(ticket) = &state.waiting { ticket.receive_ahead.store(true, Ordering::Relaxed); }
     }
+}
+
+pub(crate) fn reserved_prefetch() -> Option<crate::download_buffer::PrefetchPermit> {
+    CURRENT.try_with(|attempt| {
+        attempt.state.lock().unwrap().preparing.as_mut()
+            .and_then(|preparing| preparing.prefetch.take())
+    }).ok().flatten()
 }
 
 /// This boundary precedes content probes/HTTP bodies, after saved-data checks.

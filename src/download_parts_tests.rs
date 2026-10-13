@@ -7,6 +7,167 @@ fn progress() -> DownloadProgressContext<'static> {
     DownloadProgressContext::new(false, "range-fixture", "generated.bin")
 }
 
+type BatchHook = Box<dyn FnOnce() + Send>;
+fn batch_hooks() -> &'static std::sync::Mutex<std::collections::HashMap<String, BatchHook>> {
+    static HOOKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, BatchHook>>> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+pub(super) fn before_batch(id: &str) {
+    let hook = batch_hooks().lock().unwrap().remove(id);
+    if let Some(hook) = hook { hook(); }
+}
+
+#[tokio::test]
+async fn coordinated_writer_batches_small_chunks_and_retries_a_failed_physical_write() {
+    let id = "generated-large-writer-batch";
+    let _drive = crate::download_verification::TestDrive::new(id);
+    let directory = tempfile::tempdir().unwrap();let part = directory.path().join("generated.part");
+    let mut writer = checkpoint_writer(&part, &[]).await;
+    writer.write_gate = crate::download_verification::WriteGate::new(&writer.file, id);
+    let target = crate::download_buffer::range_write_batch(true);
+    writer.total = (2 * target) as u64;
+    let frame = (64 << 10).min(target / 2).max(1);
+    let mut position = 0;
+    while position < target {
+        let length = frame.min(target - position);
+        let chunk = download_ranges::Chunk { index: 0, offset: position as u64,
+            bytes: bytes::Bytes::from(fixture::bytes(position as u64, length, 1)) };
+        writer.push(&chunk).await.unwrap();position += length;
+        assert_eq!(writer.file.metadata().await.unwrap().len(), if position < target { 0 } else { target as u64 },
+            "Only the full coordinated batch should reach the physical writer");
+    }
+    assert!(writer.buffers.is_empty());
+    assert_eq!(std::fs::read(data_path(&part)).unwrap(), fixture::bytes(0, target, 1));
+
+    // Keep all accepted bytes available for retry if the admitted write fails.
+    writer.file = crate::download_fs::open_async(&data_path(&part), rustix::fs::OFlags::RDONLY).await.unwrap();
+    let chunk = download_ranges::Chunk { index: 0, offset: target as u64,
+        bytes: bytes::Bytes::from(fixture::bytes(target as u64, target, 1)) };
+    assert!(writer.push(&chunk).await.is_err());
+    assert_eq!(writer.buffers[&0].bytes, target);
+    assert_eq!(writer.hashes[0].bytes, (2 * target) as u64);
+    writer.file = crate::download_fs::open_async(&data_path(&part), rustix::fs::OFlags::RDWR).await.unwrap();
+    writer.flush_ready().await.unwrap();
+    assert_eq!(std::fs::read(data_path(&part)).unwrap(), fixture::bytes(0, 2 * target, 1));
+    assert!(writer.buffers.is_empty());
+}
+
+#[test]
+fn blocking_range_writes_retain_the_disk_turn_and_ram_after_async_cancellation() {
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .env("MYCLOUDDRIVER_DOWNLOAD_RAM_LIMIT_BYTES", (4 << 20).to_string())
+        .args(["--exact", "download_transport::parts::tests::blocking_range_write_retention_child", "--ignored", "--nocapture"])
+        .output().unwrap();
+    assert!(result.status.success(), "{}{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated generated slow write and RAM accounting; invoked by parent"]
+async fn blocking_range_write_retention_child() {
+    use crate::download_verification::{Scope, TestDrive};
+    let id = "generated-blocking-write-retention";
+    let _drive = TestDrive::new(id);
+    let remote = fixture::Fixture::new(1 << 20).await;
+    remote.hold_first.store(true, Ordering::Release);remote.hold_after_bytes.store(64 << 10, Ordering::Release);
+    let directory = tempfile::tempdir().unwrap();let part = directory.path().join("generated.part");
+    let mut writer = checkpoint_writer(&part, &[]).await;writer.total = remote.size;
+    writer.write_gate = crate::download_verification::WriteGate::new(&writer.file, id);
+    let other = tokio::fs::File::create(directory.path().join("generated-other.part")).await.unwrap();
+    let other_gate = crate::download_verification::WriteGate::new(&other, id);
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    Scope::new(id.into(), None).run(async {
+        let transfer = Transfer::new(&http, &remote.url, None, State::new(remote.size, "\"fixture-1\"".into(), 0),
+            pikpak::download_network::Network::new(1, None)).unwrap();
+        let mut ranges = crate::download_buffer::Ranges::new(transfer, |_| {});
+        let chunk = ranges.next().await.unwrap().unwrap();
+        let payload = ranges.accept_retaining(&chunk);ranges.stop();
+        let length = chunk.bytes.len();let offset = chunk.offset;let index = chunk.index;
+        let (entered, entry) = tokio::sync::oneshot::channel();let (release, blocked) = std::sync::mpsc::channel();
+        batch_hooks().lock().unwrap().insert(id.into(), Box::new(move || { entered.send(()).unwrap();blocked.recv().unwrap(); }));
+        let flushing = tokio::spawn(async move {
+            writer.push_retaining(&chunk, payload).await.unwrap();writer.flush_piece(index).await.unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), entry).await.unwrap().unwrap();
+        flushing.abort();assert!(flushing.await.unwrap_err().is_cancelled());
+        assert_eq!(crate::download_buffer::snapshot().used, length,
+            "The detached physical write still owns the payload's RAM charge");
+        let waiting = tokio::spawn(async move { other_gate.turn(false).await });
+        tokio::task::yield_now().await;assert!(!waiting.is_finished(), "The physical writer retains its disk turn after cancellation");
+        release.send(()).unwrap();
+        drop(tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap().unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while crate::download_buffer::snapshot().used != 0 { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let output = std::fs::read(data_path(&part)).unwrap();
+        assert_eq!(&output[offset as usize..], fixture::bytes(offset, length, 1));
+    }).await;
+}
+
+#[tokio::test]
+async fn handled_guest_416_probe_is_cached_but_auth_failures_are_not() {
+    use std::sync::{Arc, atomic::AtomicUsize};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/original", listener.local_addr().unwrap());
+    let count = Arc::new(AtomicUsize::new(0));let observed = count.clone();
+    let status = Arc::new(AtomicUsize::new(416));let response_status = status.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut buffer = [0; 2048];let bytes = socket.read(&mut buffer).await.unwrap();
+                if bytes == 0 { return; }request.extend_from_slice(&buffer[..bytes]);
+            }
+            observed.fetch_add(1, Ordering::Relaxed);
+            let reply = format!("HTTP/1.1 {} Error\r\nContent-Range: bytes */65536\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", response_status.load(Ordering::Relaxed));
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        }
+    });
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();let network = Network::new(1, None);
+    let mut progress = progress();progress.guest_range_fallback = true;
+    for _ in 0..4 { assert!(probe_etag(&http, &url, 65536, None, &progress, &network).await.map_err(DlError::into_inner).unwrap().is_none()); }
+    assert_eq!(count.load(Ordering::Relaxed), 1, "Repeated continuations reuse the same handled negative range result");
+    assert!(probe_etag(&http, &url, 65536, Some("https://mypikpak.com/"), &progress, &network).await.map_err(DlError::into_inner).unwrap().is_none());
+    assert_eq!(count.load(Ordering::Relaxed), 2, "A different source binding requires a new probe");
+    status.store(403, Ordering::Relaxed);
+    for _ in 0..2 { assert!(probe_etag(&http, &format!("{url}?auth"), 65536, None, &progress, &network).await.is_err()); }
+    assert_eq!(count.load(Ordering::Relaxed), 4, "Authentication failures must never become cached unavailability");
+    server.abort();
+}
+
+#[test]
+fn tiny_ram_many_piece_download_makes_progress_without_releasing_unwritten_payloads() {
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .env("MYCLOUDDRIVER_DOWNLOAD_RAM_LIMIT_BYTES", (512 << 10).to_string())
+        .args(["--exact", "download_transport::parts::tests::tiny_ram_many_piece_writer_child", "--ignored", "--nocapture"])
+        .output().unwrap();
+    assert!(result.status.success(), "{}{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated generated transfer with 64 pieces and 512 KiB RAM; invoked by parent"]
+async fn tiny_ram_many_piece_writer_child() {
+    let id = "generated-tiny-ram-many-pieces";
+    let _drive = crate::download_verification::TestDrive::new(id);
+    let remote = fixture::Fixture::new(16 << 20).await;remote.wire_chunk_bytes.store(16 << 10, Ordering::Release);
+    let state: State = serde_json::from_value(serde_json::json!({
+        "total":remote.size,"piece_size":256 << 10,"etag":"\"fixture-1\"",
+        "pieces":(0..64).map(|_| serde_json::json!({"received":0,"complete":false})).collect::<Vec<_>>()
+    })).unwrap();
+    assert!(state.valid());
+    let directory = tempfile::tempdir().unwrap();let part = directory.path().join("generated.part");
+    std::fs::write(data_path(&part), b"").unwrap();save(&part, "range-fixture", &state).unwrap();
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut progress = DownloadProgressContext::new(false, id, "generated.bin");progress.source_file_id = "range-fixture";
+    tokio::time::timeout(Duration::from_secs(20), super::super::attempt_for_publication(&http, &remote.url,
+        remote.size, &part, false, progress, None)).await.unwrap().map_err(DlError::into_inner).unwrap();
+    assert_eq!(std::fs::read(&part).unwrap(), fixture::bytes(0, remote.size as usize, 1));
+    let ram = crate::download_buffer::snapshot();
+    assert!(ram.peak <= 512 << 10, "All queued and coalesced payloads stay inside the tiny shared budget");
+    assert_eq!(ram.used, 0);
+    assert!(remote.requests.lock().unwrap().len() > 60, "The test actually exercises many independent sparse pieces");
+}
+
 #[test]
 fn coalescing_range_buffers_keep_their_ram_charge_until_disk_write() {
     let mut child = std::process::Command::new(std::env::current_exe().unwrap());

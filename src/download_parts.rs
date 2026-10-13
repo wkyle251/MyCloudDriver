@@ -72,6 +72,16 @@ fn load(part: &Path, file_id: &str, total: u64) -> anyhow::Result<Option<Journal
         .then_some(journal))
 }
 
+async fn length_async(path: &Path) -> anyhow::Result<Option<u64>> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || length(&path)).await?
+}
+
+async fn remove_async(part: &Path) -> anyhow::Result<()> {
+    let part = part.to_owned();
+    tokio::task::spawn_blocking(move || remove(&part)).await?
+}
+
 fn save_with_hashes(
     part: &Path,
     file_id: &str,
@@ -171,15 +181,11 @@ async fn read_hashes(
     state: &State,
     control_id: &str,
 ) -> Result<Vec<integrity::Prefix>, DlError> {
-    let mut hashes = Vec::new();
-    for (_, offset, bytes) in state.covered_ranges() {
-        hashes.push(if bytes == 0 {
-            integrity::Prefix::new()
-        } else {
-            integrity::Prefix::read(path, offset, bytes, control_id).await?
-        });
+    let regions: Vec<_> = state.covered_ranges().map(|(_, offset, bytes)| (offset, bytes, false)).collect();
+    if regions.iter().all(|(_, bytes, _)| *bytes == 0) {
+        return Ok(regions.iter().map(|_| integrity::Prefix::new()).collect());
     }
-    Ok(hashes)
+    integrity::Prefix::read_regions(path, &regions, control_id).await
 }
 
 /// The hashes a resume starts from, and how many bytes it had to read back from the staging file to get them.
@@ -204,22 +210,31 @@ async fn restore_hashes(
         .await
         .map_err(|error| fatal(error, "Cannot inspect saved download progress"))?;
     let unchanged = saved_identity.is_some_and(|saved| integrity::SavedIdentity::of(&metadata).as_ref() == Some(saved));
-    let mut restored = RestoredHashes { hashes: Vec::new(), bytes_read: 0 };
+    let mut hashes = Vec::new();
+    let mut regions = Vec::new();
+    let mut bytes_read = 0u64;
     for (position, (index, offset, bytes)) in state.covered_ranges().enumerate() {
         let trusted = unchanged && state.piece_complete(index);
-        restored.hashes.push(match saved_digests.get(position) {
-            _ if bytes == 0 => integrity::Prefix::new(),
-            Some(digest) if trusted => integrity::Prefix::frozen(bytes, digest.clone(), &metadata),
+        hashes.push(match saved_digests.get(position) {
+            _ if bytes == 0 => Some(integrity::Prefix::new()),
+            Some(digest) if trusted => Some(integrity::Prefix::frozen(bytes, digest.clone(), &metadata)),
             _ => {
-                restored.bytes_read += bytes;
-                if state.needs_eof_replay(index) {
-                    integrity::Prefix::read_for_replay(path, offset, bytes, control_id).await?
-                } else {
-                    integrity::Prefix::read(path, offset, bytes, control_id).await?
-                }
+                bytes_read = bytes_read.checked_add(bytes)
+                    .ok_or_else(|| DlError::Fatal(anyhow::anyhow!("Invalid saved download region coverage")))?;
+                regions.push((offset, bytes, state.needs_eof_replay(index)));
+                None
             }
         });
     }
+    let mut restored_regions = integrity::Prefix::read_regions(path, &regions, control_id).await?.into_iter();
+    let hashes: Vec<_> = hashes.into_iter().map(|hash| hash.unwrap_or_else(|| restored_regions.next().expect("one restored context per saved region"))).collect();
+    // Complete-piece journal proofs were bound to the initial metadata, while
+    // freshly read regions carry the reader's final identity. Both must still
+    // identify this same staging entry before any context reaches a writer.
+    let after = crate::download_fs::metadata_async(path).await
+        .map_err(|error| fatal(error, "Cannot inspect verified download progress"))?;
+    for hash in &hashes { hash.validate_restored(&after)?; }
+    let restored = RestoredHashes { hashes, bytes_read };
     Ok(restored)
 }
 
@@ -352,15 +367,21 @@ impl Writer {
     async fn flush_completed(&mut self, state: &State) -> std::io::Result<()> {
         while let Some(index) = self
             .buffers
-            .keys()
-            .copied()
-            .find(|index| state.piece_complete(*index))
+            .iter()
+            .filter(|(index, _)| state.piece_complete(**index))
+            .min_by_key(|(_, buffer)| buffer.offset)
+            .map(|(index, _)| *index)
         {
             self.flush_piece(index).await?;
         }
         Ok(())
     }
+    #[cfg(test)]
     async fn push(&mut self, chunk: &download_ranges::Chunk) -> std::io::Result<()> {
+        self.push_retaining(chunk, None).await
+    }
+    async fn push_retaining(&mut self, chunk: &download_ranges::Chunk,
+        retained: Option<crate::download_buffer::RetainedPayload>) -> std::io::Result<()> {
         if self.offsets[chunk.index] + self.hashes[chunk.index].bytes != chunk.offset {
             return Err(std::io::Error::other("Non-contiguous range checksum"));
         }
@@ -374,18 +395,19 @@ impl Writer {
         // Retain the compact receive allocation instead of copying it into
         // a second, uncharged per-file allocation while disk I/O is waiting.
         buffer.chunks.push(chunk.bytes.clone()); buffer.bytes += chunk.bytes.len();
-        if buffer.bytes >= pikpak::download_network::RECEIVE_WINDOW as usize {
-            self.flush_piece(chunk.index).await?;
-        }
+        if let Some(retained) = retained { buffer.retained.push(retained); }
+        let full = buffer.bytes >= crate::download_buffer::range_write_batch(self.write_gate.key().is_some());
         let end = self.offsets.get(chunk.index + 1).copied().unwrap_or(self.total);
         if chunk.offset + chunk.bytes.len() as u64 == end {
-            self.flush_piece(chunk.index).await?;
             self.hashes[chunk.index].update_for_replay(&chunk.bytes);
+            self.flush_piece(chunk.index).await?;
         } else {
             self.hashes[chunk.index].update(&chunk.bytes);
+            if full { self.flush_piece(chunk.index).await?; }
         }
         Ok(())
     }
+    #[cfg(test)]
     fn retain(&mut self, index: usize, payload: Option<crate::download_buffer::RetainedPayload>) {
         if let (Some(buffer), Some(payload)) = (self.buffers.get_mut(&index), payload) {
             buffer.retained.push(payload);
@@ -397,16 +419,19 @@ impl Writer {
         let bytes = self.buffers.get(&index).map_or(0, |buffer| buffer.bytes);
         if bytes == 0 { return Ok(()); }
         crate::download_buffer::write_chunk(bytes, async {
-            let _write_turn = self.write_gate.turn(false).await;
+            let write_turn = self.write_gate.turn(false).await;
             let mut diagnostic = crate::download_telemetry::Operation::new(crate::download_telemetry::Kind::PayloadWrite, self.write_gate.id());
-            self.flush_piece_in_turn(index).await?;
+            let _write_turn = self.flush_piece_in_turn(index, write_turn).await?;
             diagnostic.add_bytes(bytes as u64); diagnostic.complete(); Ok(())
         }).await
     }
-    async fn flush_piece_in_turn(&mut self, index: usize) -> std::io::Result<()> {
-        if let Some(buffer) = self.buffers.get(&index) {
-            // Only the admitted physical writer builds a contiguous disk
-            // batch. The queued per-file buffers share their original RAM.
+    async fn flush_piece_in_turn<T: Send + 'static>(&mut self, index: usize, turn: T) -> std::io::Result<T> {
+        if !self.buffers.contains_key(&index) { return Ok(turn); }
+        // SSD/network destinations have no exclusive physical-disk turn.
+        // Preserve their existing small Tokio write pipeline; only coordinated
+        // drives need the larger positional batch and detached turn ownership.
+        if self.write_gate.key().is_none() {
+            let buffer = &self.buffers[&index];
             let bytes = if buffer.chunks.len() == 1 {
                 std::borrow::Cow::Borrowed(buffer.chunks[0].as_ref())
             } else {
@@ -418,6 +443,41 @@ impl Writer {
             self.file.write_all(&bytes).await?;
             drop(bytes);
             self.buffers.remove(&index);
+            return Ok(turn);
+        }
+        // Clone only after admission, so parked writers need neither an extra
+        // descriptor nor Tokio's internal write buffer. Positional writes do
+        // not disturb any retained descriptor's seek position.
+        let file = self.file.try_clone().await?.into_std().await;
+        let buffer = self.buffers.remove(&index).unwrap();
+        #[cfg(test)]
+        let test_id = self.write_gate.id().to_owned();
+        let (buffer, result, turn) = tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::FileExt;
+            #[cfg(test)]
+            tests::before_batch(&test_id);
+            // The blocking operation owns both the turn and retained RAM.
+            // Dropping its async waiter cannot release either during I/O.
+            let bytes = if buffer.chunks.len() == 1 { std::borrow::Cow::Borrowed(buffer.chunks[0].as_ref()) }
+            else {
+                let mut bytes = Vec::with_capacity(buffer.bytes);
+                for chunk in &buffer.chunks { bytes.extend_from_slice(chunk); }
+                std::borrow::Cow::Owned(bytes)
+            };
+            let result = file.write_all_at(&bytes, buffer.offset);
+            drop(bytes);
+            (buffer, result, turn)
+        }).await.map_err(std::io::Error::other)?;
+        if let Err(error) = result {
+            self.buffers.insert(index, buffer);
+            return Err(error);
+        }
+        drop(buffer);
+        Ok(turn)
+    }
+    async fn flush_ready(&mut self) -> std::io::Result<()> {
+        while let Some(index) = self.buffers.iter().min_by_key(|(_, buffer)| buffer.offset).map(|(index, _)| *index) {
+            self.flush_piece(index).await?;
         }
         Ok(())
     }
@@ -432,7 +492,7 @@ impl Writer {
     ) -> anyhow::Result<()> {
         let mut diagnostic = crate::download_telemetry::Operation::new(
             crate::download_telemetry::Kind::Checkpoint, file_id);
-        crate::download_fs::validate_open_file(&data_path(part), &self.file.metadata().await?)?;
+        crate::download_fs::validate_open_file_async(&data_path(part), &self.file.metadata().await?).await?;
         // Keep checking destination identity during a stalled body, but do not
         // repeatedly flush the drive and replace an unchanged durable journal.
         if self.buffers.is_empty() && self.checkpointed.as_ref() == Some(state) {
@@ -440,14 +500,15 @@ impl Writer {
             return Ok(());
         }
         {
-            let _write_turn = self.write_gate.turn(false).await;
-            while let Some(index) = self.buffers.keys().next().copied() {
-                self.flush_piece_in_turn(index).await?;
+            let mut write_turn = self.write_gate.turn(false).await;
+            while let Some(index) = self.buffers.iter().min_by_key(|(_, buffer)| buffer.offset).map(|(index, _)| *index) {
+                write_turn = self.flush_piece_in_turn(index, write_turn).await?;
             }
             self.file.flush().await?;
+            drop(write_turn);
         }
         let synced = self.file.metadata().await?;
-        crate::download_fs::validate_open_file(&data_path(part), &synced)?;
+        crate::download_fs::validate_open_file_async(&data_path(part), &synced).await?;
         if state
             .covered_ranges()
             .any(|(index, _, bytes)| self.hashes[index].bytes != bytes)
@@ -480,13 +541,26 @@ async fn probe_etag(
     http: &reqwest::Client, link: &str, total: u64, referer: Option<&str>,
     progress: &DownloadProgressContext<'_>, network: &std::sync::Arc<Network>,
 ) -> Result<Option<String>, DlError> {
+    let key = crate::download_preparation::Key::for_probe(
+        link, progress.source_file_id, total, progress.source_revision.as_deref(), referer);
+    let preparation = &progress.retry_state.preparation;
+    if let Some(tag) = preparation.probe(&key) { return Ok(tag); }
     let probe = transfer_control::interruptible(
         progress.file_id, download_ranges::probe(http, link, total, referer, network),
     ).await.map_err(DlError::Fatal)?.map_err(error);
     match probe {
+        Ok(tag) => {
+            // A short-lived validator only avoids repeating setup; every
+            // payload still validates If-Range, ETag and byte coverage.
+            preparation.remember_probe(&key, &tag);
+            Ok(tag)
+        }
         Err(failure) if progress.guest_range_fallback && download_range_rejected(match &failure {
             DlError::Fatal(error) | DlError::Retryable(error) => error,
-        }) => Ok(None),
+        }) => {
+            preparation.remember_probe(&key, &None);
+            Ok(None)
+        },
         result => result,
     }
 }
@@ -503,17 +577,31 @@ pub(super) async fn attempt_outcome(
     progress: &DownloadProgressContext<'_>,
     referer: Option<&str>,
 ) -> Result<Outcome, DlError> {
-    let had_ranges = exists(part);
+    let inspection_part = part.to_owned();
+    let inspection_id = progress.source_file_id.to_owned();
+    // Directory traversal and small journal reads can block on a busy HDD.
+    // Inspect them together away from the HTTP executor's worker threads.
+    let (had_ranges, existing, mut journal, data_length, data_identity, serial_candidate) = tokio::task::spawn_blocking(move || {
+        let had_ranges = exists(&inspection_part);
+        if !had_ranges && total < download_ranges::MIN_PARALLEL_SIZE {
+            return Ok((had_ranges, 0, None, None, None, None));
+        }
+        let existing = length(&inspection_part)?.unwrap_or(0);
+        let journal = load(&inspection_part, &inspection_id, total)?;
+        let data = data_path(&inspection_part);
+        let data_length = length(&data)?;
+        let data_identity = crate::download_fs::metadata(&data).ok().and_then(|metadata| integrity::SavedIdentity::of(&metadata));
+        let serial_candidate = if !had_ranges && total >= download_ranges::MIN_PARALLEL_SIZE && existing > 0 && existing < total {
+            ResumeState::load(&inspection_part, &inspection_id, total).ok().flatten()
+        } else { None };
+        Ok::<_, anyhow::Error>((had_ranges, existing, journal, data_length, data_identity, serial_candidate))
+    }).await.map_err(|error| fatal(error, "Cannot inspect download checkpoints"))?.map_err(DlError::Fatal)?;
     if !had_ranges && total < download_ranges::MIN_PARALLEL_SIZE {
         return Ok(Outcome::Sequential {
             staging_changed: false,
         });
     }
-    let existing = length(part).map_err(DlError::Fatal)?.unwrap_or(0);
     let current_source = source_key(link);
-    let mut journal = load(part, progress.source_file_id, total).map_err(DlError::Fatal)?;
-    let data_length = length(&data_path(part)).map_err(DlError::Fatal)?;
-    let data_identity = crate::download_fs::metadata(&data_path(part)).ok().and_then(|metadata| integrity::SavedIdentity::of(&metadata));
     let network = Network::for_url(link);
     let mut probed = None;
     let mut prefetched = None;
@@ -532,10 +620,10 @@ pub(super) async fn attempt_outcome(
                 || pikpak::content_mode::matching_content_revision(saved.source_revision.as_deref(), progress.source_revision.as_deref()))
     }).map(|saved| (saved.ranges.clone(), saved.source_revision.clone())).or_else(|| {
         if had_ranges || total < download_ranges::MIN_PARALLEL_SIZE || existing == 0 || existing >= total { return None; }
-        let saved = ResumeState::load(part, progress.source_file_id, total).ok().flatten()?;
+        let saved = serial_candidate.as_ref()?;
         if saved.prefix_sha256.is_none() || saved.durable_bytes != Some(existing)
             || resume_plan(Some(&saved), true, existing, total, progress, link).is_err() { return None; }
-        Some((State::new(total, saved.etag, existing), saved.source_revision))
+        Some((State::new(total, saved.etag.clone(), existing), saved.source_revision.clone()))
     });
     if let Some((mut state, revision)) = candidate {
         if let Some(permit) = crate::download_buffer::prefetch_slot(state.received(), total.saturating_sub(state.received())) {
@@ -567,7 +655,7 @@ pub(super) async fn attempt_outcome(
             });
         }
         let data = data_path(part);
-        if length(&data)
+        if length_async(&data).await
             .map_err(DlError::Fatal)?
             .is_some_and(|size| size >= saved.ranges.extent())
         {
@@ -637,11 +725,13 @@ pub(super) async fn attempt_outcome(
                 progress.source_revision.as_deref(),
             )
     }) {
-        remove(part).map_err(DlError::Fatal)?;
+        remove_async(part).await.map_err(DlError::Fatal)?;
         journal = None;
         retained_hashes = None;
     }
-    let saved = ResumeState::load(part, progress.source_file_id, total)
+    let saved_part = part.to_owned();let saved_id = progress.source_file_id.to_owned();
+    let saved = tokio::task::spawn_blocking(move || ResumeState::load(&saved_part, &saved_id, total)).await
+        .map_err(|error| fatal(error, "Cannot inspect saved download progress"))?
         .map_err(DlError::Fatal)?
         .filter(|saved| saved.prefix_sha256.is_some())
         .filter(|saved| saved.durable_bytes == Some(existing))
@@ -671,7 +761,7 @@ pub(super) async fn attempt_outcome(
     {
         // Unverifiable staging data cannot certify holes as downloaded bytes.
         // Keep the independently validated legacy prefix, if one still exists.
-        remove(part).map_err(DlError::Fatal)?;
+        remove_async(part).await.map_err(DlError::Fatal)?;
         journal = None;
         retained_hashes = None;
     }
@@ -704,7 +794,7 @@ pub(super) async fn attempt_outcome(
             .metadata()
             .await
             .map_err(|error| fatal(error, "Cannot inspect completed download pieces"))?;
-        crate::download_fs::validate_open_file(&data_path(part), &opened)
+        crate::download_fs::validate_open_file_async(&data_path(part), &opened).await
             .map_err(|error| fatal(error, "Download staging file changed"))?;
         if opened.len() != total {
             return Err(DlError::Fatal(anyhow::anyhow!(
@@ -730,13 +820,13 @@ pub(super) async fn attempt_outcome(
             None,
         )
         .await?;
-        crate::download_fs::validate_open_file(
+        crate::download_fs::validate_open_file_async(
             &data_path(part),
             &file
                 .metadata()
                 .await
                 .map_err(|error| fatal(error, "Cannot inspect completed download pieces"))?,
-        )
+        ).await
         .map_err(|error| fatal(error, "Download staging file changed"))?;
         let verified = VerifiedCompletion::from_prefix(
             &data_path(part),
@@ -747,7 +837,7 @@ pub(super) async fn attempt_outcome(
         .await?
         .rename(&data_path(part), part)
         .await?;
-        remove(part).map_err(DlError::Fatal)?;
+        remove_async(part).await.map_err(DlError::Fatal)?;
         progress.emit(total, total);
         return Ok(Outcome::Complete(verified));
     }
@@ -823,7 +913,7 @@ pub(super) async fn attempt_outcome(
             "Invalid original entity tag"
         )));
     }
-    if length(&data_path(part)).map_err(DlError::Fatal)?.is_none() {
+    if length_async(&data_path(part)).await.map_err(DlError::Fatal)?.is_none() {
         if existing != state.prefix()
             || existing > 0
                 && saved.as_ref().is_none_or(|saved| {
@@ -863,7 +953,7 @@ pub(super) async fn attempt_outcome(
         )
         .await
         .map_err(DlError::Fatal)?;
-        if length(part).map_err(DlError::Fatal)?.is_some() {
+        if length_async(part).await.map_err(DlError::Fatal)?.is_some() {
             crate::download_fs::rename_async(part, &data_path(part))
                 .await
                 .map_err(|e| fatal(e, "Cannot retain download prefix"))?;
@@ -914,7 +1004,7 @@ pub(super) async fn attempt_outcome(
         .metadata()
         .await
         .map_err(|error| fatal(error, "Cannot inspect resumed download pieces"))?;
-    crate::download_fs::validate_open_file(&data_path(part), &opened)
+    crate::download_fs::validate_open_file_async(&data_path(part), &opened).await
         .map_err(|error| fatal(error, "Download staging file changed"))?;
     for hash in &hashes {
         hash.validate_restored(&opened)?;
@@ -945,10 +1035,17 @@ pub(super) async fn attempt_outcome(
     let mut last_progress = Instant::now();
     progress.emit(transfer.state().received(), total);
     let result = loop {
+        if !writer.buffers.is_empty() && crate::download_buffer::range_write_pressure() {
+            if let Err(error) = writer.flush_ready().await { break Err(fatal(error, "Cannot flush buffered download pieces")); }
+        }
         let received = tokio::select! {
             biased;
             _ = tokio::time::sleep_until(schedule.due_at().into()), if schedule.must_save(Instant::now()) => None,
             result = transfer_control::drainable(progress.file_id, transfer.next()) => Some(result),
+            _ = tokio::time::sleep(Duration::from_millis(25)), if !writer.buffers.is_empty() => {
+                if let Err(error) = writer.flush_ready().await { break Err(fatal(error, "Cannot flush buffered download pieces")); }
+                continue;
+            },
             _ = tokio::time::sleep_until(schedule.due_at().into()) => None,
         };
         let Some(received) = received else {
@@ -978,10 +1075,10 @@ pub(super) async fn attempt_outcome(
                 if let Err(error) = writer.flush_completed(transfer.state()).await {
                     break Err(fatal(error, "Cannot flush completed download piece"));
                 }
-                if let Err(error) = crate::download_buffer::write_chunk(chunk.bytes.len(), writer.push(&chunk)).await {
+                let retained = transfer.accept_retaining(&chunk);
+                if let Err(error) = crate::download_buffer::write_chunk(chunk.bytes.len(), writer.push_retaining(&chunk, retained)).await {
                     break Err(fatal(error, "Cannot write download pieces"));
                 }
-                writer.retain(chunk.index, transfer.accept_retaining(&chunk));
                 schedule.received(chunk.bytes.len() as u64, Instant::now());
                 if last_progress.elapsed() >= Duration::from_millis(250) {
                     progress.emit(transfer.state().received(), total);
@@ -1143,13 +1240,13 @@ pub(super) async fn attempt_outcome(
 }
 
 async fn restore_prefix(part: &Path, state: &State) -> anyhow::Result<()> {
-    if length(&data_path(part))?.is_some() {
+    if length_async(&data_path(part)).await?.is_some() {
         let file =
             crate::download_fs::open_async(&data_path(part), rustix::fs::OFlags::WRONLY).await?;
-        crate::download_fs::validate_open_file(&data_path(part), &file.metadata().await?)?;
+        crate::download_fs::validate_open_file_async(&data_path(part), &file.metadata().await?).await?;
         file.set_len(state.prefix()).await?;
         file.sync_data().await?;
-        crate::download_fs::validate_open_file(&data_path(part), &file.metadata().await?)?;
+        crate::download_fs::validate_open_file_async(&data_path(part), &file.metadata().await?).await?;
         drop(file);
         crate::download_fs::rename_async(&data_path(part), part).await?;
     }

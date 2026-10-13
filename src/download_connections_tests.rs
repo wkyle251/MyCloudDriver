@@ -60,6 +60,22 @@ fn absolute_gain_rejects_small_gains_unchanged_rates_and_slowdowns() {
 }
 
 #[test]
+fn trial_outcomes_require_a_completed_measurement_and_are_consumed_once() {
+    let mut accepted = measured_trial(1, 2_000_000, 4_000_000, true);
+    assert_eq!(accepted.take_trial_outcome(), Some(TrialOutcome::Accepted(2)));
+    assert_eq!(accepted.take_trial_outcome(), None);
+    let mut rejected = measured_trial(1, 2_000_000, 2_000_000, true);
+    assert_eq!(rejected.take_trial_outcome(), Some(TrialOutcome::Rejected));
+    assert_eq!(rejected.take_trial_outcome(), None);
+    let now = Instant::now();
+    let mut cold = Connections::with_initial(8, 1, now).with_absolute_gain();
+    cold.active = 1;
+    cold.observe(now, 0, || true);
+    cold.idle(now);
+    assert_eq!(cold.take_trial_outcome(), None, "A cold start or cancelled probe is not measured gain");
+}
+
+#[test]
 fn absolute_gain_keeps_growing_when_each_trial_adds_less_than_ten_percent() {
     let start = Instant::now();
     let mut pool = Connections::new(64, start).with_absolute_gain();

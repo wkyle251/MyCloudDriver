@@ -245,6 +245,24 @@ impl ShareClient {
         self.inner.user_fallback.clone()
     }
 
+    pub fn content_mode(&self) -> crate::ContentMode {
+        if self.inner.user_fallback.is_some() { crate::ContentMode::Dynamic }
+        else if self.inner.account.is_some() { crate::ContentMode::User }
+        else { crate::ContentMode::Guest }
+    }
+
+    /// Account identity for short-lived per-transfer route hints. Anonymous
+    /// Guest shares have no account; Dynamic shares bind their User fallback.
+    pub async fn download_account_id(&self) -> Result<Option<String>> {
+        let account = self.inner.account.as_ref().or_else(|| {
+            self.inner.user_fallback.as_ref().and_then(|user| user.inner.account.as_ref())
+        });
+        match account {
+            Some(account) => account.tokens().user_id().await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     pub async fn pass_code_token(&self) -> String {
         self.inner.pass_code_token.read().await.clone()
     }
@@ -374,7 +392,7 @@ impl ShareClient {
         let _stage = crate::download_waits::Stage::enter(crate::download_waits::Kind::DownloadUrl);
         let detail = self.get_file_detail(file_id).await?;
         let web_content_link = original_content_link(&detail)
-            .ok_or(Error::InvalidPath("shared file has no content link"))?;
+            .ok_or(Error::InvalidDownloadUrl)?;
         let source_revision = crate::client::download_revision(
             detail.info.hash.as_deref(),
             detail.info.modified_time.as_deref(),
@@ -451,9 +469,7 @@ impl ShareClient {
                 "The original shared file no longer matches this saved file. Guest access stopped.",
             ));
         }
-        let web_content_link = original_content_link(&detail).ok_or(Error::Guest(
-            "The public share did not provide an original download URL.",
-        ))?;
+        let web_content_link = original_content_link(&detail).ok_or(Error::InvalidDownloadUrl)?;
         Ok(DownloadInfo {
             web_content_link,
             name: saved.name.clone(),
@@ -756,7 +772,7 @@ struct ShareResponse {
 struct ShareFile {
     #[serde(flatten)]
     info: FileInfo,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::client::deserialize_content_link")]
     web_content_link: String,
     #[serde(default)]
     medias: Vec<MediaResponse>,
@@ -862,6 +878,15 @@ fn is_missing_share_target(error: &Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_shared_original_url_preserves_valid_original_media_fallback() {
+        let file: ShareFile = serde_json::from_value(serde_json::json!({
+            "id":"generated", "name":"generated.bin", "kind":"drive#file", "size":"8",
+            "web_content_link":null, "medias":[{"is_origin":true,"link":{"url":"https://cdn.invalid/generated"}}]
+        })).unwrap();
+        assert_eq!(original_content_link(&file).as_deref(), Some("https://cdn.invalid/generated"));
+    }
 
     #[test]
     fn parses_supported_share_hosts_and_optional_folder() {

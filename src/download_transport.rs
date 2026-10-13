@@ -2456,6 +2456,12 @@ pub(super) async fn attempt_for_publication(
             out.write_all(&chunk[same..]).await.map_err(|error| {
                 fatal(error, "Cannot write download; check storage and permissions")
             })?;
+            // A coordinated drive must finish dispatched I/O before its disk
+            // turn is released. SSD/network destinations have no such turn
+            // and retain their existing pipeline; checkpoints flush both.
+            if _write_turn.is_some() {
+                out.get_mut().flush().await.map_err(|error| fatal(error, "Cannot flush partial download"))?;
+            }
             diagnostic.add_bytes((chunk.len() - same) as u64); diagnostic.complete(); Ok::<(), DlError>(())
         }).await?; }
         hash.update(&chunk);

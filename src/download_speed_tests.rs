@@ -4,6 +4,48 @@ use super::*;
 use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[path = "download_range_fixture.rs"]
+mod range_fixture;
+
+/// Matched before/after benchmark. The physical files and HTTP payload are
+/// generated; TestDrive selects the coordinated HDD path on any development
+/// disk. Timings on an SSD are regression evidence, not a real HDD speed claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual generated coordinated range benchmark; no account or user files"]
+async fn coordinated_range_speed_benchmark() {
+    use crate::download_verification::{Scope, TestDrive};
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let remote = range_fixture::Fixture::new(128 << 20).await;
+    for round in 0..3 {
+        let directory = tempfile::tempdir().unwrap();
+        let part = directory.path().join("generated.part");
+        let id = format!("synthetic-coordinated-speed-{round}");
+        let _drive = TestDrive::new(&id);
+        let scope = Scope::new(id.clone(), None);
+        let started = Instant::now();
+        let verified = scope.run(download_transport::attempt_for_publication(
+            &http, &remote.url, remote.size, &part, false,
+            DownloadProgressContext::new(false, &id, "generated.bin"), None,
+        )).await.map_err(DlError::into_inner).unwrap();
+        assert!(verified.is_some());
+        let elapsed = started.elapsed().as_secs_f64();
+        let file = std::fs::File::open(&part).unwrap();
+        use std::io::Read;
+        let mut offset = 0u64;
+        let mut buffer = vec![0u8; 1 << 20];
+        let mut file = file;
+        loop {
+            let count = file.read(&mut buffer).unwrap();
+            if count == 0 { break; }
+            assert_eq!(&buffer[..count], range_fixture::bytes(offset, count, 1));
+            offset += count as u64;
+        }
+        assert_eq!(offset, remote.size);
+        println!("BENCH coordinated_range_round={round} mib_per_second={:.1} elapsed_seconds={elapsed:.3} verified_bytes={}",
+                 remote.size as f64 / (1 << 20) as f64 / elapsed, remote.size);
+    }
+}
+
 struct Server {
     address: std::net::SocketAddr,
     connections: Arc<AtomicUsize>,

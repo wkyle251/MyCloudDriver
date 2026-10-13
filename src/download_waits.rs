@@ -5,13 +5,100 @@ use std::{
     collections::{BTreeMap, HashMap},
     future::Future,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+// Admission safety is independent of whether diagnostics are enabled. A RAM
+// stall invalidates warm-start evidence even if it ends before the next poll.
+static RANGE_RESOURCE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static RANGE_RESOURCE_WAITS: AtomicUsize = AtomicUsize::new(0);
+static RANGE_MEMORY_PRESSURE: AtomicU32 = AtomicU32::new(1);
+
+pub fn range_memory_pressure(level: u32) {
+    let previous = RANGE_MEMORY_PRESSURE.swap(level, Ordering::AcqRel);
+    if level >= 2 && previous < 2 {
+        RANGE_RESOURCE_GENERATION.fetch_add(1, Ordering::AcqRel);
+    }
+}
+pub(crate) fn range_resources() -> (u64, bool) {
+    let before = RANGE_RESOURCE_GENERATION.load(Ordering::Acquire);
+    let blocked = RANGE_RESOURCE_WAITS.load(Ordering::Acquire) > 0
+        || RANGE_MEMORY_PRESSURE.load(Ordering::Acquire) >= 2;
+    let after = RANGE_RESOURCE_GENERATION.load(Ordering::Acquire);
+    // A short wait may both begin and end between the two loads. Never admit
+    // from the old generation merely because its active gauge is already zero.
+    (after, blocked || before != after)
+}
+#[cfg(test)]
+pub(crate) fn range_startup_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+static RANGE_ACTIVE: AtomicU64 = AtomicU64::new(0);
+static RANGE_LIMIT: AtomicU64 = AtomicU64::new(0);
+static RANGE_HEADER_ACTIVE: AtomicU64 = AtomicU64::new(0);
+static RANGE_HEADER_COUNT: AtomicU64 = AtomicU64::new(0);
+static RANGE_HEADER_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
+static RANGE_HEADER_MAX_MS: AtomicU64 = AtomicU64::new(0);
+static RANGE_HEADER_FAILED: AtomicU64 = AtomicU64::new(0);
+static RANGE_TRIAL_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+static RANGE_TRIAL_REJECTED: AtomicU64 = AtomicU64::new(0);
+static RANGE_STARTUP_REUSED: AtomicU64 = AtomicU64::new(0);
+
+/// These gauges count live range request permits and controller admission,
+/// including headers still in flight. They are not file-worker counts.
+pub(crate) struct RangeChannel;
+impl RangeChannel {
+    pub(crate) fn new() -> Self {
+        RANGE_ACTIVE.fetch_add(1, Ordering::Relaxed); Self
+    }
+}
+impl Drop for RangeChannel {
+    fn drop(&mut self) { RANGE_ACTIVE.fetch_sub(1, Ordering::Relaxed); }
+}
+#[derive(Default)]
+pub(crate) struct RangeAdmission { limit: u64 }
+impl RangeAdmission {
+    pub(crate) fn set(&mut self, limit: usize) {
+        let limit = limit as u64;
+        if limit >= self.limit { RANGE_LIMIT.fetch_add(limit - self.limit, Ordering::Relaxed); }
+        else { RANGE_LIMIT.fetch_sub(self.limit - limit, Ordering::Relaxed); }
+        self.limit = limit;
+    }
+}
+impl Drop for RangeAdmission {
+    fn drop(&mut self) { RANGE_LIMIT.fetch_sub(self.limit, Ordering::Relaxed); }
+}
+struct RangeHeader { started: Instant, success: bool }
+impl Drop for RangeHeader {
+    fn drop(&mut self) {
+        let elapsed = millis(self.started.elapsed());
+        RANGE_HEADER_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        RANGE_HEADER_COUNT.fetch_add(1, Ordering::Relaxed);
+        RANGE_HEADER_TOTAL_MS.fetch_add(elapsed, Ordering::Relaxed);
+        RANGE_HEADER_MAX_MS.fetch_max(elapsed, Ordering::Relaxed);
+        if !self.success { RANGE_HEADER_FAILED.fetch_add(1, Ordering::Relaxed); }
+    }
+}
+pub(crate) async fn range_headers(
+    future: impl Future<Output = reqwest::Result<reqwest::Response>>,
+) -> reqwest::Result<reqwest::Response> {
+    RANGE_HEADER_ACTIVE.fetch_add(1, Ordering::Relaxed);
+    let mut measured = RangeHeader { started: Instant::now(), success: false };
+    let result = future.await;
+    measured.success = result.as_ref().is_ok_and(|response| response.status().is_success());
+    result
+}
+pub(crate) fn range_trial(accepted: bool) {
+    if accepted { RANGE_TRIAL_ACCEPTED.fetch_add(1, Ordering::Relaxed); }
+    else { RANGE_TRIAL_REJECTED.fetch_add(1, Ordering::Relaxed); }
+}
+pub(crate) fn range_startup_reused() { RANGE_STARTUP_REUSED.fetch_add(1, Ordering::Relaxed); }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -167,20 +254,26 @@ fn state() -> &'static Mutex<State> {
 pub fn enable(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
-pub struct Stage(Option<u64>);
+pub struct Stage { diagnostic: Option<u64>, resource: bool }
 impl Stage {
     pub fn enter(kind: Kind) -> Self {
-        Self(ENABLED.load(Ordering::Relaxed).then(|| {
+        let resource = matches!(kind, Kind::RamBodyLimit | Kind::RamSharedLimit | Kind::RamPressure);
+        if resource {
+            RANGE_RESOURCE_WAITS.fetch_add(1, Ordering::AcqRel);
+            RANGE_RESOURCE_GENERATION.fetch_add(1, Ordering::AcqRel);
+        }
+        Self { resource, diagnostic: ENABLED.load(Ordering::Relaxed).then(|| {
             state()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .enter(kind.name(), Instant::now())
-        }))
+        }) }
     }
 }
 impl Drop for Stage {
     fn drop(&mut self) {
-        if let Some(number) = self.0 {
+        if self.resource { RANGE_RESOURCE_WAITS.fetch_sub(1, Ordering::AcqRel); }
+        if let Some(number) = self.diagnostic {
             state()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -275,6 +368,13 @@ pub fn receive_diagnostics() -> BTreeMap<String, u64> {
     }
     result.extend(snapshot.responses.into_iter().filter(|(name, _)| name.starts_with("payload_") || name.starts_with("connection_"))
         .map(|(name, value)| (name.into(), value)));
+    for (name, counter) in [
+        ("range_active_channels", &RANGE_ACTIVE), ("range_admission_limit", &RANGE_LIMIT),
+        ("range_header_active", &RANGE_HEADER_ACTIVE), ("range_header_count", &RANGE_HEADER_COUNT),
+        ("range_header_total_ms", &RANGE_HEADER_TOTAL_MS), ("range_header_max_ms", &RANGE_HEADER_MAX_MS),
+        ("range_header_failed", &RANGE_HEADER_FAILED), ("range_trial_accepted", &RANGE_TRIAL_ACCEPTED),
+        ("range_trial_rejected", &RANGE_TRIAL_REJECTED), ("range_startup_reused", &RANGE_STARTUP_REUSED),
+    ] { result.insert(name.into(), counter.load(Ordering::Relaxed)); }
     result
 }
 
@@ -311,5 +411,37 @@ mod tests {
             .values()
             .all(serde_json::Value::is_u64));
         assert!(state.active.is_empty());
+    }
+
+    #[test]
+    fn range_safety_observes_ram_stalls_even_without_diagnostics() {
+        let _guard = range_startup_test_guard();
+        let before = range_resources().0;
+        for kind in [Kind::RamBodyLimit, Kind::RamSharedLimit, Kind::RamPressure] {
+            let stage = Stage::enter(kind);
+            assert!(range_resources().1);
+            drop(stage);
+        }
+        assert!(!range_resources().1);
+        assert!(range_resources().0 >= before + 3);
+        range_memory_pressure(2);
+        assert!(range_resources().1);
+        let warning = range_resources().0;
+        range_memory_pressure(2);
+        assert_eq!(range_resources().0, warning, "One warning episode invalidates evidence once");
+        range_memory_pressure(1);
+        assert!(!range_resources().1);
+    }
+
+    #[test]
+    fn range_diagnostics_have_fixed_numeric_keys_only() {
+        let result = receive_diagnostics();
+        for name in ["range_active_channels", "range_admission_limit", "range_header_active", "range_header_count",
+            "range_header_total_ms", "range_header_max_ms", "range_header_failed", "range_trial_accepted",
+            "range_trial_rejected", "range_startup_reused"] {
+            assert!(result.contains_key(name));
+        }
+        let json = serde_json::to_value(result).unwrap();
+        assert!(json.as_object().unwrap().values().all(serde_json::Value::is_u64));
     }
 }

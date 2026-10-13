@@ -3329,177 +3329,81 @@ struct ContentView: View {
         let fraction = preparation != nil ? preparation?.fraction : matches ? model.previewBufferedFraction : nil
         let isComplete = usesCache && fraction == 1 && state != .failed
         let totalBytes = usesCache && model.previewRetainedTotalBytes > 0 ? model.previewRetainedTotalBytes : item.size
-        let speed: Double? = preparation != nil ? model.previewPreparationBytesPerSecond
-            : state == .compatibility ? nil : matches ? model.previewTransferBytesPerSecond : 0
-        return MediaPreviewBufferDetails {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Label(preparation.map { $0.activity == .transferring ? "Downloading" : "Preparing preview" }
-                        ?? (isComplete ? "Fully buffered" : state.title),
-                        systemImage: preparation != nil ? "arrow.down.circle" : isComplete ? "checkmark.circle" : state.systemImage)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(isComplete ? .green : matches ? previewStreamingStateColor : .orange)
-                    Spacer(minLength: 4)
-                    Text(model.isBrowsingSharedLink ? "Link" : "PikPak")
-                        .font(.caption2).foregroundStyle(.secondary)
-                        .help(matches ? model.previewSourceLabel ?? "" : "Preparing preview…")
-                }
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(speed.map { "Transfer speed: \($0 > 0 ? formatByteRate($0) : "0 B/s")" } ?? "Transfer speed: —")
-                        .monospacedDigit()
-                    Spacer(minLength: 4)
-                    Text(fraction.map { $0.formatted(.percent.precision(.fractionLength(0...1))) }
-                        ?? (state == .failed || state == .compatibility ? "—" : "Loading…"))
-                        .monospacedDigit()
-                }.font(.caption2).foregroundStyle(.secondary)
-                if usesCache {
-                    previewSegmentedBar(segments: model.previewRetainedSegments, color: .cyan)
-                        .accessibilityLabel("Retained buffer")
-                        .accessibilityValue(previewBufferDetail)
-                } else {
-                    ProgressView(value: state == .failed || state == .compatibility ? 0 : fraction)
-                        .progressViewStyle(.linear).tint(.cyan)
-                        .accessibilityLabel("Available media buffer")
-                }
-                if let preparation {
-                    Text(preparation.activity == .transferring
-                        ? preparation.fileSize > 0
-                            ? "\(formatBytes(preparation.bytes)) of \(formatBytes(preparation.fileSize)) received"
-                            : "\(formatBytes(preparation.bytes)) received"
-                        : preparation.message)
-                        .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
-                } else {
-                    Text(usesCache
-                    ? "\(formatBytes(model.previewRetainedBytes)) of \(formatBytes(totalBytes)) retained"
-                    : matches && model.previewStreamedBytes > 0
-                        ? "\(formatBytes(model.previewStreamedBytes)) streamed"
-                        : "File size: \(formatBytes(totalBytes))")
-                    .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
-                }
-                if let preparation { Text(preparation.message).font(.caption2).foregroundStyle(.secondary) }
-                else if matches { previewStreamingDetails(for: item) }
-                else { Text("Preparing preview…").font(.caption2).foregroundStyle(.secondary) }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    private func previewStreamingDetails(for item: BrowserItem) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Label(
-                    model.previewStreamingState.title,
-                    systemImage: model.previewStreamingState.systemImage
-                )
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(previewStreamingStateColor)
-                .fixedSize()
-
-                Spacer(minLength: 4)
-
-                if let sourceLabel = model.previewSourceLabel {
-                    Text(sourceLabel)
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .help(sourceLabel)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(Color.primary.opacity(0.055), in: Capsule())
-                }
-
-            }
-
-            if model.previewStreamingState == .paused {
-                Text("Buffering continues while paused")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.cyan)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            if model.previewStreamingState == .failed {
-                Text(model.previewPlaybackError ?? "The preview could not be loaded. Try again or download the file.")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let diagnostic = model.previewErrorDiagnostic {
-                    ErrorDiagnosticBlock(diagnostic: diagnostic, summary: model.previewPlaybackError ?? "Preview unavailable", compact: true)
-                }
-            } else if model.previewStreamingState == .compatibility {
-                Text(model.previewCompatibilityPlayerName ?? "Compatibility player")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-            } else {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(
-                        model.previewStreamedBytes > 0
-                            ? model.previewUsesRetainedCache
-                                ? "\(formatBytes(model.previewRetainedBytes)) retained"
-                                : "\(formatBytes(model.previewStreamedBytes)) streamed"
-                            : "Waiting for media data"
-                    )
-                    .font(.caption.weight(.semibold))
-                    .monospacedDigit()
-                    if model.previewTransferBytesPerSecond > 0 {
-                        Text("\(formatByteRate(model.previewTransferBytesPerSecond)) now")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                    } else if model.previewStreamedBytes > 0 {
-                        Text("No network activity")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-
-            if model.previewStreamingState == .compatibility {
-                Text(
-                    "PikPak supplied only the original AVI. Open the secure, temporary stream in IINA for legacy AVI codec support; the file is not saved to Downloads."
-                )
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            } else if model.previewStreamingState != .failed {
-                if model.previewUsesRetainedCache {
-                    previewSegmentedRow(
-                        title: "Retained buffer",
-                        systemImage: "icloud.and.arrow.down",
-                        segments: model.previewRetainedSegments,
-                        detail: previewBufferDetail,
-                        color: .cyan
-                    )
-                } else {
-                    previewProgressRow(
-                        title: "Available buffer",
-                        systemImage: "icloud.and.arrow.down",
-                        fraction: model.previewBufferedFraction,
-                        detail: previewBufferDetail,
-                        color: .cyan
-                    )
-                }
-
-                Text(
-                    model.previewUsesRetainedCache
-                        ? "Buffering continues while paused. Cyan segments show downloaded parts of this file; gaps are still loading. The buffer is cleared when you choose another file."
-                        : "Buffering continues while paused. Available ranges may change when you seek."
-                )
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .padding(12)
-        .background(
-            LinearGradient(
-                colors: [Color.cyan.opacity(0.07), Color.blue.opacity(0.045)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            ),
-            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        let transferring = preparation?.activity == .transferring
+        let provider = model.isBrowsingSharedLink ? "Link" : "PikPak"
+        let sourceName = matches && preparation == nil
+            ? model.previewSourceLabel?.components(separatedBy: " • ").first : nil
+        var summary = MediaPreviewBufferSummary(
+            title: preparation.map { $0.activity == .transferring ? "Downloading preview" : "Preparing preview" }
+                ?? (isComplete ? "Fully buffered" : state.title),
+            symbol: preparation != nil ? (transferring ? "arrow.down.circle" : "gearshape.2")
+                : isComplete ? "checkmark.circle.fill" : state.systemImage,
+            color: isComplete ? .green : matches ? previewStreamingStateColor : .orange,
+            source: [provider, sourceName].compactMap { $0 }.joined(separator: " · "),
+            sourceDetails: matches ? model.previewSourceLabel : nil,
+            fraction: fraction,
+            showsProgress: state != .failed && state != .compatibility
         )
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.cyan.opacity(0.15), lineWidth: 1)
+        if summary.showsProgress {
+            let speed = preparation != nil ? model.previewPreparationBytesPerSecond
+                : matches ? model.previewTransferBytesPerSecond : 0
+            if (preparation == nil || transferring), !isComplete, let speed, speed.isFinite {
+                summary.speed = speed > 0 ? formatByteRate(speed) : "0 B/s"
+            }
+            if let preparation {
+                if transferring {
+                    summary.amount = formatBytes(preparation.bytes)
+                    summary.amountSuffix = preparation.fileSize > 0
+                        ? "of \(formatBytes(preparation.fileSize)) downloaded" : "downloaded"
+                } else {
+                    summary.footnote = preparation.message
+                }
+            } else if usesCache {
+                summary.amount = formatBytes(model.previewRetainedBytes)
+                summary.amountSuffix = totalBytes > 0 && !isComplete ? "of \(formatBytes(totalBytes)) buffered" : "buffered"
+                summary.ranges = model.previewRetainedSegments.map { $0.start..<$0.end }
+                summary.help = isComplete
+                    ? "The whole file is buffered for this preview. Choosing another file clears the buffer."
+                    : "Cyan segments show downloaded parts of this file; gaps are still loading. Buffering continues while paused. Choosing another file clears the buffer."
+            } else {
+                if matches && model.previewBufferedSeconds > 0 {
+                    summary.amount = formatMediaTime(model.previewBufferedSeconds)
+                    summary.amountSuffix = "ready to play"
+                } else if totalBytes > 0 {
+                    summary.amount = formatBytes(totalBytes)
+                    summary.amountSuffix = "file size"
+                }
+                summary.help = "Available media ranges may change when you seek. Buffering continues while paused."
+                if matches && model.previewStreamedBytes > 0 {
+                    summary.help = "\(formatBytes(model.previewStreamedBytes)) received. " + (summary.help ?? "")
+                }
+            }
+            if preparation == nil && state == .paused && !isComplete {
+                summary.footnote = "Buffering continues while paused."
+            }
+        } else {
+            summary.fraction = nil
+        }
+        return MediaPreviewBufferDetails {
+            MediaPreviewBufferStatusView(summary) {
+                if state == .failed {
+                    Text(model.previewPlaybackError ?? "The preview could not be loaded. Try again or download the file.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let diagnostic = model.previewErrorDiagnostic {
+                        DisclosureGroup("Error details") {
+                            ErrorDiagnosticBlock(diagnostic: diagnostic,
+                                summary: model.previewPlaybackError ?? "Preview unavailable", compact: true)
+                        }.font(.caption2)
+                    }
+                } else if state == .compatibility {
+                    Text(model.previewCompatibilityPlayerName ?? "Compatibility player")
+                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text("Open the temporary stream in IINA for legacy AVI codec support.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
     }
 
@@ -3581,95 +3485,6 @@ struct ContentView: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Preview error")
-    }
-
-    /// Draws each retained span where it actually sits in the file. A single
-    /// left-anchored bar cannot do this: AVFoundation often holds a movie
-    /// header at the very end before any media at the start, which the old
-    /// bar rendered as though it were at the beginning.
-    private func previewSegmentedRow(
-        title: String,
-        systemImage: String,
-        segments: [PreviewBufferSegment],
-        detail: String,
-        color: Color
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            previewProgressLabel(title: title, systemImage: systemImage, detail: detail)
-            previewSegmentedBar(segments: segments, color: color)
-                .accessibilityLabel(title)
-                .accessibilityValue(detail)
-        }
-    }
-
-    private func previewSegmentedBar(segments: [PreviewBufferSegment], color: Color) -> some View {
-        GeometryReader { geometry in
-            let width = max(geometry.size.width, 0)
-            ZStack(alignment: .leading) {
-                Capsule().fill(Color.primary.opacity(0.09))
-                ForEach(segments) { segment in
-                    Capsule().fill(color)
-                        // Keep a tiny header visible without extending beyond the file's edge.
-                        .frame(width: min(max(segment.width * width, 2), width * (1 - segment.start)))
-                        .offset(x: segment.start * width)
-                }
-            }
-            .frame(height: 6).frame(maxHeight: .infinity, alignment: .center)
-        }.frame(height: 6)
-    }
-
-    private func previewProgressRow(
-        title: String,
-        systemImage: String,
-        fraction: Double?,
-        detail: String,
-        color: Color
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            previewProgressLabel(title: title, systemImage: systemImage, detail: detail)
-
-            if let fraction {
-                ProgressView(value: fraction)
-                    .progressViewStyle(.linear)
-                    .tint(color)
-            } else {
-                ProgressView()
-                    .progressViewStyle(.linear)
-                    .tint(color)
-            }
-        }
-    }
-
-    private func previewProgressLabel(title: String, systemImage: String, detail: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Label(title, systemImage: systemImage)
-            Spacer(minLength: 0)
-            Text(detail).monospacedDigit().multilineTextAlignment(.trailing)
-        }
-        .font(.caption).foregroundStyle(.secondary)
-        .fixedSize(horizontal: false, vertical: true)
-    }
-
-    private var previewBufferDetail: String {
-        if model.previewUsesRetainedCache {
-            guard model.previewRetainedBytes > 0 else { return "Starting…" }
-            guard let fraction = model.previewBufferedFraction else {
-                return formatBytes(model.previewRetainedBytes)
-            }
-            return "\(Int((fraction * 100).rounded()))% • \(formatBytes(model.previewRetainedBytes))"
-        }
-        guard let fraction = model.previewBufferedFraction else {
-            return model.previewBufferedSeconds > 0
-                ? formatMediaTime(model.previewBufferedSeconds)
-                : "Starting…"
-        }
-        return "\(Int((fraction * 100).rounded()))% • \(formatMediaTime(model.previewBufferedSeconds))"
-    }
-
-    private var previewPlaybackDetail: String {
-        let current = formatMediaTime(model.previewPlaybackSeconds)
-        guard model.previewDurationSeconds > 0 else { return current }
-        return "\(current) / \(formatMediaTime(model.previewDurationSeconds))"
     }
 
     private var previewStreamingStateColor: Color {

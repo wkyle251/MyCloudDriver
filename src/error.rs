@@ -79,6 +79,11 @@ pub enum Error {
     #[error("invalid path: {0}")]
     InvalidPath(&'static str),
 
+    /// Content metadata supplied no absolute HTTP(S) original URL. This is
+    /// independent of the account session and must never reach HTTP builders.
+    #[error("PikPak did not provide a usable original download URL. Refresh the file and try again.")]
+    InvalidDownloadUrl,
+
     /// A URL did not identify a PikPak public share.
     #[error("invalid PikPak share link: {0}")]
     InvalidShareLink(String),

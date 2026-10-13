@@ -11,36 +11,42 @@ use std::sync::{
 #[path = "download_range_fixture.rs"]
 mod fixture;
 
-fn counters() -> &'static Mutex<HashMap<String, Arc<AtomicU64>>> {
-    static COUNTERS: OnceLock<Mutex<HashMap<String, Arc<AtomicU64>>>> = OnceLock::new();
+#[derive(Default)]
+struct ReadCounts { bytes: AtomicU64, calls: AtomicU64 }
+fn counters() -> &'static Mutex<HashMap<String, Arc<ReadCounts>>> {
+    static COUNTERS: OnceLock<Mutex<HashMap<String, Arc<ReadCounts>>>> = OnceLock::new();
     COUNTERS.get_or_init(Mutex::default)
 }
 
 pub(crate) fn record_read(control_id: &str, bytes: u64) {
     if let Some(counter) = counters().lock().unwrap().get(control_id) {
-        counter.fetch_add(bytes, Ordering::Relaxed);
+        counter.bytes.fetch_add(bytes, Ordering::Relaxed);
+        counter.calls.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 pub(crate) struct ReadCounter {
     id: String,
-    bytes: Arc<AtomicU64>,
+    counts: Arc<ReadCounts>,
 }
 impl ReadCounter {
     pub(crate) fn new(id: &str) -> Self {
-        let bytes = Arc::new(AtomicU64::new(0));
+        let counts = Arc::new(ReadCounts::default());
         assert!(counters()
             .lock()
             .unwrap()
-            .insert(id.into(), bytes.clone())
+            .insert(id.into(), counts.clone())
             .is_none());
         Self {
             id: id.into(),
-            bytes,
+            counts,
         }
     }
     pub(crate) fn bytes(&self) -> u64 {
-        self.bytes.load(Ordering::Relaxed)
+        self.counts.bytes.load(Ordering::Relaxed)
+    }
+    pub(crate) fn calls(&self) -> u64 {
+        self.counts.calls.load(Ordering::Relaxed)
     }
 }
 impl Drop for ReadCounter {

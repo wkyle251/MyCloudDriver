@@ -1866,7 +1866,7 @@ impl Client {
             .or_else(|| body.modified_time.filter(|s| !s.trim().is_empty()));
         Ok((
             DownloadInfo {
-                web_content_link: body.web_content_link,
+                web_content_link: original_download_url(&body.medias, &body.web_content_link).ok_or(Error::InvalidDownloadUrl)?,
                 name: body.name,
                 size: body.size,
                 source_revision: download_revision(revision.as_deref(), None),
@@ -1890,7 +1890,7 @@ impl Client {
         let source_revision =
             download_revision(body.hash.as_deref(), body.modified_time.as_deref());
         Ok(DownloadInfo {
-            web_content_link: body.web_content_link,
+            web_content_link: original_download_url(&body.medias, &body.web_content_link).ok_or(Error::InvalidDownloadUrl)?,
             name: body.name,
             size: body.size,
             source_revision,
@@ -1909,9 +1909,17 @@ impl Client {
         parent_id: Option<&str>,
     ) -> Result<PreviewInfo> {
         if self.content_mode.tries_guest() {
+            // Preview callers retain Guest Mode's existing unavailable-source
+            // error contract. Downloads keep the typed URL error so their
+            // retry queue can confirm and stop malformed original metadata.
+            let original = self.guest_download_info(file_id, parent_id).await.map_err(|error| {
+                if matches!(error, Error::InvalidDownloadUrl) {
+                    Error::Guest("The public share did not provide an original download URL.")
+                } else { error }
+            });
             if let Some((download, file)) = self
                 .content_mode
-                .guest_result(self.guest_download_info(file_id, parent_id).await)?
+                .guest_result(original)?
             {
                 return Ok(crate::share::original_preview(
                     &file.info,
@@ -1967,7 +1975,7 @@ impl Client {
         let source_revision =
             download_revision(body.hash.as_deref(), body.modified_time.as_deref());
         Ok(DownloadInfo {
-            web_content_link: body.web_content_link,
+            web_content_link: original_download_url(&body.medias, &body.web_content_link).ok_or(Error::InvalidDownloadUrl)?,
             name: body.name,
             size: body.size,
             source_revision,
@@ -2621,7 +2629,7 @@ struct FileDetailResponse {
     name: String,
     #[serde(default, deserialize_with = "deserialize_string_to_u64")]
     size: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_content_link")]
     web_content_link: String,
     #[serde(default)]
     mime_type: Option<String>,
@@ -2683,8 +2691,12 @@ pub(crate) struct MediaVideoResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct MediaLinkResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_content_link")]
     url: String,
+}
+
+pub(crate) fn deserialize_content_link<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<String, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 pub(crate) fn preview_sources(
@@ -2780,7 +2792,8 @@ pub(crate) fn preview_sources(
 /// guest API can issue an allowed original with is_visible=false. Honor the
 /// original and quota flags instead of reusing the transcode-first menu.
 pub(crate) fn original_download_url(medias: &[MediaResponse], direct: &str) -> Option<String> {
-    let usable = |url: &str| !url.trim().is_empty() && preview_link_is_fresh(url);
+    let usable = |value: &str| url::Url::parse(value.trim()).is_ok_and(|url|
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some()) && preview_link_is_fresh(value);
     if usable(direct) {
         return Some(direct.trim().to_string());
     }
@@ -2906,6 +2919,20 @@ mod preview_tests {
     };
     use crate::auth::{OAuthCredentials, DESKTOP_CLIENT_ID, DESKTOP_CLIENT_SECRET};
     use crate::error::Error;
+
+    #[test]
+    fn null_original_urls_are_missing_and_valid_media_can_replace_them() {
+        let detail: super::FileDetailResponse = serde_json::from_value(serde_json::json!({
+            "web_content_link": null, "medias": [
+                {"is_origin":true,"link":{"url":null}},
+                {"is_origin":true,"link":{"url":"https://cdn.invalid/generated"}}
+            ]
+        })).unwrap();
+        assert!(detail.web_content_link.is_empty());
+        assert_eq!(super::original_download_url(&detail.medias, &detail.web_content_link).as_deref(), Some("https://cdn.invalid/generated"));
+        let missing: super::FileDetailResponse = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(super::original_download_url(&missing.medias, &missing.web_content_link).is_none());
+    }
 
     #[tokio::test]
     async fn account_profile_uses_authenticated_user_service_and_minimal_fields() {

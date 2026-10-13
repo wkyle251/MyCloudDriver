@@ -21,11 +21,23 @@ pub fn transient_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500..=599)
 }
 
+// Transparent range errors delegate Error::source to their inner error's
+// source. HttpFailure has none, so ordinary chain traversal cannot unwrap it.
+// Keep all HTTP policy decisions consistent for sequential and range bodies.
+fn content_http_failure<'a>(cause: &'a (dyn std::error::Error + 'static)) -> Option<&'a HttpFailure> {
+    cause.downcast_ref::<HttpFailure>().or_else(|| {
+        match cause.downcast_ref::<crate::download_ranges::Error>() {
+            Some(crate::download_ranges::Error::Http(failure)) => Some(failure),
+            _ => None,
+        }
+    })
+}
+
 /// A broken/expired link affects one file. Reduce the whole transfer pool only
 /// for service congestion or a process-wide shortage of file descriptors.
 pub fn reduce_concurrency(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        let status = if let Some(failure) = cause.downcast_ref::<HttpFailure>() {
+        let status = if let Some(failure) = content_http_failure(cause) {
             Some(failure.status)
         } else if let Some(
             crate::Error::Api { status, .. } | crate::Error::RetryAfter { status, .. },
@@ -127,14 +139,18 @@ pub fn retryable(error: &anyhow::Error) -> bool {
         {
             return true;
         }
-        if let Some(crate::download_ranges::Error::Network(error)) =
-            cause.downcast_ref::<crate::download_ranges::Error>()
-        {
-            // Reqwest can classify a truncated Content-Length body as a decode
-            // error. Here it is a body transport failure, not metadata parsing.
-            return !error.is_builder();
+        if let Some(range) = cause.downcast_ref::<crate::download_ranges::Error>() {
+            match range {
+                // Reqwest can classify a truncated Content-Length body as a
+                // decode error. Here it is a transport interruption.
+                crate::download_ranges::Error::Network(error) => return !error.is_builder(),
+                // A clean but early EOF carries a transparent Interrupted,
+                // which otherwise disappears from the source chain too.
+                crate::download_ranges::Error::Incomplete(_) => return true,
+                _ => {},
+            }
         }
-        if let Some(failure) = cause.downcast_ref::<HttpFailure>() {
+        if let Some(failure) = content_http_failure(cause) {
             // Signed content links expire independently of the account session.
             return transient_status(failure.status) || matches!(failure.status, 401 | 403);
         }
@@ -184,6 +200,7 @@ pub const FILE_MISSING: &str = "No longer found on PikPak; it was deleted or mov
 pub const CONTENT_GONE: &str = "PikPak reports this file's content is no longer available";
 pub const PATH_REPLACED: &str = "The path now holds a different file; refresh the folder and download it again";
 pub const ORIGINAL_SIZE_MISMATCH: &str = "PikPak repeatedly returned content larger than this original's declared size; refresh the file and retry";
+pub const ORIGINAL_URL_UNAVAILABLE: &str = "PikPak repeatedly returned no usable original download URL; refresh the file and try again";
 
 fn http_content_gone(status: u16) -> bool {
     matches!(status, 404 | 410)
@@ -209,15 +226,11 @@ pub fn permanent_failure(error: &anyhow::Error) -> Option<&'static str> {
         if cause.is::<OriginalSizeMismatch>() {
             return Some(ORIGINAL_SIZE_MISMATCH);
         }
-        if let Some(failure) = cause.downcast_ref::<HttpFailure>() {
-            return http_content_gone(failure.status).then_some(CONTENT_GONE);
-        }
-        if let Some(crate::download_ranges::Error::Http(failure)) =
-            cause.downcast_ref::<crate::download_ranges::Error>()
-        {
+        if let Some(failure) = content_http_failure(cause) {
             return http_content_gone(failure.status).then_some(CONTENT_GONE);
         }
         match cause.downcast_ref::<crate::Error>()? {
+            crate::Error::InvalidDownloadUrl => Some(ORIGINAL_URL_UNAVAILABLE),
             crate::Error::NotFound { .. } => Some(FILE_MISSING),
             crate::Error::Api { status, message } if api_file_missing(*status, message) => Some(FILE_MISSING),
             _ => None,
@@ -229,7 +242,7 @@ pub fn delay(error: &anyhow::Error) -> Option<Duration> {
     error
         .chain()
         .filter_map(|cause| {
-            if let Some(failure) = cause.downcast_ref::<HttpFailure>() {
+            if let Some(failure) = content_http_failure(cause) {
                 return failure.retry_after;
             }
             if let Some(crate::Error::RetryAfter { delay, .. }) =
@@ -245,6 +258,44 @@ pub fn delay(error: &anyhow::Error) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranged_http_statuses_keep_the_same_retry_delay_and_failure_policy() {
+        for status in [401, 403, 404, 408, 410, 416, 429, 500, 502, 503, 504] {
+            for ranged in [false, true] {
+                let failure = HttpFailure { status, retry_after: Some(Duration::from_secs(17)) };
+                let error = if ranged {
+                    anyhow::Error::new(crate::download_ranges::Error::Http(failure))
+                } else { anyhow::Error::new(failure) }
+                    .context("generated response headers").context("generated transfer attempt");
+                assert_eq!(retryable(&error), transient_status(status) || matches!(status, 401 | 403),
+                    "HTTP {status}, ranged={ranged}");
+                assert_eq!(reduce_concurrency(&error), matches!(status, 429 | 500..=599),
+                    "Only congestion reduces shared admission: HTTP {status}, ranged={ranged}");
+                assert_eq!(delay(&error), Some(Duration::from_secs(17)),
+                    "Retry-After must survive a transparent range wrapper");
+                assert_eq!(permanent_failure(&error), matches!(status, 404 | 410).then_some(CONTENT_GONE));
+            }
+        }
+    }
+
+    #[test]
+    fn ranged_early_eof_retries_without_relaxing_source_or_permission_failures() {
+        let error = anyhow::Error::new(crate::download_ranges::Error::Incomplete(Interrupted))
+            .context("generated range body ended early");
+        assert!(retryable(&error));
+        assert!(!reduce_concurrency(&error));
+        assert_eq!(delay(&error), None);
+        assert_eq!(permanent_failure(&error), None);
+        for source in [crate::download_ranges::Error::Sequential,
+            crate::download_ranges::Error::Unavailable(ContentUnavailable),
+            crate::download_ranges::Error::Io(std::io::ErrorKind::PermissionDenied.into())] {
+            let error = anyhow::Error::new(source).context("generated range failure");
+            assert!(!retryable(&error));
+            assert!(!reduce_concurrency(&error));
+        }
+    }
+
     #[test]
     fn destination_interruption_is_typed_and_does_not_retry_missing_files() {
         let guarded = anyhow::Error::new(std::io::Error::new(

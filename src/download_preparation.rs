@@ -1,5 +1,7 @@
 //! Short-lived transfer-owned cloud setup. Only verification deferrals retain
-//! it; Pause, failures and completion drop it. It never certifies local bytes.
+//! it; Pause, failures and completion drop it. A separately scoped route hint
+//! may survive a transient body retry, without retaining its signed URL or
+//! bypassing the next cloud permission check. It never certifies local bytes.
 use pikpak::{ContentMode, DownloadInfo, FileInfo};
 use std::{
     io::{self, Write},
@@ -21,6 +23,8 @@ pub(crate) struct Key {
     mode: Option<ContentMode>,
     size: u64,
     revision: Option<String>,
+    referer: Option<String>,
+    user_route_allowed: bool,
 }
 impl Key {
     pub(crate) fn new(scope: String, file: &str, mode: Option<ContentMode>) -> Self {
@@ -30,6 +34,8 @@ impl Key {
             mode,
             size: 0,
             revision: None,
+            referer: None,
+            user_route_allowed: false,
         }
     }
     pub(crate) fn for_file(scope: String, file: &FileInfo, mode: Option<ContentMode>) -> Self {
@@ -42,23 +48,24 @@ impl Key {
                 file.hash.as_deref(),
                 file.modified_time.as_deref(),
             ),
+            referer: None,
+            user_route_allowed: true,
         }
     }
-    fn matches(&self, file: &FileInfo, mode: Option<ContentMode>) -> bool {
-        self.file == file.id
-            && self.mode == mode
-            && self.size == file.size
-            && self.revision
-                == pikpak::client::download_revision(
-                    file.hash.as_deref(),
-                    file.modified_time.as_deref(),
-                )
+    pub(crate) fn for_probe(link: &str, file: &str, size: u64, revision: Option<&str>, referer: Option<&str>) -> Self {
+        Self { scope: link.into(), file: file.into(), mode: None, size,
+            revision: revision.map(str::to_owned), referer: referer.map(str::to_owned), user_route_allowed: false }
+    }
+    pub(crate) fn without_user_route(mut self) -> Self {
+        self.user_route_allowed = false;
+        self
     }
     fn bytes(&self) -> usize {
         self.scope
             .len()
             .saturating_add(self.file.len())
             .saturating_add(self.revision.as_ref().map_or(0, String::len))
+            .saturating_add(self.referer.as_ref().map_or(0, String::len))
     }
 }
 
@@ -98,6 +105,8 @@ struct Download {
     info: DownloadInfo,
     user_handoff: bool,
 }
+#[derive(Clone, PartialEq, Eq)]
+struct UserRoute { size: u64, revision: Option<String> }
 struct Cached<T> {
     key: Key,
     value: T,
@@ -154,27 +163,40 @@ impl<T: Clone> Slot<T> {
 pub(crate) struct State {
     download: Slot<Download>,
     resolved: Slot<FileInfo>,
+    probe: Slot<Option<String>>,
+    user_route: Slot<UserRoute>,
 }
 impl State {
     pub(crate) fn attempt(&self) -> Attempt<'_> {
         Attempt {
             state: self,
             deferred: false,
+            body_retry: false,
         }
     }
     pub(crate) fn download(&self, key: &Key, user_handoff: bool) -> Option<DownloadInfo> {
+        if user_handoff && !key.user_route_allowed {
+            self.download.clear();
+            return None;
+        }
         self.download
             .get(key)
             .filter(|value| value.user_handoff == user_handoff)
             .map(|value| value.info)
     }
-    pub(crate) fn user_handoff(&self, file: &FileInfo, mode: Option<ContentMode>) -> bool {
-        let slot = self.download.0.lock().unwrap();
-        slot.as_ref().is_some_and(|entry| {
-            entry.fresh() && entry.key.matches(file, mode) && entry.value.user_handoff
-        })
+    pub(crate) fn user_handoff(&self, key: &Key) -> bool {
+        self.user_route.get(key).is_some()
+    }
+    pub(crate) fn has_user_handoff(&self) -> bool {
+        let mut slot = self.user_route.0.lock().unwrap();
+        if slot.as_ref().is_some_and(|entry| !entry.fresh()) { slot.take(); }
+        slot.is_some()
     }
     pub(crate) fn remember_download(&self, key: &Key, info: &DownloadInfo, user_handoff: bool) {
+        if user_handoff && !key.user_route_allowed {
+            self.download.clear();
+            return;
+        }
         let bytes = info
             .web_content_link
             .len()
@@ -192,6 +214,19 @@ impl State {
             },
             bytes,
         );
+        if user_handoff && key.user_route_allowed {
+            let route = UserRoute { size: info.size, revision: info.source_revision.clone() };
+            let mut slot = self.user_route.0.lock().unwrap();
+            if let Some(entry) = slot.as_mut().filter(|entry| entry.key == *key) {
+                // Do not renew even an expired preference during a long User
+                // attempt. Changed source metadata invalidates the hint until
+                // the next attempt restores the original Guest-first policy.
+                if entry.value != route { entry.fetched = SystemTime::UNIX_EPOCH; }
+            } else {
+                drop(slot);
+                self.user_route.remember(key, &route, route.revision.as_ref().map_or(0, String::len));
+            }
+        }
     }
     pub(crate) fn resolved(&self, key: &Key) -> Option<FileInfo> {
         self.resolved.get(key)
@@ -219,15 +254,25 @@ impl State {
             self.resolved.clear();
         }
     }
+    pub(crate) fn probe(&self, key: &Key) -> Option<Option<String>> {
+        self.probe.get(key)
+    }
+    pub(crate) fn remember_probe(&self, key: &Key, etag: &Option<String>) {
+        self.probe.remember(key, etag, etag.as_ref().map_or(0, String::len));
+    }
 }
 
 pub(crate) struct Attempt<'a> {
     state: &'a State,
     deferred: bool,
+    body_retry: bool,
 }
 impl Attempt<'_> {
     pub(crate) fn defer(&mut self) {
         self.deferred = true;
+    }
+    pub(crate) fn retry_body(&mut self, error: &anyhow::Error) {
+        self.body_retry = error.is::<TransientBodyRetry>();
     }
 }
 impl Drop for Attempt<'_> {
@@ -235,13 +280,209 @@ impl Drop for Attempt<'_> {
         if !self.deferred {
             self.state.download.clear();
             self.state.resolved.clear();
+            self.state.probe.clear();
+            if !self.body_retry {
+                self.state.user_route.clear();
+            }
         }
     }
+}
+
+/// Created only at the original-body transport boundary. A metadata outage or
+/// an expired/denied signed URL must not preserve an earlier User route hint.
+#[derive(Debug, thiserror::Error)]
+#[error("The original body was temporarily interrupted")]
+struct TransientBodyRetry;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Guest metadata did not provide an available original route")]
+struct GuestLookupUnavailable;
+
+pub(crate) fn guest_lookup_failure(error: pikpak::Error, dynamic: bool) -> anyhow::Error {
+    let unavailable = dynamic && !pikpak::content_mode::guest_lookup_transient(&error);
+    let error = anyhow::Error::new(error);
+    if unavailable { error.context(GuestLookupUnavailable) } else { error }
+}
+pub(crate) fn guest_route_unavailable(error: &anyhow::Error) -> bool {
+    error.is::<GuestLookupUnavailable>()
+}
+
+pub(crate) fn body_failure(error: anyhow::Error) -> anyhow::Error {
+    use pikpak::download_policy::{HttpFailure, Interrupted};
+    let range_auth = |failure: &pikpak::download_ranges::Error| matches!(failure,
+        pikpak::download_ranges::Error::Http(HttpFailure { status: 401 | 403, .. }));
+    let api_auth = |failure: &pikpak::Error| matches!(failure,
+        pikpak::Error::Api { status: 401 | 403, .. } | pikpak::Error::RetryAfter { status: 401 | 403, .. });
+    // Typed anyhow contexts need direct downcasting, while transparent range
+    // wrappers need an explicit variant match. Neither may hide authentication
+    // failure behind the generic Interrupted marker used by body retries.
+    let authentication_failure = error.downcast_ref::<HttpFailure>().is_some_and(|failure| matches!(failure.status, 401 | 403))
+        || error.downcast_ref::<pikpak::download_ranges::Error>().is_some_and(range_auth)
+        || error.downcast_ref::<pikpak::Error>().is_some_and(api_auth)
+        || error.chain().any(|cause| {
+        cause.downcast_ref::<HttpFailure>().is_some_and(|failure| matches!(failure.status, 401 | 403))
+            || cause.downcast_ref::<pikpak::download_ranges::Error>().is_some_and(range_auth)
+            || cause.downcast_ref::<pikpak::Error>().is_some_and(api_auth)
+    });
+    let transient = !authentication_failure && (error.is::<Interrupted>() || error.chain().any(|cause| {
+        cause.is::<Interrupted>()
+            || cause.downcast_ref::<HttpFailure>().is_some_and(|failure| pikpak::download_policy::transient_status(failure.status))
+            || cause.downcast_ref::<reqwest::Error>().is_some_and(|failure|
+                !failure.is_builder() && (failure.is_timeout() || failure.is_connect() || failure.is_request() || failure.is_body()))
+            || cause.downcast_ref::<pikpak::download_ranges::Error>().is_some_and(|failure| match failure {
+                pikpak::download_ranges::Error::Network(error) => !error.is_builder(),
+                pikpak::download_ranges::Error::Http(failure) => pikpak::download_policy::transient_status(failure.status),
+                pikpak::download_ranges::Error::Incomplete(_) => true,
+                _ => false,
+            })
+    }));
+    if transient { error.context(TransientBodyRetry) } else { error }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranged_http_retries_preserve_user_route_only_for_transient_body_failures() {
+        use pikpak::download_policy::{HttpFailure, Interrupted};
+        for status in [401, 403, 429, 503] {
+            for interrupted_context in [false, true] {
+                let state = State::default();
+                let key = Key::for_file("account:generated".into(), &file(), Some(ContentMode::Dynamic));
+                state.remember_download(&key, &info(), true);
+                let fetched = state.user_route.0.lock().unwrap().as_ref().unwrap().fetched;
+                let error = anyhow::Error::new(pikpak::download_ranges::Error::Http(HttpFailure {
+                    status, retry_after: Some(Duration::from_secs(17)),
+                })).context("generated range body response");
+                let error = if interrupted_context { error.context(Interrupted) } else { error };
+                assert!(pikpak::download_policy::retryable(&error));
+                assert_eq!(pikpak::download_policy::delay(&error), Some(Duration::from_secs(17)));
+                let error = body_failure(error);
+                let mut attempt = state.attempt();attempt.retry_body(&error);drop(attempt);
+                assert!(state.download(&key, true).is_none(), "Every body retry refreshes the signed URL");
+                let retained = state.user_handoff(&key);
+                assert_eq!(retained, matches!(status, 429 | 503), "HTTP {status}, interrupted={interrupted_context}");
+                if retained { assert_eq!(state.user_route.0.lock().unwrap().as_ref().unwrap().fetched, fetched); }
+            }
+        }
+    }
+
+    #[test]
+    fn ranged_early_eof_keeps_the_hint_but_authentication_context_still_invalidates_it() {
+        use pikpak::download_policy::{HttpFailure, Interrupted};
+        for authentication in [false, true] {
+            let state = State::default();
+            let key = Key::for_file("account:generated".into(), &file(), Some(ContentMode::Dynamic));
+            state.remember_download(&key, &info(), true);
+            let error = anyhow::Error::new(pikpak::download_ranges::Error::Incomplete(Interrupted))
+                .context("generated range ended before its declared coverage");
+            let error = if authentication { error.context(HttpFailure { status: 403, retry_after: None }) } else { error };
+            assert!(pikpak::download_policy::retryable(&error));
+            let mut attempt = state.attempt();attempt.retry_body(&body_failure(error));drop(attempt);
+            assert_eq!(state.user_handoff(&key), !authentication);
+            assert!(state.download(&key, true).is_none());
+        }
+    }
+
+    #[test]
+    fn body_retries_keep_only_the_scoped_user_hint_without_extending_it() {
+        let state = State::default();
+        let key = Key::for_file("account:generated".into(), &file(), Some(ContentMode::Dynamic));
+        state.remember_download(&key, &info(), true);
+        let fetched = state.user_route.0.lock().unwrap().as_ref().unwrap().fetched;
+        for _ in 0..3 {
+            let mut attempt = state.attempt();
+            let error = body_failure(anyhow::Error::new(pikpak::download_policy::HttpFailure { status: 503, retry_after: None }));
+            attempt.retry_body(&error);
+            drop(attempt);
+            assert!(state.download(&key, true).is_none(), "Body retries must refresh signed URLs and permissions");
+            assert!(state.user_handoff(&key));
+            state.remember_download(&key, &info(), true);
+            assert_eq!(state.user_route.0.lock().unwrap().as_ref().unwrap().fetched, fetched);
+        }
+        state.user_route.0.lock().unwrap().as_mut().unwrap().fetched -= TTL;
+        let expired = state.user_route.0.lock().unwrap().as_ref().unwrap().fetched;
+        state.remember_download(&key, &info(), true);
+        assert_eq!(state.user_route.0.lock().unwrap().as_ref().unwrap().fetched, expired, "Even expired hints cannot renew during a long User attempt");
+        assert!(!state.user_handoff(&key));
+    }
+    #[test]
+    fn user_route_hints_never_cross_account_share_source_revision_or_mode() {
+        let state = State::default();
+        let file = file();
+        let key = Key::for_file("share:generated:account:first".into(), &file, Some(ContentMode::Dynamic));
+        for other in [
+            Key { scope: "share:generated:account:second".into(), ..key.clone() },
+            Key { scope: "share:other:account:first".into(), ..key.clone() },
+            Key { file: "other".into(), ..key.clone() },
+            Key { size: 9, ..key.clone() },
+            Key { revision: Some("gcid:OTHER".into()), ..key.clone() },
+            Key { mode: Some(ContentMode::Guest), ..key.clone() },
+        ] {
+            state.remember_download(&key, &info(), true);
+            assert!(!state.user_handoff(&other));
+            assert!(!state.user_handoff(&key), "Mismatched lookup must discard the hint");
+        }
+        for changed in [DownloadInfo { size: 9, ..info() }, DownloadInfo { source_revision: Some("gcid:CHANGED".into()), ..info() }] {
+            state.remember_download(&key, &info(), true);
+            state.remember_download(&key, &changed, true);
+            assert!(!state.user_handoff(&key), "Fresh URL metadata changes must invalidate the previous route hint too");
+        }
+        let anonymous = key.clone().without_user_route();
+        state.remember_download(&anonymous, &info(), true);
+        assert!(!state.user_handoff(&anonymous), "An unresolved account cannot authorize a reusable route preference");
+        assert!(state.download(&anonymous, true).is_none(), "Unbound account URLs cannot survive verification deferrals either");
+    }
+    #[test]
+    fn permission_metadata_and_control_failures_drop_user_preferences() {
+        for error in [
+            anyhow::Error::new(pikpak::download_policy::HttpFailure { status: 403, retry_after: None }),
+            anyhow::Error::new(pikpak::download_policy::HttpFailure { status: 401, retry_after: None }),
+            anyhow::Error::new(pikpak::Error::Api { status: 503, message: "generated metadata outage".into() }),
+            anyhow::Error::new(crate::transfer_control::Paused),
+        ] {
+            let state = State::default();
+            let key = Key::for_file("account:generated".into(), &file(), Some(ContentMode::Dynamic));
+            state.remember_download(&key, &info(), true);
+            let mut attempt = state.attempt();
+            attempt.retry_body(&body_failure(error));
+            drop(attempt);
+            assert!(!state.user_handoff(&key));
+        }
+        let state = State::default();
+        let key = Key::for_file("account:generated".into(), &file(), Some(ContentMode::Dynamic));
+        state.remember_download(&key, &info(), true);
+        drop(state.attempt());
+        assert!(!state.user_handoff(&key), "Completion/cancellation/unclassified exits release the hint");
+    }
+    #[test]
+    fn probes_are_bound_to_the_exact_request_expire_and_survive_only_deferrals() {
+        let state = State::default();
+        let key = Key::for_probe("https://example.invalid/original?sig=one", "generated", 8,
+            Some("gcid:ONE"), Some("https://example.invalid/"));
+        let mut attempt = state.attempt();
+        state.remember_probe(&key, &Some("\"etag-one\"".into()));
+        attempt.defer(); drop(attempt);
+        assert_eq!(state.probe(&key), Some(Some("\"etag-one\"".into())));
+        for changed in [
+            Key { scope: "https://example.invalid/original?sig=two".into(), ..key.clone() },
+            Key { file: "other".into(), ..key.clone() },
+            Key { size: 9, ..key.clone() },
+            Key { revision: Some("gcid:TWO".into()), ..key.clone() },
+            Key { referer: None, ..key.clone() },
+        ] {
+            state.remember_probe(&key, &Some("\"etag-one\"".into()));
+            assert!(state.probe(&changed).is_none());
+        }
+        state.remember_probe(&key, &None);
+        assert_eq!(state.probe(&key), Some(None), "Unsupported ranges are a bounded cached result too");
+        state.probe.0.lock().unwrap().as_mut().unwrap().fetched -= TTL;
+        assert!(state.probe(&key).is_none(), "Cache hits must not extend the original expiry");
+        state.remember_probe(&key, &Some("\"etag-one\"".into()));
+        drop(state.attempt());
+        assert!(state.probe(&key).is_none(), "Pause, failures and completion release cached setup");
+    }
     fn info() -> DownloadInfo {
         DownloadInfo {
             web_content_link: "https://example.invalid/original?signature=generated".into(),
@@ -267,7 +508,7 @@ mod tests {
             state.remember_download(&key, &info(), true);
             attempt.defer();
         }
-        assert!(state.user_handoff(&file, Some(ContentMode::Dynamic)));
+        assert!(state.user_handoff(&key));
         assert!(state.download(&key, false).is_none());
         assert!(state.download(&key, true).is_some());
         let fetched = state.download.0.lock().unwrap().as_ref().unwrap().fetched;
@@ -277,7 +518,8 @@ mod tests {
             fetched
         );
         state.download.0.lock().unwrap().as_mut().unwrap().fetched -= TTL;
-        assert!(!state.user_handoff(&file, Some(ContentMode::Dynamic)));
+        state.user_route.0.lock().unwrap().as_mut().unwrap().fetched -= TTL;
+        assert!(!state.user_handoff(&key));
         assert!(state.download(&key, true).is_none());
         state.remember_download(&key, &info(), true);
         state.download.0.lock().unwrap().as_mut().unwrap().fetched += TTL;
@@ -308,7 +550,7 @@ mod tests {
             } else {
                 file.size += 1;
             }
-            assert!(!state.user_handoff(&file, Some(ContentMode::Dynamic)));
+            assert!(!state.user_handoff(&Key::for_file(key.scope.clone(), &file, Some(ContentMode::Dynamic))));
             assert!(state
                 .download(
                     &Key::for_file(key.scope.clone(), &file, Some(ContentMode::Dynamic)),

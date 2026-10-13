@@ -317,3 +317,59 @@ async fn content_modes_apply_to_links_with_separate_guest_and_user_sessions() {
         }
     }
 }
+
+#[tokio::test]
+async fn malformed_original_links_are_typed_nonretryable_and_dynamic_can_fallback() {
+    for malformed in ["", "relative-original", "/original", "//cdn.invalid/original", "file:///tmp/generated", "data:generated", "https://"] {
+        let fixture = Fixture::new().await;
+        fixture.user_available.store(true, Ordering::SeqCst);
+        *fixture.user_link_override.lock().unwrap() = Some(malformed.into());
+        fixture.original.lock().unwrap()["web_content_link"] = json!(malformed);
+        let user = client(&fixture, ContentMode::User);
+        let file = user.list_folder("saved-folder").await.unwrap().remove(0);
+        let errors = [
+            user.get_download_url(&file.id).await.unwrap_err(),
+            user.get_download_url_for_file(&file).await.unwrap_err(),
+            user.similarity_download_info(&file.id, "saved-folder").await.unwrap_err(),
+            user.share_client("https://mypikpak.com/s/public-share", "", "").unwrap()
+                .get_download_url("source-id").await.unwrap_err(),
+        ];
+        for error in errors {
+            assert!(matches!(error, crate::Error::InvalidDownloadUrl));
+            let error = anyhow::Error::new(error);
+            assert!(!crate::download_policy::retryable(&error));
+            assert_eq!(crate::download_policy::permanent_failure(&error), Some(crate::download_policy::ORIGINAL_URL_UNAVAILABLE));
+            assert!(content_access_denied(&error), "Dynamic must be allowed to try its User route");
+            assert!(!error.to_string().contains(malformed) || malformed.is_empty(), "Diagnostics must not expose rejected links");
+        }
+        let guest = client(&fixture, ContentMode::Guest);
+        assert!(matches!(guest.get_preview_info_in_parent(&file.id, Some("saved-folder")).await, Err(crate::Error::Guest(_))),
+            "Preview must preserve its Guest unavailable-source error contract");
+        assert!(matches!(guest.share_client("https://mypikpak.com/s/public-share", "", "").unwrap()
+            .get_download_url("source-id").await, Err(crate::Error::InvalidDownloadUrl)),
+            "Final Guest downloads still need typed retry finalization");
+        *fixture.user_link_override.lock().unwrap() = None;
+        let dynamic = client(&fixture, ContentMode::Dynamic);
+        let share = dynamic.share_client("https://mypikpak.com/s/public-share", "", "").unwrap();
+        assert!(share.get_download_url("source-id").await.unwrap().web_content_link.contains("/user-body/"));
+    }
+}
+
+#[tokio::test]
+async fn invalid_direct_links_use_only_valid_original_media_candidates() {
+    let fixture = Fixture::new().await;
+    fixture.user_available.store(true, Ordering::SeqCst);
+    *fixture.user_link_override.lock().unwrap() = Some("relative-original".into());
+    let media = json!([
+        {"is_origin":true,"need_more_quota":false,"link":{"url":"relative-media"}},
+        {"is_origin":false,"link":{"url":"https://cdn.invalid/transcode"}},
+        {"is_origin":true,"need_more_quota":true,"link":{"url":"https://cdn.invalid/quota"}},
+        {"is_origin":true,"need_more_quota":false,"is_visible":false,"link":{"url":format!("{}/user-body/valid", fixture.base)}}
+    ]);
+    fixture.saved.lock().unwrap()["medias"] = media.clone();
+    fixture.original.lock().unwrap()["medias"] = media;
+    let user = client(&fixture, ContentMode::User);
+    assert_eq!(user.get_download_url("saved-id").await.unwrap().web_content_link, format!("{}/user-body/valid", fixture.base));
+    assert_eq!(user.share_client("https://mypikpak.com/s/public-share", "", "").unwrap()
+        .get_download_url("source-id").await.unwrap().web_content_link, format!("{}/user-body/valid", fixture.base));
+}

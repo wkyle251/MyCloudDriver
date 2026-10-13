@@ -98,6 +98,7 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/CredentialParser.swift" \
     "${PROJECT_ROOT}/macos/PreviewTransport.swift" \
     "${PROJECT_ROOT}/macos/MediaFileDownload.swift" \
+    "${PROJECT_ROOT}/macos/MediaPreviewBufferStatus.swift" \
     "${PROJECT_ROOT}/macos/MemoryRangeBuffer.swift" \
     "${PROJECT_ROOT}/macos/FilePreviewResourceLoader.swift" \
     "${PROJECT_ROOT}/macos/ExternalVolume.swift" \

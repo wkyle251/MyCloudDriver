@@ -11,6 +11,8 @@ struct CloudExtractionFixtureEngine {
         let expectedPassword = id == "protected-b" ? "fixture-second" : "fixture-password"
         precondition(!args.contains("fixture-password"))
         precondition(!ProcessInfo.processInfo.environment.keys.contains(where: { $0.contains("TOKEN") }))
+        precondition(ProcessInfo.processInfo.environment["PIKPAK_CONTENT_MODE"] == "user")
+        precondition(ProcessInfo.processInfo.environment["PIKPAK_GUEST_MODE"] == nil)
         let permissions = try FileManager.default.attributesOfItem(atPath: requestURL.path)[.posixPermissions] as! NSNumber
         precondition(permissions.intValue == 0o600)
         if args[1] == "archive-inspect" {

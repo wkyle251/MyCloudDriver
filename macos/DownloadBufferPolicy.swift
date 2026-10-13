@@ -53,6 +53,9 @@ struct DownloadDiskTraffic: Decodable, Equatable {
     let batchRemainingBytes: UInt64
     // Optional for an older helper's heartbeat during upgrades.
     var oldestPendingMs: UInt64? = nil
+    var waitingReadBytes: UInt64? = nil
+    var waitingReadTasks: Int? = nil
+    var oldestWaitingReadMs: UInt64? = nil
     var readTasksStarted: UInt64? = nil
     var readTasksFinished: UInt64? = nil
     var readWorkAddedBytes: UInt64? = nil
@@ -111,6 +114,7 @@ struct DownloadDiskTraffic: Decodable, Equatable {
     var readWriteThresholdBytes: UInt64? = nil
     var readTurnWriteHandoffs: UInt64? = nil
     var readTurnIdleHandoffs: UInt64? = nil
+    var readTurnLatencyHandoffs: UInt64? = nil
     var lastReadPendingWriteBytes: UInt64? = nil
     var lastReadBufferLimitBytes: UInt64? = nil
     var queuedDownloads: Int? = nil
@@ -124,10 +128,22 @@ struct DownloadDiskTraffic: Decodable, Equatable {
     var checkpointBarriers: UInt64? = nil
     var checkpointBatchTotalMs: UInt64? = nil
     var checkpointBatchPending: UInt64? = nil
+    var waitingCheckCount: Int {
+        waitingReadTasks ?? max(0, pendingReadTasks + readingTasks - min(readingTasks, activeReadTasks ?? 0))
+    }
+    var waitingCheckBytes: UInt64 {
+        if let bytes = waitingReadBytes { return bytes }
+        let sum = pendingReadBytes.addingReportingOverflow(readingBytes)
+        let total = sum.overflow ? UInt64.max : sum.partialValue
+        return total - min(total, activeReadBytes ?? 0)
+    }
     var turnSummary: String? {
         guard let elapsed = turnElapsedMs else { return nil }
         let text = "Turn \(elapsed / 1_000)s"
         if let percent = readWriteThresholdPercent, readDrives > 0 {
+            if let target = turnTargetMs, target > 0 {
+                return text + " • write batch after \(target / 1_000)s"
+            }
             return text + " • writes above \(percent)% \((prefetchBytes ?? 0) > 0 ? "available RAM" : "RAM")"
         }
         guard let target = turnTargetMs else { return text }
@@ -145,6 +161,7 @@ struct DownloadDiskTraffic: Decodable, Equatable {
         case 4: reason = "pause, cancel or shutdown drain"
         case 5: reason = "pending writes exceeded \(readWriteThresholdPercent ?? 80)% RAM"
         case 6: reason = "receiving idle; draining waiting writes"
+        case 7: reason = "waiting writes reached the read-turn limit"
         default: return nil
         }
         return "Last read turn: \((lastReadTurnMs ?? 0) / 1_000)s, \(reason), \(DownloadBufferPolicy.text(lastReadRemainingBytes ?? 0)) unfinished"

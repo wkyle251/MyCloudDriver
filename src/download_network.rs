@@ -14,7 +14,21 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const RECEIVE_WINDOW: u64 = 256 * 1024;
+const RANGE_STARTUP_TTL: Duration = Duration::from_secs(60);
+const RANGE_STARTUP_MAX: usize = 4;
 static KNOWN_COOLDOWN_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+struct RangeStartup {
+    channels: usize,
+    measured: Instant,
+    resource_generation: u64,
+}
+impl RangeStartup {
+    fn fresh(&self, now: Instant, resource_generation: u64) -> bool {
+        self.resource_generation == resource_generation
+            && now.checked_duration_since(self.measured).is_some_and(|age| age < RANGE_STARTUP_TTL)
+    }
+}
 
 pub fn known_cooldown_remaining_ms() -> u64 {
     KNOWN_COOLDOWN_UNTIL_MS.load(Ordering::Relaxed).saturating_sub(Network::now_millis())
@@ -57,6 +71,9 @@ pub struct Network {
     soft_limit: AtomicUsize,
     soft_until: Mutex<Instant>,
     cooldown: Mutex<(Instant, Instant)>,
+    // This Network is bound to one serving origin. No URL, account metadata or
+    // payload identity is retained in the short-lived performance evidence.
+    range_startup: Mutex<Option<RangeStartup>>,
 }
 
 #[cfg(test)]
@@ -69,6 +86,93 @@ mod tests {
         assert_eq!(descriptor_budget(128), 1);
         assert_eq!(descriptor_budget(10_240), 1_264);
         assert!(descriptor_budget(u64::MAX) <= Semaphore::MAX_PERMITS);
+    }
+
+    #[test]
+    fn accepted_range_evidence_is_bounded_expires_and_does_not_refresh_on_hits() {
+        let _guard = crate::download_waits::range_startup_test_guard();
+        let network = Network::new(16, None);
+        let now = Instant::now();
+        assert_eq!(network.range_startup_limit(8, now), 1);
+        network.accept_range_trial(2, now);
+        assert_eq!(network.range_startup_limit(8, now + Duration::from_secs(59)), 2);
+        assert_eq!(network.range_startup_limit(8, now + RANGE_STARTUP_TTL), 1);
+        network.accept_range_trial(16, now);
+        assert_eq!(network.range_startup_limit(8, now), 4);
+        assert_eq!(network.range_startup_limit(2, now), 2);
+        assert_eq!(network.range_startup_limit(1, now), 1);
+        network.clear_range_startup();
+        assert_eq!(network.range_startup_limit(8, now), 1);
+        network.accept_range_trial(2, now);
+        assert_eq!(network.range_startup_limit(8, now - Duration::from_millis(1)), 1);
+    }
+
+    #[test]
+    fn range_startup_is_per_origin_and_respects_shared_fair_share() {
+        let _guard = crate::download_waits::range_startup_test_guard();
+        let first = Network::for_url("http://range-startup-one.invalid/generated?token=one");
+        let same_origin = Network::for_url("http://range-startup-one.invalid/another?token=two");
+        let second = Network::for_url("http://range-startup-two.invalid/generated");
+        let now = Instant::now();
+        first.accept_range_trial(4, now);
+        assert_eq!(same_origin.range_startup_limit(8, now), 4);
+        assert_eq!(second.range_startup_limit(8, now), 1);
+        let local = Network::new(4, None);
+        local.accept_range_trial(4, now);
+        let a = local.register();
+        assert_eq!(local.range_startup_limit(8, now), 4);
+        let b = local.register();
+        assert_eq!(local.range_startup_limit(8, now), 2);
+        let c = local.register();
+        assert_eq!(local.range_startup_limit(8, now), 1);
+        drop((a, b, c));
+        assert_eq!(local.range_startup_limit(8, now), 4);
+        first.clear_range_startup();
+    }
+
+    #[test]
+    fn ram_waits_and_memory_warnings_invalidate_warm_evidence() {
+        let _guard = crate::download_waits::range_startup_test_guard();
+        let network = Network::new(8, None);
+        let now = Instant::now();
+        network.accept_range_trial(4, now);
+        let waiting = crate::download_waits::Stage::enter(crate::download_waits::Kind::RamSharedLimit);
+        drop(waiting);
+        assert_eq!(network.range_startup_limit(8, now), 1, "A finished RAM stall still invalidates old evidence");
+        network.accept_range_trial(4, now);
+        crate::download_waits::range_memory_pressure(2);
+        assert_eq!(network.range_startup_limit(8, now), 1);
+        network.accept_range_trial(4, now);
+        crate::download_waits::range_memory_pressure(1);
+        assert_eq!(network.range_startup_limit(8, now), 1, "Cannot learn during an active warning");
+    }
+
+    #[test]
+    fn provider_cooldown_discards_range_startup_and_cross_helper_cooldown_stays_effective() {
+        let _guard = crate::download_waits::range_startup_test_guard();
+        let directory = tempfile::tempdir().unwrap();
+        let first = Network::new(4, Some(directory.path().to_path_buf()));
+        let second = Network::new(4, Some(directory.path().to_path_buf()));
+        let missed_cooldown = Network::new(4, Some(directory.path().to_path_buf()));
+        let now = Instant::now();
+        first.accept_range_trial(4, now);
+        second.accept_range_trial(4, now);
+        missed_cooldown.accept_range_trial(4, now);
+        first.defer(Duration::from_millis(120)).unwrap();
+        assert_eq!(first.range_startup_limit(8, now), 1);
+        // The shared cooldown observer caches its control-file read for
+        // 100 ms. Advance that observer without depending on sleep jitter.
+        second.cooldown.lock().unwrap().1 = Instant::now();
+        assert_eq!(second.range_startup_limit(8, now), 1);
+        assert!(second.try_acquire().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(160));
+        assert_eq!(second.range_startup_limit(8, Instant::now()), 1);
+        assert_eq!(missed_cooldown.range_startup_limit(8, Instant::now()), 1);
+        missed_cooldown.accept_range_trial(4, Instant::now());
+        assert!(missed_cooldown.range_startup.lock().unwrap().is_none(),
+            "The provider's reduced-capacity period cannot teach a warm start");
+        let _permit = second.try_acquire().unwrap().unwrap();
+        assert!(second.try_acquire().unwrap().is_none(), "Warm evidence must never undo provider soft capacity");
     }
 
     #[test]
@@ -196,6 +300,7 @@ impl Network {
             soft_limit: AtomicUsize::new(limit),
             soft_until: Mutex::new(Instant::now()),
             cooldown: Mutex::new((Instant::now(), Instant::now())),
+            range_startup: Mutex::new(None),
         })
     }
 
@@ -238,6 +343,7 @@ impl Network {
             soft_limit: AtomicUsize::new(shared.limit),
             soft_until: Mutex::new(Instant::now()),
             cooldown: Mutex::new((Instant::now(), Instant::now())),
+            range_startup: Mutex::new(None),
         });
         routes.insert(origin, network.clone());
         network
@@ -264,6 +370,38 @@ impl Network {
                     / self.endpoint_participants.load(Ordering::Acquire).max(1),
             )
             .max(1)
+    }
+    pub(crate) fn range_startup_limit(&self, pieces: usize, now: Instant) -> usize {
+        let (generation, blocked) = crate::download_waits::range_resources();
+        if blocked || self.range_provider_constrained() {
+            self.clear_range_startup();
+            return 1;
+        }
+        let available = self.fair_share().min(pieces).max(1);
+        let mut startup = self.range_startup.lock().unwrap();
+        if startup.as_ref().is_some_and(|evidence| !evidence.fresh(now, generation)) {
+            startup.take();
+        }
+        startup.as_ref().map_or(1, |evidence| evidence.channels.min(available))
+    }
+    /// Only the range controller's accepted throughput measurement calls this.
+    /// A cache hit never refreshes the evidence or raises the shared allowance.
+    pub(crate) fn accept_range_trial(&self, channels: usize, now: Instant) {
+        let (generation, blocked) = crate::download_waits::range_resources();
+        if channels < 2 || blocked || self.range_provider_constrained() {
+            self.clear_range_startup();
+            return;
+        }
+        *self.range_startup.lock().unwrap() = Some(RangeStartup {
+            channels: channels.min(RANGE_STARTUP_MAX), measured: now, resource_generation: generation,
+        });
+    }
+    pub(crate) fn clear_range_startup(&self) {
+        self.range_startup.lock().unwrap().take();
+    }
+    fn range_provider_constrained(&self) -> bool {
+        self.cooling_down().unwrap_or(true)
+            || self.soft_limit.load(Ordering::Acquire) < self.limit
     }
     pub fn received(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
@@ -375,6 +513,7 @@ impl Network {
     }
 
     pub fn defer(&self, delay: Duration) -> io::Result<()> {
+        self.clear_range_startup();
         let delay = delay.min(Duration::from_secs(86_400));
         crate::download_waits::cooldown_requested();
         KNOWN_COOLDOWN_UNTIL_MS.fetch_max(Self::now_millis().saturating_add(delay.as_millis() as u64), Ordering::Relaxed);

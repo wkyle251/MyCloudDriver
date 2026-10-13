@@ -1,4 +1,4 @@
-//! HDD write batches alternate with RAM-threshold reads. HTTP producers never enter
+//! HDD write batches alternate with bounded read turns. HTTP producers never enter
 //! this gate. Read clocks start after previous I/O drains. Chunk boundaries let
 //! verification pause without restarting its hash or discarding RAM payload.
 use super::Key;
@@ -6,6 +6,9 @@ use std::{collections::{HashMap, HashSet, VecDeque}, sync::{Arc, Mutex, OnceLock
 use tokio::sync::Notify;
 
 const READ_WRITE_THRESHOLD_PERCENT: usize = 80;
+const READ_WRITE_BATCH_MIN_BYTES: usize = 64 << 20;
+const READ_WRITE_MAX_WAIT: Duration = Duration::from_secs(10);
+const SMALL_WRITE_MAX_WAIT: Duration = Duration::from_secs(30);
 const BACKLOG_BYTES: u64 = 1 << 30;
 const BACKLOG_AGE: Duration = Duration::from_secs(60);
 const IDLE_HANDOFF: Duration = Duration::from_millis(50);
@@ -26,7 +29,7 @@ struct WritePool { queued: u64, selected: u64, next: u64, selected_through: u64 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase { Write, Read }
 #[derive(Clone, Copy)]
-enum ReadHandover { CohortFinished = 2, ControlRequest = 4, PendingWrites = 5, ReceiveIdle = 6 }
+enum ReadHandover { CohortFinished = 2, ControlRequest = 4, PendingWrites = 5, ReceiveIdle = 6, WriteLatency = 7 }
 fn write_threshold(limit: usize) -> usize {
     (limit as u128 * READ_WRITE_THRESHOLD_PERCENT as u128 / 100) as usize
 }
@@ -52,6 +55,7 @@ struct State {
     read_turn_timeouts: u64, read_turn_finishes: u64, read_turn_pressure_handoffs: u64, read_turn_control_handoffs: u64,
     last_read_handover_sequence: u64, last_read_handover_reason: u8, last_read_turn_ms: u64, last_read_remaining_bytes: u64,
     read_turn_write_handoffs: u64, read_turn_idle_handoffs: u64, observed_pending_write_bytes: u64, observed_buffer_limit_bytes: u64,
+    read_turn_latency_handoffs: u64,
     last_read_pending_write_bytes: u64, last_read_buffer_limit_bytes: u64,
 }
 impl State {
@@ -66,6 +70,7 @@ impl State {
             read_turn_timeouts: 0, read_turn_finishes: 0, read_turn_pressure_handoffs: 0, read_turn_control_handoffs: 0,
             last_read_handover_sequence: 0, last_read_handover_reason: 0, last_read_turn_ms: 0, last_read_remaining_bytes: 0,
             read_turn_write_handoffs: 0, read_turn_idle_handoffs: 0, observed_pending_write_bytes: 0, observed_buffer_limit_bytes: 0,
+            read_turn_latency_handoffs: 0,
             last_read_pending_write_bytes: 0, last_read_buffer_limit_bytes: 0 }
     }
     fn prune(&mut self) {
@@ -175,6 +180,12 @@ impl State {
             Phase::Read if !self.write_queue.is_empty()
                 && now.saturating_duration_since(self.last_received.max(self.since.unwrap_or(self.requested))) >= RECEIVE_IDLE_HANDOFF
                 => self.finish_read(now, ReadHandover::ReceiveIdle),
+            // With large RAM allowances the pressure threshold can be many
+            // GiB away. Batch useful writes after ten seconds of reading,
+            // even when cloud reception keeps the idle handoff from firing.
+            Phase::Read if self.write_wait_target(pending_write).is_some_and(|target|
+                now.saturating_duration_since(self.since.unwrap_or(self.requested)) >= target)
+                => self.finish_read(now, ReadHandover::WriteLatency),
             // New checks can fill an emptied cohort without an unnecessary
             // write turn below the threshold. With no reads left, drain even
             // a small RAM tail and recovery checkpoints instead of stranding it.
@@ -205,11 +216,18 @@ impl State {
             ReadHandover::ControlRequest => self.read_turn_control_handoffs += 1,
             ReadHandover::PendingWrites => self.read_turn_write_handoffs += 1,
             ReadHandover::ReceiveIdle => self.read_turn_idle_handoffs += 1,
+            ReadHandover::WriteLatency => self.read_turn_latency_handoffs += 1,
         }
         self.select(Phase::Write, now);
     }
     fn force_write(&mut self, now: Instant) {
         if self.phase == Phase::Read { self.finish_read(now, ReadHandover::ControlRequest); }
+    }
+    fn write_wait_target(&self, pending_write: usize) -> Option<Duration> {
+        if self.write_queue.is_empty() { None }
+        else if pending_write >= READ_WRITE_BATCH_MIN_BYTES || !self.checkpoints.is_empty() { Some(READ_WRITE_MAX_WAIT) }
+        else if pending_write > 0 { Some(SMALL_WRITE_MAX_WAIT) }
+        else { None }
     }
 }
 impl Drop for State {
@@ -564,6 +582,7 @@ pub(crate) struct Snapshot {
     prefetch_receiver_limit: usize, prefetch_context_limit: usize,
     prefetch_finished: u64, prefetch_failed: u64, prefetch_empty_ends: u64,
     pending_read_bytes: u64, reading_bytes: u64, pending_read_tasks: usize, reading_tasks: usize,
+    waiting_read_bytes: u64, waiting_read_tasks: usize, oldest_waiting_read_ms: u64,
     pending_write_bytes: u64, writing_bytes: u64, writing_tasks: usize, waiting_writers: usize,
     read_drives: usize, write_drives: usize, batch_remaining_bytes: u64,
     turn_elapsed_ms: u64, switch_wait_ms: u64, read_turns: u64, write_turns: u64, backlog_drives: usize,
@@ -582,6 +601,7 @@ pub(crate) struct Snapshot {
     read_turn_timeouts: u64, read_turn_finishes: u64, read_turn_pressure_handoffs: u64, read_turn_control_handoffs: u64,
     last_read_handover_sequence: u64, last_read_handover_reason: u8, last_read_turn_ms: u64, last_read_remaining_bytes: u64,
     read_write_threshold_percent: usize, read_write_threshold_bytes: u64, read_turn_write_handoffs: u64, read_turn_idle_handoffs: u64,
+    read_turn_latency_handoffs: u64,
     last_read_pending_write_bytes: u64, last_read_buffer_limit_bytes: u64,
     write_dispatch_polls: u64, eligible_waiting_writers: usize,
 }
@@ -594,6 +614,14 @@ impl Snapshot {
             }
             if job.ready && job.active == 0 && job.remaining > 0 {
                 result.ready_read_tasks += 1; result.ready_read_bytes = result.ready_read_bytes.saturating_add(job.remaining);
+            }
+            if job.remaining > 0 && job.active == 0 {
+                // Selecting a cohort does not start its disk reads. Include
+                // selected but deferred checks in the queue and its wait age.
+                result.waiting_read_tasks += 1;
+                result.waiting_read_bytes = result.waiting_read_bytes.saturating_add(job.remaining);
+                result.oldest_waiting_read_ms = result.oldest_waiting_read_ms.max(
+                    now.saturating_duration_since(job.queued).as_millis().min(u64::MAX as u128) as u64);
             }
             if job.remaining > 0 && (job.selected || job.active > 0) {
                 result.reading_bytes = result.reading_bytes.saturating_add(job.remaining); result.reading_tasks += 1;
@@ -617,6 +645,12 @@ impl Snapshot {
         result.read_turn_pressure_handoffs += state.read_turn_pressure_handoffs; result.read_turn_control_handoffs += state.read_turn_control_handoffs;
         result.read_turn_write_handoffs += state.read_turn_write_handoffs;
         result.read_turn_idle_handoffs += state.read_turn_idle_handoffs;
+        result.read_turn_latency_handoffs += state.read_turn_latency_handoffs;
+        if state.phase == Phase::Read {
+            if let Some(target) = state.write_wait_target(state.observed_pending_write_bytes.min(usize::MAX as u64) as usize) {
+                result.turn_target_ms = result.turn_target_ms.max(target.as_millis() as u64);
+            }
+        }
         if state.last_read_handover_sequence > result.last_read_handover_sequence {
             result.last_read_handover_sequence = state.last_read_handover_sequence;
             result.last_read_handover_reason = state.last_read_handover_reason;

@@ -1,7 +1,7 @@
 //! Validated parallel byte ranges. Coverage advances only after the caller has
 //! accepted a chunk; disk and RAM callers retain the same state across retries.
 use crate::{
-    download_connections::Connections,
+    download_connections::{Connections, TrialOutcome},
     download_network::{Network, Permit},
     download_policy::{self, HttpFailure, Interrupted},
 };
@@ -222,6 +222,7 @@ fn status(response: &Response, network: &Network) -> Result<(), Error> {
         status: response.status().as_u16(),
         retry_after: download_policy::retry_after(response.headers()),
     };
+    network.clear_range_startup();
     if matches!(failure.status, 429 | 500..=599) {
         network.defer(failure.retry_after.unwrap_or(Duration::from_secs(1)))?;
     }
@@ -301,10 +302,11 @@ struct Read {
     response: Response,
     permit: Permit,
     chunk: Option<Bytes>,
+    channel: crate::download_waits::RangeChannel,
 }
 type Job = BoxFuture<'static, (usize, Result<Read, Error>)>;
 
-fn read(index: usize, mut response: Response, permit: Permit) -> Job {
+fn read(index: usize, mut response: Response, permit: Permit, channel: crate::download_waits::RangeChannel) -> Job {
     Box::pin(async move {
         let result = response
             .chunk()
@@ -313,6 +315,7 @@ fn read(index: usize, mut response: Response, permit: Permit) -> Job {
                 response,
                 permit,
                 chunk,
+                channel,
             })
             .map_err(Error::from);
         (index, result)
@@ -340,6 +343,7 @@ struct SequentialRead {
     position: u64,
     chunk: Option<Bytes>,
     eof: bool,
+    _channel: crate::download_waits::RangeChannel,
 }
 
 pub struct Transfer {
@@ -357,6 +361,9 @@ pub struct Transfer {
     sequential_start: Option<BoxFuture<'static, Result<SequentialRead, Error>>>,
     sequential_pending: Option<(usize, usize)>,
     _participant: crate::download_network::Participant,
+    admission: crate::download_waits::RangeAdmission,
+    learn_startup: bool,
+    resource_generation: u64,
 }
 
 impl Transfer {
@@ -390,6 +397,9 @@ impl Transfer {
             sequential_start: None,
             sequential_pending: None,
             _participant: participant,
+            admission: crate::download_waits::RangeAdmission::default(),
+            learn_startup: false,
+            resource_generation: crate::download_waits::range_resources().0,
         })
     }
     pub fn state(&self) -> &State {
@@ -397,7 +407,12 @@ impl Transfer {
     }
     /// Apply the normal-download gain threshold before starting range requests.
     pub fn with_absolute_gain(mut self) -> Self {
-        self.connections = self.connections.with_absolute_gain();
+        let now = Instant::now();
+        let initial = self.network.range_startup_limit(self.state.pieces.len(), now);
+        self.connections = Connections::with_initial(self.network.limit().min(self.state.pieces.len()), initial, now)
+            .with_absolute_gain().with_coordinator(self.network.trials());
+        self.learn_startup = true;
+        if initial > 1 { crate::download_waits::range_startup_reused(); }
         self
     }
     /// An early receiver can change request strategy without waiting for its
@@ -425,6 +440,7 @@ impl Transfer {
         self.sequential_start = None;
         self.sequential_pending = None;
         self.active.fill(false);
+        self.admission.set(0);
     }
     /// The caller reserves this headroom before polling HTTP bodies. It covers
     /// all outstanding per-connection receive windows, including paused reads.
@@ -439,9 +455,16 @@ impl Transfer {
 
     fn schedule_at(&mut self, now: Instant) -> Result<(), Error> {
         self.connections.active = self.active.iter().filter(|active| **active).count();
-        self.connections
-            .limit_for_resources(self.network.fair_share(), now);
-        let admission = self.connections.limit.min(self.network.fair_share());
+        let (generation, blocked) = crate::download_waits::range_resources();
+        let resources = if blocked { 1 } else { self.network.fair_share() };
+        if generation != self.resource_generation || resources < self.connections.limit {
+            self.network.clear_range_startup();
+            self.connections.idle(now);
+            self.resource_generation = generation;
+        }
+        self.connections.limit_for_resources(resources, now);
+        let admission = self.connections.limit.min(resources);
+        self.admission.set(admission);
         for index in 0..self.state.pieces.len() {
             if self.connections.active >= admission {
                 break;
@@ -452,6 +475,7 @@ impl Transfer {
             let Some(permit) = self.network.try_acquire()? else {
                 break;
             };
+            let channel = crate::download_waits::RangeChannel::new();
             let start = index as u64 * self.state.piece_size + self.state.pieces[index].received;
             let end = index as u64 * self.state.piece_size + self.state.size(index) - 1;
             let mut request = self
@@ -468,7 +492,7 @@ impl Transfer {
             let network = self.network.clone();
             self.jobs.push(Box::pin(async move {
                 let result = async {
-                    let response = request.send().await?;
+                    let response = crate::download_waits::range_headers(request.send()).await?;
                     crate::download_waits::payload_response(response.status().as_u16());
                     if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
                         let cap = response
@@ -503,7 +527,7 @@ impl Transfer {
                     {
                         return Err(Error::Sequential);
                     }
-                    read(index, response, permit).await.1
+                    read(index, response, permit, channel).await.1
                 }
                 .await;
                 (index, result)
@@ -514,8 +538,21 @@ impl Transfer {
         // An EOF followed by an immediately ready piece is continuous demand.
         // Sample after refill so short pieces cannot repeatedly invalidate the
         // controller's five-second window with a transient empty socket slot.
-        self.connections
-            .observe(now, self.network.received(), || true);
+        if blocked { self.connections.idle(now); }
+        else { self.connections.observe(now, self.network.received(), || true); }
+        if let Some(outcome) = self.connections.take_trial_outcome() {
+            match outcome {
+                TrialOutcome::Accepted(channels) => {
+                    crate::download_waits::range_trial(true);
+                    if self.learn_startup { self.network.accept_range_trial(channels, now); }
+                }
+                TrialOutcome::Rejected => {
+                    crate::download_waits::range_trial(false);
+                    self.network.clear_range_startup();
+                }
+            }
+        }
+        self.admission.set(self.connections.limit.min(resources));
         Ok(())
     }
 
@@ -548,6 +585,7 @@ impl Transfer {
             if self.sequential.is_some() { return self.next_sequential().await; }
             self.schedule()?;
             if self.state.complete() {
+                self.admission.set(0);
                 return Ok(None);
             }
             tokio::select! {
@@ -558,10 +596,12 @@ impl Transfer {
                             self.start_sequential();
                             continue;
                         }
-                        result => result?,
+                        Err(error) => { self.network.clear_range_startup(); return Err(error); }
+                        Ok(received) => received,
                     };
                     if let Some(bytes) = received.chunk.take() {
                         if bytes.len() as u64 > self.state.size(index) - self.state.pieces[index].received {
+                            self.network.clear_range_startup();
                             return Err(Error::Sequential);
                         }
                         let offset = index as u64 * self.state.piece_size + self.state.pieces[index].received;
@@ -569,7 +609,9 @@ impl Transfer {
                         return Ok(Some(Event::Data(Chunk { index, offset, bytes })));
                     }
                     self.active[index] = false;
-                    if self.state.pieces[index].received != self.state.size(index) { return Err(Interrupted.into()); }
+                    if self.state.pieces[index].received != self.state.size(index) {
+                        self.network.clear_range_startup(); return Err(Interrupted.into());
+                    }
                     self.state.pieces[index].complete = true;
                     return Ok(Some(Event::PieceEof(index)));
                 }
@@ -590,11 +632,13 @@ impl Transfer {
         self.state.pieces[index].received += bytes as u64;
         self.network.record(bytes as u64);
         self.jobs
-            .push(read(index, read_result.response, read_result.permit));
+            .push(read(index, read_result.response, read_result.permit, read_result.channel));
     }
 
     fn start_sequential(&mut self) {
         self.stop();
+        self.network.clear_range_startup();
+        self.admission.set(1);
         crate::download_waits::payload_event(crate::download_waits::PayloadEvent::StreamingFallback);
         let start = self.state.pieces.iter().enumerate().find(|(index, piece)| piece.received < self.state.size(*index))
             .map(|(index, piece)| index as u64 * self.state.piece_size + piece.received)
@@ -609,7 +653,9 @@ impl Transfer {
         let etag = self.state.etag.clone();
         self.sequential_start = Some(Box::pin(async move {
             let permit = network.acquire().await?;
-            let response = crate::download_waits::track(crate::download_waits::Kind::ContentHeaders, request.send()).await?;
+            let channel = crate::download_waits::RangeChannel::new();
+            let response = crate::download_waits::range_headers(
+                crate::download_waits::track(crate::download_waits::Kind::ContentHeaders, request.send())).await?;
             crate::download_waits::payload_response(response.status().as_u16());
             status(&response, &network)?;
             let position = match response.status() {
@@ -621,7 +667,7 @@ impl Transfer {
                 || !identity(&response) || response.content_length().is_some_and(|length| length != total - position) {
                 return Err(Error::Sequential);
             }
-            Ok(SequentialRead { response, _permit: permit, position, chunk: None, eof: false })
+            Ok(SequentialRead { response, _permit: permit, position, chunk: None, eof: false, _channel: channel })
         }));
     }
 

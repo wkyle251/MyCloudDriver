@@ -154,6 +154,9 @@ private struct ArchiveActivityRow: View {
                     ? "PikPak denied cloud extraction with Token login. Retry this archive using Normal login for the same account."
                     : "PikPak denied cloud extraction with Token login. Connect Normal login for this account, then retry the archive.")
                     .font(.caption).foregroundStyle(.secondary)
+            } else if task.connectionAccountID != nil {
+                Text("Using Normal login for this archive.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             if showsError, let error = task.error {
                 Text(error.displayText).font(.system(.caption2, design: .monospaced))

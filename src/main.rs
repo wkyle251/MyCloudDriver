@@ -4842,6 +4842,7 @@ fn download_range_rejected(error: &anyhow::Error) -> bool {
 
 fn download_route_unavailable(error: &anyhow::Error) -> bool {
     pikpak::content_mode::content_access_denied(error) || download_range_rejected(error)
+        || download_preparation::guest_route_unavailable(error)
 }
 
 /// A helper holds filesystem identities for its lifetime. Ask the native queue
@@ -4991,12 +4992,25 @@ async fn download_file_as_with_retry(
         }
     };
     let original_mode = client.content_mode();
-    let mut account_handoff = original_mode == pikpak::ContentMode::Dynamic
-        && retry_state.preparation.user_handoff(file, Some(original_mode));
+    let mut initialization_error = None;
+    let mut account_handoff = false;
+    if original_mode == pikpak::ContentMode::Dynamic && retry_state.preparation.has_user_handoff() {
+        match transfer_control::metadata_interruptible(transfer_id, client.tokens().user_id()).await {
+            Ok(Ok(account)) => {
+                let key = download_preparation::Key::for_file(format!("account:{account}"), file, Some(original_mode));
+                account_handoff = retry_state.preparation.user_handoff(&key);
+            }
+            Ok(Err(error)) => initialization_error = Some(anyhow::Error::new(error)),
+            Err(error) => initialization_error = Some(error),
+        }
+    }
     let mut route = if account_handoff { client.clone().with_content_mode(pikpak::ContentMode::User) } else { client.clone() };
     let network_counter = transfer_control::network_counter(transfer_id);
     loop {
-        let result = download_file_inner(
+        // Keep the large transport/metadata state on the heap. Queue and
+        // control wrappers otherwise embed every inner future in their own
+        // stack frame, especially costly in unoptimized helpers and tests.
+        let result = if let Some(error) = initialization_error.take() { Err(error) } else { Box::pin(download_file_inner(
             &route,
             file,
             output_dir,
@@ -5009,8 +5023,8 @@ async fn download_file_as_with_retry(
             original_mode,
             _output_lease.as_ref(),
             retry_state.clone(),
-        )
-        .await;
+        ))
+        .await };
         match result {
             Ok(finished) => {
                 // Only a download that is verified complete may lead to its source being moved to Trash.
@@ -5054,6 +5068,7 @@ async fn download_file_as_with_retry(
             Err(error)
                 if transfer_control::enabled() && pikpak::download_policy::retryable(&error) =>
             {
+                preparation.retry_body(&error);
                 return Err(error.context(transfer_control::Retry(
                     "Waiting to retry the download".into(),
                 )));
@@ -5228,9 +5243,15 @@ async fn download_file_inner(
     let mut dl = if let Some(info) = retry_state.preparation.download(&setup_key, account_handoff) {
         info
     } else {
+        // Keep the actual route visible to the outer per-file handoff loop.
+        // Otherwise metadata fallback would issue a User URL while leaving
+        // the retry state marked Guest and repeat setup after a body outage.
+        let lookup = if client.content_mode() == pikpak::ContentMode::Dynamic {
+            client.clone().with_content_mode(pikpak::ContentMode::Guest)
+        } else { client.clone() };
         match transfer_control::metadata_interruptible(
             transfer_id,
-            client.get_download_url_for_file(file),
+            lookup.get_download_url_for_file(file),
         ).await? {
             Ok(dl) => {
                 retry_state.preparation.remember_download(&setup_key, &dl, account_handoff);
@@ -5242,7 +5263,8 @@ async fn download_file_inner(
                 skip_recycled_source(file, output_dir, progress_json, transfer_id)?;
                 return Ok(Finished::SourceInRecycleBin);
             }
-            Err(error) => return Err(error).context("failed to get download URL"),
+            Err(error) => return Err(download_preparation::guest_lookup_failure(error,
+                client.content_mode() == pikpak::ContentMode::Dynamic)).context("failed to get download URL"),
         }
     };
     // Keep one destination through URL refresh and Guest/User handoff, even
@@ -5452,7 +5474,7 @@ async fn download_file_inner(
                     }
                     continue;
                 }
-                return Err(e).with_context(|| format!("failed to download {}", dl.name));
+                return Err(download_preparation::body_failure(e)).with_context(|| format!("failed to download {}", dl.name));
             }
         }
     };
@@ -5637,12 +5659,26 @@ async fn download_share_file_as_with_retry(
             ))
         }
     };
+    let original_mode = client.content_mode();
+    // Fresh Guest work has no reason to wait for the fallback account. Check
+    // identity only for an existing User preference or actual User access.
+    let mut initialization_error = None;
+    let account = if original_mode == pikpak::ContentMode::User || retry_state.preparation.has_user_handoff() {
+        match transfer_control::metadata_interruptible(transfer_id, client.download_account_id()).await {
+            Ok(result) => result.ok().flatten(),
+            Err(error) => { initialization_error = Some(error); None },
+        }
+    } else { None };
+    let mut route_key = download_preparation::Key::for_file(
+        format!("share:{}:account:{}", client.parsed_link().share_id, account.as_deref().unwrap_or("anonymous")),
+        file, Some(original_mode));
+    route_key = if account.is_some() { route_key } else { route_key.without_user_route() };
     let mut account_handoff = client.user_fallback().is_some()
-        && retry_state.preparation.user_handoff(file, None);
+        && retry_state.preparation.user_handoff(&route_key);
     let mut route = if account_handoff { client.user_fallback().expect("Deferred Dynamic share route") } else { client.clone() };
     let network_counter = transfer_control::network_counter(transfer_id);
     loop {
-        let result = download_share_file_inner(
+        let result = if let Some(error) = initialization_error.take() { Err(error) } else { Box::pin(download_share_file_inner(
             &route,
             file,
             output_dir,
@@ -5652,10 +5688,11 @@ async fn download_share_file_as_with_retry(
             batch_received_bytes.clone(),
             transfer_id,
             account_handoff,
+            &route_key,
             _output_lease.as_ref(),
             retry_state.clone(),
-        )
-        .await;
+        ))
+        .await };
         match result {
             Ok(()) => return Ok(()),
             Err(error) if error.is::<transfer_control::Cancelled>() => {
@@ -5681,11 +5718,20 @@ async fn download_share_file_as_with_retry(
             Err(error) if route.user_fallback().is_some() && download_route_unavailable(&error) => {
                 route = route.user_fallback().expect("Dynamic share fallback");
                 account_handoff = true;
+                let account = match transfer_control::metadata_interruptible(transfer_id, route.download_account_id()).await {
+                    Ok(result) => result.ok().flatten(),
+                    Err(error) => { initialization_error = Some(error); continue; },
+                };
+                route_key = download_preparation::Key::for_file(
+                    format!("share:{}:account:{}", client.parsed_link().share_id, account.as_deref().unwrap_or("anonymous")),
+                    file, Some(original_mode));
+                if account.is_none() { route_key = route_key.without_user_route(); }
                 continue;
             }
             Err(error)
                 if transfer_control::enabled() && pikpak::download_policy::retryable(&error) =>
             {
+                preparation.retry_body(&error);
                 return Err(error.context(transfer_control::Retry(
                     "Waiting to retry the download".into(),
                 )));
@@ -5724,6 +5770,7 @@ async fn download_share_file_inner(
     batch_received_bytes: Arc<AtomicU64>,
     transfer_id: &str,
     account_handoff: bool,
+    setup_key: &download_preparation::Key,
     output_lease: Option<&std::fs::File>,
     retry_state: Arc<download_transport::RetryState>,
 ) -> Result<()> {
@@ -5739,12 +5786,12 @@ async fn download_share_file_inner(
     {
         return Ok(());
     }
-    let setup_key = download_preparation::Key::for_file(format!("share:{}", client.parsed_link().share_id), file, None);
     let mut detail = if let Some(info) = retry_state.preparation.download(&setup_key, account_handoff) {
         info
     } else {
-        let info = transfer_control::metadata_interruptible(transfer_id, client.get_download_url(&file.id))
-            .await?.context("failed to get shared download URL")?;
+        let info = transfer_control::metadata_interruptible(transfer_id, client.get_download_url_on_current_route(&file.id))
+            .await?.map_err(|error| download_preparation::guest_lookup_failure(error, client.user_fallback().is_some()))
+            .context("failed to get shared download URL")?;
         retry_state.preparation.remember_download(&setup_key, &info, account_handoff);
         info
     };
@@ -5955,7 +6002,7 @@ async fn download_share_file_inner(
                     }
                     continue;
                 }
-                return Err(inner).with_context(|| format!("failed to download {name}"));
+                return Err(download_preparation::body_failure(inner)).with_context(|| format!("failed to download {name}"));
             }
         }
     };

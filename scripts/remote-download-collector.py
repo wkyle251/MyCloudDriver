@@ -19,6 +19,8 @@ total_files completed_files skipped_files failed_files active_files retrying_fil
 totals_incomplete reception_paused is_downloading app_bytes_per_second overall_bytes_per_second eta_seconds chart_eta_seconds
 ram_buffered_bytes ram_peak_bytes ram_limit_bytes ram_configured_bytes ram_reserve_bytes ram_memory_pressure
 pending_read_bytes reading_bytes pending_read_tasks reading_tasks read_drives write_drives
+waiting_read_bytes waiting_read_tasks oldest_waiting_read_ms
+read_turn_latency_handoffs
 oldest_pending_read_ms pending_write_bytes writing_bytes writing_tasks active_read_tasks active_write_tasks
 ready_read_tasks ready_read_bytes turn_elapsed_ms switch_wait_ms read_write_threshold_percent
 read_tasks_started read_tasks_finished read_turns write_turns receiving_tasks ram_waiting_receivers
@@ -30,7 +32,9 @@ RECEIVE_COUNTERS = set('''payload_timeout payload_connection payload_range_valid
 payload_unavailable payload_streaming_fallback payload_early_empty_retry payload_deferred_rearm payload_http_success
 payload_http_429 payload_http_5xx payload_http_auth payload_http_416 payload_http_other connection_budget_blocked_polls
 connection_cooldown_blocked_polls connection_endpoint_blocked_polls connection_shared_blocked_polls
-connection_cooldown_events connection_known_cooldown_remaining_ms'''.split())
+connection_cooldown_events connection_known_cooldown_remaining_ms
+range_active_channels range_admission_limit range_header_active range_header_count range_header_total_ms
+range_header_max_ms range_header_failed range_trial_accepted range_trial_rejected range_startup_reused'''.split())
 RECEIVE_KEYS = RECEIVE_COUNTERS | {kind+'_'+suffix for kind in RECEIVE_WAITS for suffix in ('count','active','total_ms','max_ms','oldest_ms')}
 PROGRESS_KEYS |= RECEIVE_KEYS
 WINDOW_KEYS = PROGRESS_KEYS | set('''received_bytes seconds bytes_per_second min_bytes_per_second

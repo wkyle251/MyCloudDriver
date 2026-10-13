@@ -24,7 +24,7 @@ mod traffic;
 mod admission;
 #[path = "download_receive_admission.rs"]
 mod receive_admission;
-pub(crate) use admission::{Deferred, Receiving, Scope};
+pub(crate) use admission::{Deferred, Receiving, Scope, reserved_prefetch};
 pub(crate) use admission::ready_to_receive;
 pub(crate) use admission::prepare_metadata;
 pub(crate) use admission::release_receiving_for_read;

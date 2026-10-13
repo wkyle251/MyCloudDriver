@@ -7,6 +7,7 @@ use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 const READ_CHUNK_BYTES: usize = 1 << 20;
+const COORDINATED_READ_CHUNK_BYTES: usize = 4 << 20;
 
 /// One sequential disk stream, with at most one buffer being hashed and one
 /// being filled. Hashing runs away from the HTTP executor. No file data is
@@ -76,6 +77,49 @@ async fn read_chunk(
     #[cfg(test)]
     super::completion_tests::record_read(id, buffer.len() as u64);
     Ok(())
+}
+
+/// Reuse the same allocations and physical-reader lease across saved regions.
+/// Only the hash state is region-specific; chunk admission still gives queued
+/// writers their normal turns without reopening or rereading an earlier region.
+async fn read_region(
+    file: &mut tokio::fs::File,
+    verification: &Option<crate::download_verification::Guard>,
+    mut hasher: ReadHasher,
+    buffers: (Vec<u8>, Vec<u8>),
+    id: &str,
+    diagnostic: &mut crate::download_telemetry::Operation,
+) -> Result<(ReadHasher, (Vec<u8>, Vec<u8>)), DlError> {
+    let (mut buffer, mut spare) = buffers;
+    if hasher.total == 0 { return Ok((hasher, (buffer, spare))); }
+    file.seek(std::io::SeekFrom::Start(hasher.offset))
+        .await.map_err(|error| fatal(error, "Cannot seek saved download progress"))?;
+    let capacity = buffer.len();
+    let total = hasher.total;
+    let mut count = total.min(capacity as u64) as usize;
+    let mut received = count as u64;
+    read_chunk(file, verification, &mut buffer[..count], id, diagnostic).await?;
+    loop {
+        let hash_id = id.to_owned();
+        let hash = tokio::task::spawn_blocking(move || {
+            let mut timing = crate::download_telemetry::Operation::new(crate::download_telemetry::Kind::ReadHash, &hash_id);
+            hasher.update(&buffer[..count])?;
+            timing.add_bytes(count as u64);timing.complete();
+            Ok::<_, DlError>((hasher, buffer))
+        });
+        let next = (total - received).min(capacity as u64) as usize;
+        // Await both sides even on checksum failure: a tokio::fs future being
+        // dropped does not cancel its underlying blocking read.
+        let (hashed, read) = if next > 0 {
+            let (hashed, read) = tokio::join!(hash,
+                read_chunk(file, verification, &mut spare[..next], id, diagnostic));
+            (hashed, read)
+        } else { (hash.await, Ok(())) };
+        let (state, previous) = hashed.map_err(|error| fatal(error, "Cannot hash saved download progress"))??;
+        read?;hasher = state;
+        if next == 0 { return Ok((hasher, (previous, spare))); }
+        buffer = spare;spare = previous;count = next;received += next as u64;
+    }
 }
 
 #[derive(Clone)]
@@ -265,6 +309,70 @@ impl Prefix {
         }
         Self::read_inner(path, 0, bytes, expected, false, &[], control_id).await.map(|result| result.0)
     }
+    /// Restore independent sparse-piece contexts in one ordered physical pass.
+    /// The third tuple field retains the state before that region's final byte
+    /// for EOF replay. No holes or journal-trusted complete pieces are read.
+    pub async fn read_regions(
+        path: &Path,
+        regions: &[(u64, u64, bool)],
+        control_id: &str,
+    ) -> Result<Vec<Self>, DlError> {
+        if regions.is_empty() { return Ok(Vec::new()); }
+        let mut total = 0u64;
+        let mut end = 0u64;
+        for (offset, bytes, _) in regions {
+            if *bytes == 0 { continue; }
+            let next = offset.checked_add(*bytes).filter(|_| *offset >= end)
+                .ok_or_else(|| DlError::Fatal(anyhow::anyhow!("Invalid saved download region coverage")))?;
+            end = next;
+            total = total.checked_add(*bytes)
+                .ok_or_else(|| DlError::Fatal(anyhow::anyhow!("Invalid saved download region coverage")))?;
+        }
+        let mut diagnostic = crate::download_telemetry::Operation::new(
+            crate::download_telemetry::Kind::ResumeRead, control_id);
+        let mut file = crate::download_fs::open_async(path, rustix::fs::OFlags::RDONLY)
+            .await.map_err(|error| fatal(error, "Cannot verify saved download progress"))?;
+        let mut gate_wait = crate::download_telemetry::Operation::new(crate::download_telemetry::Kind::ReadGateWait, control_id);
+        let verification = if total > 0 {
+            crate::download_verification::acquire_async(&file, control_id, total).await
+                .map_err(|error| {
+                    if error.is::<crate::download_verification::Deferred>() { diagnostic.deferred(); gate_wait.deferred(); }
+                    DlError::Fatal(error)
+                })?
+        } else { None };
+        gate_wait.complete();drop(gate_wait);
+        let before = file.metadata().await
+            .map_err(|error| fatal(error, "Cannot inspect saved download progress"))?;
+        crate::download_fs::validate_open_file_async(path, &before).await
+            .map_err(|error| fatal(error, "Download staging file changed"))?;
+        if end > before.len() {
+            return Err(DlError::Fatal(anyhow::anyhow!("Saved download progress was truncated")));
+        }
+        let chunk_bytes = if verification.is_some() { COORDINATED_READ_CHUNK_BYTES } else { READ_CHUNK_BYTES };
+        let capacity = regions.iter().map(|(_, bytes, _)| *bytes).max().unwrap_or(0).min(chunk_bytes as u64) as usize;
+        if verification.is_some() && capacity > 0 { file.set_max_buf_size(capacity); }
+        let mut buffers = (vec![0; capacity], vec![0; capacity]);
+        let mut results = Vec::with_capacity(regions.len());
+        for (offset, bytes, retain_replay_tail) in regions {
+            let hasher = ReadHasher { result: Self::new(), region_hash: Self::new(), region_index: 0,
+                offset: *offset, total: *bytes, expected: Vec::new().into(), retain_replay_tail: *retain_replay_tail,
+                partitions: Vec::new(), pieces: Vec::new(), piece_index: 0 };
+            let (hasher, reused) = read_region(&mut file, &verification, hasher, buffers, control_id, &mut diagnostic).await?;
+            results.push(hasher.result);buffers = reused;
+            #[cfg(test)]
+            tests::after_region(control_id).await;
+        }
+        let after = file.metadata().await
+            .map_err(|error| fatal(error, "Cannot inspect verified download progress"))?;
+        crate::download_fs::validate_open_file_async(path, &after).await
+            .map_err(|error| fatal(error, "Download staging file changed"))?;
+        if identity(&before) != identity(&after) {
+            return Err(DlError::Fatal(anyhow::anyhow!("Download staging file changed while verifying progress")));
+        }
+        for result in &mut results { result.adopt_verified_metadata(&after); }
+        diagnostic.complete();
+        Ok(results)
+    }
     async fn read_inner(
         path: &Path,
         offset: u64,
@@ -292,7 +400,7 @@ impl Prefix {
             .metadata()
             .await
             .map_err(|error| fatal(error, "Cannot inspect saved download progress"))?;
-        crate::download_fs::validate_open_file(path, &before)
+        crate::download_fs::validate_open_file_async(path, &before).await
             .map_err(|error| fatal(error, "Download staging file changed"))?;
         if offset
             .checked_add(bytes)
@@ -302,45 +410,20 @@ impl Prefix {
                 "Saved download progress was truncated"
             )));
         }
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(|error| fatal(error, "Cannot seek saved download progress"))?;
-        let mut hasher = ReadHasher { result: Self::new(), region_hash: Self::new(), region_index: 0,
+        let hasher = ReadHasher { result: Self::new(), region_hash: Self::new(), region_index: 0,
             offset, total: bytes, expected: expected.to_vec().into(), retain_replay_tail,
             partitions: partitions.to_vec(), pieces: partitions.iter().map(|_| Self::new()).collect(), piece_index: 0 };
-        if bytes > 0 {
-            let capacity = bytes.min(READ_CHUNK_BYTES as u64) as usize;
-            let mut buffer = vec![0; capacity];let mut spare = vec![0; capacity];
-            let mut count = capacity;let mut received = count as u64;
-            read_chunk(&mut file, &verification, &mut buffer[..count], control_id, &mut diagnostic).await?;
-            loop {
-                let id = control_id.to_owned();
-                let hash = tokio::task::spawn_blocking(move || {
-                    let mut timing = crate::download_telemetry::Operation::new(crate::download_telemetry::Kind::ReadHash, &id);
-                    hasher.update(&buffer[..count])?;
-                    timing.add_bytes(count as u64);timing.complete();
-                    Ok::<_, DlError>((hasher, buffer))
-                });
-                let next = (bytes - received).min(capacity as u64) as usize;
-                // Await both sides even on checksum failure so an outstanding
-                // file read finishes before its reader permit can be released.
-                let (hashed, read) = if next > 0 {
-                    let (hashed, read) = tokio::join!(hash,
-                        read_chunk(&mut file, &verification, &mut spare[..next], control_id, &mut diagnostic));
-                    (hashed, read)
-                } else { (hash.await, Ok(())) };
-                let (state, previous) = hashed.map_err(|error| fatal(error, "Cannot hash saved download progress"))??;
-                read?;hasher = state;
-                if next == 0 { break; }
-                buffer = spare;spare = previous;count = next;received += next as u64;
-            }
-        }
+        let chunk_bytes = if verification.is_some() { COORDINATED_READ_CHUNK_BYTES } else { READ_CHUNK_BYTES };
+        let capacity = bytes.min(chunk_bytes as u64) as usize;
+        if verification.is_some() && capacity > 0 { file.set_max_buf_size(capacity); }
+        let (mut hasher, _) = read_region(&mut file, &verification, hasher,
+            (vec![0; capacity], vec![0; capacity]), control_id, &mut diagnostic).await?;
         let mut result = hasher.result;
         let after = file
             .metadata()
             .await
             .map_err(|error| fatal(error, "Cannot inspect verified download progress"))?;
-        crate::download_fs::validate_open_file(path, &after)
+        crate::download_fs::validate_open_file_async(path, &after).await
             .map_err(|error| fatal(error, "Download staging file changed"))?;
         if identity(&before) != identity(&after) {
             return Err(DlError::Fatal(anyhow::anyhow!(
@@ -374,6 +457,176 @@ pub(super) fn fixture_digest(path: &Path, offset: u64, bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    type RegionHook = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+    fn region_hooks() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<RegionHook>>> {
+        static HOOKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<RegionHook>>>> = std::sync::OnceLock::new();
+        HOOKS.get_or_init(Default::default)
+    }
+    pub(super) async fn after_region(id: &str) {
+        let hook = {
+            let mut hooks = region_hooks().lock().unwrap();
+            let hook = hooks.get_mut(id).and_then(|queue| queue.pop_front());
+            if hooks.get(id).is_some_and(|queue| queue.is_empty()) { hooks.remove(id); }
+            hook
+        };
+        if let Some(hook) = hook { hook.await; }
+    }
+
+    #[tokio::test]
+    async fn sparse_region_reader_preserves_separate_hashes_holes_and_eof_replay() {
+        let id = "generated-batched-sparse-read";
+        let _drive = crate::download_verification::TestDrive::new(id);
+        let reads = super::super::completion_tests::ReadCounter::new(id);
+        let directory = tempfile::tempdir().unwrap();let path = directory.path().join("generated.part");
+        let first = COORDINATED_READ_CHUNK_BYTES + 17;
+        let second_offset = first + 41;
+        let second = 2 * COORDINATED_READ_CHUNK_BYTES + 23;
+        let data: Vec<u8> = (0..second_offset + second + 13).map(|index| (index % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let regions = [(0, first as u64, true), (first as u64, 0, false), (second_offset as u64, second as u64, true)];
+        let mut hashes = Prefix::read_regions(&path, &regions, id).await.map_err(DlError::into_inner).unwrap();
+        for (hash, (offset, bytes, replay)) in hashes.iter_mut().zip(regions) {
+            assert_eq!(hash.bytes, bytes);
+            assert_eq!(hash.digest(), fixture_digest(&path, offset, bytes));
+            if replay {
+                assert!(hash.rewind_for_replay(bytes - 1));
+                assert_eq!(hash.digest(), fixture_digest(&path, offset, bytes - 1));
+            }
+            hash.validate_restored(&std::fs::metadata(&path).unwrap()).map_err(DlError::into_inner).unwrap();
+        }
+        assert_eq!(reads.bytes(), (first + second) as u64, "Each required byte is read once; sparse holes remain unread");
+        assert_eq!(reads.calls(), 5, "All regions keep the coordinated 4 MiB read bound");
+    }
+
+    #[tokio::test]
+    async fn sparse_region_reader_keeps_one_physical_reader_until_all_regions_are_checked() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let id = "generated-batched-reader-lease";
+        let drive = crate::download_verification::TestDrive::new(id);
+        let sibling = drive.sibling("generated-batched-reader-competitor");
+        let directory = tempfile::tempdir().unwrap();let path = directory.path().join("generated.part");
+        std::fs::write(&path, vec![0x5a; 96]).unwrap();
+        let (arrived, at_boundary) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let competitor_started = Arc::new(AtomicBool::new(false));
+        let checked = competitor_started.clone();
+        region_hooks().lock().unwrap().insert(id.into(), std::collections::VecDeque::from([
+            Box::pin(async move { arrived.send(()).unwrap();resumed.await.unwrap(); }) as RegionHook,
+            Box::pin(async move { assert!(!checked.load(Ordering::SeqCst), "Another file cannot take the reader between saved regions"); }) as RegionHook,
+        ]));
+        let reader = tokio::spawn(async move { Prefix::read_regions(&path, &[(0, 16, false), (64, 16, false)], id).await });
+        at_boundary.await.unwrap();
+        let mark = competitor_started.clone();
+        let competitor = tokio::spawn(async move { let _guard = sibling.hold_read(1).await;mark.store(true, Ordering::SeqCst); });
+        tokio::task::yield_now().await;
+        assert!(!competitor.is_finished());
+        resume.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), reader).await.unwrap().unwrap().map_err(DlError::into_inner).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), competitor).await.unwrap().unwrap();
+        assert!(competitor_started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn sparse_region_reader_resumes_its_context_after_a_forced_writer_turn() {
+        use tokio::io::AsyncWriteExt;
+        let id = "generated-batched-writer-handover";
+        let _drive = crate::download_verification::TestDrive::new(id);
+        let reads = super::super::completion_tests::ReadCounter::new(id);
+        let directory = tempfile::tempdir().unwrap();let path = directory.path().join("generated.part");
+        std::fs::write(&path, b"abcdefghijklmnop").unwrap();
+        let mut writer = tokio::fs::File::create(directory.path().join("generated-sibling.part")).await.unwrap();
+        let writer_gate = crate::download_verification::WriteGate::new(&writer, id);
+        region_hooks().lock().unwrap().insert(id.into(), std::collections::VecDeque::from([
+            Box::pin(async move {
+                let _turn = writer_gate.turn(true).await;
+                writer.write_all(b"other output").await.unwrap();writer.flush().await.unwrap();
+            }) as RegionHook,
+        ]));
+        let hashes = tokio::time::timeout(std::time::Duration::from_secs(2),
+            Prefix::read_regions(&path, &[(0, 4, true), (8, 4, true)], id))
+            .await.unwrap().map_err(DlError::into_inner).unwrap();
+        assert_eq!(hashes[0].digest(), fixture_digest(&path, 0, 4));
+        assert_eq!(hashes[1].digest(), fixture_digest(&path, 8, 4));
+        assert_eq!(reads.bytes(), 8, "Writer handover must not restart either saved region");
+    }
+
+    #[tokio::test]
+    async fn sparse_region_reader_does_not_acquire_the_disk_for_zero_length_regions() {
+        let id = "generated-batched-empty-regions";
+        let drive = crate::download_verification::TestDrive::new(id);
+        let _held = drive.hold().await;
+        let directory = tempfile::tempdir().unwrap();let path = directory.path().join("generated.part");
+        std::fs::write(&path, b"").unwrap();
+        let hashes = tokio::time::timeout(std::time::Duration::from_secs(2),
+            Prefix::read_regions(&path, &[(0, 0, false), (u64::MAX, 0, true)], id))
+            .await.unwrap().map_err(DlError::into_inner).unwrap();
+        assert!(hashes.iter().all(|hash| hash.bytes == 0));
+    }
+
+    #[tokio::test]
+    async fn sparse_region_reader_rejects_changed_bytes_and_replaced_staging_entries() {
+        for replace in [false, true] {
+            let id = format!("generated-batched-change-{replace}");
+            let _drive = crate::download_verification::TestDrive::new(&id);
+            let directory = tempfile::tempdir().unwrap();let path = directory.path().join("generated.part");
+            std::fs::write(&path, vec![0x5a; 96]).unwrap();
+            let changed = path.clone();
+            region_hooks().lock().unwrap().insert(id.clone(), std::collections::VecDeque::from([
+                Box::pin(async move {
+                    if replace {
+                        std::fs::rename(&changed, changed.with_extension("retained")).unwrap();
+                        std::fs::write(&changed, vec![0x5a; 96]).unwrap();
+                    } else {
+                        use std::io::{Seek, Write};
+                        let mut file = std::fs::OpenOptions::new().write(true).open(&changed).unwrap();
+                        file.seek(std::io::SeekFrom::Start(3)).unwrap();file.write_all(b"changed").unwrap();
+                    }
+                }) as RegionHook,
+            ]));
+            assert!(Prefix::read_regions(&path, &[(0, 16, false), (64, 16, false)], &id).await.is_err(),
+                "A changed inode/ctime/path cannot certify any restored region");
+        }
+    }
+
+    #[tokio::test]
+    async fn sparse_region_reader_rejects_invalid_coverage_before_reading() {
+        let id = "generated-batched-invalid-regions";
+        let reads = super::super::completion_tests::ReadCounter::new(id);
+        let directory = tempfile::tempdir().unwrap();let path = directory.path().join("generated.part");
+        std::fs::write(&path, vec![0x5a; 96]).unwrap();
+        for regions in [vec![(64, 16, false), (0, 16, false)], vec![(0, 16, false), (8, 16, false)],
+            vec![(u64::MAX, 2, false)], vec![(95, 2, false)]] {
+            assert!(Prefix::read_regions(&path, &regions, id).await.is_err());
+        }
+        assert_eq!(reads.bytes(), 0);
+        assert!(Prefix::read_regions(&path, &[(u64::MAX, 0, true)], id).await.map_err(DlError::into_inner).unwrap()[0].bytes == 0);
+    }
+
+    #[tokio::test]
+    async fn coordinated_checks_read_larger_batches_and_preserve_cross_batch_proofs() {
+        let id = "generated-coordinated-large-read";
+        let _drive = crate::download_verification::TestDrive::new(id);
+        let reads = super::super::completion_tests::ReadCounter::new(id);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("generated.part");
+        let data: Vec<u8> = (0..3 * COORDINATED_READ_CHUNK_BYTES + 23).map(|index| (index % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let boundaries = [0, READ_CHUNK_BYTES - 7, COORDINATED_READ_CHUNK_BYTES + 9,
+            2 * COORDINATED_READ_CHUNK_BYTES + 5, data.len()];
+        let proof: Vec<_> = boundaries.windows(2).map(|pair| {
+            let digest = ring::digest::digest(&ring::digest::SHA256, &data[pair[0]..pair[1]]);
+            (pair[0] as u64, (pair[1]-pair[0]) as u64, hex::encode(digest))
+        }).collect();
+        let verified = Prefix::read_verified(&path, data.len() as u64, &proof, id).await.map_err(DlError::into_inner).unwrap();
+        assert_eq!(verified.digest(), fixture_digest(&path, 0, data.len() as u64));
+        assert_eq!(reads.bytes(), data.len() as u64, "Every byte still receives one integrity read");
+        assert_eq!(reads.calls(), 4, "The coordinated reader uses four read requests instead of thirteen 1 MiB requests");
+        let mut damaged = data;
+        damaged[COORDINATED_READ_CHUNK_BYTES + 10] ^= 1;
+        std::fs::write(&path, &damaged).unwrap();
+        assert!(Prefix::read_verified(&path, damaged.len() as u64, &proof, id).await.is_err(),
+            "A changed byte must still be rejected across the larger I/O boundaries");
+    }
     #[tokio::test]
     async fn pipelined_checks_preserve_cross_buffer_piece_proofs_offsets_and_eof_replay() {
         let directory = tempfile::tempdir().unwrap();let path = directory.path().join("generated.part");

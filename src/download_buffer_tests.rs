@@ -1,4 +1,19 @@
 use super::*;
+
+#[test]
+fn normal_memory_pressure_keeps_write_batches_and_tight_ram_drains_them() {
+    for reserved in [0, 64 << 10, 1 << 20, 4 << 20] {
+        assert!(!range_write_pressure_at(1 << 30, 1, reserved),
+                "Normal macOS pressure must not turn every receive frame into a disk write");
+    }
+    for warning in [2, 4] {
+        assert!(range_write_pressure_at(1 << 30, warning, 64 << 10));
+    }
+    assert!(!range_write_pressure_at(512 << 10, 1, 128 << 10));
+    assert!(range_write_pressure_at(512 << 10, 1, 448 << 10),
+            "Make room before a tiny shared allowance strands partial range buffers");
+    assert!(range_write_pressure_at(4 << 10, 1, 0));
+}
 use std::sync::atomic::AtomicU64;
 
 #[path = "download_range_fixture.rs"]

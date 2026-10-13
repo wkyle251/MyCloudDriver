@@ -19,6 +19,34 @@ c=m.COLLECT
 
 
 class DashboardTests(unittest.TestCase):
+    def test_range_channels_and_header_metrics_are_numeric_at_both_boundaries(self):
+        packet=m.demo_packet(0,1000)
+        counters={'range_active_channels':3,'range_admission_limit':4,'range_header_active':1,
+                  'range_header_count':10,'range_header_total_ms':200,'range_header_max_ms':80,
+                  'range_header_failed':2,'range_trial_accepted':1,'range_trial_rejected':2,'range_startup_reused':5}
+        packet['state']['values'].update(counters)
+        packet['window']={'updated_at':1000,'values':dict(counters)}
+        clean=c.sanitize_packet(packet)
+        for location in ('state','window'):
+            for key,value in counters.items(): self.assertEqual(clean[location]['values'][key],value)
+        packet['state']['values']['range_active_channels']='https://generated.invalid/private'
+        packet['window']['values']['range_header_max_ms']=True
+        clean=c.sanitize_packet(packet)
+        self.assertNotIn('range_active_channels',clean['state']['values'])
+        self.assertNotIn('range_header_max_ms',clean['window']['values'])
+
+    def test_waiting_check_counters_remain_numeric_at_both_boundaries(self):
+        packet=m.demo_packet(0,1000)
+        counters={'waiting_read_bytes':100,'waiting_read_tasks':99,'oldest_waiting_read_ms':90_000,
+                  'read_turn_latency_handoffs':3}
+        packet['state']['values'].update(counters)
+        packet['window']={'updated_at':1000,'values':dict(counters)}
+        clean=c.sanitize_packet(packet)
+        for location in ('state','window'):
+            for key,value in counters.items(): self.assertEqual(clean[location]['values'][key],value)
+        packet['state']['values']['waiting_read_tasks']='generated-private.bin'
+        self.assertNotIn('waiting_read_tasks',c.sanitize_packet(packet)['state']['values'])
+
     def test_receive_wait_and_payload_counters_survive_privacy_filtering(self):
         packet=m.demo_packet(0,1000)
         values={'ram_body_limit_active':2,'ram_shared_limit_max_ms':123,'ram_pressure_count':1,
