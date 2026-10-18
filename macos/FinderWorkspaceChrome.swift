@@ -113,6 +113,7 @@ struct FinderContentModeSelector: View {
             .accessibilityHint("Choose User, Guest or Dynamic for PikPak previews and similarity scans")
             .help("\(settings.contentMode.detail) Applies to new PikPak previews and similarity scans. Downloads always use Dynamic Mode.")
             .popover(isPresented: $isPresented, arrowEdge: .trailing) { choices }
+            .onReceive(NotificationCenter.default.publisher(for: FinderPopover.dismissAllNotification)) { _ in isPresented = false }
         }.padding(.horizontal, 8).padding(.vertical, 4)
     }
 

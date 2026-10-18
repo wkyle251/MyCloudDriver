@@ -3,6 +3,33 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[tokio::test]
+async fn restored_completed_file_without_gcid_or_parent_skips_stale_path_and_original_url_lookups() {
+    let fixture = crate::guest_fixture::Fixture::new().await;
+    fixture.user_available.store(true, Ordering::SeqCst);
+    let mut gcid = pikpak::upload::GcidHasher::new(8); gcid.update(b"abcdefgh");
+    fixture.saved.lock().unwrap()["hash"] = serde_json::json!(gcid.finish());
+    let client = Client::builder().personal_access_token("account-access")
+        .api_base_url(&fixture.base).auth_base_url(&fixture.base).build().unwrap();
+    let directory = tempfile::tempdir().unwrap(); let output = directory.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    let file: FileInfo = serde_json::from_value(fixture.saved.lock().unwrap().clone()).unwrap();
+    crate::download_file(&client, &file, &output, false, false, Arc::new(AtomicU64::new(0))).await.unwrap();
+    let mut restored = file.clone(); restored.hash = None; restored.parent_id = None;
+    restored.modified_time = Some("stale-queue-time".into());
+    let mut restored = serde_json::to_value(restored).unwrap();
+    restored["size"] = serde_json::json!("8"); // Native inboxes use PikPak's string size encoding.
+    let inbox = directory.path().join("inbox.json");
+    std::fs::write(&inbox, serde_json::json!({"version":1,"content_mode":"dynamic","requests":[{
+        "id":"generated-restored-root","path":"/Gone/old-name.bin","destination":output,
+        "relative_parent":[],"file":restored
+    }]}).to_string()).unwrap();
+    fixture.user_available.store(false, Ordering::SeqCst); fixture.requests.lock().unwrap().clear();
+    tokio::time::timeout(Duration::from_secs(10), run(&client, Args { request_file: inbox })).await.unwrap().unwrap();
+    assert!(fixture.requests.lock().unwrap().is_empty(), "A delivered old queue must not look up a stale cloud path or URL");
+    assert_eq!(std::fs::read(output.join(&file.name)).unwrap(), b"abcdefgh");
+}
+
 #[test]
 fn live_destinations_keep_independent_checkpoint_policies_including_late_roots() {
     use crate::download_checkpoint::CheckpointPolicy;

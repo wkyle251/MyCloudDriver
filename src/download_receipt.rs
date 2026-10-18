@@ -163,6 +163,107 @@ struct Receipt {
     recovery: Option<RecoveryPublication>,
 }
 
+/// Duplicate checks trust a completed download's GCID without revalidating its
+/// contents or comparing the old filesystem identity. The user assumes these
+/// downloads are unmodified. The receipt must still belong to this filename.
+pub(crate) struct DuplicateGcidReceipt {
+    filename: std::ffi::OsString,
+    recorded: std::time::SystemTime,
+    receipt: Receipt,
+}
+
+impl DuplicateGcidReceipt {
+    pub fn gcid_for(&self, output: &Path, metadata: &std::fs::Metadata) -> Option<String> {
+        let receipt = &self.receipt;
+        if receipt.version != 1 || !receipt.committed || !metadata.is_file() { return None; }
+        let bound = if let Some(route) = &receipt.recovery {
+            route.owned && valid_recovery_name(&route.output_name)
+                && output.file_name() == route.output_name.file_name()
+        } else {
+            path(output, &receipt.source).ok()?.file_name()? == self.filename
+        };
+        if !bound { return None; }
+        let gcid = receipt.source.revision.as_deref()?.strip_prefix("gcid:")?;
+        (gcid.len() == 40 && gcid.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| gcid.to_ascii_uppercase())
+    }
+}
+
+pub(crate) struct DuplicateGcidReceiptIndex {
+    receipts: Vec<DuplicateGcidReceipt>,
+    by_inode: std::collections::HashMap<u64, Vec<usize>>,
+    complete: bool,
+}
+
+impl DuplicateGcidReceiptIndex {
+    pub fn gcid_for(&self, output: &Path, metadata: &std::fs::Metadata) -> Option<String> {
+        use std::os::unix::fs::MetadataExt;
+        if !self.complete { return duplicate_gcid_from_receipts(output, metadata); }
+        // Inode is only a lookup hint. Copied files and other mount views can
+        // have different inodes, so a miss searches the other receipt bindings.
+        self.by_inode.get(&metadata.ino()).into_iter().flatten()
+            .find_map(|&position| self.receipts[position].gcid_for(output, metadata))
+            .or_else(|| self.receipts.iter().filter(|entry| entry.receipt.local.inode != metadata.ino())
+                .find_map(|entry| entry.gcid_for(output, metadata)))
+    }
+}
+
+fn duplicate_receipt_entries(parent: &Path) -> Option<std::fs::ReadDir> {
+    let directory = parent.join(".myclouddriver-downloads");
+    if !std::fs::symlink_metadata(&directory).is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink()) { return None; }
+    std::fs::read_dir(directory).ok()
+}
+
+fn read_duplicate_gcid_receipt(entry: std::io::Result<std::fs::DirEntry>) -> Option<DuplicateGcidReceipt> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let entry = entry.ok()?;
+    let filename = entry.file_name(); let name = filename.to_str()?;
+    if name.len() != 69 || !name.ends_with(".json") || !name.as_bytes()[..64].iter().all(u8::is_ascii_hexdigit) { return None; }
+    if !entry.file_type().ok()?.is_file() { return None; }
+    let file = std::fs::OpenOptions::new().read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32).open(entry.path()).ok()?;
+    let metadata = file.metadata().ok()?;
+    if metadata.len() > 64 * 1024 { return None; }
+    // JSON's stream reader requests one byte at a time. Buffer the bounded
+    // receipt stream so those requests do not become individual read syscalls.
+    let reader = std::io::BufReader::new(file.take(64 * 1024 + 1));
+    let receipt: Receipt = serde_json::from_reader(reader).ok()?;
+    if receipt.source.scope.len() > 512 || receipt.source.file_id.len() > 512 { return None; }
+    Some(DuplicateGcidReceipt { filename, recorded: metadata.modified().ok()?, receipt })
+}
+
+/// Memory pressure and index size affect caching only, never GCID availability.
+pub(crate) fn duplicate_gcid_from_receipts(output: &Path, metadata: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    duplicate_receipt_entries(output.parent()?)?.filter_map(read_duplicate_gcid_receipt)
+        .filter_map(|entry| {
+            let gcid = entry.gcid_for(output, metadata)?;
+            Some(((entry.receipt.local.inode == metadata.ino(), entry.recorded, std::cmp::Reverse(entry.filename)), gcid))
+        }).max_by(|a, b| a.0.cmp(&b.0)).map(|(_, gcid)| gcid)
+}
+
+pub(crate) fn duplicate_gcid_receipts(parent: &Path) -> DuplicateGcidReceiptIndex {
+    let mut index = DuplicateGcidReceiptIndex { receipts: vec![], by_inode: std::collections::HashMap::new(), complete: true };
+    if let Some(entries) = duplicate_receipt_entries(parent) {
+        for entry in entries {
+            if index.receipts.len() >= 4096 || crate::download_buffer::memory_pressure() >= 2 {
+                index.complete = false;
+                break;
+            }
+            if let Some(receipt) = read_duplicate_gcid_receipt(entry) {
+                index.receipts.push(receipt);
+            }
+        }
+    }
+    // Prefer the matching inode when available, and the latest completed
+    // receipt if a filename has been downloaded from several cloud sources.
+    index.receipts.sort_by(|a, b| b.recorded.cmp(&a.recorded).then_with(|| a.filename.cmp(&b.filename)));
+    for (position, receipt) in index.receipts.iter().enumerate() {
+        index.by_inode.entry(receipt.receipt.local.inode).or_default().push(position);
+    }
+    index
+}
+
 /// A source-bound route never replaces the selected destination. An intent
 /// without recorded ownership cannot adopt a partial file left at this name.
 #[derive(Serialize, Deserialize)]
@@ -686,11 +787,7 @@ fn copy_partial_path(output: &Path, copy: &CopyPublication) -> Result<PathBuf> {
         .join(&copy.partial_name))
 }
 
-fn receipt_output(output: &Path, receipt: &Receipt) -> Result<PathBuf> {
-    let Some(recovery) = receipt.recovery.as_ref() else {
-        return Ok(output.to_owned());
-    };
-    let name = &recovery.output_name;
+fn valid_recovery_name(name: &Path) -> bool {
     let valid_name = name.to_str().is_some_and(|name| {
         name.rsplit_once(" (Recovered ")
             .is_some_and(|(stem, tail)| {
@@ -704,7 +801,15 @@ fn receipt_output(output: &Path, receipt: &Receipt) -> Result<PathBuf> {
                     })
             })
     });
-    if name.file_name() != Some(name.as_os_str()) || !valid_name {
+    name.file_name() == Some(name.as_os_str()) && valid_name
+}
+
+fn receipt_output(output: &Path, receipt: &Receipt) -> Result<PathBuf> {
+    let Some(recovery) = receipt.recovery.as_ref() else {
+        return Ok(output.to_owned());
+    };
+    let name = &recovery.output_name;
+    if !valid_recovery_name(name) {
         bail!("Download recovery route is invalid; existing files were preserved");
     }
     let recovered = output.parent().unwrap_or(Path::new(".")).join(name);
@@ -1393,6 +1498,46 @@ pub async fn completed_without_reading(
     })
     .await
     .context("Download receipt check worker stopped")?
+}
+
+/// Older saved queue entries can omit the GCID. Recover the completed receipt
+/// for this exact account, source ID and size before requesting another URL.
+/// This uses the download completion metadata checks, not the duplicate
+/// scanner's assumption that all receipted contents remain unchanged.
+pub async fn completed_source_from_history(
+    output: &Path,
+    scope: &str,
+    file_id: &str,
+    size: u64,
+) -> Result<Option<Source>> {
+    let (output, scope, file_id) = (output.to_owned(), scope.to_owned(), file_id.to_owned());
+    tokio::task::spawn_blocking(move || {
+        if !download_fs::metadata(&output).is_ok_and(|metadata| metadata.is_file()) { return Ok(None); }
+        let Some(entries) = output.parent().and_then(duplicate_receipt_entries) else { return Ok(None) };
+        for entry in entries.filter_map(read_duplicate_gcid_receipt) {
+            let receipt = &entry.receipt;
+            let source = &receipt.source;
+            let gcid = source.revision.as_deref().and_then(|value| value.strip_prefix("gcid:"));
+            if receipt.version != 1 || !receipt.committed || source.scope != scope || source.file_id != file_id
+                || source.size != size || !gcid.is_some_and(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                || path(&output, source)?.file_name() != Some(entry.filename.as_os_str()) { continue; }
+            if receipt.recovery.as_ref().is_some_and(|route| !route.owned) { continue; }
+            let actual = receipt_output(&output, receipt)?;
+            let Ok(metadata) = download_fs::metadata(&actual) else { continue };
+            let Ok(current) = Identity::read(&metadata) else { continue };
+            if current.size == size && receipt.local.vouched_by_metadata(&current) { return Ok(Some(source.clone())); }
+        }
+        Ok(None)
+    }).await.context("Download history check worker stopped")?
+}
+
+pub async fn completed_with_unknown_revision(
+    output: &Path, scope: &str, file_id: &str, size: u64, transfer_id: &str,
+) -> Result<Option<(PathBuf, Source)>> {
+    let Some(source) = completed_source_from_history(output, scope, file_id, size).await? else { return Ok(None) };
+    // Revalidate under the caller's output lease before cleaning staging or
+    // reporting completion; the earlier history lookup itself is read-only.
+    Ok(completed_without_reading(output, &source, transfer_id).await?.map(|path| (path, source)))
 }
 
 #[cfg(test)]
@@ -2133,6 +2278,101 @@ mod disk_fixture;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_receipts_trust_recorded_gcid_but_require_the_bound_filename() {
+        let root = tempfile::tempdir().unwrap(); let output = root.path().join("generated.bin");
+        let bytes = b"abcdefgh"; std::fs::write(&output, bytes).unwrap();
+        let mut hasher = pikpak::upload::GcidHasher::new(bytes.len() as u64); hasher.update(bytes);
+        let gcid = hasher.finish();
+        let source = Source { scope: "generated-account".into(), file_id: "generated-file".into(),
+            revision: Some(format!("gcid:{gcid}")), size: bytes.len() as u64 };
+        let receipt = Receipt { version: 1, source: source.clone(),
+            local: Identity::read(&std::fs::metadata(&output).unwrap()).unwrap(),
+            sha256: hex::encode(ring::digest::digest(&ring::digest::SHA256, bytes)), committed: true,
+            copy: None, recovery: None };
+        save(&path(&output, &source).unwrap(), &receipt).unwrap();
+        let receipts = duplicate_gcid_receipts(root.path()); assert_eq!(receipts.receipts.len(), 1);
+        assert_eq!(receipts.gcid_for(&output, &std::fs::metadata(&output).unwrap()), Some(gcid.clone()));
+        assert!(receipts.gcid_for(&root.path().join("renamed.bin"), &std::fs::metadata(&output).unwrap()).is_none());
+        let incomplete = DuplicateGcidReceiptIndex { receipts: vec![], by_inode: std::collections::HashMap::new(), complete: false };
+        assert_eq!(incomplete.gcid_for(&output, &std::fs::metadata(&output).unwrap()), Some(gcid.clone()),
+            "an index truncated by pressure or capacity still finds the receipt by streaming");
+        let modified = std::fs::metadata(&output).unwrap().modified().unwrap();
+        std::fs::write(&output, b"xxxxxxxx").unwrap();
+        std::fs::File::options().write(true).open(&output).unwrap().set_modified(modified).unwrap();
+        assert_eq!(receipts.gcid_for(&output, &std::fs::metadata(&output).unwrap()), Some(gcid));
+    }
+
+    #[test]
+    fn duplicate_receipts_ignore_recorded_identity_and_accept_only_completed_bound_routes() {
+        let root = tempfile::tempdir().unwrap(); let output = root.path().join("generated.bin");
+        let bytes = b"abcdefgh"; std::fs::write(&output, bytes).unwrap();
+        let metadata = std::fs::metadata(&output).unwrap();
+        let mut hasher = pikpak::upload::GcidHasher::new(bytes.len() as u64); hasher.update(bytes);
+        let gcid = hasher.finish();
+        let source = Source { scope: "generated-account".into(), file_id: "generated-file".into(),
+            revision: Some(format!("gcid:{gcid}")), size: bytes.len() as u64 };
+        let filename = path(&output, &source).unwrap().file_name().unwrap().to_owned();
+        let local = Identity::read(&metadata).unwrap();
+        let mut receipt = DuplicateGcidReceipt { filename, recorded: std::time::SystemTime::now(), receipt: Receipt {
+            version: 1, source, local: local.clone(),
+            sha256: hex::encode(ring::digest::digest(&ring::digest::SHA256, bytes)), committed: true,
+            copy: None, recovery: None,
+        } };
+        receipt.receipt.local.device ^= 1;
+        assert_eq!(receipt.gcid_for(&output, &metadata), Some(gcid.clone()));
+        let remounted = receipt.receipt.local.clone();
+        for field in 0..4 {
+            receipt.receipt.local = remounted.clone();
+            match field {
+                0 => receipt.receipt.local.inode ^= 1,
+                1 => receipt.receipt.local.size += 1,
+                2 => receipt.receipt.local.modified += 1,
+                _ => receipt.receipt.local.changed += 1,
+            }
+            assert_eq!(receipt.gcid_for(&output, &metadata), Some(gcid.clone()), "changed field {field}");
+        }
+        receipt.receipt.local = remounted;
+        let modified = metadata.modified().unwrap();
+        std::fs::write(&output, b"xxxxxxxx").unwrap();
+        std::fs::File::options().write(true).open(&output).unwrap().set_modified(modified).unwrap();
+        assert_eq!(receipt.gcid_for(&output, &std::fs::metadata(&output).unwrap()), Some(gcid.clone()));
+        receipt.receipt.committed = false;
+        assert!(receipt.gcid_for(&output, &metadata).is_none());
+        receipt.receipt.committed = true;
+        receipt.receipt.source.revision = Some("gcid:invalid".into());
+        receipt.filename = path(&output, &receipt.receipt.source).unwrap().file_name().unwrap().to_owned();
+        assert!(receipt.gcid_for(&output, &metadata).is_none());
+        receipt.receipt.source.revision = Some(format!("gcid:{gcid}"));
+        let recovered = root.path().join("generated (Recovered 00000000000000000000000000000001).bin");
+        std::fs::write(&recovered, bytes).unwrap();
+        receipt.receipt.recovery = Some(RecoveryPublication { output_name: recovered.file_name().unwrap().into(), owned: false });
+        assert!(receipt.gcid_for(&recovered, &std::fs::metadata(&recovered).unwrap()).is_none());
+        receipt.receipt.recovery.as_mut().unwrap().owned = true;
+        assert_eq!(receipt.gcid_for(&recovered, &std::fs::metadata(&recovered).unwrap()), Some(gcid));
+        assert!(receipt.gcid_for(&output, &metadata).is_none());
+    }
+
+    #[test]
+    fn duplicate_receipt_index_and_streaming_choose_the_same_latest_bound_source() {
+        let root = tempfile::tempdir().unwrap(); let output = root.path().join("generated.bin");
+        std::fs::write(&output, b"abcdefgh").unwrap();
+        let metadata = std::fs::metadata(&output).unwrap();
+        for (index, gcid) in ["AB".repeat(20), "CD".repeat(20)].iter().enumerate() {
+            let source = Source { scope: "generated-account".into(), file_id: format!("generated-{index}"),
+                revision: Some(format!("gcid:{gcid}")), size: 8 };
+            let mut local = Identity::read(&metadata).unwrap(); local.inode ^= 1;
+            let receipt = Receipt { version: 1, source: source.clone(), local, sha256: "00".repeat(32),
+                committed: true, copy: None, recovery: None };
+            let receipt_path = path(&output, &source).unwrap(); save(&receipt_path, &receipt).unwrap();
+            let recorded = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + index as u64);
+            std::fs::File::options().write(true).open(&receipt_path).unwrap().set_modified(recorded).unwrap();
+        }
+        let expected = Some("CD".repeat(20));
+        assert_eq!(duplicate_gcid_receipts(root.path()).gcid_for(&output, &metadata), expected);
+        assert_eq!(duplicate_gcid_from_receipts(&output, &metadata), expected);
+    }
     fn source(scope: &str, id: &str) -> Source {
         let file = serde_json::from_value(serde_json::json!({"id":id,"name":"file.bin","kind":"drive#file","size":"8","hash":"synthetic-revision"})).unwrap();
         Source::new(scope.into(), &file, 8)

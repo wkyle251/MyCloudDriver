@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 
 @main struct WorkspaceSessionTests {
@@ -49,11 +50,24 @@ import Foundation
         bridge.register()
         try await Task.sleep(nanoseconds: 40_000_000)
         precondition(FinderCommandRouter.shared.actions?.section == 10)
+        var insideTeardown = false, synchronousPublications = 0, deferredPublications = 0
+        let observation = FinderCommandRouter.shared.objectWillChange.sink {
+            if insideTeardown { synchronousPublications += 1 }
+            else { deferredPublications += 1 }
+        }
+        insideTeardown = true
         bridge.removeFromSuperview()
+        insideTeardown = false
+        precondition(FinderCommandRouter.shared.actions == nil,
+            "Detached views must invalidate their commands immediately")
+        precondition(synchronousPublications == 0,
+            "SwiftUI view teardown must never synchronously publish routing changes")
         try await Task.sleep(nanoseconds: 40_000_000)
         precondition(FinderCommandRouter.shared.actions == nil, "Detaching the view must unregister its commands")
+        precondition(deferredPublications == 1, "Routing teardown must publish once after the update pass")
+        observation.cancel()
         bridgeWindow.close()
-        print("PASS command routing: token-aware teardown, Home clearing, and invalidated deferred callbacks")
+        print("PASS command routing: immediate token-aware invalidation with deferred teardown publication, Home clearing, and stale callback rejection")
     }
 
     @MainActor static func testSessionLifecycle() async throws {

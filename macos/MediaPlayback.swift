@@ -74,6 +74,23 @@ enum MediaBuffering {
     }
 }
 
+/// KVO may arrive on several queues and in bursts. Keep one main-actor
+/// refresh queued, rather than creating a task for every property callback.
+final class MediaPlaybackRefreshQueue: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = false
+    func schedule(_ refresh: @escaping @MainActor @Sendable () -> Void) {
+        lock.lock()
+        guard !pending else { lock.unlock(); return }
+        pending = true; lock.unlock()
+        Task { @MainActor in
+            self.consume()
+            refresh()
+        }
+    }
+    private func consume() { lock.lock(); pending = false; lock.unlock() }
+}
+
 /// Observe only the player surface, avoiding a browser/tree redraw for each tick.
 /// The source owner still owns cloud transport, retry and buffer recovery.
 @MainActor final class MediaPlaybackController: ObservableObject {
@@ -117,14 +134,18 @@ enum MediaBuffering {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }; endObserver = nil
         player?.pause()
         seekID = UUID(); pendingSeek = nil
-        player = next; position = 0; duration = 0; bufferedRanges = []; memoryBuffer = nil; wantsPlayback = false; phase = .loading
+        player = next
+        if position != 0 { position = 0 }; if duration != 0 { duration = 0 }
+        if !bufferedRanges.isEmpty { bufferedRanges = [] }; if memoryBuffer != nil { memoryBuffer = nil }
+        if wantsPlayback { wantsPlayback = false }; if phase != .loading { phase = .loading }
         guard let next, let item = next.currentItem else { return }
         // Inline previews must render here even when another player has left
         // an external video route active on the system.
         next.allowsExternalPlayback = false
         apply(settings.values)
+        let refreshQueue = MediaPlaybackRefreshQueue()
         let changed: () -> Void = { [weak self, weak next] in
-            Task { @MainActor in
+            refreshQueue.schedule { [weak self, weak next] in
                 guard let self, let next, self.player === next else { return }
                 self.refresh()
             }
@@ -140,7 +161,9 @@ enum MediaBuffering {
         endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self, weak next] _ in
             Task { @MainActor in
                 guard let self, let next, self.player === next else { return }
-                self.wantsPlayback = false; self.phase = .finished; self.position = self.duration
+                if self.wantsPlayback { self.wantsPlayback = false }
+                if self.phase != .finished { self.phase = .finished }
+                if self.position != self.duration { self.position = self.duration }
             }
         }
         refresh()
@@ -148,10 +171,10 @@ enum MediaBuffering {
 
     /// Byte ranges mapped proportionally onto the track, so they need no known duration; approximate for variable bitrates.
     func updateMemoryBuffer(_ snapshot: PreviewResourceCacheSnapshot?) {
-        memoryBuffer = snapshot
+        if memoryBuffer != snapshot { memoryBuffer = snapshot }
         if let snapshot { if snapshot.normalizedRanges != bufferedRanges { bufferedRanges = snapshot.normalizedRanges } }
         else if player != nil { refresh() }
-        else { bufferedRanges = [] }
+        else if !bufferedRanges.isEmpty { bufferedRanges = [] }
     }
     var bufferHelp: String? {
         guard let memoryBuffer else { return nil }
@@ -170,18 +193,23 @@ enum MediaBuffering {
     private func refresh() {
         guard let player, let item = player.currentItem else { return }
         let total = item.duration.seconds
-        duration = total.isFinite && total > 0 ? total : 0
+        let nextDuration = total.isFinite && total > 0 ? total : 0
+        if duration != nextDuration { duration = nextDuration }
         let current = pendingSeek ?? player.currentTime().seconds
-        position = current.isFinite ? max(0, duration > 0 ? min(current, duration) : current) : 0
+        let nextPosition = current.isFinite ? max(0, duration > 0 ? min(current, duration) : current) : 0
+        if position != nextPosition { position = nextPosition }
         let loaded = memoryBuffer?.normalizedRanges
             ?? MediaBuffering.normalizedRanges(item.loadedTimeRanges.map(\.timeRangeValue), duration: duration)
         if loaded != bufferedRanges { bufferedRanges = loaded }
-        if item.status == .failed { phase = .failed; wantsPlayback = false }
-        else if item.status != .readyToPlay { phase = .loading }
-        else if player.timeControlStatus == .waitingToPlayAtSpecifiedRate { phase = .buffering; wantsPlayback = true }
-        else if player.timeControlStatus == .playing { phase = .playing; wantsPlayback = true }
-        else if duration > 0 && position >= duration - 0.05 { phase = .finished; wantsPlayback = false }
-        else { phase = position > 0.05 ? .paused : .ready; wantsPlayback = false }
+        let nextPhase: Phase, nextWantsPlayback: Bool
+        if item.status == .failed { nextPhase = .failed; nextWantsPlayback = false }
+        else if item.status != .readyToPlay { nextPhase = .loading; nextWantsPlayback = wantsPlayback }
+        else if player.timeControlStatus == .waitingToPlayAtSpecifiedRate { nextPhase = .buffering; nextWantsPlayback = true }
+        else if player.timeControlStatus == .playing { nextPhase = .playing; nextWantsPlayback = true }
+        else if duration > 0 && position >= duration - 0.05 { nextPhase = .finished; nextWantsPlayback = false }
+        else { nextPhase = position > 0.05 ? .paused : .ready; nextWantsPlayback = false }
+        if phase != nextPhase { phase = nextPhase }
+        if wantsPlayback != nextWantsPlayback { wantsPlayback = nextWantsPlayback }
     }
     func togglePlayback() {
         guard let player, canPlay else { return }

@@ -11,12 +11,15 @@ private final class SimilarityActionDrive: NativeCloudDrive, @unchecked Sendable
     var keeperSizeChanged = false
     var changedRemoval = false
     var changedKeeperRevision = false
+    let expectedKeeperID: String?
+    var onRefresh: (@MainActor () -> Void)?
     private(set) var deleteCalls = 0
     private let lock = NSLock()
     private var removed = false
     var isTrashed: Bool { lock.lock(); defer { lock.unlock() }; return removed }
-    init(_ kind: CloudDriveKind, batch: Bool = false) {
+    init(_ kind: CloudDriveKind, batch: Bool = false, keeperID: String? = nil) {
         self.kind = kind
+        expectedKeeperID = batch ? keeperID ?? "original-asset" : nil
         root = .init(id: "test-root", title: "Synthetic Drive", url: URL(fileURLWithPath: "/synthetic-drive"))
         let folder = root.url!
         items = (batch ? ["original-asset", "copy-b", "copy-c"] : ["original-asset"]).enumerated().map { index, id in
@@ -33,7 +36,7 @@ private final class SimilarityActionDrive: NativeCloudDrive, @unchecked Sendable
     }
     func scanItems(_ items: [CloudDriveItem], location: CloudDriveLocation, progress: @escaping CloudDriveProgressHandler) async throws -> [CloudDriveItem] { self.items }
     func delete(_ items: [CloudDriveItem], progress: @escaping CloudDriveProgressHandler) async throws -> CloudDriveUndo? {
-        let expected = self.items.count > 1 ? Array(self.items.dropFirst()).map(\.id) : [item.id]
+        let expected = self.items.filter { $0.id != expectedKeeperID }.map(\.id)
         precondition(Set(items.map(\.id)) == Set(expected), "Must trash only original non-keepers, never temporary previews")
         deleteCalls += 1
         try await Task.sleep(nanoseconds: 30_000_000)
@@ -41,11 +44,12 @@ private final class SimilarityActionDrive: NativeCloudDrive, @unchecked Sendable
         return kind == .photos ? nil : undo(restoring: true)
     }
     func refreshedItems(_ items: [CloudDriveItem]) async throws -> [CloudDriveItem] {
+        if let onRefresh { await onRefresh() }
         if keeperMissing { throw CloudDriveError.message("Synthetic keeper is missing") }
         return items.map { item in
             var copy = item
-            if keeperSizeChanged { copy.bytes = 999 }
-            if (changedRemoval && item.id == "copy-b") || (changedKeeperRevision && item.id == "original-asset") {
+            if keeperSizeChanged && item.id == expectedKeeperID { copy.bytes = 999 }
+            if (changedRemoval && item.id == "copy-b") || (changedKeeperRevision && item.id == expectedKeeperID) {
                 copy.revision = "edited-with-the-same-size"
             }
             return copy
@@ -82,9 +86,14 @@ private final class SimilarityActionDrive: NativeCloudDrive, @unchecked Sendable
         try await testOutsideBrowserRoot()
         try await testPikPakTrash()
         try await testKeepSmallestPlanning()
+        try await testKeepLargestPlanning()
+        try await testSizeBasedPlanCache()
         try await testNativeKeepSmallest()
         try await testLocalKeepSmallest()
+        try await testLocalKeepLargest()
         try await testPikPakKeepSmallest()
+        try await testPikPakKeepLargest()
+        try await testCrossDriveProviderEndpoints()
     }
     @MainActor static func testResultActions() async throws {
         let files = [file("a"), file("b"), file("c")], results = SimilarityResultsModel()
@@ -220,9 +229,147 @@ private final class SimilarityActionDrive: NativeCloudDrive, @unchecked Sendable
         precondition(results.trashedIDs.isEmpty && results.fileActionMessage == nil)
         print("PASS smallest planning: zero bytes, deterministic ties, overlapping groups, search scope, partial acknowledgement, double click, stale groups and new-session isolation")
     }
+    @MainActor static func testKeepLargestPlanning() async throws {
+        let a = file("a", bytes: 10), b = file("b", bytes: 20), c = file("c", bytes: 30), d = file("d", bytes: 40)
+        func group(_ id: String, _ files: [SimilarityFile]) -> SimilarityResultGroup {
+            .init(id: id, members: files, minimumScore: 0.95, identical: false)
+        }
+        let groups = [group("one", [c,b,a]), group("two", [b,d])]
+        let results = SimilarityResultsModel()
+        results.load(report([a,b,c,d]), configuration: nil)
+        try await wait { !results.isIndexing && !results.isGrouping }
+        results.setFixtureGroups(groups, at: 0.9)
+        results.query = "a.jpg"
+        let all = results.keepLargestPlan()!, one = results.keepLargestPlan(groupID: "one")!
+        precondition(all.policy == .largest && all.actionTitle == "Keep Largest")
+        precondition(Set(all.keepers.map(\.id)) == ["c","d"] && all.removalIDs == ["a","b"] && all.bytesToRemove == 30)
+        precondition(one.groupIDs == ["one"] && one.keepers.map(\.id) == ["c"] && one.removalIDs == ["a","b"])
+        precondition(results.keepLargestPlan(groupID: "missing") == nil)
+        let smallest = results.keepSmallestPlan()!
+        precondition(smallest.policy == .smallest && smallest.actionTitle == "Keep Smallest"
+                     && Set(smallest.keepers.map(\.id)) == ["a","b"] && smallest.removalIDs == ["c","d"])
+        try results.validateKeepSmallest(all)
+        try results.validateKeepSmallest(one)
+        func rejects(_ plan: SimilarityKeepSmallestPlan) {
+            do { try results.validateKeepSmallest(plan); preconditionFailure("Must reject changed group-action snapshot") }
+            catch { }
+        }
+        results.minimumScore = 0.91; rejects(all)
+        results.minimumScore = 0.9
+        results.identicalOnly = true; rejects(all)
+        results.identicalOnly = false
+        results.setFixtureGroups([group("one", [file("c", bytes: 31),b,a]), groups[1]], at: 0.9)
+        rejects(all) // The keeper remains the largest, but its size changed.
+        results.setFixtureGroups([group("one", [c,b,file("a", bytes: 11)]), groups[1]], at: 0.9)
+        rejects(all) // An unchanged keeper does not excuse a changed removal.
+        results.setFixtureGroups(groups, at: 0.9)
+        var calls = 0
+        results.keepSmallest(one) { plan in
+            calls += 1; precondition(plan.policy == .largest && plan.keepers.map(\.id) == ["c"])
+            try await Task.sleep(nanoseconds: 30_000_000)
+            return plan.removalIDs
+        }
+        results.keepSmallest(one) { _ in preconditionFailure("Largest must reject duplicate batch clicks") }
+        try await wait { results.trashingIDs.isEmpty }
+        precondition(calls == 1 && results.trashedIDs == ["a","b"] && results.selectedID == "c"
+                     && results.query.isEmpty && results.fileActionMessage?.contains("largest") == true)
+        results.load(report([a,b,c,d]), configuration: nil)
+        try await wait { !results.isIndexing && !results.isGrouping }
+        rejects(all)
+
+        let allResults = SimilarityResultsModel()
+        allResults.load(report([a,b,c,d]), configuration: nil)
+        try await wait { !allResults.isIndexing && !allResults.isGrouping }
+        allResults.setFixtureGroups(groups, at: 0.9)
+        allResults.keepSmallest(allResults.keepLargestPlan()!) { $0.removalIDs }
+        try await wait { allResults.trashingIDs.isEmpty }
+        precondition(allResults.trashedIDs == ["a","b"] && allResults.visibleFileCount == 2 && allResults.fileActionError == nil)
+
+        func alias(_ id: String, path: String, bytes: UInt64, cloudID: String? = nil, localPath: String? = nil) -> SimilarityFile {
+            .init(id: id, name: id + ".jpg", path: path, bytes: bytes, family: "image",
+                  localPath: localPath, cloudId: cloudID, ancestors: [])
+        }
+        let first = alias("first", path: "/z", bytes: 200, cloudID: "shared-original")
+        let second = alias("second", path: "/y", bytes: 200, cloudID: "shared-original")
+        let top = file("top", bytes: 300)
+        let overlap = SimilarityKeepSmallestPlan(groups: [group("left", [first,a]), group("right", [second,top])],
+            session: UUID(), minimumScore: 0.9, identicalOnly: false, policy: .largest)
+        precondition(Set(overlap.keepers.map(\.id)) == ["first","top"] && overlap.removalIDs == ["a"],
+                     "An original kept by one group must be protected through every score-row alias")
+        let duplicateRemovals = SimilarityKeepSmallestPlan(groups: [group("left", [top,first]), group("right", [top,second])],
+            session: UUID(), minimumScore: 0.9, identicalOnly: false, policy: .largest)
+        precondition(duplicateRemovals.keepers.count == 1 && duplicateRemovals.removals.count == 1
+                     && duplicateRemovals.bytesToRemove == 200, "Each removed original must appear in the provider batch only once")
+        let localFirst = alias("local-first", path: "/z", bytes: 200, localPath: "/synthetic/x/../original.jpg")
+        let localSecond = alias("local-second", path: "/y", bytes: 200, localPath: "/synthetic/original.jpg")
+        let localOverlap = SimilarityKeepSmallestPlan(groups: [group("left", [localFirst,a]), group("right", [localSecond,b])],
+            session: UUID(), minimumScore: 0.9, identicalOnly: false, policy: .largest)
+        precondition(localOverlap.keepers.count == 1 && localOverlap.removalIDs == ["a","b"],
+                     "Standardized local aliases must protect and count a keeper only once")
+        let tieA = alias("tie-a", path: "/a", bytes: 0), tieB = alias("tie-b", path: "/a", bytes: 0)
+        let tieZ = alias("tie-z", path: "/z", bytes: 0)
+        for tied in [[tieZ,tieB,tieA], [tieA,tieZ,tieB], [tieB,tieA,tieZ]] {
+            precondition(SimilarityKeepSmallestPlan.largest(in: tied)?.id == "tie-a")
+            precondition(SimilarityKeepSmallestPlan.smallest(in: tied)?.id == "tie-a")
+        }
+        precondition(SimilarityKeepSmallestPlan.largest(in: []) == nil)
+
+        let previews = SimilarityResultsModel()
+        previews.load(report([a,b,c]), configuration: nil, allowsSizeBasedCleanup: false)
+        try await wait { !previews.isIndexing && !previews.isGrouping }
+        precondition(previews.keepLargestPlan() == nil && previews.keepSmallestPlan() == nil)
+        let previewPlan = SimilarityKeepSmallestPlan(groups: previews.groups, session: previews.sessionToken,
+            minimumScore: previews.minimumScore, identicalOnly: previews.identicalOnly, policy: .largest)
+        previews.keepSmallest(previewPlan) { _ in preconditionFailure("Preview scans must not execute size-based cleanup") }
+        precondition(previews.trashedIDs.isEmpty && previews.fileActionError != nil)
+        print("PASS largest planning/execution: all and selected groups, deterministic path/ID ties, overlap aliases, unchanged smallest policy, stale threshold/session, changed sizes and preview restriction")
+    }
+    @MainActor static func testSizeBasedPlanCache() async throws {
+        let files = (0..<13).map { file("cache-\($0)", bytes: UInt64($0 + 1)) }
+        let results = SimilarityResultsModel()
+        results.load(report(files), configuration: nil)
+        try await wait { !results.isIndexing && !results.isGrouping }
+        let groups = (1..<files.count).map { index in
+            SimilarityResultGroup(id: "group-\(index)", members: [files[0],files[index]], minimumScore: 0.95, identical: false)
+        }
+        results.setFixtureGroups(groups, at: 0.9)
+        _ = results.keepSmallestPlan(); _ = results.keepLargestPlan()
+        let first = results.sizeBasedPlanBuildCount
+        for _ in 0..<20 { _ = results.keepSmallestPlan(); _ = results.keepLargestPlan() }
+        precondition(results.sizeBasedPlanBuildCount == first, "Body redraws must reuse both all-group plans")
+        _ = results.keepLargestPlan(groupID: "missing")
+        let empty = results.sizeBasedPlanBuildCount
+        _ = results.keepLargestPlan(groupID: "missing")
+        precondition(results.sizeBasedPlanBuildCount == empty, "Empty plans must also be cached")
+        for group in groups { _ = results.keepLargestPlan(groupID: group.id) }
+        precondition(results.sizeBasedPlanCacheCount <= 10)
+        let beforeEviction = results.sizeBasedPlanBuildCount
+        _ = results.keepLargestPlan(groupID: groups.last!.id)
+        precondition(results.sizeBasedPlanBuildCount == beforeEviction)
+        _ = results.keepLargestPlan(groupID: groups.first!.id)
+        precondition(results.sizeBasedPlanBuildCount == beforeEviction + 1, "Old group-specific entries must be evicted")
+        results.setFixtureGroups(groups, at: 0.9)
+        precondition(results.sizeBasedPlanCacheCount == 0, "Changed groups invalidate plans even when group IDs are reused")
+        let plan = results.keepLargestPlan()!
+        var complete: (() -> Void)?
+        results.keepSmallest(plan) { plan in
+            await withCheckedContinuation { continuation in complete = { continuation.resume() } }
+            return plan.removalIDs
+        }
+        try await wait { complete != nil }
+        precondition(results.keepLargestPlan() == nil && results.keepSmallestPlan() == nil,
+                     "Busy guards must run before a cached plan can be returned")
+        complete?(); try await wait { results.trashingIDs.isEmpty }
+        precondition(results.sizeBasedPlanCacheCount == 0, "Trash acknowledgements invalidate group plans")
+        results.reset()
+        precondition(results.sizeBasedPlanCacheCount == 0)
+        print("PASS size-based plan cache: both policies, empty results, bounded group LRU, reused-ID invalidation, busy guards, Trash and reset")
+    }
     @MainActor static func testNativeKeepSmallest() async throws {
+      for policy in [SimilarityKeepSmallestPlan.SizePolicy.smallest, .largest] {
         for kind in [CloudDriveKind.local, .icloud, .photos] {
-            let drive = SimilarityActionDrive(kind, batch: true), model = NativeDriveModel(kind: kind)
+            let keeperID = policy == .smallest ? "original-asset" : "copy-c"
+            let drive = SimilarityActionDrive(kind, batch: true, keeperID: keeperID), model = NativeDriveModel(kind: kind)
             defer { model.close() }
             model.connect(drive); model.findSimilar([], presentWindow: false)
             let sources = try await model.similarity.local.inventoryExternalSources!()
@@ -231,7 +378,8 @@ private final class SimilarityActionDrive: NativeCloudDrive, @unchecked Sendable
             let results = model.similarity.local.results
             results.load(report(files), configuration: nil)
             try await wait { !results.isIndexing && !results.isGrouping }
-            let plan = results.keepSmallestPlan()!
+            let plan = (policy == .smallest ? results.keepSmallestPlan() : results.keepLargestPlan())!
+            precondition(plan.policy == policy && plan.keepers.first?.bytes == (policy == .smallest ? 100 : 300))
             for missing in [true, false] {
                 drive.keeperMissing = missing; drive.keeperSizeChanged = !missing
                 results.keepSmallest(plan, using: model.similarity.keepSmallest!)
@@ -258,7 +406,8 @@ private final class SimilarityActionDrive: NativeCloudDrive, @unchecked Sendable
                 precondition(results.visibleFileCount == 1 && drive.isTrashed)
             } else { precondition(model.undoStack.isEmpty) }
         }
-        print("PASS native keep-smallest: verifies retained original, blocks missing/changed keepers, uses one provider batch and one Undo/Redo")
+        print("PASS native \(policy.actionTitle): verifies retained original, blocks missing/size/revision changes, uses one provider batch and one Undo/Redo")
+      }
     }
     @MainActor static func testLocalKeepSmallest() async throws {
         let fm = FileManager.default, directory = fm.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("KeepSmallest-\(UUID())")
@@ -283,6 +432,34 @@ private final class SimilarityActionDrive: NativeCloudDrive, @unchecked Sendable
             precondition(data == Data(repeating: UInt8(65 + index), count: (index + 1) * 100))
         }
         print("PASS real synthetic Local Disk batch: keeps smallest original, trashes the others, restores every byte with one Undo")
+    }
+    @MainActor static func testLocalKeepLargest() async throws {
+        let fm = FileManager.default, directory = fm.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("KeepLargest-\(UUID())")
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: directory) }
+        let urls = ["small.txt", "medium.txt", "large.txt"].map { directory.appendingPathComponent($0) }
+        for (index, url) in urls.enumerated() { try Data(repeating: UInt8(65 + index), count: (index + 1) * 100).write(to: url) }
+        let model = NativeDriveModel(kind: .local); defer { model.close() }
+        model.connect(ICloudDriveProvider(rootURL: directory, kind: .local)); model.findSimilar([], presentWindow: false)
+        let sources = try await model.similarity.local.inventoryExternalSources!()
+        let files = sources.map { source in SimilarityFile(id: source.id, name: source.name, path: source.path,
+            bytes: source.size, family: "text", localPath: source.localPath, cloudId: nil, ancestors: []) }
+        let results = model.similarity.local.results
+        results.load(report(files), configuration: nil); try await wait { !results.isIndexing }
+        let plan = results.keepLargestPlan()!
+        precondition(plan.keepers.first?.bytes == 300)
+        results.keepSmallest(plan, using: model.similarity.keepSmallest!)
+        try await wait { results.trashingIDs.isEmpty && !model.isMutating }
+        precondition(results.fileActionError == nil && !fm.fileExists(atPath: urls[0].path)
+                     && !fm.fileExists(atPath: urls[1].path) && fm.fileExists(atPath: urls[2].path))
+        let kept = try Data(contentsOf: urls[2])
+        precondition(kept == Data(repeating: 67, count: 300), "The largest original must survive intact")
+        model.undo(); try await wait { !model.isMutating }
+        for (index, url) in urls.enumerated() {
+            let data = try Data(contentsOf: url)
+            precondition(data == Data(repeating: UInt8(65 + index), count: (index + 1) * 100))
+        }
+        print("PASS real synthetic Local Disk largest batch: keeps 300-byte original, trashes smaller originals, restores every byte with one Undo")
     }
     @MainActor static func testPikPakKeepSmallest() async throws {
         let suite = "SimilarityKeepSmallest-\(UUID())", defaults = UserDefaults(suiteName: suite)!
@@ -309,6 +486,137 @@ private final class SimilarityActionDrive: NativeCloudDrive, @unchecked Sendable
         account.performFileUndo(redo: false)
         precondition(results.trashedIDs.isEmpty, "One Undo restores the complete acknowledged batch")
         print("PASS PikPak smallest batch: partial acknowledgement, retained keeper, account-owned batch Undo, shared-link isolation")
+    }
+    @MainActor static func testPikPakKeepLargest() async throws {
+        let suite = "SimilarityKeepLargest-\(UUID())", defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let account = DownloaderModel.finderWorkspaceFixture(defaults: defaults)
+        defer { account.stopForWindowClose() }
+        let files = [file("small", cloud: true, bytes: 10), file("medium", cloud: true, bytes: 20), file("largest", cloud: true, bytes: 30)]
+        let results = account.fileSimilarity.cloud.results
+        results.load(report(files, source: .cloud), configuration: nil)
+        try await wait { !results.isIndexing }
+        let plan = results.keepLargestPlan()!
+        precondition(plan.keepers.map(\.cloudId) == ["largest"] && plan.removalIDs == ["small","medium"])
+        account.similarityTrashFixtureResponse = (1, "{\"trashed_ids\":[\"medium\",\"largest\"]}", "Synthetic second batch failed")
+        results.keepSmallest(plan, using: account.fileSimilarity.keepSmallest!)
+        try await wait { results.trashingIDs.isEmpty }
+        precondition(results.trashedIDs == ["medium"] && !results.trashedIDs.contains("largest")
+                     && results.fileActionError != nil && account.canUndoFileAction,
+                     "Even an unexpected acknowledgement must never remove the retained cloud original")
+        account.performFileUndo(redo: false)
+        precondition(results.trashedIDs.isEmpty)
+        account.similarityTrashFixtureResponse = nil
+        results.keepSmallest(results.keepLargestPlan()!, using: account.fileSimilarity.keepSmallest!)
+        try await wait { results.trashingIDs.isEmpty }
+        precondition(results.trashedIDs == ["small","medium"] && results.fileActionError == nil)
+        account.performFileUndo(redo: false)
+        precondition(results.trashedIDs.isEmpty, "One Undo restores both acknowledged smaller cloud originals")
+        print("PASS PikPak largest batch: protects keeper cloud ID, partial acknowledgement, unexpected keeper acknowledgement ignored and batch Undo")
+    }
+    @MainActor static func testCrossDriveProviderEndpoints() async throws {
+        for kind in [CloudDriveKind.local, .icloud, .photos] {
+            let drive = SimilarityActionDrive(kind, batch: true, keeperID: "copy-c")
+            let model = NativeDriveModel(kind: kind); defer { model.close() }
+            model.connect(drive)
+            let originals = drive.items.map { item in SimilarityFile(id: item.id, name: item.name,
+                path: item.url?.path ?? "/Synthetic/\(item.id)", bytes: item.bytes!, family: "image",
+                localPath: item.url?.path, cloudId: nil, ancestors: [], nativeRevision: item.revision) }
+            let mixed = originals.map { original in SimilarityFile(id: "cross-native:\(kind.rawValue):" + Data(original.id.utf8).base64EncodedString(),
+                name: original.name, path: original.path, bytes: original.bytes, family: original.family,
+                localPath: original.localPath, cloudId: nil, ancestors: [], nativeRevision: original.nativeRevision) }
+            let results = SimilarityResultsModel()
+            results.load(report(mixed), configuration: nil)
+            try await wait { !results.isIndexing }
+            let session = results.sessionToken, removed = Set(mixed.prefix(2).map(\.id))
+            do {
+                _ = try await model.trashCrossDriveSimilarityFiles(Array(originals.prefix(2)), keeping: [originals[2]],
+                    provider: drive, results: results, session: session, resultIDs: Set(mixed.suffix(2).map(\.id)))
+                preconditionFailure("Decoded originals must correspond to the reviewed result IDs")
+            } catch { }
+            precondition(drive.deleteCalls == 0)
+            try await model.preflightSimilarityFiles(originals, provider: drive)
+            drive.changedKeeperRevision = true
+            do {
+                _ = try await model.trashCrossDriveSimilarityFiles(Array(originals.prefix(2)), keeping: [originals[2]],
+                    provider: drive, results: results, session: session, resultIDs: removed)
+                preconditionFailure("Changed cross-drive keeper must block native mutations")
+            } catch { }
+            precondition(drive.deleteCalls == 0 && results.trashedIDs.isEmpty)
+            drive.changedKeeperRevision = false
+            let confirmed = try await model.trashCrossDriveSimilarityFiles(Array(originals.prefix(2)), keeping: [originals[2]],
+                provider: drive, results: results, session: session, resultIDs: removed)
+            results.setTrashedIDs(confirmed, true)
+            precondition(confirmed == removed && results.visibleFileCount == 1 && model.similarity.local.results.index == nil,
+                         "Cross-drive endpoints must use supplied combined results, not the single-drive scan")
+            if kind != .photos {
+                model.undo(); try await wait { !model.isMutating }
+                precondition(results.trashedIDs.isEmpty && !drive.isTrashed, "Native Undo must restore combined row IDs")
+            } else { precondition(model.undoStack.isEmpty) }
+            let closing = NativeDriveModel(kind: kind), closingDrive = SimilarityActionDrive(kind, batch: true, keeperID: "copy-c")
+            let closingResults = SimilarityResultsModel()
+            closingResults.load(report(mixed), configuration: nil)
+            try await wait { !closingResults.isIndexing }
+            closingDrive.onRefresh = { closing.close() }
+            do {
+                _ = try await closing.trashCrossDriveSimilarityFiles(Array(originals.prefix(2)), keeping: [originals[2]],
+                    provider: closingDrive, results: closingResults, session: closingResults.sessionToken, resultIDs: removed)
+                preconditionFailure("Closing during preflight must prevent a later native deletion")
+            } catch { }
+            precondition(closingDrive.deleteCalls == 0)
+        }
+        let suite = "SimilarityCrossDriveActions-\(UUID())", defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let account = DownloaderModel.finderWorkspaceFixture(defaults: defaults)
+        defer { account.stopForWindowClose() }
+        func cloud(_ row: String, _ original: String, _ bytes: UInt64) -> SimilarityFile {
+            .init(id: row, name: row + ".jpg", path: "/Synthetic/" + row, bytes: bytes,
+                family: "image", localPath: nil, cloudId: original, ancestors: [])
+        }
+        let cloudFiles = [cloud("cloud-row-a", "raw-a", 100), cloud("cloud-row-b", "raw-b", 200), cloud("cloud-row-c", "raw-c", 300)]
+        let mixedFiles = cloudFiles + [file("native-row", bytes: 400)]
+        let results = SimilarityResultsModel()
+        results.load(report(mixedFiles, source: .cloud), configuration: nil)
+        try await wait { !results.isIndexing }
+        let session = results.sessionToken, accountID = account.activeAccountID
+        account.similarityPreflightFixtureError = CloudDriveError.message("Synthetic cloud metadata changed")
+        do {
+            _ = try await account.trashCrossDriveSimilarityFiles(Array(cloudFiles.prefix(2)), keeping: [],
+                results: results, session: session, accountID: accountID)
+            preconditionFailure("Failed cloud preflight must block mutations")
+        } catch { }
+        precondition(results.trashedIDs.isEmpty && !account.canUndoFileAction)
+        account.similarityPreflightFixtureError = nil
+        do {
+            try await account.preflightCrossDriveSimilarityFiles(cloudFiles, accountID: UUID())
+            preconditionFailure("A different account must not operate on mixed results")
+        } catch { }
+        account.similarityTrashFixtureResponse = (1, "{\"trashed_ids\":[\"raw-a\",\"native-row\"]}", "Synthetic partial failure")
+        let partial = try await account.trashCrossDriveSimilarityFiles(Array(cloudFiles.prefix(2)), keeping: [],
+            results: results, session: session, accountID: accountID)
+        precondition(partial == ["cloud-row-a"] && results.trashedIDs == partial && account.fileSimilarity.cloud.results.index == nil)
+        account.performFileUndo(redo: false)
+        precondition(results.trashedIDs.isEmpty, "Cloud Undo must update combined result ownership")
+        account.similarityTrashFixtureResponse = nil
+        let confirmed = try await account.trashCrossDriveSimilarityFiles(Array(cloudFiles.prefix(2)), keeping: [cloudFiles[2]],
+            results: results, session: session, accountID: accountID)
+        precondition(confirmed == ["cloud-row-a","cloud-row-b"] && !results.trashedIDs.contains("cloud-row-c"))
+        results.load(report(mixedFiles, source: .cloud), configuration: nil)
+        try await wait { !results.isIndexing }
+        results.setTrashed("cloud-row-a", true)
+        account.performFileUndo(redo: false)
+        precondition(results.trashedIDs == ["cloud-row-a"], "An old batch Undo must not change a newer scan's row state")
+        let late = DownloaderModel.finderWorkspaceFixture(defaults: defaults, workspaceSessionID: "workspace-3")
+        defer { late.stopForWindowClose() }
+        let lateResults = SimilarityResultsModel()
+        lateResults.load(report(mixedFiles, source: .cloud), configuration: nil)
+        try await wait { !lateResults.isIndexing }
+        late.similarityTrashFixtureSwitchAccountBeforeAcknowledgement = true
+        let lateReceipt = try await late.trashCrossDriveSimilarityFiles(Array(cloudFiles.prefix(2)), keeping: [],
+            results: lateResults, session: lateResults.sessionToken, accountID: late.activeAccountID)
+        precondition(lateReceipt == ["cloud-row-a","cloud-row-b"] && lateResults.trashedIDs.isEmpty && !late.canUndoFileAction,
+                     "An old-account receipt must not mutate the new account's results or Undo history")
+        print("PASS cross-drive endpoints: original provider IDs, combined row Undo, native keeper revision guard, cloud account/preflight guard, local-only keepers, partial acknowledgements and stale session isolation")
     }
     @MainActor static func testPikPakTrash() async throws {
         let suite = "SimilarityPikPakActions-\(UUID())"

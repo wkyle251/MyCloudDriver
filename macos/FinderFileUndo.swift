@@ -99,16 +99,31 @@ struct FinderFileUndoHistory {
 @MainActor final class FinderUndoCommandFocus: ObservableObject {
     private var monitor: Any?
     private var observers: [NSObjectProtocol] = []
-    init() {
+    private let notificationCenter: NotificationCenter
+    private var publicationScheduled = false
+    init(notificationCenter: NotificationCenter = .default) {
+        self.notificationCenter = notificationCenter
         monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseUp]) { [weak self] event in
-            DispatchQueue.main.async { self?.objectWillChange.send() }
+            MainActor.assumeIsolated { self?.schedulePublication() }
             return event
         }
         for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
                      NSText.didBeginEditingNotification, NSText.didEndEditingNotification, NSText.didChangeNotification] {
-            observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                self?.objectWillChange.send()
+            observers.append(notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.schedulePublication() }
             })
+        }
+    }
+    private func schedulePublication() {
+        guard !publicationScheduled else { return }
+        publicationScheduled = true
+        // Key-window and field-editor notifications can arrive from AppKit
+        // during SwiftUI layout. Read live focus immediately, but invalidate
+        // command views once on the next main turn, outside that update pass.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.publicationScheduled = false
+            self.objectWillChange.send()
         }
     }
     var editor: NSTextView? {
@@ -121,6 +136,6 @@ struct FinderFileUndoHistory {
     }
     deinit {
         if let monitor { NSEvent.removeMonitor(monitor) }
-        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        for observer in observers { notificationCenter.removeObserver(observer) }
     }
 }

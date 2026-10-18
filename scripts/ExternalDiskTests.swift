@@ -82,6 +82,7 @@ import Photos
         hub.local.sendToPikPak([item])
         precondition(handedOff == urls)
         hub.connectLocalFolder(root.appendingPathComponent("Missing Folder"))
+        try await wait { !hub.local.isLoading }
         precondition(hub.local.provider?.root.url?.path == folder.path && hub.connectionError != nil,
                      "Invalid folder must preserve the selected disk: \(hub.local.provider?.root.url?.path ?? "nil"), \(hub.connectionError ?? "no error")")
         let output = root.appendingPathComponent("Export")
@@ -109,6 +110,7 @@ import Photos
         let restored = CloudDriveHub(pikpak: DownloaderModel.finderWorkspaceFixture(defaults: defaults), defaults: defaults,
             photosAccess: photos)
         defer { restored.close() }
+        try await wait { !restored.local.isLoading }
         precondition(!restored.local.isConnected && restored.local.provider?.root.url?.path == folder.path,
                      "Restart must retain the unavailable external folder instead of switching to Home")
         precondition(!manager.fileExists(atPath: source.path), "Restoring a bookmark must not mount its disk")

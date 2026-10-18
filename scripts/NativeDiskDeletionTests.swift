@@ -45,13 +45,13 @@ import Foundation
         try assertContents(file)
     }
 
-    static func externalDisk(_ root: URL) async throws {
+    static func externalDisk(_ root: URL, filesystem: String) async throws {
         let fm = FileManager.default
         let image = root.appendingPathComponent("Disposable.dmg", isDirectory: false)
         let mount = root.appendingPathComponent("Disposable Mount", isDirectory: true)
         var mounted = false
         defer { if mounted { try? disk(["detach", mount.path, "-force"]) } }
-        try disk(["create", "-size", "64m", "-fs", "HFS+", "-volname", "MyCloudDriver Deletion Test", image.path])
+        try disk(["create", "-size", "128m", "-fs", filesystem, "-volname", String(UUID().uuidString.prefix(8)), image.path])
         try disk(["attach", image.path, "-nobrowse", "-mountpoint", mount.path]); mounted = true
         let folder = mount.appendingPathComponent("Generated Files", isDirectory: true)
         try fm.createDirectory(at: folder, withIntermediateDirectories: false)
@@ -61,9 +61,15 @@ import Foundation
         // this disposable mounted volume as Trash storage to exercise the app.
         let provider = ICloudDriveProvider(rootURL: folder, kind: .local, diskTrashRootURL: mount)
         precondition(provider.diskTrash != nil && provider.volumeID != nil && provider.volumeID != LocalFileAccess.volumeID(root))
-        print("CHECK external volume: Trash, Undo and Redo")
+        print("CHECK external \(filesystem) volume: Trash, Undo and Redo")
         try await roundTrip(provider, file: file)
-        print("PASS external volume: Trash, Undo and Redo preserve generated file contents")
+        let trash = provider.diskTrash!
+        precondition(trash.folder.lastPathComponent.hasPrefix(".") && DiskTrash.isManagedStorage(trash.folder))
+        precondition(!fm.fileExists(atPath: mount.appendingPathComponent("Trash").path))
+        let rootProvider = ICloudDriveProvider(rootURL: mount, kind: .local, diskTrashRootURL: mount)
+        let page = try await rootProvider.list(rootProvider.root, offset: 0, search: "")
+        precondition(page.items.map(\.name) == [folder.lastPathComponent], "The app's hidden container must never appear in Browser")
+        print("PASS external \(filesystem) volume: hidden Trash, Undo and Redo preserve generated file contents")
 
         let child = folder.appendingPathComponent("Parent/Child.txt", isDirectory: false)
         try fm.createDirectory(at: child.deletingLastPathComponent(), withIntermediateDirectories: false)
@@ -124,7 +130,11 @@ import Foundation
             .appendingPathComponent("NativeDiskDeletion-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: root) }
-        try await externalDisk(root)
+        for filesystem in ["HFS+", "APFS", "ExFAT"] {
+            let fixture = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: fixture, withIntermediateDirectories: false)
+            try await externalDisk(fixture, filesystem: filesystem)
+        }
         if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--network-root" {
             try await networkDisk(URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true))
         } else {

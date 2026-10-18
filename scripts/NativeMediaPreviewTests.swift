@@ -85,6 +85,7 @@ private final class MediaProvider: NativeCloudDrive, @unchecked Sendable {
             "Photos keeps its buffering panel after the original is ready")
         model.clear()
         precondition(model.sourceBufferStatus == nil)
+        await wait { !FileManager.default.fileExists(atPath: initial[0].deletingLastPathComponent().path) }
         precondition(!FileManager.default.fileExists(atPath: initial[0].deletingLastPathComponent().path))
         print("PASS native preview reuses its player across layout changes and cleans only its staging area")
 
@@ -98,6 +99,7 @@ private final class MediaProvider: NativeCloudDrive, @unchecked Sendable {
             return model.ready && model.itemID == first.id && completed == 3
         }
         let paths = await provider.requests.paths
+        await wait { !FileManager.default.fileExists(atPath: paths[1].deletingLastPathComponent().path) }
         precondition(!FileManager.default.fileExists(atPath: paths[1].deletingLastPathComponent().path))
         precondition(model.itemID == first.id && model.ready)
         let preparedBytes = UInt64(try Data(contentsOf: paths[2]).count)
@@ -215,6 +217,7 @@ private final class MediaProvider: NativeCloudDrive, @unchecked Sendable {
                      "A provider completing after close cannot restore media or source identity")
         precondition(model.sourceBufferStatus == nil, "Late progress after close cannot restore a buffering panel")
         let latePaths = await late.requests.paths
+        await wait { !FileManager.default.fileExists(atPath: latePaths[0].deletingLastPathComponent().path) }
         precondition(latePaths.count == 1 && !FileManager.default.fileExists(atPath: latePaths[0].deletingLastPathComponent().path))
         print("PASS late completion after preview close preserves the cleared selection and removes only generated staging")
 

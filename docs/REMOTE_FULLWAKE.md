@@ -1,4 +1,4 @@
-# Remote download FullWake guard
+# Remote FullWake guard
 
 The remote Mac at `192.168.50.228` can enter DarkWake with its laptop lid closed,
 even while Amphetamine and `caffeinate` hold idle-sleep assertions. The verified
@@ -6,8 +6,13 @@ closed-lid workaround is the system-wide `pmset disablesleep` override. Ordinary
 pings and repeated user-activity assertions did not maintain continuous FullWake.
 
 `scripts/remote-fullwake-guard.py` scopes that override to active MyCloudDriver
-downloads on AC power. It reads only the bounded numeric monitor snapshot; it
-does not inspect downloaded files, cloud credentials, or the saved transfer queue.
+downloads, Find Similarity and Check Duplicates on AC power. It reads bounded
+numeric transfer and app-work heartbeats; it does not inspect original files,
+cloud credentials, or the saved transfer queue. The app-work heartbeat contains
+only its version, app PID, timestamp and active-owner count, refreshes off the
+main actor, and covers native duplicate scans without a helper process.
+For older apps without this heartbeat, the guard privately verifies an owned
+installed-app descendant and its scan operation; it does not log raw arguments.
 Pausing still retains protection while accepted RAM data, active verification,
 pending reads/writes, or checkpoint batches drain. Fully idle work releases after
 15 seconds; missing/stale app snapshots release within about 25 seconds of the
@@ -17,7 +22,7 @@ check, normally within ten seconds. Resume reacquires protection automatically.
 The guard runs independently of SSH, Screen Sharing, and the TUI. It does not
 change download concurrency, disk policy, idle/display sleep timers, or Amphetamine
 preferences. During protection, manual system sleep and lid sleep are suppressed;
-disable the guard first if you want the Mac to sleep while downloads remain active.
+disable the guard first if you want the Mac to sleep while this work remains active.
 This addresses power state; verification and HDD scheduling can still lower speed.
 
 ## Installed on the remote Mac
@@ -43,7 +48,7 @@ Run these commands **over SSH on the remote Mac**:
 # Disable the guard and let it restore the original sleep setting.
 sudo /usr/bin/python3 '/Library/Application Support/MyCloudDriver/FullWake/guard.py' --disable
 
-# Re-enable automatic protection for active downloads on AC.
+# Re-enable automatic protection for active downloads/scans on AC.
 sudo /usr/bin/python3 '/Library/Application Support/MyCloudDriver/FullWake/guard.py' --enable
 ```
 
@@ -68,7 +73,10 @@ python3 scripts/test-remote-fullwake-guard.py
 
 Synthetic tests cover drained Pause, completion, stale/crashed helpers, AC removal,
 explicit disable, preservation of external overrides, journal ordering, daemon
-recovery, command failures, and bounded snapshot reads. Deployment checks additionally
+recovery, command failures, bounded snapshot reads, independent scan owners,
+native-only scans, idle/stale heartbeats and verified legacy-helper fallback.
+Tests use injected process/power observations and never inspect host files or
+change power settings. Deployment checks additionally
 verify disable/restore and re-enable, plus FullWake with Screen Sharing disconnected.
 
 On 12 October 2026, the installed service held kernel capabilities at `15` in all

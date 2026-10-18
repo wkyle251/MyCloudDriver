@@ -1,14 +1,19 @@
 //! Download RAM admission. Streaming originals claim small receive windows;
 //! a one-resource Banker's check prevents incomplete buffers from deadlocking.
 use super::*;
-use std::sync::{atomic::AtomicU64, Mutex};
+use filetwin_core::memory_control::ExternalMemory;
+use std::sync::{
+    atomic::{AtomicU32, AtomicU64},
+    Mutex,
+};
 
 pub(super) const RECEIVE_WINDOW: u64 = 256 * 1024;
 pub(super) const FORECAST_SECONDS: f64 = 2.0;
+pub(super) const ANALYSIS_HEADROOM: u64 = 512 << 20;
 const INITIAL_RATE: f64 = 1024.0 * 1024.0;
 
 #[derive(Debug, thiserror::Error)]
-#[error("Original exceeds Download RAM; increase Download RAM in Scan Resources. No disk copy was created.")]
+#[error("Original cannot fit in available system memory. No disk copy was created.")]
 pub(super) struct Limit;
 
 #[derive(Default)]
@@ -16,6 +21,7 @@ struct State {
     used: u64,
     next_id: u64,
     streams: HashMap<u64, Stream>,
+    usage: Option<Arc<ExternalMemory>>,
 }
 struct Stream {
     claim: u64,
@@ -23,8 +29,29 @@ struct Stream {
     rate: f64,
     updated: Instant,
     done: bool,
+    processing_extra: u64,
 }
 impl State {
+    fn add(&mut self, bytes: u64) {
+        self.used += bytes;
+        self.publish();
+    }
+    fn release(&mut self, bytes: u64) {
+        self.used -= bytes;
+        self.publish();
+    }
+    fn publish(&self) {
+        if let Some(usage) = &self.usage {
+            usage.used.store(self.used, Ordering::Release);
+            usage.incomplete.store(
+                self.streams
+                    .values()
+                    .filter(|stream| stream.reserved > 0 && !stream.done)
+                    .count() as u64,
+                Ordering::Release,
+            );
+        }
+    }
     // Work is free RAM. A finished original can release its allocation after
     // analysis; then the smallest remaining claim can finish. Reject a grant
     // unless that sequence can eventually drain every partially held input.
@@ -36,7 +63,12 @@ impl State {
             .streams
             .values()
             .filter(|s| s.reserved > 0)
-            .map(|s| (if s.done { 0 } else { s.claim - s.reserved }, s.reserved))
+            .map(|s| {
+                (
+                    (if s.done { 0 } else { s.claim - s.reserved }) + s.processing_extra,
+                    s.reserved,
+                )
+            })
             .collect();
         pending.sort_unstable();
         for (need, held) in pending {
@@ -67,9 +99,12 @@ impl State {
 }
 
 pub(super) struct Budget {
-    limit: AtomicU64,
     state: Mutex<State>,
     pub waiting: AtomicU64,
+    ceiling: AtomicU64,
+    pressure: AtomicU32,
+    required: AtomicU64,
+    pub usage: Arc<ExternalMemory>,
 }
 #[cfg(test)]
 pub(super) struct Lease {
@@ -80,7 +115,7 @@ pub(super) struct Lease {
 #[cfg(test)]
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.budget.state.lock().unwrap().used -= self.reserved;
+        self.budget.state.lock().unwrap().release(self.reserved);
     }
 }
 #[cfg(test)]
@@ -115,7 +150,7 @@ impl Drop for StreamLease {
     fn drop(&mut self) {
         let mut state = self.budget.state.lock().unwrap();
         if let Some(stream) = state.streams.remove(&self.id) {
-            state.used -= stream.reserved;
+            state.release(stream.reserved);
         }
     }
 }
@@ -135,7 +170,7 @@ impl filetwin_core::memory_input::OriginalReservation for StreamLease {
         assert!(stream.done);
         let bytes = stream.reserved;
         stream.reserved = 0;
-        state.used -= bytes;
+        state.release(bytes);
     }
     fn try_reacquire(&self) -> bool {
         let mut state = self.budget.state.lock().unwrap();
@@ -148,12 +183,12 @@ impl filetwin_core::memory_input::OriginalReservation for StreamLease {
         if bytes > self.budget.limit().saturating_sub(state.used) {
             return false;
         }
-        state.used += bytes;
+        state.add(bytes);
         state.streams.get_mut(&self.id).unwrap().reserved = bytes;
         if state.safe(self.budget.limit()) {
             return true;
         }
-        state.used -= bytes;
+        state.release(bytes);
         state.streams.get_mut(&self.id).unwrap().reserved = 0;
         false
     }
@@ -186,7 +221,22 @@ impl StreamLease {
             return true;
         }
         let delta = target - old;
-        if delta > self.budget.limit().saturating_sub(state.used) {
+        // Publish the safe completion requirement even while pressure blocks
+        // admission, so the governor can grow rather than reject a large file.
+        // Evaluate the hypothetical grant privately. Shared usage must contain
+        // only real reservations, since the analysis scheduler reads it without
+        // taking this mutex.
+        state.used += delta;
+        state.streams.get_mut(&self.id).unwrap().reserved = target;
+        let required = Budget::minimum_for(&state);
+        state.used -= delta;
+        state.streams.get_mut(&self.id).unwrap().reserved = old;
+        self.budget.required.fetch_max(required, Ordering::Relaxed);
+        let pressure = self.budget.pressure.load(Ordering::Acquire);
+        if pressure >= 4 || (admission && pressure >= 2) {
+            return false;
+        }
+        if required > self.budget.limit() {
             return false;
         }
         if admission
@@ -196,14 +246,9 @@ impl StreamLease {
         {
             return false;
         }
-        state.used += delta;
         state.streams.get_mut(&self.id).unwrap().reserved = target;
-        if state.safe(self.budget.limit()) {
-            return true;
-        }
-        state.used -= delta;
-        state.streams.get_mut(&self.id).unwrap().reserved = old;
-        false
+        state.add(delta);
+        true
     }
     pub async fn grow(&self, target: u64, cancel: &AtomicBool) -> Result<()> {
         check_cancel(cancel)?;
@@ -229,21 +274,68 @@ impl StreamLease {
         let released = stream.reserved - kept;
         stream.reserved = kept;
         stream.claim = kept;
+        stream.processing_extra = self.budget.processing_extra(kept);
         stream.done = true;
         stream.rate = 0.0;
-        state.used -= released;
+        state.release(released);
     }
 }
 impl Budget {
+    fn processing_extra(&self, claim: u64) -> u64 {
+        if self.ceiling.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        let headroom = ANALYSIS_HEADROOM.min(self.ceiling() / 4);
+        claim
+            .saturating_add(headroom)
+            .min(
+                self.ceiling()
+                    .saturating_add(headroom)
+                    .saturating_sub(claim),
+            )
+            .saturating_sub(headroom)
+    }
     pub fn new(limit: u64) -> Arc<Self> {
+        let usage = Arc::new(ExternalMemory::default());
+        usage.limit.store(limit, Ordering::Release);
         Arc::new(Self {
-            limit: AtomicU64::new(limit),
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                usage: Some(usage.clone()),
+                ..State::default()
+            }),
             waiting: AtomicU64::new(0),
+            ceiling: AtomicU64::new(0),
+            pressure: AtomicU32::new(1),
+            required: AtomicU64::new(0),
+            usage,
         })
     }
+    pub fn enable_automatic(&self, ceiling: u64) {
+        self.ceiling.store(ceiling, Ordering::Release);
+    }
+    pub fn ceiling(&self) -> u64 {
+        match self.ceiling.load(Ordering::Acquire) {
+            0 => self.limit(),
+            value => value,
+        }
+    }
+    pub fn take_required(&self) -> u64 {
+        self.required.swap(0, Ordering::Relaxed)
+    }
+    pub fn auto_resize(&self, limit: u64, pressure: u32) {
+        self.pressure.store(pressure, Ordering::Release);
+        self.usage
+            .limit
+            .store(limit.min(self.ceiling()), Ordering::Release);
+    }
+    pub fn auto_reduce(&self, limit: u64, pressure: u32) {
+        self.pressure.store(pressure, Ordering::Release);
+        if limit < self.limit() {
+            self.auto_resize(limit, pressure);
+        }
+    }
     pub fn limit(&self) -> u64 {
-        self.limit.load(Ordering::Acquire)
+        self.usage.limit.load(Ordering::Acquire)
     }
     pub fn minimum_limit(&self) -> u64 {
         let state = self.state.lock().unwrap();
@@ -256,7 +348,12 @@ impl Budget {
             .streams
             .values()
             .filter(|s| s.reserved > 0)
-            .map(|s| (if s.done { 0 } else { s.claim - s.reserved }, s.reserved))
+            .map(|s| {
+                (
+                    (if s.done { 0 } else { s.claim - s.reserved }) + s.processing_extra,
+                    s.reserved,
+                )
+            })
             .collect();
         pending.sort_unstable();
         for (need, held) in pending {
@@ -270,8 +367,42 @@ impl Budget {
         if limit < Self::minimum_for(&state) {
             bail!("The retained downloads need more RAM to finish. Resume before reducing Download RAM.");
         }
-        self.limit.store(limit, Ordering::Release);
+        self.usage.limit.store(limit, Ordering::Release);
         Ok(())
+    }
+    /// A completed, independently evictable media range. Unlike an incomplete
+    /// original it needs no further RAM to make progress or release its lease.
+    pub fn try_cache(self: &Arc<Self>, bytes: u64) -> Option<StreamLease> {
+        if bytes == 0 || self.pressure.load(Ordering::Acquire) >= 2 { return None; }
+        let reserved = self.charged(bytes);
+        let mut state = self.state.lock().unwrap();
+        if reserved > self.limit().saturating_sub(state.used) { return None; }
+        state.next_id += 1;
+        let id = state.next_id;
+        state.streams.insert(id, Stream { claim: reserved, reserved, rate: 0.0,
+            updated: Instant::now(), done: true, processing_extra: 0 });
+        state.add(reserved);
+        if !state.safe(self.limit()) {
+            state.streams.remove(&id);
+            state.release(reserved);
+            return None;
+        }
+        Some(StreamLease { budget: self.clone(), id, capacity: bytes })
+    }
+    pub async fn cache(self: &Arc<Self>, bytes: u64, cancel: &AtomicBool) -> Result<StreamLease> {
+        if bytes == 0 || bytes > self.ceiling() { return Err(Limit.into()); }
+        let _waiting = Waiting::new(&self.waiting);
+        loop {
+            check_cancel(cancel)?;
+            if let Some(lease) = self.try_cache(bytes) { return Ok(lease); }
+            self.required.fetch_max(self.used().saturating_add(self.charged(bytes))
+                .saturating_add(ANALYSIS_HEADROOM), Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    pub fn cache_target(&self, readers: u64) -> u64 {
+        if self.pressure.load(Ordering::Acquire) >= 2 { RECEIVE_WINDOW }
+        else { (self.limit() / readers.max(1) / 2).max(RECEIVE_WINDOW) }
     }
     pub fn used(&self) -> u64 {
         self.state.lock().unwrap().used
@@ -285,7 +416,8 @@ impl Budget {
     fn charged(&self, bytes: u64) -> u64 {
         // Apple Silicon commits 16 KiB pages. Tiny logical budgets are used by
         // unit tests only; production settings are always many megabytes.
-        let page = if self.limit() >= 16 * 1024 {
+        let page = if self.limit() >= 16 * 1024 || self.ceiling.load(Ordering::Acquire) >= 16 * 1024
+        {
             16 * 1024
         } else {
             1
@@ -294,18 +426,34 @@ impl Budget {
     }
     pub async fn stream(self: &Arc<Self>, size: u64, cancel: &AtomicBool) -> Result<StreamLease> {
         let capacity = if size == 0 {
-            if self.limit() < 16384 {
-                self.limit()
+            // A temporarily closed automatic bank is not an empty original.
+            // Preserve the usual allowance-based unknown-size capacity once
+            // the governor reopens admission; do not claim all physical RAM.
+            let _waiting = Waiting::new(&self.waiting);
+            let limit = loop {
+                check_cancel(cancel)?;
+                let limit = self.limit();
+                if limit > 0 || self.ceiling.load(Ordering::Acquire) == 0 { break limit; }
+                self.required.fetch_max(RECEIVE_WINDOW, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            if limit < 16384 {
+                limit
             } else {
-                self.limit() / 16384 * 16384
+                limit / 16384 * 16384
             }
         } else {
             size
         };
         let claim = self.charged(capacity);
-        if claim == 0 || claim > self.limit() {
+        if claim == 0 || claim > self.ceiling() {
             return Err(Limit.into());
         }
+        // Keep a completion path through decoding, not just through receiving
+        // bytes. One original may need a reader copy as well. The shared
+        // analysis headroom covers the first decoder; additional reader RAM
+        // participates in the same Banker's check as the original's claim.
+        let processing_extra = self.processing_extra(claim);
         let id = {
             let mut state = self.state.lock().unwrap();
             state.next_id += 1;
@@ -330,6 +478,7 @@ impl Budget {
                     rate,
                     updated: Instant::now(),
                     done: false,
+                    processing_extra,
                 },
             );
             id
@@ -343,8 +492,16 @@ impl Budget {
         let _waiting = Waiting::new(&self.waiting);
         loop {
             check_cancel(cancel)?;
-            if claim > self.limit() {
+            if claim > self.ceiling() {
                 return Err(Limit.into());
+            }
+            if claim > self.limit() {
+                self.required.fetch_max(
+                    self.used()
+                        .saturating_add(claim)
+                        .saturating_add(processing_extra),
+                    Ordering::Relaxed,
+                );
             }
             if lease.try_grow(target, true) {
                 return Ok(lease);
@@ -365,7 +522,7 @@ impl Budget {
             {
                 let mut state = self.state.lock().unwrap();
                 if reserved <= self.limit().saturating_sub(state.used) {
-                    state.used += reserved;
+                    state.add(reserved);
                     if state.safe(self.limit()) {
                         return Ok(Lease {
                             budget: self.clone(),
@@ -373,7 +530,7 @@ impl Budget {
                             capacity,
                         });
                     }
-                    state.used -= reserved;
+                    state.release(reserved);
                 }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -383,6 +540,163 @@ impl Budget {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn zero_automatic_source_bank_retains_leases_and_blocks_new_admission() {
+        use super::*;
+        let budget = Budget::new(8 << 20);
+        budget.enable_automatic(16 << 20);
+        let cancel = AtomicBool::new(false);
+        let original = budget.stream(2 << 20, &cancel).await.unwrap();
+        original.grow(1 << 20, &cancel).await.unwrap();
+        for pressure in [2, 4] {
+            budget.auto_resize(0, pressure);
+            assert_eq!(budget.limit(), 0, "A closed source bank must not reserve a phantom byte");
+            assert_eq!(budget.used(), 1 << 20, "Closing admission must retain existing leases");
+            assert!(!original.try_reserve(2 << 20).unwrap());
+            assert!(budget.try_cache(1).is_none());
+            assert!(!budget.has_forecast_room());
+            for size in [1 << 20, 0] {
+                assert!(tokio::time::timeout(Duration::from_millis(30), budget.stream(size, &cancel)).await.is_err(),
+                    "A closed automatic bank must wait rather than admit or reject an original");
+            }
+            assert_eq!(budget.waiting.load(Ordering::Acquire), 0);
+            assert_eq!(budget.usage.used.load(Ordering::Acquire), 1 << 20);
+        }
+        drop(original);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.usage.committed(), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_size_auto_stream_waits_at_zero_then_uses_the_reopened_allowance() {
+        use super::*;
+        let budget = Budget::new(8 << 20);
+        budget.enable_automatic(16 << 20);
+        budget.auto_resize(0, 4);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ram = budget.clone(); let stop = cancel.clone();
+        let pending = tokio::spawn(async move { ram.stream(0, &stop).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!pending.is_finished(), "Temporary zero allowance must not fail an unknown-size source");
+        assert!(budget.take_required() > 0);
+        cancel.store(true, Ordering::Release);
+        assert!(tokio::time::timeout(Duration::from_millis(100), pending).await.unwrap().unwrap().is_err());
+        assert_eq!(budget.waiting.load(Ordering::Acquire), 0);
+        let ram = budget.clone();
+        let pending = tokio::spawn(async move { ram.stream(0, &AtomicBool::new(false)).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!pending.is_finished());
+        budget.auto_resize(4 << 20, 1);
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while budget.take_required() < 8 << 20 { tokio::time::sleep(Duration::from_millis(5)).await; }
+        }).await.unwrap();
+        // The first positive allowance fixes capacity; more source-bank room
+        // supplies its existing reader-completion requirement, not a new claim.
+        budget.auto_resize(8 << 20, 1);
+        let original = tokio::time::timeout(Duration::from_millis(100), pending).await.unwrap().unwrap().unwrap();
+        assert_eq!(original.capacity, 4 << 20);
+        assert!(original.capacity < budget.ceiling());
+        drop(original);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.waiting.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_receive_windows_never_publish_ungranted_ram() {
+        use super::*;
+        let budget = Budget::new(8 << 20);
+        let cancel = AtomicBool::new(false);
+        let first = budget.stream(8 << 20, &cancel).await.unwrap();
+        let second = budget.stream(4 << 20, &cancel).await.unwrap();
+        second.grow(4 << 20, &cancel).await.unwrap();
+        second.finish(4 << 20);
+        let done = Arc::new(AtomicBool::new(false));
+        let stop = done.clone();
+        let usage = budget.usage.clone();
+        let observer = std::thread::spawn(move || {
+            let mut peak = 0;
+            while !stop.load(Ordering::Acquire) {
+                peak = peak.max(usage.used.load(Ordering::Acquire));
+            }
+            peak
+        });
+        for _ in 0..20_000 {
+            assert!(!first.try_reserve(8 << 20).unwrap());
+        }
+        done.store(true, Ordering::Release);
+        assert!(
+            observer.join().unwrap() <= 8 << 20,
+            "An ungranted window entered shared accounting"
+        );
+        assert_eq!(budget.usage.used.load(Ordering::Acquire), budget.used());
+        drop((first, second));
+    }
+    #[tokio::test]
+    async fn automatic_prefetch_leaves_a_completion_path_through_reader_copies() {
+        use super::*;
+        use filetwin_core::memory_input::OriginalReservation;
+        let budget = Budget::new(31 << 30);
+        budget.enable_automatic((64 << 30) - ANALYSIS_HEADROOM);
+        let cancel = AtomicBool::new(false);
+        let first = budget.stream(8 << 30, &cancel).await.unwrap();
+        first.grow(8 << 30, &cancel).await.unwrap();
+        first.finish(8 << 30);
+        let second = budget.stream(8 << 30, &cancel).await.unwrap();
+        second.grow(8 << 30, &cancel).await.unwrap();
+        second.finish(8 << 30);
+        assert_eq!(budget.minimum_limit(), 24 << 30);
+        let third = budget.stream(8 << 30, &cancel).await.unwrap();
+        assert!(
+            !third.try_reserve(8 << 30).unwrap(),
+            "Receive windows may overlap, but must leave a reader-copy completion path"
+        );
+        assert_eq!(budget.used(), (16 << 30) + RECEIVE_WINDOW);
+        first.release();
+        assert!(third.try_reserve(8 << 30).unwrap());
+        drop((first, second, third));
+        assert_eq!(budget.used(), 0);
+    }
+    #[tokio::test]
+    async fn automatic_large_claim_waits_for_growth_and_pressure_keeps_partial_bytes() {
+        use super::*;
+        let budget = Budget::new(1 << 20);
+        budget.enable_automatic(16 << 20);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ram = budget.clone();
+        let stop = cancel.clone();
+        let pending = tokio::spawn(async move { ram.stream(8 << 20, &stop).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !pending.is_finished(),
+            "A soft allowance must not reject a large original"
+        );
+        assert!(budget.take_required() >= 8 << 20);
+        budget.auto_resize(16 << 20, 1);
+        let lease = pending.await.unwrap().unwrap();
+        lease.grow(2 << 20, &cancel).await.unwrap();
+        budget.auto_resize(1 << 20, 4);
+        assert!(!lease.try_reserve(3 << 20).unwrap());
+        assert_eq!(budget.used(), 2 << 20);
+        assert_eq!(budget.usage.used.load(Ordering::Acquire), budget.used());
+        budget.auto_resize(16 << 20, 2);
+        assert!(
+            lease.try_reserve(3 << 20).unwrap(),
+            "Existing downloads may finish at warning pressure"
+        );
+        let next = budget.stream(1 << 20, &cancel);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next)
+                .await
+                .is_err(),
+            "Warning must stop new downloads"
+        );
+        drop(lease);
+        budget.auto_resize(16 << 20, 1);
+        let lease = budget.stream(1 << 20, &cancel).await.unwrap();
+        drop(lease);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.usage.used.load(Ordering::Acquire), 0);
+    }
     #[tokio::test]
     async fn completed_original_handoff_frees_download_capacity_and_retries_without_double_release()
     {

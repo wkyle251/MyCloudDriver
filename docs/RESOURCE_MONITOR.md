@@ -26,10 +26,11 @@ task activity. The monitor does not have access to CoreML's internal
 so it does not assign the whole Mac's GPU percentage to a particular task or
 label shared system GPU activity as MyCloudDriver-only usage.
 
-File → Find Similar Files is available from All Drives. It uses the active
-workspace, defaults to Local Disk without requiring sign-in, and keeps the
-existing scan's drive when reopening retained work. Other file operations still
-require an open drive. The scan window's drive picker includes all four drives.
+File → Find Similarity Across Drives is available from All Drives. It uses the active
+workspace and opens Across Drives, where multiple locations share one comparison.
+Native-only scans require no PikPak sign-in. The drive picker also includes all four
+separate drive scans. The resource monitor attributes the combined helper and its
+processing to the owning workspace.
 
 Validation covers malformed/missing GPU counters, device identity, per-task
 attribution, current backend/progress, multiple workspaces and Home command

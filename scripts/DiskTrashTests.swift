@@ -11,6 +11,100 @@ import Foundation
         while !condition() && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
         precondition(condition(), "Timed out waiting for generated Trash state")
     }
+
+    static func legacyMigration(in root: URL, keepsUserFolder: Bool) async throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: root, withIntermediateDirectories: false)
+        let store = DiskTrash(volumeRoot: root, volumeID: LocalFileAccess.volumeID(root))
+        try await store.prepare()
+        let original = root.appendingPathComponent(UUID().uuidString + ".bin")
+        try data.write(to: original)
+        let undo = try await store.trash([original], title: "Migration fixture", progress: { _ in })
+        let ids = try await store.list().map(\.id)
+        let legacy = root.appendingPathComponent("Trash", isDirectory: true)
+        try fm.createDirectory(at: legacy, withIntermediateDirectories: false)
+        try fm.moveItem(at: store.storage, to: legacy.appendingPathComponent("MyCloudDriver", isDirectory: true))
+        try fm.moveItem(at: store.folder.appendingPathComponent(".MyCloudDriver.lock"), to: legacy.appendingPathComponent(".MyCloudDriver.lock"))
+        try fm.removeItem(at: store.folder)
+        let unrelated = legacy.appendingPathComponent(UUID().uuidString + ".bin")
+        if keepsUserFolder { try data.write(to: unrelated) }
+
+        let reopened = DiskTrash(volumeRoot: root, volumeID: LocalFileAccess.volumeID(root))
+        let before = try await reopened.list()
+        precondition(before.map(\.id) == ids && !fm.fileExists(atPath: reopened.folder.path), "Reading legacy Trash must not write or rename it")
+        let migrated = try await reopened.prepare()
+        let after = try await reopened.list()
+        precondition(migrated && after.map(\.id) == ids && DiskTrash.isManagedStorage(reopened.folder))
+        precondition(!fm.fileExists(atPath: legacy.appendingPathComponent("MyCloudDriver").path))
+        precondition(fm.fileExists(atPath: legacy.path) == keepsUserFolder, "Only the empty app-created wrapper is removed")
+        if keepsUserFolder { let contents = try Data(contentsOf: unrelated); precondition(contents == data) }
+        _ = try await undo.apply()
+        let restored = try Data(contentsOf: original), empty = try await reopened.list()
+        precondition(restored == data, "Undo captured before migration still restores the original")
+        precondition(empty.isEmpty)
+        print("PASS marked legacy Trash migrates with entry IDs and Undo intact; unrelated siblings are preserved")
+    }
+
+    static func concurrentPreparation(in root: URL) async throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: root, withIntermediateDirectories: false)
+        let files = (0..<6).map { _ in root.appendingPathComponent(UUID().uuidString + ".bin") }
+        let volumeID = LocalFileAccess.volumeID(root), contents = data
+        for file in files { try contents.write(to: file) }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for file in files {
+                group.addTask {
+                    let store = DiskTrash(volumeRoot: root, volumeID: volumeID)
+                    try await store.prepare()
+                    _ = try await store.trash([file], title: "Concurrent fixture", progress: { _ in })
+                }
+            }
+            try await group.waitForAll()
+        }
+        let reopened = DiskTrash(volumeRoot: root, volumeID: volumeID)
+        let items = try await reopened.list()
+        precondition(items.count == files.count)
+        let hidden = try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).filter { $0.lastPathComponent.hasPrefix(".") }
+        precondition(hidden.map(\.lastPathComponent) == [reopened.folder.lastPathComponent], "Concurrent windows publish one complete container and clean up staging folders: \(hidden.map(\.lastPathComponent))")
+        _ = try await reopened.putBack(items.map(\.id))
+        for file in files { let restored = try Data(contentsOf: file); precondition(restored == contents) }
+        print("PASS concurrent windows share one hidden Trash and retain every generated file")
+    }
+
+    static func mergeLegacyStorage(in root: URL) async throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: root, withIntermediateDirectories: false)
+        let store = DiskTrash(volumeRoot: root, volumeID: LocalFileAccess.volumeID(root))
+        let originals = (0..<2).map { _ in root.appendingPathComponent(UUID().uuidString + ".bin") }
+        for file in originals { try data.write(to: file) }
+        let oldUndo = try await store.trash([originals[0]], title: "Legacy fixture", progress: { _ in })
+        let oldItems = try await store.list()
+        let saved = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.moveItem(at: store.storage, to: saved)
+        try await store.prepare()
+        _ = try await store.trash([originals[1]], title: "New fixture", progress: { _ in })
+        let newItems = try await store.list()
+        let legacy = root.appendingPathComponent("Trash", isDirectory: true)
+        try fm.createDirectory(at: legacy, withIntermediateDirectories: false)
+        let legacyStorage = legacy.appendingPathComponent("MyCloudDriver", isDirectory: true)
+        try fm.moveItem(at: saved, to: legacyStorage)
+        try Data().write(to: legacy.appendingPathComponent(".MyCloudDriver.lock"))
+        let newEntry = store.storage.appendingPathComponent(newItems[0].id.uuidString, isDirectory: true)
+        let collision = legacyStorage.appendingPathComponent(newItems[0].id.uuidString, isDirectory: true)
+        try fm.copyItem(at: newEntry, to: collision)
+        try await rejects { try await store.prepare() }
+        precondition(fm.fileExists(atPath: newEntry.path) && fm.fileExists(atPath: legacyStorage.appendingPathComponent(oldItems[0].id.uuidString).path),
+                     "A duplicate ID must be detected before moving any entry")
+        try fm.removeItem(at: collision)
+        let migrated = try await store.prepare(), merged = try await store.list()
+        precondition(migrated && Set(merged.map(\.id)) == Set((oldItems + newItems).map(\.id)))
+        precondition(!fm.fileExists(atPath: legacy.path))
+        _ = try await oldUndo.apply()
+        _ = try await store.putBack(newItems.map(\.id))
+        for file in originals { let contents = try Data(contentsOf: file); precondition(contents == data) }
+        print("PASS old and new Trash merge without changing entry IDs; duplicate IDs cannot overwrite or partially migrate files")
+    }
+
     static func main() async throws {
         setbuf(stdout, nil)
         let fm = FileManager.default
@@ -19,7 +113,11 @@ import Foundation
         defer { try? fm.removeItem(at: root) }
         let store = DiskTrash(volumeRoot: root, volumeID: LocalFileAccess.volumeID(root))
         try await store.prepare()
-        precondition(fm.fileExists(atPath: root.appendingPathComponent("Trash").path))
+        precondition(fm.fileExists(atPath: store.folder.path) && !fm.fileExists(atPath: root.appendingPathComponent("Trash").path))
+        precondition(store.folder.lastPathComponent.hasPrefix(".") && UUID(uuidString: String(store.folder.lastPathComponent.dropFirst())) != nil)
+        precondition(DiskTrash.isManagedStorage(store.folder) && DiskTrash.isManagedStorage(store.storage))
+        precondition(store.contains(store.folder) && store.contains(store.storage))
+        precondition(!store.contains(URL(fileURLWithPath: store.folder.path + "-other", isDirectory: true)))
         let originals = [root.appendingPathComponent("One/Same.txt"), root.appendingPathComponent("Two/Same.txt")]
         for file in originals {
             try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: false)
@@ -30,6 +128,7 @@ import Foundation
         precondition(listed.count == 2 && Set(listed.map(\.originalPath)) == ["/One/Same.txt", "/Two/Same.txt"])
         precondition(originals.allSatisfy { !fm.fileExists(atPath: $0.path) })
         let reopened = DiskTrash(volumeRoot: root, volumeID: LocalFileAccess.volumeID(root))
+        precondition(reopened.folder == store.folder, "The opaque container name survives reopening")
         let reopenedItems = try await reopened.list()
         precondition(reopenedItems.count == 2)
         let redo = try await undo.apply()
@@ -78,9 +177,35 @@ import Foundation
         try fm.createDirectory(at: preexisting.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: preexisting)
         let foreign = DiskTrash(volumeRoot: collision, volumeID: LocalFileAccess.volumeID(collision))
-        try await rejects { try await foreign.prepare() }
+        try await foreign.prepare()
         let foreignData = try Data(contentsOf: preexisting); precondition(foreignData == data)
-        print("PASS existing unmarked Trash/MyCloudDriver contents are preserved")
+        precondition(!foreign.contains(preexisting) && !DiskTrash.isManagedStorage(preexisting.deletingLastPathComponent()))
+        let foreignProvider = ICloudDriveProvider(rootURL: collision, kind: .local, diskTrashRootURL: collision)
+        let foreignPage = try await foreignProvider.list(foreignProvider.root, offset: 0, search: "")
+        precondition(foreignPage.items.contains { $0.name == "Trash" } && !foreignPage.items.contains { $0.url == foreign.folder })
+        let userTrash = foreignPage.items.first { $0.name == "Trash" }!
+        let userTrashPage = try await foreignProvider.list(userTrash.location, offset: 0, search: "")
+        precondition(userTrashPage.items.contains { $0.name == "MyCloudDriver" })
+        print("PASS ordinary Trash folders and unmarked contents remain visible; the app container is hidden")
+
+        let reservedRoot = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: reservedRoot, withIntermediateDirectories: false)
+        let reserved = DiskTrash(volumeRoot: reservedRoot, volumeID: LocalFileAccess.volumeID(reservedRoot))
+        try fm.createDirectory(at: reserved.folder, withIntermediateDirectories: false)
+        let reservedFile = reserved.folder.appendingPathComponent(UUID().uuidString + ".bin")
+        try data.write(to: reservedFile)
+        try await rejects { try await reserved.prepare() }
+        let reservedData = try Data(contentsOf: reservedFile)
+        precondition(reservedData == data)
+        precondition(!DiskTrash.isManagedStorage(reserved.folder) && !reserved.contains(reservedFile))
+        let reservedContents = try fm.contentsOfDirectory(atPath: reserved.folder.path)
+        precondition(reservedContents == [reservedFile.lastPathComponent], "A namespace collision must not adopt or modify user data")
+        print("PASS even an unmarked folder with the reserved UUID is preserved without being adopted")
+
+        try await legacyMigration(in: root.appendingPathComponent(UUID().uuidString, isDirectory: true), keepsUserFolder: false)
+        try await legacyMigration(in: root.appendingPathComponent(UUID().uuidString, isDirectory: true), keepsUserFolder: true)
+        try await concurrentPreparation(in: root.appendingPathComponent(UUID().uuidString, isDirectory: true))
+        try await mergeLegacyStorage(in: root.appendingPathComponent(UUID().uuidString, isDirectory: true))
 
         let provider = ICloudDriveProvider(rootURL: root, kind: .local, diskTrashRootURL: root)
         let model = NativeDriveModel(kind: .local)

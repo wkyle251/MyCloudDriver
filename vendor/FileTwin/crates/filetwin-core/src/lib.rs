@@ -10,6 +10,8 @@ mod error;
 mod local;
 #[doc(hidden)]
 pub mod memory_input;
+#[doc(hidden)]
+pub mod memory_control;
 mod native;
 pub mod profile;
 mod scan;
@@ -20,4 +22,4 @@ pub mod worker_protocol;
 
 pub use engine::Encoder;
 pub use error::{Error, ErrorCode, Result};
-pub use vector_file::{read_vectors, write_vectors};
+pub use vector_file::{read_vectors, write_vectors, valid_content_id};

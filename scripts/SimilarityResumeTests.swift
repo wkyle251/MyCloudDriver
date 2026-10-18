@@ -75,16 +75,13 @@ import Foundation
         scan.pause(); try await until { !scan.isRunning }
         precondition(scan.isPaused && !scan.interrupted && scan.processIdentifier == retainedPID && scan.retainsOriginalsInRAM)
         precondition(FileManager.default.fileExists(atPath:SimilaritySessionStore.directory(config,id:id).appendingPathComponent("checkpoint.sqlite3").path))
-        var invalid = adjusted; invalid.downloadMemoryMiB = invalid.memoryMiB
-        do { try scan.updatePausedResources(invalid, sessionID: id); preconditionFailure("Download RAM must leave memory for analysis") }
-        catch { precondition(scan.savedSession!.resources == initialResources) }
         do { try scan.updatePausedResources(adjusted, sessionID: UUID().uuidString); preconditionFailure("An old editor must not change a different scan") }
         catch { precondition(scan.savedSession!.resources == initialResources) }
         // Resource edits may not replace the original vector backend.
         adjusted.processingMode = initialResources.acceleration == .cpu ? .automatic : .cpu
         try scan.updatePausedResources(adjusted, sessionID: id)
         let editedResources = scan.savedSession!.resources
-        precondition(editedResources.workers == 3 && editedResources.memoryBytes == 4 << 30 && editedResources.downloadBudgetBytes == 1 << 30)
+        precondition(editedResources.automaticMemory == true && editedResources.memoryBytes == SimilarityHardware.current.recommendedLimits.memoryBytes)
         precondition(editedResources.acceleration == (initialResources.acceleration ?? .cpu))
         let descriptor = SimilaritySessionStore.directory(config,id:id).appendingPathComponent("session.json")
         let persisted = try JSONDecoder().decode(SimilaritySavedSession.self,from:Data(contentsOf:descriptor))
@@ -101,14 +98,14 @@ import Foundation
         precondition(!other.local.isRunning && other.local.error?.contains("another window") == true)
         owner.resume(scan)
         precondition(scan.processIdentifier == retainedPID, "Resume must keep the RAM-owning helper")
-        try await until { scan.progress.analysed == 1 && scan.progress.memoryScheduling && scan.progress.analysisMemoryLimit == 3 << 30 }
+        try await until { scan.progress.analysed == 1 && scan.progress.memoryScheduling && scan.progress.analysisMemoryLimit > 0 }
         precondition(scan.progress.workerLimit > 3,"The saved worker count must not constrain memory scheduling")
         precondition(scan.runResources == editedResources,"Resume must use this scan's limits instead of app-wide defaults")
         scan.pause(); try await until { !scan.isRunning }
         adjusted.workers = 2; adjusted.memoryMiB = 2_048; adjusted.downloadMemoryMiB = 512
         try scan.updatePausedResources(adjusted, sessionID: id)
         first.hold=false; owner.resume(scan)
-        precondition(scan.runResources?.workers == 2 && scan.runResources?.memoryBytes == 2 << 30 && scan.runResources?.downloadBudgetBytes == 512 << 20)
+        precondition(scan.runResources?.automaticMemory == true)
         try await until { !scan.isRunning }
         precondition(!scan.isPaused && scan.report?.analysedFiles == 2 && scan.report?.scoresRetained == 1,scan.error ?? "Missing completed results")
         precondition(first.resolved["one.txt"] == 1,"Completed files must bypass fetching when resumed")
@@ -131,7 +128,7 @@ import Foundation
         SimilaritySessionStore.discard(config,id:pendingID,report:archivedReport)
         precondition(!FileManager.default.fileExists(atPath:pendingDirectory.path) && !FileManager.default.fileExists(atPath:pendingMatrix.path))
         print("PASS manual pause/resume keeps the same helper and originals; duplicate window claims are refused")
-        print("PASS pause/edit/save/resume applies RAM budgets, ignores old worker limits, keeps vectors/backend, and isolates defaults")
+        print("PASS pause/resume ignores legacy RAM limits, keeps vectors/backend, and isolates defaults")
 
         let crashFeed=Feed("crash"), crashOwner=coordinator(crashFeed), crashed=crashOwner.local
         crashOwner.start(crashed); try await until { crashed.progress.analysed == 1 }

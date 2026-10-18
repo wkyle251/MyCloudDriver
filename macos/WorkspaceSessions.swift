@@ -6,30 +6,49 @@ import SwiftUI
 /// workspace windows. A window registration avoids broadcasting actions.
 @MainActor final class FinderCommandRouter: ObservableObject {
     static let shared = FinderCommandRouter()
-    @Published private(set) var actions: FinderWindowActions?
+    nonisolated let objectWillChange = ObservableObjectPublisher()
+    var actions: FinderWindowActions? {
+        guard let focusedWindow, !closedWindows.contains(focusedWindow) else { return nil }
+        return entries[ObjectIdentifier(focusedWindow)]?.actions
+    }
     private struct Entry { let token: UUID; let actions: FinderWindowActions }
     private var entries: [ObjectIdentifier: Entry] = [:]
     private weak var focusedWindow: NSWindow?
     private let closedWindows = NSHashTable<NSWindow>.weakObjects()
+    private var publicationScheduled = false
     func update(_ actions: FinderWindowActions, window: NSWindow, token: UUID) {
         guard !closedWindows.contains(window) else { return }
         entries[ObjectIdentifier(window)] = Entry(token: token, actions: actions)
         if window.isKeyWindow || focusedWindow === window {
-            focusedWindow = window; self.actions = actions
+            focusedWindow = window; schedulePublication()
         }
     }
-    func focus(_ window: NSWindow) { focusedWindow = window; actions = entries[ObjectIdentifier(window)]?.actions }
+    func focus(_ window: NSWindow) {
+        guard !closedWindows.contains(window), focusedWindow !== window else { return }
+        focusedWindow = window; schedulePublication()
+    }
     func unregister(_ window: NSWindow, token: UUID) {
         guard entries[ObjectIdentifier(window)]?.token == token else { return }
         remove(window)
     }
     func remove(_ window: NSWindow) {
-        entries[ObjectIdentifier(window)] = nil
-        if focusedWindow === window { actions = nil }
+        let removed = entries.removeValue(forKey: ObjectIdentifier(window))
+        if removed != nil, focusedWindow === window { schedulePublication() }
     }
     func close(_ window: NSWindow) {
         closedWindows.add(window); remove(window)
         if focusedWindow === window { focusedWindow = nil }
+    }
+    private func schedulePublication() {
+        guard !publicationScheduled else { return }
+        publicationScheduled = true
+        // ViewBridge can detach during SwiftUI's update pass. Invalidate its
+        // commands immediately, but notify SwiftUI on the next main turn.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.publicationScheduled = false
+            self.objectWillChange.send()
+        }
     }
 }
 
@@ -131,7 +150,7 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
         }
     }
     private func similarityCoordinators(in hub: CloudDriveHub) -> [FileSimilarityCoordinator] {
-        [hub.pikpak.fileSimilarity] + hub.nativeDrives.map(\.similarity)
+        [hub.pikpak.fileSimilarity, hub.similarityAcrossDrives.coordinator] + hub.nativeDrives.map(\.similarity)
     }
     private func similarityWindows(in hub: CloudDriveHub) -> [NSWindow] {
         similarityCoordinators(in: hub).compactMap(\.presentedWindow)
@@ -152,17 +171,19 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
     }
     func presentSearch(scope: FileSearchScope) {
         guard let drive = searchDrive, !activeHub.pikpak.isLoginPresented,
-              NSApp.keyWindow?.isSheet != true, scope != .root || drive == .pikpak else { return }
+              NSApp.keyWindow?.isSheet != true, scope != .root || drive != .photos else { return }
         let owner = activeHub
         owner.showCurrentDrive(drive)
         // A scan can outlive its browser. Search must restore and raise the
         // owning browser instead of presenting an overlay in a closed view.
         activateBrowser(in: owner)
         if drive == .pikpak { owner.pikpak.presentFileSearch(scope: scope) }
-        else {
+        else if drive == .photos {
             DispatchQueue.main.async {
                 NotificationCenter.default.post(name: .init("MyCloudDriverFind"), object: owner)
             }
+        } else {
+            owner.nativeDrive(for: drive)?.presentFileSearch(scope: scope)
         }
     }
     var resourceActivities: [Int32: TaskResourceActivity] {
@@ -319,6 +340,7 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
               !entries.values.contains(where: { $0.hub === hub && $0.window != nil }),
               similarityWindows(in: hub).isEmpty else { return }
         guard !hub.pikpak.keepsWorkspaceAlive, !hub.nativeDrives.contains(where: { $0.isBusy }),
+              !hub.similarityAcrossDrives.model.isRunning, !hub.similarityAcrossDrives.model.retainsOriginalsInRAM,
               !needsRelayAccount(in: hub) else { return }
         entries = entries.filter { $0.value.hub !== hub }
         tearDown(hub)

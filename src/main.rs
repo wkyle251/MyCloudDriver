@@ -17,6 +17,7 @@ mod download_buffer;
 mod download_telemetry;
 mod download_verification;
 mod duplicate_cross_drive;
+mod duplicate_admission;
 #[cfg(test)]
 mod duplicate_scan_tests;
 mod live_downloads;
@@ -75,6 +76,8 @@ enum Command {
     SimilarityScores(SimilarityScanArgs),
     /// Regroup a saved score matrix without reading original files.
     SimilarityGroups(SimilarityScanArgs),
+    /// Verify compared PikPak file metadata without changing files.
+    SimilarityPreflight(SimilarityScanArgs),
     /// List files and directories.
     Ls(LsArgs),
     /// Return one JSON page of folder entries for an interactive browser.
@@ -759,6 +762,25 @@ enum DuplicateProgressEvent<'a> {
         failed_folders: usize,
         current_path: &'a str,
     },
+    LocalDiscoveryProgress {
+        scanned_files: usize,
+        scanned_folders: usize,
+        discovered_folders: usize,
+        pending_folders: usize,
+        failed_folders: usize,
+        current_path: &'a str,
+    },
+    LocalHashProgress {
+        scanned_files: usize,
+        scanned_folders: usize,
+        discovered_folders: usize,
+        pending_folders: usize,
+        failed_folders: usize,
+        current_path: &'a str,
+        hashed_bytes: u64,
+        active_files: usize,
+        pending_files: usize,
+    },
     FolderRetrying {
         scanned_files: usize,
         scanned_folders: usize,
@@ -806,6 +828,7 @@ fn duplicate_error_is_transient(error: &PikPakError) -> bool {
             error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
         }
         PikPakError::Api { status, .. } => *status == 429 || *status >= 500,
+        PikPakError::RetryAfter { .. } => true,
         _ => false,
     }
 }
@@ -826,7 +849,11 @@ fn duplicate_folder_failure_action(
         return DuplicateFolderFailureAction::Abort;
     }
     if duplicate_error_is_transient(error) && attempt < DUPLICATE_FOLDER_MAX_ATTEMPTS {
-        return DuplicateFolderFailureAction::Retry(duplicate_folder_backoff(attempt));
+        let delay = match error {
+            PikPakError::RetryAfter { delay, .. } => duplicate_folder_backoff(attempt).max(*delay),
+            _ => duplicate_folder_backoff(attempt),
+        };
+        return DuplicateFolderFailureAction::Retry(delay);
     }
     if is_root {
         DuplicateFolderFailureAction::Abort
@@ -1464,7 +1491,7 @@ async fn run(cli: Cli) -> Result<()> {
             let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
             signal_hook::flag::register(signal_hook::consts::SIGTERM, cancelled.clone())?;
             signal_hook::flag::register(signal_hook::consts::SIGINT, cancelled.clone())?;
-            if request.source == pikpak::similarity::ScanSource::Local {
+            if request.cloud_items.is_empty() {
                 return pikpak::similarity::scan(request, None, cancelled).await;
             }
             let (client, token) = build_client()?;
@@ -1501,6 +1528,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::ShareMeasure(args) => cmd_share_measure(&client, args).await,
         Command::Duplicates(args) => cmd_duplicates(&client, args).await,
         Command::Trash(args) => cmd_trash(&client, args).await,
+        Command::SimilarityPreflight(args) => cmd_similarity_preflight(&client, args).await,
         Command::UndoFiles(args) => {
             let request = serde_json::from_slice(&tokio::fs::read(args.request_file).await?)?;
             let result = pikpak::file_undo::undo_files(&client, request).await;
@@ -2387,129 +2415,135 @@ async fn collect_duplicate_candidates(
 ) -> Result<(usize, usize, Vec<DuplicateCandidate>)> {
     // Scanning never reads or writes the persistent inventory used by other operations.
     let client = client.clone().without_duplicate_cache();
-    let root_path = normalize_remote_path(root_path);
     let root_created = if root_id.is_empty() { None } else {
         client.file_metadata(root_id).await.ok().and_then(|value| value["created_time"].as_str().map(str::to_owned))
     };
-    let mut pending = vec![(root_id.to_string(), root_path.clone(), root_created)];
-    let mut visited = HashSet::from([root_id.to_string()]);
+    collect_duplicate_tree(root_id, root_path, root_created, progress_json, duplicate_admission::Mode::Automatic, move |id| {
+        let client = client.clone();
+        async move { client.list_folder(&id).await }
+    }).await
+}
+
+struct DuplicateFolder {
+    id: String,
+    path: String,
+    created_time: Option<String>,
+    attempt: u32,
+    retry_delay: Duration,
+}
+
+async fn collect_duplicate_tree<F, Fut>(
+    root_id: &str, root_path: &str, root_created: Option<String>,
+    progress_json: bool, concurrency: impl Into<duplicate_admission::Mode>, mut list: F,
+) -> Result<(usize, usize, Vec<DuplicateCandidate>)>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = std::result::Result<Vec<FileInfo>, PikPakError>>,
+{
+    let root_path = normalize_remote_path(root_path);
+    let mut pending = vec![DuplicateFolder {
+        id: root_id.to_owned(), path: root_path.clone(), created_time: root_created,
+        attempt: 1, retry_delay: Duration::ZERO,
+    }];
+    let mut visited = HashSet::from([root_id.to_owned()]);
     let mut candidates = Vec::new();
-    let mut scanned_folders = 0usize;
-    let mut failed_folders = 0usize;
+    let (mut scanned_folders, mut failed_folders) = (0usize, 0usize);
+    let mut running = FuturesUnordered::new();
+    emit_duplicate_progress(progress_json, DuplicateProgressEvent::ScanStarted {
+        root_path: &root_path, discovered_folders: visited.len(),
+    });
 
-    emit_duplicate_progress(
-        progress_json,
-        DuplicateProgressEvent::ScanStarted {
-            root_path: &root_path,
-            discovered_folders: visited.len(),
-        },
-    );
-
-    while let Some((folder_id, folder_path, folder_created_time)) = pending.pop() {
-        let mut attempt = 1u32;
-        let entries = loop {
-            match client
-                .list_folder(&folder_id)
-                .await
-            {
-                Ok(entries) => break Some(entries),
-                Err(error) => {
-                    match duplicate_folder_failure_action(&error, attempt, folder_id == root_id) {
-                        DuplicateFolderFailureAction::Retry(retry_delay) => {
-                            attempt = attempt.saturating_add(1);
-                            emit_duplicate_progress(
-                                progress_json,
-                                DuplicateProgressEvent::FolderRetrying {
-                                    scanned_files: candidates.len(),
-                                    scanned_folders,
-                                    discovered_folders: visited.len(),
-                                    pending_folders: pending.len().saturating_add(1),
-                                    failed_folders,
-                                    current_path: &folder_path,
-                                    attempt,
-                                    max_attempts: DUPLICATE_FOLDER_MAX_ATTEMPTS,
-                                    retry_in_millis: u64::try_from(retry_delay.as_millis())
-                                        .unwrap_or(u64::MAX),
-                                },
-                            );
-                            eprintln!(
-                            "warning: PikPak temporarily failed while scanning {folder_path}; retrying attempt {attempt} of {DUPLICATE_FOLDER_MAX_ATTEMPTS} in {:.1}s ({error})",
-                            retry_delay.as_secs_f64()
-                        );
-                            tokio::time::sleep(retry_delay).await;
-                            continue;
-                        }
-                        DuplicateFolderFailureAction::Abort => {
-                            // Authentication failures affect the complete scan and
-                            // reach the app so its normal sign-in recovery can run.
-                            // A failed root also has no useful partial result.
-                            return Err(anyhow::Error::new(error)).with_context(|| {
-                                format!("failed to inspect folder {folder_path}")
-                            });
-                        }
-                        DuplicateFolderFailureAction::Skip => {
-                            // Descendant failures are recorded and skipped so one
-                            // inaccessible folder cannot erase a long scan.
-                            failed_folders = failed_folders.saturating_add(1);
-                            emit_duplicate_progress(
-                                progress_json,
-                                DuplicateProgressEvent::FolderSkipped {
-                                    scanned_files: candidates.len(),
-                                    scanned_folders,
-                                    discovered_folders: visited.len(),
-                                    pending_folders: pending.len(),
-                                    failed_folders,
-                                    current_path: &folder_path,
-                                },
-                            );
-                            eprintln!(
-                            "warning: skipped unavailable folder {folder_path} after {attempt} attempt(s); partial scan will continue ({error})"
-                        );
-                            break None;
-                        }
+    let initial = std::thread::available_parallelism().map(usize::from).unwrap_or(1);
+    let mut admission = duplicate_admission::Admission::new(concurrency.into(), initial, false);
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        let limit = admission.update(Instant::now(), (scanned_folders + failed_folders) as u64, running.len(), !pending.is_empty());
+        while running.len() < limit {
+            let Some(folder) = pending.pop() else { break };
+            let listing = list(folder.id.clone());
+            running.push(async move {
+                // A folder's backoff occupies only its own slot. Other folder
+                // requests and completed results keep moving during the delay.
+                if !folder.retry_delay.is_zero() { tokio::time::sleep(folder.retry_delay).await; }
+                (folder, listing.await)
+            });
+        }
+        if running.is_empty() {
+            if pending.is_empty() { break; }
+            ticker.tick().await;
+            continue;
+        }
+        let result = tokio::select! {
+            result = running.next() => result,
+            _ = ticker.tick() => continue,
+        };
+        let Some((mut folder, entries)) = result else { break };
+        let entries = match entries {
+            Ok(entries) => entries,
+            Err(error) => {
+                if matches!(&error, PikPakError::Api { status: 429, .. } | PikPakError::RetryAfter { .. }) {
+                    admission.throttled(Instant::now());
+                }
+                match duplicate_folder_failure_action(&error, folder.attempt, folder.id == root_id) {
+                    DuplicateFolderFailureAction::Retry(delay) => {
+                        folder.attempt = folder.attempt.saturating_add(1);
+                        folder.retry_delay = delay;
+                        emit_duplicate_progress(progress_json, DuplicateProgressEvent::FolderRetrying {
+                            scanned_files: candidates.len(), scanned_folders,
+                            discovered_folders: visited.len(),
+                            pending_folders: pending.len() + running.len() + 1,
+                            failed_folders, current_path: &folder.path,
+                            attempt: folder.attempt, max_attempts: DUPLICATE_FOLDER_MAX_ATTEMPTS,
+                            retry_in_millis: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        });
+                        eprintln!("warning: PikPak temporarily failed while scanning {}; retrying attempt {} of {DUPLICATE_FOLDER_MAX_ATTEMPTS} in {:.1}s ({error})",
+                            folder.path, folder.attempt, delay.as_secs_f64());
+                        pending.push(folder);
+                        continue;
+                    }
+                    DuplicateFolderFailureAction::Abort => {
+                        return Err(anyhow::Error::new(error))
+                            .with_context(|| format!("failed to inspect folder {}", folder.path));
+                    }
+                    DuplicateFolderFailureAction::Skip => {
+                        failed_folders = failed_folders.saturating_add(1);
+                        emit_duplicate_progress(progress_json, DuplicateProgressEvent::FolderSkipped {
+                            scanned_files: candidates.len(), scanned_folders,
+                            discovered_folders: visited.len(), pending_folders: pending.len() + running.len(),
+                            failed_folders, current_path: &folder.path,
+                        });
+                        eprintln!("warning: skipped unavailable folder {} after {} attempt(s); partial scan will continue ({error})",
+                            folder.path, folder.attempt);
+                        continue;
                     }
                 }
             }
         };
-
-        let Some(entries) = entries else { continue };
         scanned_folders = scanned_folders.saturating_add(1);
-
         for entry in entries {
-            let path = join_remote_display_path(&folder_path, &entry.name);
+            let path = join_remote_display_path(&folder.path, &entry.name);
             if entry.kind.is_folder() {
                 if visited.insert(entry.id.clone()) {
-                    pending.push((entry.id, path, entry.created_time));
+                    pending.push(DuplicateFolder {
+                        id: entry.id, path, created_time: entry.created_time,
+                        attempt: 1, retry_delay: Duration::ZERO,
+                    });
                 }
             } else {
                 candidates.push(DuplicateCandidate {
-                    id: entry.id,
-                    name: entry.name,
-                    path,
-                    size: entry.size,
-                    modified_time: entry.modified_time,
-                    content_hash: entry.hash,
-                    md5_checksum: entry.md5_checksum,
-                    source: duplicate_cross_drive::DuplicateSource::Pikpak,
-                    folder_created_time: folder_created_time.clone(),
-                    local_identity: None,
+                    id: entry.id, name: entry.name, path, size: entry.size,
+                    modified_time: entry.modified_time, content_hash: entry.hash,
+                    md5_checksum: entry.md5_checksum, source: duplicate_cross_drive::DuplicateSource::Pikpak,
+                    folder_created_time: folder.created_time.clone(), local_identity: None,
                 });
             }
         }
-
-        emit_duplicate_progress(
-            progress_json,
-            DuplicateProgressEvent::ScanProgress {
-                scanned_files: candidates.len(),
-                scanned_folders,
-                discovered_folders: visited.len(),
-                pending_folders: pending.len(),
-                failed_folders,
-                current_path: &folder_path,
-            },
-        );
+        emit_duplicate_progress(progress_json, DuplicateProgressEvent::ScanProgress {
+            scanned_files: candidates.len(), scanned_folders,
+            discovered_folders: visited.len(), pending_folders: pending.len() + running.len(),
+            failed_folders, current_path: &folder.path,
+        });
     }
-
     Ok((scanned_folders, failed_folders, candidates))
 }
 
@@ -2612,6 +2646,14 @@ fn join_remote_display_path(parent: &str, name: &str) -> String {
     } else {
         format!("{}/{name}", parent.trim_end_matches('/'))
     }
+}
+
+async fn cmd_similarity_preflight(client: &Client, args: SimilarityScanArgs) -> Result<()> {
+    let files: Vec<trash_selection::Keeper> =
+        read_json_request_bounded(&args.request_file, 64 * 1024 * 1024)?;
+    trash_selection::verify_all(client, &files).await?;
+    println!("{}", serde_json::json!({"verified_ids": files.iter().map(|file| &file.id).collect::<Vec<_>>()}));
+    Ok(())
 }
 
 async fn cmd_trash(client: &Client, args: TrashArgs) -> Result<()> {
@@ -4845,6 +4887,16 @@ fn download_route_unavailable(error: &anyhow::Error) -> bool {
         || download_preparation::guest_route_unavailable(error)
 }
 
+fn explain_original_url_failure(error: anyhow::Error, user: bool, after_guest: bool) -> anyhow::Error {
+    if user && error.downcast_ref::<PikPakError>().is_some_and(|error| matches!(error, PikPakError::InvalidDownloadUrl)) {
+        error.context(if after_guest {
+            "Guest access was unavailable; User Mode also provided no original URL after a fresh lookup"
+        } else {
+            "User Mode provided no original URL after a fresh lookup"
+        })
+    } else { error }
+}
+
 /// A helper holds filesystem identities for its lifetime. Ask the native queue
 /// to revalidate the original volume before restarting a helper with new FDs.
 fn download_destination_error(
@@ -5074,6 +5126,8 @@ async fn download_file_as_with_retry(
                 )));
             }
             Err(error) => {
+                let error = explain_original_url_failure(error,
+                    route.content_mode() == pikpak::ContentMode::User, account_handoff);
                 if let Err(destination) = download_fs::validate(output_dir) {
                     if pikpak::download_policy::destination_io_interrupted(&destination) {
                         return Err(download_destination_error(
@@ -5131,7 +5185,7 @@ async fn skip_receipted_without_link(
     output_lease: Option<&std::fs::File>,
 ) -> Result<bool> {
     let revision = pikpak::client::download_revision(file.hash.as_deref(), file.modified_time.as_deref());
-    if file.size == 0 || revision.is_none() {
+    if file.size == 0 {
         return Ok(false);
     }
     let listed = pikpak::DownloadInfo {
@@ -5140,10 +5194,17 @@ async fn skip_receipted_without_link(
         size: file.size,
         source_revision: revision,
     };
-    let source = download_receipt::Source::from_download(scope, &file.id, &listed, file.size);
-    let Some(published_output) =
-        download_receipt::completed_without_reading(file_path, &source, transfer_id).await?
-    else {
+    let mut source = download_receipt::Source::from_download(scope.clone(), &file.id, &listed, file.size);
+    let mut published_output = download_receipt::completed_without_reading(file_path, &source, transfer_id).await?;
+    if published_output.is_none() && file.hash.as_deref().is_none_or(|value| value.trim().is_empty()) {
+        if let Some((output, recorded_source)) = download_receipt::completed_with_unknown_revision(
+            file_path, &scope, &file.id, file.size, transfer_id,
+        ).await? {
+            published_output = Some(output);
+            source = recorded_source;
+        }
+    }
+    let Some(published_output) = published_output else {
         return Ok(false);
     };
     if let Some(lease) = output_lease {
@@ -5737,6 +5798,8 @@ async fn download_share_file_as_with_retry(
                 )));
             }
             Err(error) => {
+                let error = explain_original_url_failure(error,
+                    route.content_mode() == pikpak::ContentMode::User, account_handoff);
                 if let Err(destination) = download_fs::validate(output_dir) {
                     if pikpak::download_policy::destination_io_interrupted(&destination) {
                         return Err(download_destination_error(

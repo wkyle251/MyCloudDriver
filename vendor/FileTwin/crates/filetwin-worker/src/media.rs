@@ -86,7 +86,7 @@ fn decoder(request: &Request, probe: bool) -> Result<Command> {
         // Only local RAM transport, no redirects/proxies or disk cache. Do not
         // permit playlist/manifest demuxers to initiate additional network I/O.
         c.env_remove("http_proxy").env_remove("HTTP_PROXY").env_remove("ALL_PROXY");
-        c.args(["-protocol_whitelist", "http,tcp", "-rw_timeout", "30000000",
+        c.args(["-protocol_whitelist", "http,tcp", "-rw_timeout", if memory.range_only { "0" } else { "30000000" },
             "-format_whitelist", "mov,matroska,webm,avi,mpeg,mpegts,mp3,flac,ogg,wav,aiff,caf,ape,wv,amr,au,mpc,mpc8,asf,flv,rm,aac,ac3,eac3,dts,mxf,mpegvideo",
         ]);
     } else {

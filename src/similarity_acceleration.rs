@@ -66,6 +66,10 @@ fn probe(config: &EncoderConfig, cancel: &AtomicBool) -> Result<bool> {
     probe.backend = Backend::Coreml;
     probe.workers = 1;
     probe.memory_bytes = probe.memory_bytes.min(2 << 30);
+    // The isolated synthetic check has no acquisition pipeline/governor.
+    probe.memory_ceiling = None;
+    probe.total_memory_bytes = None;
+    probe.external_memory = None;
     let token = CancellationToken::default();
     let started = Instant::now();
     // Synthetic PPM stays in RAM. No user original is downloaded for this check.

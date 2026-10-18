@@ -176,6 +176,30 @@ mod tests {
     }
 
     #[test]
+    fn metadata_cooldown_preserves_content_capacity_and_existing_shared_reductions() {
+        let full = Network::new(4, None);
+        full.defer_metadata(Duration::from_millis(30)).unwrap();
+        assert!(full.try_acquire().unwrap().is_none(), "Metadata must publish the origin cooldown");
+        std::thread::sleep(Duration::from_millis(60));
+        let permits: Vec<_> = (0..4).map(|_| full.try_acquire().unwrap().unwrap()).collect();
+        assert!(full.try_acquire().unwrap().is_none());
+        drop(permits);
+
+        let directory = tempfile::tempdir().unwrap();
+        let content = Network::new(4, Some(directory.path().to_owned()));
+        let metadata = Network::new(4, Some(directory.path().to_owned()));
+        let permits: Vec<_> = (0..4).map(|_| content.try_acquire().unwrap().unwrap()).collect();
+        content.defer(Duration::from_millis(30)).unwrap();
+        drop(permits);
+        metadata.defer_metadata(Duration::from_millis(30)).unwrap();
+        std::thread::sleep(Duration::from_millis(130));
+        let first = metadata.try_acquire().unwrap().unwrap();
+        let second = metadata.try_acquire().unwrap().unwrap();
+        assert!(metadata.try_acquire().unwrap().is_none(), "Metadata must not erase a content-driven capacity reduction");
+        drop((first, second));
+    }
+
+    #[test]
     fn more_than_sixty_four_connections_share_and_release_the_same_budget() {
         let directory = tempfile::tempdir().unwrap();
         let first = Network::new(80, Some(directory.path().to_path_buf()));
@@ -513,14 +537,25 @@ impl Network {
     }
 
     pub fn defer(&self, delay: Duration) -> io::Result<()> {
+        self.defer_with_capacity(delay, true)
+    }
+
+    /// Metadata backoff shares the serving-origin cooldown and descriptor
+    /// pool, without treating API occupancy as content throughput evidence.
+    pub(crate) fn defer_metadata(&self, delay: Duration) -> io::Result<()> {
+        self.defer_with_capacity(delay, false)
+    }
+
+    fn defer_with_capacity(&self, delay: Duration, reduce_capacity: bool) -> io::Result<()> {
         self.clear_range_startup();
         let delay = delay.min(Duration::from_secs(86_400));
         crate::download_waits::cooldown_requested();
         KNOWN_COOLDOWN_UNTIL_MS.fetch_max(Self::now_millis().saturating_add(delay.as_millis() as u64), Ordering::Relaxed);
-        let limited_until = Instant::now() + delay + Duration::from_secs(30);
-        let limit = (self.endpoint_active.load(Ordering::Acquire) / 2).max(1);
-        self.soft_limit.fetch_min(limit, Ordering::AcqRel);
-        *self.soft_until.lock().unwrap() = limited_until;
+        let limit = reduce_capacity.then(|| (self.endpoint_active.load(Ordering::Acquire) / 2).max(1));
+        if let Some(limit) = limit {
+            self.soft_limit.fetch_min(limit, Ordering::AcqRel);
+            *self.soft_until.lock().unwrap() = Instant::now() + delay + Duration::from_secs(30);
+        }
         {
             let mut state = self.cooldown.lock().unwrap();
             state.0 = state.0.max(Instant::now() + delay);
@@ -533,11 +568,18 @@ impl Network {
             let previous = Self::read_control(&mut file)?;
             let now = Self::now_millis();
             let until = previous[0].max(now.saturating_add(delay.as_millis() as u64));
-            let limited_until = previous[1].max(until.saturating_add(30_000));
-            let limit = if previous[1] > now && previous[2] > 0 {
-                previous[2].min(limit as u64)
+            let (limited_until, limit) = if let Some(limit) = limit {
+                let limited_until = previous[1].max(until.saturating_add(30_000));
+                let limit = if previous[1] > now && previous[2] > 0 {
+                    previous[2].min(limit as u64)
+                } else {
+                    limit as u64
+                };
+                (limited_until, limit)
             } else {
-                limit as u64
+                // Preserve a reduction already measured by actual downloads;
+                // metadata alone does not create or extend that evidence.
+                (previous[1], previous[2])
             };
             file.rewind()?;
             for value in [until, limited_until, limit] {

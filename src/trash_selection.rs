@@ -1,4 +1,4 @@
-//! Keep-smallest uses a guarded batch: verify every retained original before
+//! Size-based cleanup uses a guarded batch: verify every retained original before
 //! changing anything, then acknowledge only successfully completed batches.
 use anyhow::{bail, Context, Result};
 use pikpak::Client;
@@ -34,7 +34,7 @@ impl Request {
                 keep,
             }) => {
                 if keep.is_empty() {
-                    bail!("A keep-smallest request needs at least one retained file");
+                    bail!("A size-based cleanup request needs at least one retained file");
                 }
                 ids.append(&mut more);
                 keep
@@ -91,6 +91,33 @@ fn verify_keeper(keeper: &Keeper, value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+async fn verify_all_with_backend(backend: &impl Backend, files: &[Keeper]) -> Result<()> {
+    // Reject the complete malformed selection before issuing any metadata
+    // requests. The original IDs are never trimmed or silently deduplicated.
+    let mut seen = HashSet::new();
+    if files.iter().any(|file| {
+        file.id.is_empty()
+            || file.id.chars().any(char::is_whitespace)
+            || !seen.insert(file.id.as_str())
+    }) {
+        bail!("Compared file IDs must be non-empty, contain no whitespace and be unique");
+    }
+    for file in files {
+        let value = backend
+            .metadata(&file.id)
+            .await
+            .context("Could not verify a compared file")?;
+        verify_keeper(file, &value)?;
+    }
+    Ok(())
+}
+
+/// Read-only preflight for a mixed-provider plan. No original URLs or content
+/// are requested, and no mutation is performed even when verification fails.
+pub async fn verify_all(client: &Client, files: &[Keeper]) -> Result<()> {
+    verify_all_with_backend(client, files).await
+}
+
 async fn apply(backend: &impl Backend, request: Request) -> Result<Outcome> {
     for keeper in &request.keep {
         let value = backend
@@ -126,6 +153,7 @@ mod tests {
         reads: Mutex<Vec<String>>,
         batches: Mutex<Vec<Vec<String>>>,
         missing: bool,
+        metadata_override: Option<serde_json::Value>,
         fail_batch: Option<usize>,
     }
     impl Backend for Fake {
@@ -137,6 +165,11 @@ mod tests {
             self.reads.lock().unwrap().push(id.to_string());
             if self.missing && id == "keep2" {
                 bail!("not found");
+            }
+            if id == "keep2" {
+                if let Some(value) = &self.metadata_override {
+                    return Ok(value.clone());
+                }
             }
             Ok(serde_json::json!({"id": id, "kind": "drive#file", "trashed": false, "size": "42"}))
         }
@@ -155,6 +188,7 @@ mod tests {
             reads: Mutex::new(vec![]),
             batches: Mutex::new(vec![]),
             missing,
+            metadata_override: None,
             fail_batch,
         }
     }
@@ -193,6 +227,95 @@ mod tests {
         let success = apply(&fake(false, None), request(205)).await.unwrap();
         assert_eq!(success.confirmed.len(), 205);
         assert!(success.error.is_none());
+    }
+    #[tokio::test]
+    async fn read_only_preflight_verifies_every_file_without_trashing() {
+        let backend = fake(false, None);
+        let files = request(1).keep;
+        verify_all_with_backend(&backend, &files).await.unwrap();
+        assert_eq!(*backend.reads.lock().unwrap(), vec!["keep1", "keep2"]);
+        assert!(backend.batches.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn read_only_preflight_rejects_malformed_ids_before_metadata() {
+        for ids in [
+            vec![""],
+            vec![" "],
+            vec![" keep1"],
+            vec!["keep1 "],
+            vec!["keep\t1"],
+            vec!["keep\n1"],
+            vec!["keep\u{2003}1"],
+            vec!["keep1", "keep1"],
+        ] {
+            let backend = fake(false, None);
+            let files = ids
+                .into_iter()
+                .map(|id| Keeper {
+                    id: id.into(),
+                    size: 42,
+                })
+                .collect::<Vec<_>>();
+            assert!(verify_all_with_backend(&backend, &files).await.is_err());
+            assert!(backend.reads.lock().unwrap().is_empty());
+            assert!(backend.batches.lock().unwrap().is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn read_only_preflight_rejects_missing_and_changed_metadata_without_trashing() {
+        let missing = fake(true, None);
+        assert!(verify_all_with_backend(&missing, &request(1).keep)
+            .await
+            .is_err());
+        assert!(missing.batches.lock().unwrap().is_empty());
+        let changed = fake(false, None);
+        let files = vec![Keeper {
+            id: "keep1".into(),
+            size: 43,
+        }];
+        assert!(verify_all_with_backend(&changed, &files).await.is_err());
+        assert!(changed.batches.lock().unwrap().is_empty());
+        let good =
+            serde_json::json!({"id":"keep2", "kind":"drive#file", "trashed":false, "size":42});
+        for (field, value) in [
+            ("id", serde_json::json!("different")),
+            ("kind", serde_json::json!("drive#folder")),
+            ("trashed", serde_json::json!(true)),
+            ("size", serde_json::json!(43)),
+        ] {
+            let mut changed = fake(false, None);
+            let mut bad = good.clone();
+            bad[field] = value;
+            changed.metadata_override = Some(bad);
+            assert!(verify_all_with_backend(&changed, &request(1).keep)
+                .await
+                .is_err());
+            assert_eq!(changed.reads.lock().unwrap().len(), 2);
+            assert!(changed.batches.lock().unwrap().is_empty());
+        }
+        for field in ["id", "kind", "trashed", "size"] {
+            let mut changed = fake(false, None);
+            let mut bad = good.clone();
+            bad.as_object_mut().unwrap().remove(field);
+            changed.metadata_override = Some(bad);
+            assert!(verify_all_with_backend(&changed, &request(1).keep)
+                .await
+                .is_err());
+            assert!(changed.batches.lock().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn read_only_preflight_requires_an_array_of_complete_typed_metadata_expectations() {
+        for encoded in [
+            r#"{"id":"keep1","size":42}"#,
+            r#"[{}]"#,
+            r#"[{"id":"keep1"}]"#,
+            r#"[{"id":1,"size":42}]"#,
+            r#"[{"id":"keep1","size":-1}]"#,
+            r#"[{"id":"keep1","size":"42"}]"#,
+        ] {
+            assert!(serde_json::from_str::<Vec<Keeper>>(encoded).is_err());
+        }
     }
     #[test]
     fn guarded_selection_rejects_keeper_as_target_and_checks_current_metadata() {

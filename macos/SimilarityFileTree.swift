@@ -4,7 +4,7 @@ import SwiftUI
 /// AppKit recycles visible rows; a large result set never creates one SwiftUI
 /// view per scanned file. The immutable tree is built away from the main queue.
 struct SimilarityFileTree: NSViewRepresentable {
-    let roots: [SimilarityTreeNode]
+    let snapshot: SimilarityTreeSnapshot
     let selectedID: String?
     let searching: Bool
     var groupExpansion: SimilarityGroupExpansion? = nil
@@ -34,48 +34,48 @@ struct SimilarityFileTree: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         let coordinator = context.coordinator
         coordinator.select = select; coordinator.preview = preview
-        coordinator.update(roots: roots, selectedID: selectedID, searching: searching, groupExpansion: groupExpansion)
+        coordinator.update(snapshot: snapshot, selectedID: selectedID, searching: searching, groupExpansion: groupExpansion)
     }
     final class Coordinator: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
         weak var outline: NSOutlineView?
         var roots: [SimilarityTreeNode] = []
         var nodes: [String: SimilarityTreeNode] = [:]
-        var parents: [String: [SimilarityTreeNode]] = [:]
+        var parents: [String: SimilarityTreeNode] = [:]
         var updating = false
+        private var snapshotID: UUID?
+        private var grouped = false
+        private var expandedIDs = Set<String>()
+        private var expansionTask: Task<Void, Never>?
         private var appliedGroupExpansionID: UUID?
         var select: (String?) -> Void = { _ in }
         var preview: (SimilarityFile) -> Void = { _ in }
-        func update(roots: [SimilarityTreeNode], selectedID: String?, searching: Bool,
+        func update(snapshot: SimilarityTreeSnapshot, selectedID: String?, searching: Bool,
                     groupExpansion: SimilarityGroupExpansion?) {
             guard let outline else { return }
-            let changed = self.roots.count != roots.count || zip(self.roots, roots).contains { $0 !== $1 }
+            let roots = snapshot.roots, changed = snapshotID != snapshot.id
             updating = true
             defer { updating = false }
             if changed {
-                let known = Set(nodes.keys)
-                let expanded = Set(nodes.values.filter { $0.file == nil && outline.isItemExpanded($0) }.map(\.id))
-                let groupTree = roots.contains { $0.group != nil }
-                let changedKind = groupTree != self.roots.contains { $0.group != nil }
-                self.roots = roots; nodes = [:]; parents = [:]
-                func visit(_ node: SimilarityTreeNode, ancestors: [SimilarityTreeNode]) {
-                    nodes[node.id] = node; parents[node.id] = ancestors
-                    for child in node.children { visit(child, ancestors: ancestors + [node]) }
-                }
-                for root in roots { visit(root, ancestors: []) }
+                expansionTask?.cancel()
+                let known = nodes, expanded = expandedIDs
+                let groupTree = snapshot.grouped, changedKind = groupTree != grouped
+                self.roots = roots; nodes = snapshot.nodes; parents = snapshot.parents
+                snapshotID = snapshot.id; grouped = groupTree; expandedIDs = []
                 outline.reloadData()
                 if groupTree, let groupExpansion {
                     // Preserve individual toggles for surviving groups. Newly
                     // formed groups follow the last bulk expansion choice.
-                    for root in roots {
-                        if known.contains(root.id) ? expanded.contains(root.id) : groupExpansion.expanded {
-                            outline.expandItem(root, expandChildren: true)
-                        }
-                    }
+                    let toExpand = roots.filter { known[$0.id] != nil ? expanded.contains($0.id) : groupExpansion.expanded }
+                    expand(toExpand, recursively: true)
                 } else if known.isEmpty || searching || changedKind {
+                    outline.beginUpdates()
+                    defer { outline.endUpdates() }
                     var budget = 200
                     func expand(_ node: SimilarityTreeNode, depth: Int) {
-                        guard node.file == nil, budget > 0, searching || depth < 2 else { return }
-                        budget -= 1; outline.expandItem(node)
+                        guard node.file == nil, !node.children.isEmpty, node.children.count <= budget, searching || depth < 2 else { return }
+                        // Count the rows that expansion adds, not just groups.
+                        // A single huge group must not expose 100,000 rows.
+                        budget -= node.children.count; outline.expandItem(node)
                         for child in node.children { expand(child, depth: depth + 1) }
                     }
                     for root in roots { expand(root, depth: 0) }
@@ -86,12 +86,15 @@ struct SimilarityFileTree: NSViewRepresentable {
                 }
             }
             if let groupExpansion, appliedGroupExpansionID != groupExpansion.id {
-                if groupExpansion.expanded { outline.expandItem(nil, expandChildren: true) }
-                else { outline.collapseItem(nil, collapseChildren: true) }
+                expansionTask?.cancel()
+                if groupExpansion.expanded { expand(roots, recursively: true) }
+                else { outline.collapseItem(nil, collapseChildren: true); expandedIDs = [] }
             }
             appliedGroupExpansionID = groupExpansion?.id
             if let selectedID, let node = nodes[selectedID] {
-                for parent in parents[selectedID] ?? [] { outline.expandItem(parent) }
+                var ancestors: [SimilarityTreeNode] = [], parent = parents[selectedID]
+                while let item = parent { ancestors.append(item); parent = parents[item.id] }
+                for parent in ancestors.reversed() { outline.expandItem(parent) }
                 let row = outline.row(forItem: node)
                 if row >= 0 && outline.selectedRow != row {
                     outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
@@ -101,6 +104,41 @@ struct SimilarityFileTree: NSViewRepresentable {
                 outline.deselectAll(nil)
             }
         }
+        private func expand(_ roots: [SimilarityTreeNode], recursively: Bool) {
+            guard let outline else { return }
+            if nodes.count <= 2_000 {
+                outline.beginUpdates()
+                defer { outline.endUpdates() }
+                for root in roots { outline.expandItem(root, expandChildren: recursively) }
+                return
+            }
+            // Explicit Expand All remains available, but yields between batches
+            // so a large result can still be searched, selected or collapsed.
+            expansionTask = Task { @MainActor [weak self] in
+                var pending = roots.reversed().map { $0 }
+                while !pending.isEmpty {
+                    guard let self, !Task.isCancelled, let outline = self.outline else { return }
+                    self.updating = true
+                    outline.beginUpdates()
+                    for _ in 0..<16 {
+                        guard let node = pending.popLast() else { break }
+                        guard node.file == nil else { continue }
+                        outline.expandItem(node)
+                        if recursively { pending.append(contentsOf: node.children.reversed().filter { $0.file == nil }) }
+                    }
+                    outline.endUpdates()
+                    self.updating = false
+                    await Task.yield()
+                }
+            }
+        }
+        func outlineViewItemDidExpand(_ notification: Notification) {
+            if let node = notification.userInfo?["NSObject"] as? SimilarityTreeNode { expandedIDs.insert(node.id) }
+        }
+        func outlineViewItemDidCollapse(_ notification: Notification) {
+            if let node = notification.userInfo?["NSObject"] as? SimilarityTreeNode { expandedIDs.remove(node.id) }
+        }
+        deinit { expansionTask?.cancel() }
         func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
             (item as? SimilarityTreeNode)?.children.count ?? roots.count
         }

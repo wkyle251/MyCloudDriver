@@ -36,7 +36,8 @@ struct ArchiveActivityFooter: View {
             .accessibilityAddTraits(.isButton)
             .accessibilityLabel("Extractions: \(activity.summary)")
             .fixedSize()
-            .popover(isPresented: $activity.showsActivity, arrowEdge: .top) {
+            .finderPopover(isPresented: $activity.showsActivity, contentSize: .init(width: 480, height: 600),
+                           presentationID: ObjectIdentifier(activity), arrowEdge: .top) {
                 ArchiveActivityList(model: model, activity: activity, revealOutput: revealOutput)
             }
         }
@@ -83,13 +84,13 @@ private struct ArchiveActivityList: View {
                     }
                 }
             }
-            .frame(height: min(520, max(300, CGFloat(tasks.count) * 106)))
+            .frame(maxHeight: .infinity)
             Divider()
             Text("Progress is reported by PikPak. Finished extractions stay here until cleared.")
                 .font(.caption2).foregroundStyle(.secondary)
                 .padding(12)
         }
-        .frame(width: 480)
+        .frame(width: 480, height: 600)
         .background(Color(nsColor: .controlBackgroundColor))
         .tint(FinderAppearance.accent)
     }

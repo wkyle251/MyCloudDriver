@@ -69,6 +69,8 @@ impl Drop for ProducerDone {
 pub(super) struct State {
     pub found: AtomicU64,
     pub file_bytes: AtomicU64,
+    pub cloud_file_bytes: AtomicU64,
+    pub has_cloud: bool,
     pub queued: AtomicU64,
     pub complete: AtomicBool,
     stop: AtomicBool,
@@ -99,6 +101,8 @@ impl Discovery {
     ) -> Self {
         let found = snapshot.files.len() as u64;
         let bytes = snapshot.files.iter().map(|file| file.display.bytes).sum();
+        let cloud_bytes = snapshot.files.iter().filter(|file| file.cloud.is_some()).map(|file| file.display.bytes).sum();
+        let has_cloud = snapshot.files.iter().any(|file| file.cloud.is_some());
         Self {
             receiver: InventoryReceiver::Snapshot(Mutex::new((
                 snapshot.files.into(),
@@ -109,6 +113,8 @@ impl Discovery {
             state: Arc::new(State {
                 found: AtomicU64::new(found),
                 file_bytes: AtomicU64::new(bytes),
+                cloud_file_bytes: AtomicU64::new(cloud_bytes),
+                has_cloud,
                 queued: AtomicU64::new(found),
                 complete: AtomicBool::new(true),
                 control,
@@ -225,7 +231,7 @@ pub(super) fn start_controlled(
     control: filetwin_core::api::CancellationToken,
 ) -> Result<Discovery> {
     let (sender, receiver) =
-        if request.source == ScanSource::Cloud || request.external_source_stream.is_some() {
+        if !request.cloud_items.is_empty() || request.external_source_stream.is_some() {
             // Anonymous/0600/CLOEXEC file; only metadata enters it. Closing the last
             // handle removes it. Original contents retain their normal RAM leases.
             let spool = Arc::new(Mutex::new(Spool {
@@ -250,18 +256,19 @@ pub(super) fn start_controlled(
     let done = producer_done.clone();
     let state = Arc::new(State {
         control,
+        has_cloud: !request.cloud_items.is_empty(),
         ..State::default()
     });
     let shared = state.clone();
     let worker = std::thread::spawn(move || {
         let _done = ProducerDone(done);
-        let mut seen = HashSet::new();
-        let mut last_progress = Instant::now();
+        let seen = Mutex::new(HashSet::new());
+        let last_progress = Mutex::new(Instant::now());
         let _ = emit(&json!({"event":"discovery", "found":0, "complete":false}));
-        let mut next = |mut file: scope::InputFile| -> Result<()> {
+        let publish = |mut file: scope::InputFile| -> Result<()> {
             control::wait_blocking(&shared.control, &shared.stop)?;
             check_cancel(&cancel)?;
-            if file.display.name.starts_with('.') || !seen.insert(file.display.id.clone()) {
+            if file.display.name.starts_with('.') || !seen.lock().unwrap().insert(file.display.id.clone()) {
                 return Ok(());
             }
             file.capture_inventory_version();
@@ -269,34 +276,49 @@ pub(super) fn start_controlled(
             shared
                 .file_bytes
                 .fetch_add(file.display.bytes, Ordering::AcqRel);
+            if file.cloud.is_some() {
+                shared.cloud_file_bytes.fetch_add(file.display.bytes, Ordering::AcqRel);
+            }
             shared.queued.fetch_add(1, Ordering::AcqRel);
-            if seen.len() == 1 || last_progress.elapsed() >= Duration::from_millis(250) {
+            let mut last_progress = last_progress.lock().unwrap();
+            if shared.found.load(Ordering::Acquire) == 1 || last_progress.elapsed() >= Duration::from_millis(250) {
                 emit(
                     &json!({"event":"discovery", "found":shared.found.load(Ordering::Acquire),
                     "file_bytes":shared.file_bytes.load(Ordering::Acquire),
                     "queued":shared.queued.load(Ordering::Acquire), "complete":false}),
                 )?;
-                last_progress = Instant::now();
+                *last_progress = Instant::now();
             }
+            drop(last_progress);
             send(&sender, Event::File(file), &shared, &cancel)
         };
         let mut staged = StagedCloud::new();
-        let result = if request.source == ScanSource::Cloud {
-            match client.as_ref() {
-                Some(client) => runtime.block_on(discover_cloud(
-                    &request,
-                    client,
-                    &temporary,
-                    &shared.stop,
-                    &mut staged,
-                    &mut |item| next(scope::InputFile::cloud(item)),
-                )),
-                None => Err(anyhow::anyhow!("Sign in to PikPak before scanning.")),
-            }
+        let result = if !request.cloud_items.is_empty() && client.is_none() {
+            Err(anyhow::anyhow!("Sign in to PikPak before scanning."))
+        } else if !request.cloud_items.is_empty() {
+            // Native metadata and PikPak pages feed one queue concurrently.
+            // Neither provider can hide the other's inventory behind a slow
+            // traversal; both must complete before this inventory is certified.
+            std::thread::scope(|threads| {
+                let native = request.external_source_stream.as_ref().map(|path| {
+                    threads.spawn(|| read_external(path, &cancel, &shared, &mut |file| publish(file)))
+                });
+                let cloud = match client.as_ref() {
+                    Some(client) => runtime.block_on(discover_cloud(
+                        &request, client, &temporary, &shared.stop, &shared.control,
+                        &mut staged, &mut |item| publish(scope::InputFile::cloud(item)),
+                    )),
+                    None => Err(anyhow::anyhow!("Sign in to PikPak before scanning.")),
+                };
+                let native = native.map(|thread| thread.join().unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!("Native drive discovery stopped unexpectedly."))
+                })).transpose();
+                cloud.and(native.map(|_| ()))
+            })
         } else if let Some(path) = &request.external_source_stream {
-            read_external(path, &cancel, &shared, &mut next)
+            read_external(path, &cancel, &shared, &mut |file| publish(file))
         } else {
-            scope::discover(&request, &staged, &shared.stop, &mut report, &mut next)
+            scope::discover(&request, &staged, &shared.stop, &mut report, &mut |file| publish(file))
         };
         let missing_issues = staged.skipped.saturating_sub(staged.issues.len() as u64);
         let remaining = MAX_ISSUES.saturating_sub(report.issues.len());
@@ -588,6 +610,7 @@ mod tests {
                 send(
                     &InventorySender::Disk(spool.clone()),
                     Event::File(scope::InputFile::external(ExternalSource {
+                        provider: None,
                         content_kind: None,
                         id: "fixture".into(),
                         name: "fixture.txt".into(),
@@ -687,6 +710,7 @@ mod tests {
         assert!(worker.join().unwrap().is_err());
         let (sender, _receiver) = mpsc::sync_channel(0);
         let file = scope::InputFile::external(ExternalSource {
+            provider: None,
             content_kind: None,
             revision: None,
             id: "id".into(),

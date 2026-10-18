@@ -56,10 +56,18 @@ enum MediaFileDownload {
         try Task.checkCancellation()
         let manager = FileManager.default
         guard !manager.fileExists(atPath: destination.path) else { throw CocoaError(.fileWriteFileExists) }
-        let session = URLSession(configuration: configuration)
+        let delegate = DownloadDelegate()
+        // Classic download tasks deliver didWriteData on this serial delegate
+        // queue. The async download(for:delegate:) overlay can consume those
+        // callbacks internally instead of forwarding incremental progress.
+        let delegateQueue = OperationQueue()
+        delegateQueue.name = "MyCloudDriver.media-download"
+        delegateQueue.maxConcurrentOperationCount = 1
+        delegateQueue.qualityOfService = .userInitiated
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: delegateQueue)
         var ownsDestination = false, complete = false
         defer {
-            session.invalidateAndCancel()
+            NativeFileWork.performCancellation { session.invalidateAndCancel() }
             if ownsDestination && !complete { try? manager.removeItem(at: destination) }
         }
         var received: UInt64 = 0
@@ -75,8 +83,18 @@ enum MediaFileDownload {
                 request.setValue("bytes=\(received)-\(end.map(String.init) ?? "")", forHTTPHeaderField: "Range")
                 if let validator { request.setValue(validator.value, forHTTPHeaderField: "If-Range") }
             }
-            let delegate = DownloadProgress(offset: received, total: total, progress: progress)
-            let (temporary, rawResponse) = try await session.download(for: request, delegate: delegate)
+            let responseProgress = DownloadProgress(offset: received, total: total, progress: progress)
+            // Construct/register before installing cancellation: if a caller
+            // cancels before bind(), the existing task can still be cancelled
+            // without racing creation against session invalidation.
+            let task = session.downloadTask(with: request)
+            delegate.register(responseProgress, task: task)
+            let (temporary, rawResponse) = try await withTaskCancellationHandler(operation: {
+                try await withCheckedThrowingContinuation { continuation in
+                    responseProgress.install(continuation)
+                    responseProgress.bind(task)
+                }
+            }, onCancel: { responseProgress.cancel() })
             defer { try? manager.removeItem(at: temporary) }
             try Task.checkCancellation()
             guard let response = rawResponse as? HTTPURLResponse else { throw URLError(.badServerResponse) }
@@ -156,20 +174,104 @@ enum MediaFileDownload {
         }
     }
 
-    private final class DownloadProgress: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    /// One session is reused across capped byte-range responses. Its relay
+    /// owns each response until didComplete, including cancelled responses.
+    private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+        private let lock = NSLock()
+        private var responses: [Int: DownloadProgress] = [:]
+        func register(_ response: DownloadProgress, task: URLSessionDownloadTask) {
+            lock.lock(); responses[task.taskIdentifier] = response; lock.unlock()
+        }
+        private func response(for task: URLSessionTask, removing: Bool = false) -> DownloadProgress? {
+            lock.lock(); defer { lock.unlock() }
+            return removing ? responses.removeValue(forKey: task.taskIdentifier) : responses[task.taskIdentifier]
+        }
+        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
+                        totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+            response(for: downloadTask)?.wrote(downloadTask, totalBytesWritten: totalBytesWritten,
+                totalBytesExpectedToWrite: totalBytesExpectedToWrite)
+        }
+        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+            response(for: downloadTask)?.downloaded(location, response: downloadTask.response)
+        }
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            response(for: task, removing: true)?.completed(error: error)
+        }
+    }
+
+    /// Exactly one result owns the preserved response file. Cancellation can
+    /// win before continuation installation, task binding or file movement.
+    private final class DownloadProgress: @unchecked Sendable {
+        typealias Output = (URL, URLResponse)
         let offset: UInt64
         let total: UInt64?
         let progress: @Sendable (UInt64, UInt64) -> Void
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Output, Error>?
+        private var result: Result<Output, Error>?
+        private weak var task: URLSessionDownloadTask?
+        private var file: Output?
+        private var finished = false
         private var lastReport = -TimeInterval.infinity
         init(offset: UInt64, total: UInt64?, progress: @escaping @Sendable (UInt64, UInt64) -> Void) {
             self.offset = offset; self.total = total; self.progress = progress
         }
-        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {}
-        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
-                        totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        func install(_ continuation: CheckedContinuation<Output, Error>) {
+            lock.lock()
+            if finished {
+                let result = result!; self.result = nil; lock.unlock()
+                continuation.resume(with: result)
+            } else { self.continuation = continuation; lock.unlock() }
+        }
+        func bind(_ task: URLSessionDownloadTask) {
+            lock.lock(); self.task = task; let finished = finished; lock.unlock()
+            if finished { NativeFileWork.performCancellation { task.cancel() } }
+            else { task.resume() }
+        }
+        func cancel() {
+            finish(.failure(CancellationError()), cancelling: true)
+        }
+        func downloaded(_ location: URL, response: URLResponse?) {
+            lock.lock(); let finished = finished; lock.unlock()
+            guard !finished else { return }
+            guard let response else { finish(.failure(URLError(.badServerResponse))); return }
+            // Foundation deletes location when this callback returns. Move it
+            // now on the non-main delegate queue; no staging folder is needed.
+            let temporary = FileManager.default.temporaryDirectory
+                .appendingPathComponent("MyCloudDriver-MediaResponse-\(UUID().uuidString)")
+            var accepted = false
+            defer { if !accepted { NativeFileWork.cleanup(temporary) } }
+            do {
+                try FileManager.default.moveItem(at: location, to: temporary)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
+                lock.lock()
+                if !self.finished, file == nil { file = (temporary, response); accepted = true }
+                lock.unlock()
+            } catch { finish(.failure(error)) }
+        }
+        func completed(error: Error?) {
+            lock.lock(); let file = file; lock.unlock()
+            if let error { finish(.failure(error)) }
+            else if let file { finish(.success(file)) }
+            else { finish(.failure(URLError(.badServerResponse))) }
+        }
+        private func finish(_ result: Result<Output, Error>, cancelling: Bool = false) {
+            lock.lock()
+            guard !finished else { lock.unlock(); return }
+            finished = true
+            let continuation = continuation; self.continuation = nil
+            if continuation == nil { self.result = result }
+            let file = file; self.file = nil
+            let task = cancelling ? task : nil; lock.unlock()
+            continuation?.resume(with: result)
+            if let task { NativeFileWork.performCancellation { task.cancel() } }
+            if case .failure = result, let file { NativeFileWork.cleanup(file.0) }
+        }
+        func wrote(_ downloadTask: URLSessionDownloadTask, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
             let now = ProcessInfo.processInfo.systemUptime
-            guard now - lastReport >= 0.2 || totalBytesWritten == totalBytesExpectedToWrite else { return }
-            lastReport = now
+            lock.lock()
+            guard !finished, now - lastReport >= 0.2 || totalBytesWritten == totalBytesExpectedToWrite else { lock.unlock(); return }
+            lastReport = now; lock.unlock()
             let response = downloadTask.response as? HTTPURLResponse
             let base = response?.statusCode == 200 ? 0 : offset
             let (received, overflow) = base.addingReportingOverflow(UInt64(max(0, totalBytesWritten)))

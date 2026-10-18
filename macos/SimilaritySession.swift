@@ -29,6 +29,9 @@ struct SimilaritySavedSession: Codable, Identifiable {
     var localURLs: [URL]
     var cloudRoots: [SimilarityCloudRoot]
     var nativeScope: SimilarityNativeScope?
+    // Multiple captured drive scopes share one comparison and one feature cache.
+    // Optional for compatibility with existing single-drive checkpoints.
+    var acrossDriveScopes: [SimilarityAcrossDriveScope]? = nil
     var scope: String
     var families: Set<String>
     var threshold: Double
@@ -91,9 +94,14 @@ extension SimilarityScanProgress {
         next.waitingMemoryFiles = 0; next.waitingReuseFiles = 0; next.waitingDownloadFiles = 0
         next.retryingDownloadFiles = 0; next.readyFiles = 0; next.resolvingFiles = 0
         next.originalMemoryBytes = 0; next.analysisMemoryBytes = 0; next.retainedDownloadMinimum = 0
+        next.memoryLimit = nil; next.analysisMemoryRequired = nil; next.analysisMemoryForecast = nil
+        next.analysisGrowthBytes = nil; next.analysisTransferBytes = nil
+        next.stagingMemoryRequired = nil; next.stagingMemoryLimit = nil
         next.downloads = []; next.downloadCount = 0; next.omittedDownloads = 0
         next.downloadSpeed = 0; next.downloadForecastBytes = 0; next.hasDownloadTelemetry = false
         next.currentName = nil; next.currentBytes = 0; next.currentSize = 0
+        next.listingFoldersDiscovered = nil; next.listingFoldersCompleted = nil
+        next.listingFoldersPending = nil; next.listingPagesCompleted = nil; next.listingFilesFound = nil
         return next
     }
     mutating func restoreSummary(from saved: Self) {
@@ -104,6 +112,8 @@ extension SimilarityScanProgress {
         foundFiles = max(foundFiles, saved.foundFiles)
         cloudBytesReady = saved.cloudBytesReady; cloudBytesTotal = saved.cloudBytesTotal
         cloudByteInventoryComplete = saved.cloudByteInventoryComplete
+        cloudOnDemand = saved.cloudOnDemand; sampledOriginals = saved.sampledOriginals
+        sampledReceivedBytes = saved.sampledReceivedBytes
     }
     static func cumulative(_ base: UInt64, _ current: UInt64) -> UInt64 {
         let sum = base.addingReportingOverflow(current)

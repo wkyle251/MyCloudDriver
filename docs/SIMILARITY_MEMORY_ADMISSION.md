@@ -1,13 +1,13 @@
 # Memory-based analysis admission (2.2.17)
 
-Scan Resources has two amounts: **Analysis RAM** and **Download RAM**, displayed
-in GB. Editing either preserves the other; the calculated total cannot exceed
-the Mac's physical RAM. Automatic retains the hardware-derived RAM defaults.
-Pause & Adjust Resources, Save, and Save & Resume retain their existing behavior.
-Changing RAM does not invalidate completed vectors, comparisons or the pinned
-processing backend. Only Clear deletes a scan.
+App scans automatically rebalance Download/Read RAM and Analysis RAM under one
+pressure-aware allowance. Processing Options selects the backend; RAM has no
+user control. Old saved manual amounts are ignored. The allowance starts small,
+grows on demand, and pauses acquisition under system pressure without discarding
+held originals. Temporary reductions preserve queued files. Only Clear deletes
+a scan; its backend remains pinned so completed vectors stay compatible.
 
-New and resumed app scans send `memory_scheduling: true`. Saved `workers` and
+New and resumed app scans send `memory_scheduling: true` and `automatic_memory: true`. Saved `workers` and
 batch fields remain compatible but no longer define scan concurrency. FileTwin's
 legacy mode remains available to other hosts. Only the vendored package changes;
 the independent FileTwin checkout remains untouched.
@@ -22,16 +22,23 @@ The streaming scheduler admits work from a shared analysis-byte allowance:
 | Original handed over for analysis | Its download/staging reservation, transferred without copying |
 | Image/document reader's original copy | Exact original size, in addition to the original and decoder |
 | FFmpeg audio/video/HEIF/AVIF and UTF-8 original copy | None; reads the shared original |
+| Verified PikPak range original | One admitted RAM block and scan transport entitlement; extra blocks use spare capacity |
 
 Initial decoder allowances are capped by available configured memory after
 original and reader-copy costs. A native decoder can request a larger allowance
 and retry. Its previous decoder/copy reservation is released, while its original
-remains accounted for. The original returns to Download RAM if that queue has
-room; otherwise its Analysis RAM lease remains until retry or completion. Both
-transitions reserve the destination first, so no original is ever unaccounted for.
-If all work is waiting and retained originals prevent any retry from fitting,
-one input reports an actionable RAM shortage to let the others drain. Requests
-that cannot fit the whole Analysis RAM pool fail without waiting indefinitely.
+remains accounted for in Analysis RAM until retry or completion. Automatic
+admission waits for needed capacity up to the physical resource ceiling, rather
+than failing when a temporary soft allowance is small. Both source banks reserve
+a safe completion path through reader copies and decoding. Fixed-budget hosts
+retain their original explicit shortage behavior.
+
+Live download and staging allowances may be zero while pressure drains held
+originals. Actual reservations still count, but an unused source bank contributes
+zero bytes, so a ready input can use an exact-fit analysis allowance. New reads
+wait cancellably for capacity; unknown-size streams wait for a positive allowance
+before choosing their bounded claim. Initial encoder configuration and analysis
+allowances retain their positive minimum.
 
 Reading releases its allowance before a decoded input enters the ready queue.
 Reading never holds analysis RAM while waiting for original RAM; this prevents
@@ -44,6 +51,16 @@ and processing allowances belong to analysis. Total reservations remain bounded
 by the two configured pools; they do not force actual RSS to fill all 64 GB.
 Larger waiting inputs therefore do not block smaller ready inputs that fit.
 Completion, reuse, failure and cancellation release the associated reservations.
+
+Verified PikPak audio/video may be acquired as a seekable original instead of
+a complete RAM buffer. Its independently evictable range blocks stay charged
+to Download RAM during analysis; the decoder has its own Analysis RAM allowance.
+The first block and a scan transport entitlement are admitted together. A
+waiter releases the block if no entitlement is available. An active reader
+never waits for a new block reservation: it borrows immediately available spare
+capacity or recycles an admitted block. Pressure reduces its target cache size.
+This preserves progress when complete-original buffers already occupy the pool.
+Origin-level network admission remains enforced for each request.
 
 Progress reports the active **Analysing** count without a worker denominator and
 **Analysis RAM reserved** separately from Download RAM. Allowances are estimates
@@ -67,7 +84,16 @@ Validation covers mixed reader costs, a large retry borrowing the entire
 analysis pool while originals wait for RAM, smaller inputs passing larger ones,
 exact reader-copy accounting, reservation release, real image decoders and
 pause/resume with changed RAM. Matrix recovery retains all comparisons after
-both a pause and forced helper termination, even without the original files.
+both a pause and forced helper termination without rereading original content;
+fresh scope metadata is still required for before/after validation.
 Handoff tests exercise logical 40/24 GB budgets without allocating GB of fixture
 data, refill downloads while decoders run, verify retry backpressure/deadlock
 handling, and retain the analysis lease until every reader has stopped.
+
+Exact comparison uses bounded CPU workers and bounded result queues, sharing
+vectors rather than copying them per job. Exact float64 scores are stored in
+versioned chunks, with canonical cursor/count updates in the same transaction.
+Threshold grouping keeps its sorted edges, cluster links and pending merges in
+private disposable SQLite tables; its page cache shrinks on memory pressure.
+Neither comparison nor grouping imposes a fixed pair-count ceiling. Their total
+compute and disk requirements remain quadratic in each compatible profile.

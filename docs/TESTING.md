@@ -1,5 +1,101 @@
 # Testing MyCloudDriver
 
+## Automatic memory for Find Similar
+
+App requests set `automatic_memory`; saved manual RAM amounts are ignored on
+new scans and recovery. The settings sheet exposes only the processing backend.
+The helper starts with a small hardware-derived allowance, grows it on demand,
+and rebalances acquisition and analysis every 250 ms. This is admission
+accounting, not a preallocation or a measurement of process RSS. System pressure
+stops new downloads at warning level and pauses acquisition at critical level;
+active analysis drains, retained originals survive, and growth has a recovery
+hold. The physical-memory ceiling is a final resource boundary.
+
+Originals transfer to analysis without copying. Both source banks account for
+the reader/decoder headroom needed to complete their buffered files, preventing
+prefetch from filling every available byte and blocking analysis. Temporary
+allowance reductions wait rather than fail otherwise admissible queued files.
+Low-level fixed-budget requests remain supported for compatibility and fixtures.
+
+```sh
+python3 scripts/with-client-credentials.py cargo test --locked --offline --lib similarity::
+cargo test --locked --offline --manifest-path vendor/FileTwin/Cargo.toml -p filetwin-core --lib --test native_contract -- --test-threads=1
+swiftc -swift-version 5 -parse-as-library macos/SimilarityResources.swift scripts/SimilarityResourceTests.swift -o /private/tmp/mycloud-similarity-resource-tests
+/private/tmp/mycloud-similarity-resource-tests
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer scripts/build-native-test.sh scripts/SimilarityRAMPauseTests.swift /private/tmp/mycloud-similarity-ram-pause-tests
+/private/tmp/mycloud-similarity-ram-pause-tests dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources
+python3 scripts/test-similarity-memory-images.py dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources --automatic
+```
+
+The policy tests inject pressure and a clock, and cover growth beyond old caps,
+large-original borrowing, recovery and retained leases. Native contracts exercise
+source/analysis waits, temporary critical pressure, decoder retries and a logical
+20 GiB zero-copy handoff without allocating 20 GiB. The loopback cloud fixture
+checks continued acquisition while analysis is busy and identical final results.
+Review regressions also cover ungranted receive windows staying out of shared
+accounting, partial originals draining before a large retry, read lookahead when
+all processing slots hold retries, and idle model processes exiting at critical
+pressure. At the physical ceiling, a working set that cannot progress reports
+one blocking file's resource failure and finishes the others instead of hanging.
+The logical-capacity tests use tiny fixture bytes, not multi-gigabyte allocations.
+`SimilarityResumeTests.swift` covers same-helper resume, legacy-setting migration
+and backend pinning. `SimilarityAutoMemoryUITestApp.swift` displays the production
+settings/progress views with synthetic normal, warning and critical states.
+
+## Scalable comparisons and seekable cloud media
+
+Similarity cache regressions cover unchanged-source hits without recompression
+or repeated writes, corrupt payload repair, GCID/size/profile aliases across
+cloud file IDs, account/backend isolation and age-preserving alias migration.
+Exact-copy identity tests combine full SHA-256 and range GCID records in both
+completion orders without rewriting their truthful cache IDs. Previews, changed
+sources and inconsistent original sizes must not gain exact-copy evidence.
+
+Comparison tests retain more than four million exact scores and check the
+first, middle and final rows. They compare parallel scores bit-for-bit with
+the reference cosine, including signed zero, migrate old row checkpoints,
+interrupt upgrades and verify cancellation/progress-sink cleanup. The larger
+disk-backed grouping regression is explicitly opt-in:
+
+```sh
+python3 scripts/with-client-credentials.py cargo test --locked --offline --lib similarity::
+python3 scripts/with-client-credentials.py cargo test --locked --offline --lib similarity::grouping::tests::more_than_four_million_qualifying_edges_group_completely -- --ignored
+```
+
+Both generated comparison-process scripts now use 5,000 files and 12,497,500
+pairs. They read transactional committed progress in the compact format, retain
+the old row-format fallback, and request interruption after durable first-chunk
+progress. Resume checks validate every stored chunk score and recover without
+rereading original content; scope metadata validation remains required. Live Pause checks that committed progress stops while the
+same helper remains alive.
+
+```sh
+python3 scripts/test-similarity-live-pause.py dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources
+python3 scripts/test-similarity-resume.py dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources
+python3 scripts/with-client-credentials.py cargo build --locked --offline --release --lib
+python3 scripts/test-similarity-cloud-video-ranges.py --resources dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources
+python3 scripts/test-similarity-cloud-video-ranges.py --resources dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources --pause-seconds 35
+```
+
+Listing regressions overlap independent folder pages while preserving each
+folder's page chain and selected scope, enforce the eight-request bound, and
+exercise shared Retry-After cooldowns. Empty folder trees honour Pause/Cancel
+without needing a file callback. Repeated page tokens, denied folders and
+interrupted inventories remain incomplete; neither full before/after comparison
+validation pass may certify removals from a partial listing. Numeric
+folder/page/file progress is checked in Rust and the Swift progress fixtures.
+
+Use a freshly rebuilt protocol-v5 helper and worker together. The cloud-media
+fixture compiles a driver against the matching release library, serves generated
+MP4 originals from loopback HTTP, and compares a full-input vector with one
+read through ranges across a 512 MiB sparse container gap. It rejects complete
+retrieval of the ranged original, checks actual fetched bytes, checks vector
+agreement and temporary-content cleanup, and can pause an active range read
+longer than the former 30-second decoder socket timeout. It uses no real
+account, cloud data or user files. Rust range fixtures cover malformed/ignored
+ranges, changed validators and GCIDs, Guest-to-User handoff, retries, pressure,
+transport/RAM admission and server-local cancellation.
+
 ## Download setup and receiving independence
 
 ```sh
@@ -51,11 +147,16 @@ env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer scripts/build-nativ
 Disk Trash tests cover persistent original locations, duplicate names, repeated
 Undo/Redo, Put Back conflicts and missing parents, emptying a confirmation's
 snapshot, history invalidation, symlink/replaced/read-only/disconnected disks,
-and preservation of unrelated contents in an existing Trash folder. Only marked
-`Trash/MyCloudDriver` entries are managed. Connected external and network drives
-prepare this storage in the background; native internal/iCloud Trash behavior is
-unchanged. Both mounted-volume checks use exclusively generated files. The HFS+ disk image
-uses an explicit Trash root because macOS gives disk images unknown external
+and preservation of unrelated contents in an existing Trash folder. App-owned
+storage uses a stable, hidden UUID container, excluded from Browser and scans.
+Tests cover concurrent initialization, refusing unmarked namespace collisions,
+legacy `Trash/MyCloudDriver` migration/merging with entry IDs and Undo preserved,
+duplicate-entry preflight without overwrites or partial migration, and
+read-only legacy listing without writes. Ordinary user Trash folders remain
+visible; migration removes only an empty old wrapper. Connected external and network drives
+prepare this storage in the background. Mounted HFS+, APFS and ExFAT fixtures
+check hidden storage, Trash/restore and read-only/disconnected behavior using
+exclusively generated files. Disk images use an explicit Trash root because macOS gives them unknown external
 flags; the network fixture also verifies automatic share-root selection without
 opening or creating Trash among existing share contents.
 
@@ -249,11 +350,82 @@ damaged without a trace fails the final check, withdraws the trust, and is then 
 own (one 16 MiB range, not the file); and that the final check leaves a good journal alone.
 Duplicate fixtures cover multiple disk and PikPak roots, local content hashes,
 newer-folder recommendations, and changed or disconnected disk keepers. Repeated
-scans fetch all current PikPak folder listings, ignore a stale account inventory,
-and create no scan cache. Disk checks read matching-size candidates again, detect
-edits and removals without saved hashes, and accept older scope files with unused
-volume metadata. The removed `--refresh-cache` flag is rejected. Download
-fixtures cover durable share reuse, uncertain creation and cancellation, anonymous
+scans fetch all current PikPak folder listings and ignore a stale account inventory.
+Cross-drive disk checks keep verified GCID/conditional MD5 hashes in a private
+SQLite cache with hashed path keys. Hits require matching inode, size,
+nanosecond modification and change times, plus matching open-file and path metadata.
+Local APFS/HFS hits permit a changed temporary device number after remount;
+SMB hits also require the recorded device number to match.
+Coarse/unknown change timestamps and unsupported filesystems are rehashed. Cache
+errors fall back to reads. Valid completed download receipt GCIDs take priority
+over the computed cache and MD5 requirements, assuming downloaded contents have
+not changed. Recorded inode, size, timestamps and device are ignored for receipt
+reuse on local and SMB mounts; filename/source or owned recovery-route binding
+is still required. Assumed receipt GCIDs are not written into the verified hash
+cache. Index limits and memory pressure use a streaming receipt lookup rather
+than causing a full content read.
+Directory receipt indexes initialize independently without holding the shared
+LRU lock during filesystem I/O.
+Fixtures verify cache reuse across reopen, MD5 enrichment, same-size edits with
+restored modification time, replacements and symlinks, corrupt-cache fallback,
+remount reuse, no-read receipt reuse after edits/copies and stale metadata,
+invalid/unfinished receipt and wrong-filename rejection. Files without receipts
+still detect edits; before Trash, current scan identities detect edits and
+removals since the scan. Scopes accept older scope files with unused
+volume metadata. The removed `--refresh-cache` flag is rejected. Parallel scan
+fixtures use explicit worker counts to verify identical serial/parallel results,
+unique-size skips, conditional MD5 only for cloud fallback sizes, and changed-file
+isolation. Content hashing starts with at most two readers, then tests both larger
+and smaller pools using fresh byte-throughput windows. A smaller pool is retained
+when it preserves at least 98% of throughput; growth still requires a measured gain.
+Both native and cross-drive workers park between chunks when a smaller trial starts,
+preserving partially hashed files. Completion promotes waiting readers, and
+cancellation wakes them. RAM/descriptor capacity is
+an outer resource bound, without a fixed 4/40-file ceiling. Injected-clock policy
+tests cover growth past 40, rejection at a bandwidth plateau, warning reduction,
+critical-pressure admission pause, and a 30-second recovery hold. Completion-gap
+fixtures keep a pending backlog while observing one fewer active
+worker after each short file; useful throughput must still grow beyond 40.
+Native admission covers the same completion gap. Scans use the
+same host memory-pressure signal as Download RAM and stream file contents; the
+OS file cache manages spare RAM. Cross-drive disk discovery also uses adaptive
+admission, overlaps directory listing with batches of metadata requests, and
+resolves only selected roots rather than every descendant. Generated fixtures
+verify bounded metadata concurrency, serial/parallel inventory equivalence,
+overlapping and hidden selections, hard links, symlink exclusion, and partial
+results after a child disappears. Discovery reports immediately and every
+250 milliseconds even while a storage call is blocked. The native task-activity
+fixture verifies the discovery label, the transition to content checking, and
+that progress updates refresh only the activity footer. Content-check progress
+also reports cumulative bytes read and active/queued files, with a timer
+heartbeat while reads are blocked; its native fixture advances byte counts
+without completing a file, so large SMB originals do not appear idle.
+Cloud retries leave sibling requests running;
+authentication/root failures abort and drop outstanding requests, and provider
+throttling lowers admission while preserving Retry-After.
+
+```sh
+python3 scripts/with-client-credentials.py cargo test --release --locked --offline --bin pikpak duplicate_hashing_speed_benchmark -- --ignored --nocapture --test-threads=1
+python3 scripts/with-client-credentials.py cargo test --locked --offline --bin pikpak duplicate_cloud_listing_speed_benchmark -- --ignored --nocapture --test-threads=1
+python3 scripts/with-client-credentials.py cargo test --release --locked --offline --bin pikpak worker_count_benchmark -- --ignored --nocapture --test-threads=1
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./scripts/build-native-test.sh scripts/NativeDuplicateScanTests.swift /private/tmp/mycloud-native-duplicate-tests
+/private/tmp/mycloud-native-duplicate-tests --benchmark
+```
+
+The hashing benchmarks generate 16 files of 16 MiB and compare identical groups.
+The Rust benchmark compares the previous serial GCID+MD5 work with four GCID
+workers; the native benchmark compares one and four SHA-256 workers. Files will
+usually be in the OS cache after generation, so these measure hash/worker speed
+rather than cold external-disk throughput. The cloud benchmark uses 25 generated
+folders with 50 ms per listing and makes no account requests. No benchmark
+asserts a hardware-dependent speed threshold.
+The worker-count benchmark uses 80 files of 16 MiB so that all 40 workers can
+run. It compares GCID-only work at 1, 2, 4, 8, 16, 24 and 40 workers, reports the
+median of five trials with rotating order, and verifies identical complete
+reports. Its cloud counterpart uses 81 synthetic folders and compares 4, 8, 16
+and 40 requests without rate limits; it does not measure PikPak's real capacity.
+
+Download fixtures cover durable share reuse, uncertain creation and cancellation, anonymous
 Guest requests, Guest-prefix/User-suffix recovery, and admission beyond 64 while
 retaining bandwidth backoff and the shared descriptor budget.
 The speed-history fixtures verify time-weighted averages, stalls, pauses, helper
@@ -1023,15 +1195,23 @@ area. Compile **one entry point at a time**; each declares `@main`.
 | `LocalDiskWorkspaceTests.swift` | Four-drive Browser entry, local folder/volume selection, symlink/root boundaries, and Show in Folder routing that opens and selects the original local or PikPak file. |
 | `ExternalDiskCatalogTests.swift` | Generated mounted-volume metadata: separate external/network groups, read-only filtering, duplicate names, disk identity, UUID-less SMB identity with credentials removed, server/share replacement, mount/unmount/rename refresh and observer cleanup. A blocked metadata loader proves that the UI remains responsive, refresh requests coalesce, stale results do not publish and closing rejects pending results. No real volumes are enumerated. Include `MountedVolumeIdentity.swift` when compiling this standalone test. |
 | `DownloadRecoveryTests.swift` (speed monitor) | Pause All, or every unfinished file paused, holds the download speed monitor still: no samples, the active time and average are not diluted, the time remaining does not stretch, resuming records the pause as one flat gap, and a file paused while another runs does not pause it. |
-| `DownloadRecoveryTests.swift` (idle sleep) | One macOS activity per downloading workspace; repeated heartbeats retain it. Pause permits sleep after RAM, verification and checkpoints finish; Resume and normal-Quit draining reacquire it. Completion, failure and close release it, and closing one owner does not release another's activity. A direct `pmset -g assertions` check verifies creation and release of `PreventUserIdleSystemSleep` without disabling display sleep. |
-| `NativeMeasureProgressTests.swift` | Recalculate size progress on generated folders: one folder shows a running tally of files and size ("so far") with no invented percentage; several folders advance a bar one finished folder at a time (never backwards, ending full) and keep the tally; repeated folders and files in the selection still finish the bar. |
-| `NativeDuplicateScanTests.swift` | Generated native duplicate scans: every run hashes matching-size files again, ignores hidden files and symlinks, detects same-size edits with restored modification time, additions and removals, and sends cross-drive scope requests without hash-cache metadata. No persistent scan cache or cloud credentials. |
+| `DownloadRecoveryTests.swift` (idle sleep) | One full-wake macOS activity per downloading workspace; repeated heartbeats retain it. Pause permits sleep after RAM, verification and checkpoints finish; Resume and normal-Quit draining reacquire it. Completion, failure and close release it, and closing one owner does not release another's activity. Full-wake options prevent idle system/display sleep and App Nap. |
+| `WorkWakeMonitorTests.swift` | Full-wake options, balanced activity/report ownership, independent owners and a generated numeric heartbeat that stays fresh while the main actor is busy. Checks private permissions, schema and heartbeat shutdown without changing real power settings. |
+| `SimilaritySleepPreventionTests.swift` | Generated helper/provider lifecycle: active scans, retained-RAM pause/resume, Finish, interrupted checkpoints, cancellation and provider cleanup, independent models, shutdown, duplicate-only scans and model deallocation retain protection through final pipe/report drain. |
+| `DuplicateSleepPreventionTests.swift` | Injected cloud duplicate activity lifecycle, cancellation, independent owners and model closure/deallocation through helper/report drain. `NativeDuplicateScanTests.swift` also blocks a generated hash worker and verifies cancellation cannot release its activity before the worker finishes. |
+| `test-remote-fullwake-guard.py` | Mocked closed-lid/AC policy, crash-safe restoration, stale/invalid/idle numeric heartbeat handling, overlapping downloads/scans and bounded unavailable-state grace. Tests never change host power settings or inspect real process arguments. |
+| `NativeMeasureProgressTests.swift` | Recalculate size progress on generated folders and disposable APFS/ExFAT disk images: one folder shows a running tally with unknown total; several folders advance by completed roots; a whole disk or Select All at its root uses bytes over approximate used disk space. Partial root selections and iCloud never inherit disk totals. Checks scan speed and ETA against elapsed time, startup, zero-byte files, unknown totals and logical bytes exceeding disk usage. Finalizing subfolder totals is explicit, stays below 100% and remains cancellable; completed scans reach 100%. |
+| `NativeDuplicateScanTests.swift` | Generated native duplicate scans: every run hashes matching-size files again, ignores hidden files and symlinks, detects same-size edits with restored modification time, additions and removals, and sends cross-drive scope requests without hash-cache metadata. Verifies explicit worker limits, unchanged groups/inventory order, a two-reader warm start, growth past 40, smaller-reader trials, paused-reader promotion/cancellation, injected critical-pressure pause/recovery, and cancellation while memory-paused. Capacity is based on RAM/descriptors and measured throughput. Optional `--benchmark` compares one and four workers on 256 MiB of generated files. Native hashes have no persistent cache or cloud credentials. |
 | `ExternalDiskWorkspaceTests.swift` | Generated folders with injected volume metadata: external/network browsing and titles, return to the Mac folder, stale/wrong-disk rejection, download destination identity, independent windows, internal search/reveal routing, disk/share disconnect/reconnect recovery and Expand All Levels over several folders on an external disk and a network share. |
 | `TransferRowPaginationTests.swift` | Fixed-size transfer row windows, page navigation and shrinking queues, empty/negative inputs, large queues and overflow-safe bounds. Only visible page rows are passed to the list; full queue processing is unchanged. |
-| `SimilaritySessionTests.swift` | Separate four-drive scan scopes/results; Home → Scan drive discovers paused cloud/native scans with saved RAM/time settings, fresh ownership claims and account isolation; status dismissal/window close retain state; explicit Clear cancels and cleans up without late results. |
+| `SimilaritySessionTests.swift` | Captured cloud/native scan scopes/results; revisiting their owning coordinator discovers saved scans with RAM/time settings, fresh ownership claims and account isolation; status dismissal/window close retain state; explicit Clear cancels and cleans up without late results. |
 | `NativeListingTests.swift` | Large-folder listing. iCloud-only resource keys (about 1.2 s per 50,000 files, against 0.07 s without them) are requested only by the iCloud Drive browser or for a folder that is itself in iCloud. An ordinary folder lists rows identical to the full-key path (names, folders first, sizes, revisions, types, downloaded state), skips links and hidden files and still filters by search. File types are remembered per extension, equal to the direct lookup, safe from many threads and bounded. |
 | `NativeThumbnailCacheTests.swift` | Shared grid/list/preview readers, visible priority, cancellation and late results, bounded decoded-image memory, revision/root keys, unavailable thumbnails and iCloud placeholders, current-folder pagination/cycle protection, and real Quick Look prefetch using a generated PNG. Folder warming stops after a bounded number of images (the cache holds only a few hundred) without reading further pages, and starts at the selected file and wraps. |
-| `SimilarityFileActionTests.swift` | Original-provider Trash routing for all four drives; Keep Smallest groups/batches, ties, overlap, retained-file checks, partial acknowledgements, duplicate clicks, stale sessions and one-step Undo/Redo. Real Trash tests restore only synthetic local files. Uses synthetic accounts/assets only. |
+| `SimilarityFileActionTests.swift` | Original-provider Trash routing for all four drives; Keep Smallest and Keep Largest groups/batches, ties, overlap, retained-file checks, partial acknowledgements, duplicate clicks, stale sessions and one-step Undo/Redo. Real Trash tests restore only synthetic local files. Uses synthetic accounts/assets only. |
+| `SimilarityAcrossDriveTests.swift` | One-location readiness/recursive inventory, empty-scope rejection, folder-granular cloud removal, default Across entry routing, A+B → A+C stable identities, saved provider provenance, account/scope validation, mixed-provider Keep Largest, global keeper preflight, partial receipts and original-provider Undo. All content is generated. |
+| `SimilarityAcrossDriveRevealTests.swift` | Captured Photos and outside-root Local reveal, original ID/path/revision checks, busy/closed owner guards and preserved Undo. Uses generated providers and files only. |
+| `SimilarityAcrossDriveScopeUITests.swift` | In-process generated compact Locations panel and scan window: source menu, removable rows, bounded list height, no drive selector, and Start Scan readiness at the minimum window size. Optional `--scope-ui-image=/private/tmp/mycloud-similarity-scope296.png` renders only the fixture's backing view for visual review. |
+| `test-similarity-across-drive-native.py` | Packaged helper and FileTwin worker: generated folders share one comparison and cache, including A+B → A+C → A+B reuse, exact and edited content. Runs without accounts or real libraries. |
 | `SimilarityScopePickerTests.swift` | Direct folder selection, paging/deduplication, ancestor routes, loading and access errors, stale replies, close cancellation, and iCloud scan scope independent of Browser. |
 | `NativeDriveTests.swift` | iCloud path boundaries, copying/rollback, cleanup revalidation, Undo/Redo, folder merge, Photos membership planning, search cancellation, concurrent native scans and Photos staging cleanup. A delayed provider withholds its second file until the first is analysed, proving discovery and analysis overlap. The Local Disk and iCloud size walk must match a full item scan (hidden items, symbolic links and overlapping selections excluded), including each folder's own total with throttled progress, and listed items must keep the identity a scan gives the same file. Pass the built app's Resources path to include real engine scans. |
 | `NativeFolderSizeTests.swift` | Calculate on a folder shows the row spinner (also on unsized folders below it, never on files or unrelated folders), then sizes that folder and every subfolder, whether already expanded or expanded later; several selected folders are sized together; a refresh discards the sizes. Runs on generated folders and on newly created APFS, case-sensitive APFS, HFS+ and ExFAT disk images for the external-disk case, with folder names containing spaces and accents so a listing and the size walk must agree on each file system's name form; never touches a real disk. Needs full Xcode (`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`) when `xcode-select` points at the Command Line Tools. |
@@ -1072,10 +1252,14 @@ area. Compile **one entry point at a time**; each declares `@main`.
 | `TaskActivityTests.swift` | File-menu tasks, footer progress, results, and account-scoped updates. |
 | `SimilarityTests.swift` | 5% minimum score, upstream raw counters, real saved-score row queries, tree identity, score precision, unmatched/skipped files, source isolation, cancellation and cleanup. Also covers automatic recovery of an interrupted scan (bounded attempts, budget reset on progress, user actions ending it) and the engine `note:` filter that keeps a status line from masking a real failure. Pass the built app's `Contents/Resources` path as its first argument. |
 | `SimilarityTreeExpansionTests.swift` | Expand/collapse 250 groups, visible selection after collapse, search/regroup persistence, individual toggles, repeated commands, mode switches and whole-percent cutoff values. |
+| `DuplicateResultsResponsivenessTests.swift` | 100,000 generated native files and 100,000 cross-drive files, including a 50,000-member group. Measures main-actor responsiveness, prepared tree installation, repeated selection redraws and checkbox toggles; verifies bounded pages/ranges, complete page coverage, cached cleanup plans, keeper protection, byte overflow/reversal, Trash/Undo visibility and rejection of cancelled result preparation. Uses an isolated scroll view and synthetic metadata only; never inspects the running app or real user files. Compile with `scripts/build-native-test.sh`. |
 | `BrowserDragDropTests.swift` | Drag targets across full rows, nested/file parents, blank space, thumbnails, clipping, scrolling, spring loading and rejection; Finder providers with native NSURL, async ordering, Unicode paths, atomic failure and root deduplication; release handoff geometry, provider capture and destination capture. Compile with `-D BROWSER_DROP_TESTS`. |
 | `BrowserFolderExpansionTests.swift` | Direct Expand All Levels action with no submenu, correct callbacks and fresh menu instances, cached fixed-size template icons at 1x/2x, and expansion plans covering cycles, duplicate IDs, repeated page tokens and partial-failure totals. Compile with `-D FOLDER_EXPANSION_TESTS`. |
 | `CloudExtractionTests.swift` | Dynamic-mode extraction using same-account Normal login while retaining the selected Token connection, account-only helper authorization across mode changes, missing/expired/removed connection rejection, explicit User-mode permission retries, blocked extraction requests, parallel progress/selection, memory-only passwords, cancellation, bounded batch inspection and wrong-password retry. Compile with `-D ARCHIVE_TASK_TESTS` and pass a built `CloudExtractionFixtureEngine` as its first argument. |
 | `FileSearchTests.swift` | Search pagination, Unicode, ranking, limits, paths, navigation, cache replacement and redaction; offline local scope with duplicate link identities; transfer selection layouts and output collisions; Finder drop formats; and a live helper covering progressive root results, scope/cache isolation and cancel/reset races. Compile with `-D FILE_SEARCH_TESTS` and pass a built `FileSearchFixtureEngine` as its first argument to include the live-helper section. |
+| `NativeFileSearchMetadataTests.swift` | Generated metadata-only filesystem pages, unreadable file names, folder/symlink/hidden policies, cancellation and root containment; 5,000 names with a main-actor heartbeat. |
+| `NativeFileSearchTests.swift` | Shared native search scanner/model: bounded concurrent pages, live results, Unicode, cycles, partial failures, context cache isolation, successful-rescan pruning, cancellation and explicit retry. The focused build defines `NATIVE_FILE_SEARCH_FOCUSED_TESTS`. |
+| `NativeFileSearchIntegrationTests.swift` | Shipping NativeDriveModel/palette: zero-I/O expanded rows, deep files/folders, cached reveal, reconnect races, filesystem volume validation, disconnected status and Photos isolation. Uses generated providers and files only. |
 | `FolderSizeCacheTests.swift` | Exact and recursive deletion with ancestor updates and sibling preservation, overlapping multiselection, new folder/file insertion, moves across common ancestors, dirty-branch repair with clean-subtree reuse, size seeds limited to clean descendants, and complete-listing reconciliation that stays safe for unknown folders. With `-D FOLDER_SIZE_TESTS` it also checks that opening a folder for the first time during a scan keeps the scan while a changed listing still discards it, and that the saved-size store rereads a file replaced on disk. Compile with `-D FOLDER_SIZE_TESTS`; `cargo test --bin pikpak folder_measurement` covers the bounded concurrent walk. |
 | `GuestModeTests.swift` | Guest Mode behaviour alongside the live download queue and retry suites. Its results appear under the download-queue PASS lines rather than its own. |
 | `ICloudStorageTests.swift` | Quota parsing for personal, legacy, zero and enterprise responses plus invalid/ambiguous ones; a bounded read-only helper process covering missing commands, oversized output, timeout and cancellation; and refresh deduplication with truthful error state. Add `--live` to query the real macOS iCloud account. |
@@ -1403,7 +1587,7 @@ original or a middle window and create another; shared work and existing window
 geometry must survive. Verify that Settings has no transfer-worker field and
 that there is no Split menu. At narrow
 widths the sidebar overlays from the left edge; short sidebars and Home scroll.
-Fixture → Find Similar Files opens the four-drive source menu and Scan Resources
+Fixture → Find Similar Files opens the four-drive source menu and Processing Options
 controls. Verify Automatic/Custom integer fields and Right/Bottom preview placement.
 Use its Fixture menu to switch appearance, resize to the minimum window size
 and show scan progress. Check that entering any drive opens Browser, preserves
@@ -1629,31 +1813,20 @@ pause exclusion, restored-counter baselines, stage ETA and bounded history.
 comparison speed charts. Resource tests include Automatic/CPU Only and
 legacy resource preference compatibility.
 
-## Resource changes on resume (2.2.16)
+## Resource changes on resume (legacy fixed-budget compatibility)
 
-`SimilarityResumeTests.swift` also runs the real helper through pause, resource
-edits and repeated resumes. It checks memory-based admission in helper progress,
-lowered RAM budgets, atomic descriptor persistence, unchanged completed-file
-reuse, backend pinning, unchanged app defaults and recovery in a new window.
-Edits are rejected while running, for a stale session and for invalid Download
-RAM. `SimilarityResourceTests.swift` covers restoring an editor from the scan's
-own settings and older CPU checkpoints.
+`test-similarity-resume.py <Resources>` still exercises low-level fixed-budget
+requests, lowering and increasing allowances while resuming a committed matrix.
+Originals are made unavailable after analysis; all scores must remain retained.
+App scans now ignore those old amounts. `SimilarityResumeTests.swift` and
+`SimilarityRAMPauseTests.swift` verify automatic-memory migration, pinned
+backends, atomic descriptors, same-helper resume and retained partial originals.
+The resource editor is no longer present.
 
-`test-similarity-resume.py <Resources>` lowers then increases RAM limits while
-resuming a partially committed matrix. Original files are made
-unavailable after analysis; all expected scores must still be retained.
+## Memory-based admission (2.2.17+)
 
-`SimilarityResumeUITestApp.swift` uses two synthetic documents. Start a scan,
-choose Pause & Adjust Resources, edit limits, then verify Save leaves it paused
-and Save & Resume continues with the new limits. The fixture's Continue Sample
-Discovery command lets the second document finish. It has no cloud credentials.
-
-## Memory-based admission (2.2.17)
-
-`SimilarityResourceTests.swift` checks independent Analysis RAM and Download RAM
-editing, calculated totals, hardware ceilings and legacy worker migration.
-`SimilarityResumeTests.swift` verifies that old worker preferences no longer
-constrain resumed helpers while the changed RAM limits appear in live progress.
+`SimilarityResourceTests.swift` checks automatic app requests, ignored custom
+preferences, hardware starting allowances and compatibility with old sessions.
 `test-similarity-memory-images.py <Resources>` runs real JPEG, HEIC and AVIF
 readers with memory scheduling enabled and a deliberately small legacy worker
 value. All originals must use memory transport and leave no processing files.
@@ -1867,7 +2040,8 @@ disconnection handling, inventory refresh ownership and decreasing UI totals.
   close retention, cancelled partial reports, resume without refetching completed
   originals, crash recovery and Clear of a paused helper.
 - `python3 scripts/test-similarity-resume.py dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources`:
-  comparison checkpoint and abrupt process recovery, parent disappearance.
+  compact comparison checkpoint and abrupt process recovery across 12,497,500
+  generated pairs, old-format fallback, exact chunk validation and parent disappearance.
 
 Cloud continuation follows [RFC 9110 ranges](https://www.rfc-editor.org/rfc/rfc9110.html#section-14)
 and [If-Range](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.5).
@@ -1879,7 +2053,7 @@ and [If-Range](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.5).
 
 - `python3 scripts/test-similarity-live-pause.py dist/AppBuild.noindex/MyCloudDriver.app/Contents/Resources`:
   cooperative comparison pause freezes committed scores, keeps the same helper
-  and resumes to the full matrix.
+  and resumes to all 12,497,500 generated comparisons.
 # Similarity cache and scan layout (2.2.22)
 
 - `python3 scripts/with-client-credentials.py cargo test --lib similarity::`
@@ -2564,6 +2738,21 @@ and non-HTTP original URLs use a typed unavailable result, allow a valid origina
 media candidate or Dynamic account fallback, and never reach Reqwest's builder.
 Repeated fresh metadata with no valid original URL follows the native app's
 three-confirmation failure policy instead of retrying indefinitely.
+Authenticated account and shared-file URL lookups refresh missing originals once;
+Guest remains strict and throttling/transport errors retain their policy. Fixtures
+cover OAuth and PAT downloads with unavailable Guest originals, a missing first
+User response followed by a valid original, bounded all-missing responses, and
+failure messages that state User fallback was attempted. Metadata-only similarity
+revision checks continue working without a downloadable original.
+Native retry fixtures also cover an interrupted parent whose files have all
+reached confirmed final failure: no new automatic timer or parent replay is
+allowed. Incomplete discovery and transient siblings still retry, while manual
+Return Interrupted to Queue remains available. Generated restored-queue tests
+omit both GCID and parent metadata and use a stale cloud path. A matching
+completed account/source/size receipt skips all path, URL and body requests;
+completion is revalidated under the output lease. Known different revisions
+and same-size local edits with restored mtime are not adopted by this download
+recovery path. The duplicate scanner's receipt-trust policy is unchanged.
 
 Transparent ranged HTTP errors retain their status and Retry-After policy:
 429/5xx responses and truncated bodies stay retryable, while signed-link

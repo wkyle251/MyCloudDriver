@@ -101,6 +101,7 @@ fn edits_after_native_acquisition_cannot_relabel_old_analysis() {
     let path = root.path().join("generated.txt");
     std::fs::write(&path, b"before").unwrap();
     let mut file = scope::InputFile::external(ExternalSource {
+        provider: None,
         content_kind: None,
         id: "native-generated".into(),
         name: "generated.txt".into(),

@@ -106,6 +106,7 @@ impl Checkpoint {
             CREATE TABLE IF NOT EXISTS sealed_files(ordinal INTEGER PRIMARY KEY, payload BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS origins(id TEXT PRIMARY KEY, revision TEXT, newly INTEGER NOT NULL,
                 reused INTEGER NOT NULL, finished INTEGER NOT NULL);")?;
+        db.execute("INSERT OR IGNORE INTO metadata VALUES('source_cache_generation',0)", [])?;
         // Runtime paths and credentials are deliberately excluded. Account and
         // drive isolation comes from the host's private data directory.
         let identity =
@@ -267,6 +268,7 @@ impl Checkpoint {
             "INSERT OR REPLACE INTO origins VALUES(?1,?2,?3,?4,?5)",
             params![file.display.id, revision, values.0, values.1, values.2],
         )?;
+        tx.execute("UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='source_cache_generation'", [])?;
         tx.commit()?;
         let old = previous
             .map(|(_, newly, reused, _)| (newly, reused))
@@ -589,6 +591,7 @@ mod tests {
         let path = root.path().canonicalize().unwrap().join("original.txt");
         std::fs::write(&path, "first").unwrap();
         let file = scope::InputFile::external(ExternalSource {
+            provider: None,
             content_kind: None,
             id: "local:test".into(),
             name: "original.txt".into(),

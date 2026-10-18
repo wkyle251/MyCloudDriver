@@ -12,6 +12,8 @@ struct Row {
     state: &'static str,
     attempt: u32,
     retry_seconds: u64,
+    on_demand: bool,
+    cloud: bool,
 }
 struct Entry {
     row: Row,
@@ -48,6 +50,8 @@ impl Downloads {
                     state: "connecting",
                     attempt: 1,
                     retry_seconds: 0,
+                    on_demand: false,
+                    cloud: true,
                 },
                 sampled: Instant::now(),
                 sample_bytes: 0,
@@ -109,11 +113,23 @@ impl Downloads {
                 }
             })
             .sum();
+        let full_received_bytes: u64 = rows.iter().filter(|r| !r.on_demand)
+            .map(|r| if r.total > 0 { r.received.min(r.total) } else { r.received }).sum();
+        let sampled_received_bytes = received_bytes.saturating_sub(full_received_bytes);
+        let cloud_full_received_bytes: u64 = rows.iter().filter(|r| r.cloud && !r.on_demand)
+            .map(|r| if r.total > 0 { r.received.min(r.total) } else { r.received }).sum();
         rows.truncate(128);
-        json!({"items":rows,"total":count,"omitted":count.saturating_sub(128),"speed":speed,"received_bytes":received_bytes})
+        json!({"items":rows,"total":count,"omitted":count.saturating_sub(128),"speed":speed,"received_bytes":received_bytes,
+            "full_received_bytes":full_received_bytes,"cloud_full_received_bytes":cloud_full_received_bytes,"sampled_received_bytes":sampled_received_bytes})
     }
 }
 impl Ticket {
+    pub fn native(&self) {
+        self.downloads.rows.lock().unwrap().get_mut(&self.id).unwrap().row.cloud = false;
+    }
+    pub fn on_demand(&self) {
+        self.downloads.rows.lock().unwrap().get_mut(&self.id).unwrap().row.on_demand = true;
+    }
     pub fn id(&self) -> u64 {
         self.id
     }

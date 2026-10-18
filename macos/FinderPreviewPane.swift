@@ -59,6 +59,7 @@ struct FinderPreviewPane<Header: View, Media: View, Details: View>: View {
                         ScrollView { details().frame(maxWidth: .infinity, alignment: .leading).padding(18) }
                             .frame(width: 360, height: 270)
                     }
+                    .onReceive(NotificationCenter.default.publisher(for: FinderPopover.dismissAllNotification)) { _ in showsDetails = false }
             }
             GeometryReader { viewport in
                 let layout = FinderPreviewGeometry(available: viewport.size, requestedHeight: liveHeight ?? CGFloat(savedHeight))

@@ -305,8 +305,17 @@ pub async fn run(account: &Client, args: Args) -> Result<()> {
                                 // Old persisted queue entries have only ID/name/size.
                                 // Resolve their folder without using the quota-gated
                                 // file endpoint, and never substitute a same-named ID.
+                                // An already delivered file must not depend on
+                                // its old cloud path still resolving to this ID.
+                                let completed_history = if client.content_mode().tries_guest() && task.file.parent_id.is_none()
+                                    && task.file.hash.as_deref().is_none_or(|value| value.trim().is_empty()) {
+                                    let account = transfer_control::metadata_interruptible(&body.id, client.tokens().user_id()).await??;
+                                    let output = task.output_directory.join(safe_component(&task.file.name)?);
+                                    download_receipt::completed_source_from_history(&output, &format!("account:{account}"),
+                                        &task.file.id, task.file.size).await?.is_some()
+                                } else { false };
                                 let resolved;
-                                let file = if client.content_mode().tries_guest() && task.file.parent_id.is_none() {
+                                let file = if client.content_mode().tries_guest() && task.file.parent_id.is_none() && !completed_history {
                                     let key = crate::download_preparation::Key::new(format!("path:{}", task.remote_path), &task.file.id, Some(client.content_mode()));
                                     let result = if let Some(file) = task.retry_state.preparation.resolved(&key) {
                                         Ok(file)

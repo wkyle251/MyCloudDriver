@@ -22,7 +22,10 @@ struct DriveConnectionFeedback {
     let photos: NativeDriveModel
     let local: NativeDriveModel
     let externalDisks: ExternalDiskCatalog
+    lazy var similarityAcrossDrives = SimilarityAcrossDrives(hub: self)
     private var localBaseProvider: ICloudDriveProvider?
+    private var localBaseURL: URL?
+    private var pendingExternalDisk = false
     private var externalDiskObservation: AnyCancellable?
     var selectedDriveTitle: String {
         selected == .local ? selectedExternalDisk?.name ?? CloudDriveKind.local.title : selected?.title ?? "All Drives"
@@ -41,6 +44,13 @@ struct DriveConnectionFeedback {
     private static let photosDisconnectedKey = "myCloudDriver.photosDisconnected"
     private var scopedICloudURL: URL?
     private var scopedLocalURL: URL?
+    private var localConnectionTask: Task<Void, Never>?
+    private var localConnectionID = UUID()
+    private var iCloudConnectionTask: Task<Void, Never>?
+    private var iCloudConnectionID = UUID()
+    private var closed = false
+    private var crossDriveScopePresentationTask: Task<Void, Never>?
+    private var crossDriveScopePresentationID = UUID()
     init(pikpak: DownloaderModel, defaults: UserDefaults = .standard, restoreConnections: Bool = true,
          photosAccess: PhotosAccessClient? = nil, icloudStorage: ICloudStorageModel? = nil, localRootURL: URL? = nil,
          externalDisks: ExternalDiskCatalog? = nil) {
@@ -61,16 +71,24 @@ struct DriveConnectionFeedback {
         }
         pikpak.additionalResourceActivities = { [weak self] in
             guard let self else { return [:] }
-            return self.nativeDrives.reduce(into: [:]) { result, drive in result.merge(drive.resourceActivities, uniquingKeysWith: { _, new in new }) }
+            var result = self.nativeDrives.reduce(into: [Int32: TaskResourceActivity]()) { result, drive in result.merge(drive.resourceActivities, uniquingKeysWith: { _, new in new }) }
+            let scan = self.similarityAcrossDrives.model
+            if let pid = scan.processIdentifier {
+                result[pid] = .init(name: "Finding similarity across drives", detail: "\(scan.scopeLabel)\n\(scan.message)\n\(scan.detail)",
+                    symbol: "square.stack.3d.up", processing: scan.resourceProcessing)
+            }
+            return result
         }
         pikpak.additionalResourceDescriptions = { [weak self] in
             guard let self else { return [] }
             return self.nativeDrives.flatMap { drive in
                 drive.activity.active.map { "\(drive.kind.title): \($0.progress.message)" }
                     + (drive.similarity.local.isRunning ? ["\(drive.kind.title): \(drive.similarity.local.message)"] : [])
+                    + (drive.fileSearch.isScanning ? ["\(drive.kind.title): Indexing file and folder names"] : [])
             }
         }
-        local.connect(ICloudDriveProvider(rootURL: localRootURL ?? FileManager.default.homeDirectoryForCurrentUser, kind: .local))
+        localBaseURL = localRootURL ?? FileManager.default.homeDirectoryForCurrentUser
+        _ = setLocalFolder(localBaseURL!, remember: false, volumeID: nil, preserveBase: false)
         local.onSendToPikPak = { [weak self] urls in
             guard let self else { return }
             if self.pikpak.uploadDroppedLocalItems(urls, to: self.pikpak.effectiveUploadDestination) {
@@ -84,15 +102,7 @@ struct DriveConnectionFeedback {
             if localRootURL == nil, let data = defaults.data(forKey: "myCloudDriver.localBookmark") {
                 restoreLocalFolder(data)
             }
-            if let data = defaults.data(forKey: "myCloudDriver.iCloudBookmark") {
-                do {
-                    var stale = false
-                    let url = try URL(resolvingBookmarkData: data, options: [.withSecurityScope, .withoutUI], bookmarkDataIsStale: &stale)
-                    if url.startAccessingSecurityScopedResource() { scopedICloudURL = url }
-                    icloud.connect(ICloudDriveProvider(rootURL: url))
-                    if stale { defaults.set(try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil), forKey: "myCloudDriver.iCloudBookmark") }
-                } catch { connectionError = "Reconnect iCloud Drive to restore access to its folder." }
-            }
+            if let data = defaults.data(forKey: "myCloudDriver.iCloudBookmark") { restoreICloudFolder(data) }
             if hasPhotosPermission && !defaults.bool(forKey: Self.photosDisconnectedKey) {
                 photos.connect(photosAccess.provider())
             }
@@ -120,15 +130,49 @@ struct DriveConnectionFeedback {
         return .local
     }
     func presentSimilarity() {
-        pikpak.fileSimilarity.presentDrive(similarityEntryDrive.rawValue)
+        presentAcrossDriveSimilarity()
+    }
+    func presentAcrossDriveSimilarity() {
+        guard !closed else { return }
+        pikpak.fileSimilarity.presentDrive(SimilarityAcrossDrives.driveID)
+    }
+    func revealAcrossSimilarityFile(_ file: SimilarityFile, provider: any NativeCloudDrive, item: CloudDriveItem) throws {
+        guard !closed, let drive = nativeDrive(for: provider.kind) else { throw CancellationError() }
+        guard drive.revealSimilarityFile(file, using: provider, scannedItem: item) else {
+            throw CloudDriveError.message(drive.error ?? "Reconnect this result’s original drive to show its folder.")
+        }
+        showCurrentDrive(provider.kind)
+        if provider.kind == .local { reconcileLocalDiskSelection() }
+        WorkspaceSessionManager.current?.activateBrowser(in: self)
     }
     func presentCrossDriveDuplicates() {
-        guard pikpak.canCheckCrossDriveDuplicates else { return }
+        guard !closed, pikpak.canCheckCrossDriveDuplicates else { return }
         let folders = selected == .local ? local.location.url.map { [$0] } ?? [] : []
+        let account = pikpak.activeAccountID
+        FinderPopover.dismissAll()
+        pikpak.taskActivity.showsDetails = false; pikpak.extractionActivity.showsActivity = false
         open(.pikpak)
-        pikpak.presentCrossDriveDuplicateScope(localFolders: folders)
+        crossDriveScopePresentationTask?.cancel()
+        let request = UUID(); crossDriveScopePresentationID = request
+        crossDriveScopePresentationTask = Task { @MainActor [weak self] in
+            // Let the menu and outgoing workspace process their dismissal
+            // before the mounted PikPak host receives a sheet presentation.
+            await Task.yield()
+            guard let self, !Task.isCancelled, !self.closed,
+                  self.crossDriveScopePresentationID == request, self.selected == .pikpak,
+                  self.pikpak.activeAccountID == account, self.pikpak.canCheckCrossDriveDuplicates else { return }
+            self.crossDriveScopePresentationTask = nil
+            self.pikpak.presentCrossDriveDuplicateScope(localFolders: folders)
+        }
     }
     func open(_ kind: CloudDriveKind) {
+        if kind == .local, pendingExternalDisk {
+            guard !local.isBusy else { connectionError = "Finish or cancel local work before changing its disk."; return }
+            localConnectionID = UUID(); localConnectionTask?.cancel(); localConnectionTask = nil
+            pendingExternalDisk = false
+            if let localBaseProvider { local.connect(localBaseProvider); selectedExternalDisk = nil }
+            else if let localBaseURL { _ = setLocalFolder(localBaseURL, remember: false, volumeID: nil, preserveBase: false) }
+        }
         if kind == .local, selectedExternalDisk != nil, let localBaseProvider {
             guard !local.isBusy else { connectionError = "Finish or cancel local work before changing its disk."; return }
             local.connect(localBaseProvider)
@@ -141,6 +185,9 @@ struct DriveConnectionFeedback {
     /// Local Disk menu selection uses `open` to return to the saved Mac folder.
     func showCurrentDrive(_ kind: CloudDriveKind) {
         if selected != kind {
+            FinderPopover.dismissAll()
+            pikpak.taskActivity.showsDetails = false; pikpak.extractionActivity.showsActivity = false
+            crossDriveScopePresentationID = UUID(); crossDriveScopePresentationTask?.cancel(); crossDriveScopePresentationTask = nil
             pikpak.fileSimilarity.browserRevealTask?.cancel()
             pikpak.previewPlayer?.pause(); nativeDrives.forEach { $0.mediaPreview.clear() }
         }
@@ -156,23 +203,37 @@ struct DriveConnectionFeedback {
             connectionError = "This disk is no longer mounted. Reconnect it and select it again."
             return
         }
-        if selectedExternalDisk?.id == mounted.id, local.provider?.root.url == mounted.url.standardizedFileURL.resolvingSymlinksInPath() {
+        if selectedExternalDisk?.id == mounted.id, local.provider?.root.url == mounted.url.standardizedFileURL {
             local.refreshAvailability()
             showCurrentDrive(.local)
             return
         }
-        guard setLocalFolder(mounted.url, remember: false, volumeID: mounted.volumeID, preserveBase: true) else { return }
-        selectedExternalDisk = mounted
+        guard setLocalFolder(mounted.url, remember: false, volumeID: mounted.volumeID, preserveBase: true, disk: mounted) else { return }
         showCurrentDrive(.local)
     }
     /// Copy the starting disk, while retaining a separate provider and folder history.
     func inheritLocalBrowser(from source: CloudDriveHub) {
         guard let provider = source.local.provider as? ICloudDriveProvider, let url = provider.root.url else { return }
-        if let base = source.localBaseProvider, let baseURL = base.root.url {
-            localBaseProvider = ICloudDriveProvider(rootURL: baseURL, kind: .local, volumeID: base.volumeID)
+        localConnectionID = UUID(); let request = localConnectionID
+        localConnectionTask?.cancel(); local.beginConnectionCheck()
+        let base = source.localBaseProvider, disk = source.selectedExternalDisk
+        localConnectionTask = Task { [weak self] in
+            do {
+                let copied = try await NativeFileWork.run {
+                    let current = ICloudDriveProvider(rootURL: url, kind: .local, volumeID: provider.volumeID)
+                    let original = base.flatMap { base in base.root.url.map { ICloudDriveProvider(rootURL: $0, kind: .local, volumeID: base.volumeID) } }
+                    return (current, original)
+                }
+                guard let self, !self.closed, self.localConnectionID == request, !Task.isCancelled else { return }
+                guard !self.local.isBusy else { self.local.finishConnectionCheck(); return }
+                self.localBaseProvider = copied.1 ?? copied.0; self.selectedExternalDisk = disk
+                self.localBaseURL = self.localBaseProvider?.root.url
+                self.local.connect(copied.0); self.localConnectionTask = nil
+            } catch {
+                guard let self, !self.closed, self.localConnectionID == request, !Task.isCancelled else { return }
+                self.local.finishConnectionCheck(error: error); self.connectionError = error.localizedDescription
+            }
         }
-        local.connect(ICloudDriveProvider(rootURL: url, kind: .local, volumeID: provider.volumeID))
-        selectedExternalDisk = source.selectedExternalDisk
     }
     private func reconcileLocalDiskSelection() {
         guard let provider = local.provider as? ICloudDriveProvider, let root = provider.root.url else {
@@ -187,14 +248,19 @@ struct DriveConnectionFeedback {
         selectedExternalDisk = externalDisks.disks.filter(matches).max { $0.url.path.count < $1.url.path.count }
     }
     private func configureSimilarityDrives() {
-        let options = CloudDriveKind.allCases.map { kind in
+        let options = [SimilarityDriveOption(id: SimilarityAcrossDrives.driveID, title: "Across Drives", symbol: "square.stack.3d.up", source: .local)] + CloudDriveKind.allCases.map { kind in
             SimilarityDriveOption(id: kind.rawValue, title: kind.title, symbol: kind.symbol, source: kind == .pikpak ? .cloud : .local)
         }
         let host = pikpak.fileSimilarity
-        for coordinator in [host] + nativeDrives.map(\.similarity) {
+        let across = similarityAcrossDrives.coordinator
+        across.presentationHost = host
+        host.newScanPresentation = { [weak self] in self?.presentAcrossDriveSimilarity() }
+        for coordinator in [host, across] + nativeDrives.map(\.similarity) {
             coordinator.driveOptions = options
             coordinator.resolveDrive = { [weak self] id in
-                guard let self, let kind = CloudDriveKind(rawValue: id) else { return nil }
+                guard let self else { return nil }
+                if id == SimilarityAcrossDrives.driveID { return self.similarityAcrossDrives.coordinator }
+                guard let kind = CloudDriveKind(rawValue: id) else { return nil }
                 return kind == .pikpak ? self.pikpak.fileSimilarity : self.nativeDrive(for: kind)?.similarity
             }
         }
@@ -208,6 +274,14 @@ struct DriveConnectionFeedback {
         for drive in nativeDrives {
             drive.similarity.preferredDriveID = drive.kind.rawValue
             drive.similarity.presentationHost = host
+            drive.presentAcrossDriveSimilarity = { [weak self] selection, provider, location in
+                guard let self, !self.closed else { return }
+                self.similarityAcrossDrives.addNativeScope(.init(drive: provider.kind, providerRoot: provider.root,
+                    location: location, selection: selection,
+                    bookmark: provider.root.url.flatMap { try? $0.bookmarkData(options: .withSecurityScope,
+                        includingResourceValuesForKeys: nil, relativeTo: nil) }, photosUsePreviews: false), provider: provider)
+                self.presentAcrossDriveSimilarity()
+            }
             drive.similarity.chooseDriveScope = { [weak drive] _, selected in
                 guard let drive else { return }
                 guard drive.isConnected else {
@@ -243,53 +317,138 @@ struct DriveConnectionFeedback {
     @discardableResult func connectLocalFolder(_ url: URL, remember: Bool = true, volumeID: String? = nil) -> Bool {
         setLocalFolder(url, remember: remember, volumeID: volumeID, preserveBase: false)
     }
-    private func setLocalFolder(_ url: URL, remember: Bool, volumeID: String?, preserveBase: Bool) -> Bool {
-        guard !local.isBusy else { connectionError = "Finish or cancel local work before changing its connected folder."; return false }
-        let scoped = url.startAccessingSecurityScopedResource()
-        do {
-            try LocalFileAccess.validate(url, volumeID: volumeID, directory: true)
-            if remember {
-                let data = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: [.pathKey, .volumeUUIDStringKey], relativeTo: nil)
-                defaults.set(data, forKey: "myCloudDriver.localBookmark")
-                defaults.set(url.path, forKey: "myCloudDriver.localFolderPath")
-                defaults.set(LocalFileAccess.volumeID(url), forKey: "myCloudDriver.localVolumeID")
+    private func setLocalFolder(_ url: URL, remember: Bool, volumeID: String?, preserveBase: Bool,
+                                disk: ExternalDisk? = nil) -> Bool {
+        guard !closed, !local.isBusy else { connectionError = "Finish or cancel local work before changing its connected folder."; return false }
+        localConnectionTask?.cancel(); localConnectionID = UUID(); let request = localConnectionID
+        pendingExternalDisk = preserveBase
+        let missingBaseURL = preserveBase && localBaseProvider == nil ? localBaseURL : nil
+        local.beginConnectionCheck()
+        localConnectionTask = Task { [weak self] in
+            do {
+                let result = try await NativeFileWork.run(priority: .high) {
+                    let lease = LocalFileAccessLease([url])
+                    defer { withExtendedLifetime(lease) {} }
+                    try LocalFileAccess.validate(url, volumeID: volumeID, directory: true)
+                    let bookmark = remember ? try url.bookmarkData(options: .withSecurityScope,
+                        includingResourceValuesForKeys: [.pathKey, .volumeUUIDStringKey], relativeTo: nil) : nil
+                    let base = missingBaseURL.map { ICloudDriveProvider(rootURL: $0, kind: .local) }
+                    return (ICloudDriveProvider(rootURL: url, kind: .local, volumeID: volumeID), bookmark, base)
+                }
+                guard let self, !self.closed, self.localConnectionID == request, !Task.isCancelled else { return }
+                guard !self.local.isBusy else {
+                    self.pendingExternalDisk = false; self.localConnectionTask = nil
+                    self.local.finishConnectionCheck(); self.connectionError = "Finish or cancel local work before changing its connected folder."; return
+                }
+                if let bookmark = result.1 {
+                    self.defaults.set(bookmark, forKey: "myCloudDriver.localBookmark")
+                    self.defaults.set(url.path, forKey: "myCloudDriver.localFolderPath")
+                    self.defaults.set(result.0.volumeID, forKey: "myCloudDriver.localVolumeID")
+                }
+                self.scopedLocalURL?.stopAccessingSecurityScopedResource(); self.scopedLocalURL = nil
+                self.local.connect(result.0); self.local.section = 0
+                if !preserveBase { self.localBaseProvider = result.0; self.localBaseURL = result.0.root.url; self.selectedExternalDisk = nil }
+                else if let disk { self.selectedExternalDisk = disk }
+                if let base = result.2 { self.localBaseProvider = base }
+                self.pendingExternalDisk = false
+                self.localConnectionTask = nil; self.connectionError = nil
+            } catch {
+                guard let self, !self.closed, self.localConnectionID == request, !Task.isCancelled else { return }
+                self.localConnectionTask = nil; self.local.finishConnectionCheck(error: error)
+                self.pendingExternalDisk = false
+                self.connectionError = error.localizedDescription
             }
-            scopedLocalURL?.stopAccessingSecurityScopedResource()
-            scopedLocalURL = scoped ? url : nil
-            let provider = ICloudDriveProvider(rootURL: url, kind: .local, volumeID: volumeID)
-            local.connect(provider); local.section = 0
-            if !preserveBase { localBaseProvider = provider; selectedExternalDisk = nil }
-            connectionError = nil
-            return true
-        } catch {
-            if scoped { url.stopAccessingSecurityScopedResource() }
-            connectionError = error.localizedDescription
-            return false
         }
+        // Accepted for asynchronous validation. Invalid or stale roots cannot
+        // replace the connected provider before their worker succeeds.
+        return true
     }
     private func restoreLocalFolder(_ data: Data) {
-        let values = URL.resourceValues(forKeys: [.pathKey, .volumeUUIDStringKey], fromBookmarkData: data)
-        let path = defaults.string(forKey: "myCloudDriver.localFolderPath") ?? values?.path
-        let volumeID = defaults.string(forKey: "myCloudDriver.localVolumeID") ?? values?.volumeUUIDString
-        do {
-            var stale = false
-            let url = try URL(resolvingBookmarkData: data, options: [.withSecurityScope, .withoutUI, .withoutMounting], bookmarkDataIsStale: &stale)
-            if url.startAccessingSecurityScopedResource() { scopedLocalURL = url }
-            local.connect(ICloudDriveProvider(rootURL: url, kind: .local, volumeID: volumeID))
-            // Never replace the saved identity while its disk is unavailable.
-            if local.isConnected {
-                defaults.set(url.path, forKey: "myCloudDriver.localFolderPath")
-                defaults.set(LocalFileAccess.volumeID(url), forKey: "myCloudDriver.localVolumeID")
-                if stale, let refreshed = try? url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: [.pathKey, .volumeUUIDStringKey], relativeTo: nil) {
-                    defaults.set(refreshed, forKey: "myCloudDriver.localBookmark")
+        localConnectionTask?.cancel(); localConnectionID = UUID(); let request = localConnectionID
+        local.beginConnectionCheck()
+        let savedPath = defaults.string(forKey: "myCloudDriver.localFolderPath")
+        let savedVolume = defaults.string(forKey: "myCloudDriver.localVolumeID")
+        localConnectionTask = Task { [weak self] in
+            do {
+                let result = try await NativeFileWork.run {
+                    let values = URL.resourceValues(forKeys: [.pathKey, .volumeUUIDStringKey], fromBookmarkData: data)
+                    var stale = false
+                    let url: URL
+                    do {
+                        url = try URL(resolvingBookmarkData: data, options: [.withSecurityScope, .withoutUI, .withoutMounting], bookmarkDataIsStale: &stale)
+                    } catch {
+                        guard let path = savedPath ?? values?.path else { throw error }
+                        url = URL(fileURLWithPath: path)
+                    }
+                    let provider = ICloudDriveProvider(rootURL: url, kind: .local, volumeID: savedVolume ?? values?.volumeUUIDString)
+                    let available = (try? provider.validateAccess()) != nil
+                    let refreshed = available && stale ? try? url.bookmarkData(options: .withSecurityScope,
+                        includingResourceValuesForKeys: [.pathKey, .volumeUUIDStringKey], relativeTo: nil) : nil
+                    return (provider, refreshed, available)
                 }
+                guard let self, !self.closed, self.localConnectionID == request, !Task.isCancelled else { return }
+                guard !self.local.isBusy else { self.local.finishConnectionCheck(); return }
+                self.local.connect(result.0); self.localBaseProvider = result.0
+                self.localBaseURL = result.0.root.url
+                if result.2 {
+                    self.defaults.set(result.0.root.url?.path, forKey: "myCloudDriver.localFolderPath")
+                    self.defaults.set(result.0.volumeID, forKey: "myCloudDriver.localVolumeID")
+                    if let bookmark = result.1 { self.defaults.set(bookmark, forKey: "myCloudDriver.localBookmark") }
+                }
+                self.localConnectionTask = nil
+            } catch {
+                guard let self, !self.closed, self.localConnectionID == request, !Task.isCancelled else { return }
+                self.localConnectionTask = nil; self.local.finishConnectionCheck(error: error)
+                self.connectionError = "Reconnect the saved local folder or disk to restore access."
             }
-        } catch {
-            if let path {
-                local.connect(ICloudDriveProvider(rootURL: URL(fileURLWithPath: path), kind: .local, volumeID: volumeID))
-            } else {
-                local.disconnect()
-                connectionError = "Reconnect the saved local folder or disk to restore access."
+        }
+    }
+    private func restoreICloudFolder(_ data: Data) {
+        iCloudConnectionTask?.cancel(); iCloudConnectionID = UUID(); let request = iCloudConnectionID
+        icloud.beginConnectionCheck()
+        iCloudConnectionTask = Task { [weak self] in
+            do {
+                let result = try await NativeFileWork.run {
+                    var stale = false
+                    let url = try URL(resolvingBookmarkData: data, options: [.withSecurityScope, .withoutUI, .withoutMounting], bookmarkDataIsStale: &stale)
+                    let provider = ICloudDriveProvider(rootURL: url)
+                    let bookmark = stale && (try? provider.validateAccess()) != nil ? try? url.bookmarkData(
+                        options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil) : nil
+                    return (provider, bookmark)
+                }
+                guard let self, !self.closed, self.iCloudConnectionID == request, !Task.isCancelled else { return }
+                guard !self.icloud.isBusy else { self.icloud.finishConnectionCheck(); return }
+                self.icloud.connect(result.0)
+                if let bookmark = result.1 { self.defaults.set(bookmark, forKey: "myCloudDriver.iCloudBookmark") }
+                self.iCloudConnectionTask = nil
+            } catch {
+                guard let self, !self.closed, self.iCloudConnectionID == request, !Task.isCancelled else { return }
+                self.icloud.finishConnectionCheck(error: error); self.iCloudConnectionTask = nil
+                self.connectionError = "Reconnect iCloud Drive to restore access to its folder."
+            }
+        }
+    }
+    private func setICloudFolder(_ url: URL) {
+        guard !closed, !icloud.isBusy else { connectionError = "Finish or cancel iCloud Drive work before reconnecting."; return }
+        iCloudConnectionTask?.cancel(); iCloudConnectionID = UUID(); let request = iCloudConnectionID
+        icloud.beginConnectionCheck()
+        iCloudConnectionTask = Task { [weak self] in
+            do {
+                let result = try await NativeFileWork.run {
+                    let lease = LocalFileAccessLease([url]); defer { withExtendedLifetime(lease) {} }
+                    try LocalFileAccess.validate(url, directory: true)
+                    let bookmark = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+                    return (ICloudDriveProvider(rootURL: url), bookmark)
+                }
+                guard let self, !self.closed, self.iCloudConnectionID == request, !Task.isCancelled else { return }
+                guard !self.icloud.isBusy else { self.icloud.finishConnectionCheck(); return }
+                self.defaults.set(result.1, forKey: "myCloudDriver.iCloudBookmark")
+                self.icloud.connect(result.0); self.iCloudConnectionTask = nil; self.connectionError = nil
+                self.icloudStorage.clear(); self.icloudStorage.refresh(force: true)
+            } catch {
+                guard let self, !self.closed, self.iCloudConnectionID == request, !Task.isCancelled else { return }
+                self.icloud.finishConnectionCheck(error: error); self.iCloudConnectionTask = nil
+                self.connectionError = error.localizedDescription
             }
         }
     }
@@ -300,20 +459,7 @@ struct DriveConnectionFeedback {
         panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
         panel.begin { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
-            Task { @MainActor in
-                guard let self else { return }
-                guard !self.icloud.isBusy else {
-                    self.connectionError = "Finish or cancel iCloud Drive work before reconnecting."; return
-                }
-                do {
-                    let data = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
-                    self.scopedICloudURL?.stopAccessingSecurityScopedResource()
-                    self.scopedICloudURL = url.startAccessingSecurityScopedResource() ? url : nil
-                    self.defaults.set(data, forKey: "myCloudDriver.iCloudBookmark")
-                    self.icloud.connect(ICloudDriveProvider(rootURL: url)); self.connectionError = nil
-                    self.icloudStorage.clear(); self.icloudStorage.refresh(force: true)
-                } catch { self.connectionError = error.localizedDescription }
-            }
+            Task { @MainActor in self?.setICloudFolder(url) }
         }
     }
     var hasPhotosPermission: Bool { photosAuthorization == .authorized || photosAuthorization == .limited }
@@ -390,11 +536,17 @@ struct DriveConnectionFeedback {
     }
     func disconnectICloud() {
         guard !icloud.isBusy else { return }
+        iCloudConnectionID = UUID(); iCloudConnectionTask?.cancel(); iCloudConnectionTask = nil
         icloud.disconnect(); defaults.removeObject(forKey: "myCloudDriver.iCloudBookmark")
         icloudStorage.clear()
         scopedICloudURL?.stopAccessingSecurityScopedResource(); scopedICloudURL = nil
     }
     func close() {
+        closed = true
+        similarityAcrossDrives.close()
+        crossDriveScopePresentationID = UUID(); crossDriveScopePresentationTask?.cancel(); crossDriveScopePresentationTask = nil
+        localConnectionID = UUID(); localConnectionTask?.cancel(); localConnectionTask = nil
+        iCloudConnectionID = UUID(); iCloudConnectionTask?.cancel(); iCloudConnectionTask = nil
         externalDiskObservation?.cancel(); externalDiskObservation = nil; externalDisks.close(); localBaseProvider = nil
         photosConnectionID = UUID(); photosConnectionTask?.cancel(); photosConnectionTask = nil; connectingPhotos = false
         icloudStorage.clear(); localStorage.clear()

@@ -26,14 +26,16 @@ import Foundation
         }
         try await waitForTree { model.roots.count == 250 && model.roots.allSatisfy { $0.group != nil } }
 
-        let outline = NSOutlineView()
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 350, height: 650))
+        let outline = NSOutlineView(frame: scroll.bounds)
+        scroll.documentView = outline
         let column = NSTableColumn(identifier: .init("name"))
         outline.addTableColumn(column); outline.outlineTableColumn = column
         let tree = SimilarityFileTree.Coordinator()
         tree.outline = outline; outline.dataSource = tree; outline.delegate = tree
         tree.select = { model.selectNode($0) }
         func refresh() {
-            tree.update(roots: model.roots, selectedID: model.selectedNodeID,
+            tree.update(snapshot: model.tree, selectedID: model.selectedNodeID,
                 searching: !model.query.isEmpty, groupExpansion: model.browseGroups ? model.groupExpansion : nil)
         }
         refresh()

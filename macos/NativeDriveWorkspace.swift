@@ -81,7 +81,8 @@ struct NativeDriveWorkspace: View {
         }
         .focusedSceneValue(\.finderWindowActions, actions)
         .background(FinderWindowActionRegistration(actions: actions))
-        .onChange(of: model.query) { _ in model.reload() }
+        .overlay { FileSearchOverlay(search: model.fileSearch, onReveal: model.revealFileSearch) }
+        .onChange(of: model.query) { _ in if model.kind == .photos { model.reload() } }
         .onChange(of: model.selection) { _ in
             if model.selection.isEmpty { previewExpanded = false }
         }
@@ -112,9 +113,10 @@ struct NativeDriveWorkspace: View {
         .onChange(of: settings.layoutResetRevision) { _ in previewExpanded = false }
         .onReceive(NotificationCenter.default.publisher(for: .init("MyCloudDriverFind"))) { note in
             guard let target = note.object as? CloudDriveHub, target === hub else { return }
-            selectSection(0); showsSearch = true; searchFocused = true
+            selectSection(0)
+            if !model.presentFileSearch() { showsSearch = true; searchFocused = true }
         }
-        .onDisappear { model.closePreview(); model.mediaPreview.clear(); model.setThumbnailPrefetchActive(false) }
+        .onDisappear { model.fileSearch.close(); model.closePreview(); model.mediaPreview.clear(); model.setThumbnailPrefetchActive(false) }
         .sheet(item: $prompt) { prompt in
             NativeNameSheet(prompt: prompt) { name in
                 if let item = prompt.item { model.rename(item, name: name) }
@@ -246,7 +248,9 @@ struct NativeDriveWorkspace: View {
             trashHelp: model.kind == .photos ? "Delete selected items from Photos" : model.usesDiskTrash ? "Move selected items to this disk’s Trash" : "Move selected items to Finder’s Trash",
             fileTypeFilter: $model.fileTypeFilter, fileExtensions: model.availableFileExtensions,
             hidesEmptyFolders: $model.hidesEmptyFolders,
-            back: { model.back() }, search: { showsSearch = true; searchFocused = true },
+            back: { model.back() }, search: {
+                if !model.presentFileSearch() { showsSearch = true; searchFocused = true }
+            },
             importFiles: { transferDirection = 1; model.chooseImport() },
             exportFiles: { transferDirection = 0; model.chooseExport(model.selectedItems) },
             trash: { requestDelete(model.selectedItems) }, create: newContainer,
@@ -268,6 +272,7 @@ struct NativeDriveWorkspace: View {
                     HStack { Button("Clear") { model.query = "" }; Spacer(); Button("Done") { showsSearch = false } }
                 }.padding(16).frame(width: 320)
             }
+            .onReceive(NotificationCenter.default.publisher(for: FinderPopover.dismissAllNotification)) { _ in showsSearch = false }
     }
     private var table: some View {
         NativeDriveFileList(model: model, resetRevision: settings.layoutResetRevision, menu: contextMenu,
@@ -644,7 +649,29 @@ struct NativeDriveActivities: View {
                                     else if record.progress.total > 0 { ProgressView(value: Double(record.progress.completed), total: Double(record.progress.total)) }
                                     else { ProgressView().controlSize(.small) }
                                 }
-                                if record.progress.total > 0 { Text("\(record.progress.completed.formatted()) of \(record.progress.total.formatted()) items").font(.caption).foregroundStyle(.secondary).monospacedDigit() }
+                                if record.progress.total > 0 || (record.active && record.progress.folderSize?.fraction != nil) {
+                                    HStack {
+                                        if record.progress.total > 0 { Text("\(record.progress.completed.formatted()) of \(record.progress.total.formatted()) items") }
+                                        Spacer(minLength: 0)
+                                        if record.active, let fraction = record.progress.folderSize?.fraction {
+                                            Text("≈ \(fraction.formatted(.percent.precision(.fractionLength(0))))")
+                                                .help(FolderSizeProgress.diskUsageHelp)
+                                        }
+                                    }.font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                                }
+                                if record.active, let size = record.progress.folderSize {
+                                    ViewThatFits(in: .horizontal) {
+                                        HStack {
+                                            Text(size.speedSummary).help(FolderSizeProgress.speedHelp)
+                                            Spacer(minLength: 12)
+                                            Text(size.timeRemainingSummary)
+                                        }
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text(size.speedSummary).help(FolderSizeProgress.speedHelp)
+                                            Text(size.timeRemainingSummary)
+                                        }
+                                    }.font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                                }
                             }.padding(14).background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
                         }
                     }
@@ -703,6 +730,7 @@ private struct NativeDriveFooter: View {
                 NativeDriveActivities(model: model, store: store, scan: scan, compact: true,
                     close: { showsStatus = false }).frame(width: 560, height: 540)
             }
+            .onReceive(NotificationCenter.default.publisher(for: FinderPopover.dismissAllNotification)) { _ in showsStatus = false }
     }
 }
 

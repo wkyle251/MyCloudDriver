@@ -29,8 +29,11 @@ impl Control {
         let stop = Arc::new(AtomicBool::new(false));
         let acquisition_cancel = if request.checkpoint_id.is_some() {
             Arc::new(AtomicBool::new(false))
-        } else { cancel.clone() };
+        } else {
+            cancel.clone()
+        };
         let watcher = request.checkpoint_id.as_ref().map(|id| {
+            let automatic_memory = request.resources.automatic_memory;
             // macOS GUI URLs often use /var while secure openat traversal
             // correctly rejects that symlink. Resolve the owned directory,
             // then continue rejecting symlinks for individual control files.
@@ -53,7 +56,7 @@ impl Control {
                     }
                     // The GUI atomically publishes settings before removing
                     // pause. They change admission, never the vector profile.
-                    if let Ok(file) = scope::open_secure(&directory.join("live-resources.json")) {
+                    if let Some(file) = (!automatic_memory).then(|| scope::open_secure(&directory.join("live-resources.json")).ok()).flatten() {
                         if file.metadata().is_ok_and(|m| m.len() <= 16 * 1024) {
                             use std::io::Read;
                             let mut bytes = Vec::new();
@@ -66,6 +69,7 @@ impl Control {
                                     token.update_resources(LiveResources {
                                         workers: resources::prepare(settings.effective_workers()),
                                         memory_bytes: settings.analysis_budget(), staging_bytes: settings.download_budget(),
+                                        total_memory_bytes: None, acquisition_paused: false, external_memory_bytes: None,
                                     });
                                     Ok(())
                                 })();
@@ -192,13 +196,16 @@ mod tests {
         std::fs::write(checkpoint.directory.join("pause"), []).unwrap();
         let control = Control::new(&request, Arc::new(AtomicBool::new(false)), None);
         let until = Instant::now() + Duration::from_secs(2);
-        while !control.token.is_paused() && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
+        while !control.token.is_paused() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(control.token.is_paused());
         std::fs::write(checkpoint.directory.join("finish"), []).unwrap();
-        while !control.token.is_finishing() && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
+        while !control.token.is_finishing() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(control.token.is_finishing());
         assert!(!control.token.is_paused() && !control.token.is_cancelled());
         assert!(control.acquisition_cancel.load(Ordering::Acquire));
     }
-
 }

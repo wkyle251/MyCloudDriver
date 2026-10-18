@@ -41,9 +41,7 @@ struct FileSearchOverlay: View {
                     .foregroundStyle(.secondary)
                 FileSearchField(
                     text: search.query,
-                    placeholder: search.scope == .expanded
-                        ? "Search current expanded files and folders…"
-                        : "Search every file and folder from PikPak root…",
+                    placeholder: search.placeholder,
                     focusRequest: search.focusRequest,
                     onChange: search.updateQuery,
                     onMove: search.moveSelection,
@@ -65,7 +63,7 @@ struct FileSearchOverlay: View {
 
             Divider()
             HStack {
-                Label(search.scope.title, systemImage: search.scope == .expanded ? "list.bullet.indent" : "cloud")
+                Label(search.scopeTitle, systemImage: search.scope == .expanded ? "list.bullet.indent" : search.sourceSymbol)
                     .fixedSize()
                 Text(search.contextName).truncationMode(.middle)
                 Spacer(minLength: 0)
@@ -176,27 +174,35 @@ struct FileSearchOverlay: View {
     private var emptyTitle: String {
         if search.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Find a file or folder" }
         if search.scope == .expanded { return "No matching expanded items" }
-        if search.isScanning { return "Searching your PikPak…" }
+        if search.isScanning { return search.isNative ? "Searching \(search.sourceName)…" : "Searching your PikPak…" }
         return search.isComplete ? "No matching names" : "No matches in the scanned folders yet"
     }
 
     private var emptyDetail: String {
         if search.scope == .expanded {
+            if search.isNative {
+                return search.query.isEmpty
+                    ? "Search names already visible in the current tree. Use ⌘⇧F to search from this drive’s root."
+                    : "Collapsed and not-yet-loaded items aren't included. Use ⌘⇧F to search from this drive’s root."
+            }
             return search.query.isEmpty
                 ? "Search names already visible in the current tree. Use ⌘⇧F to search your entire PikPak account."
                 : "Collapsed and not-yet-loaded items aren't included. Use ⌘⇧F to search from PikPak root."
         }
-        if search.query.isEmpty { return "Start typing a name. Matches appear while the rest of your account is scanned." }
+        if search.query.isEmpty { return search.isNative
+            ? "Start typing a name. Matches appear while the rest of this drive is scanned."
+            : "Start typing a name. Matches appear while the rest of your account is scanned." }
         if search.isScanning { return "You don't need to wait for the scan to finish to open a result." }
         return search.isComplete ? "Try a shorter name or an abbreviation." : "Use Scan to keep searching, or check any error details below."
     }
 
     private var scanStatus: String {
         if search.scope == .expanded { return "\(search.indexedItems.formatted()) visible names · local search, no scan needed" }
-        if search.isScanning { return search.indexedItems == 0 ? "Contacting PikPak…" : "Still searching · results update as folders arrive" }
+        if search.isScanning { return search.indexedItems == 0 ? (search.isNative ? "Reading folder names…" : "Contacting PikPak…") : "Still searching · results update as folders arrive" }
         if search.isComplete { return "Scan complete · cached for this app session" }
         if search.indexedItems > 0 { return "Scan stopped or incomplete · showing cached matches" }
-        return "Searches your account, excluding Trash and unsaved shared links"
+        return search.isNative ? "Searches file and folder names under the connected drive root; original content stays on the drive"
+            : "Searches your account, excluding Trash and unsaved shared links"
     }
 
     private func resultRow(_ result: FileSearchMatch) -> some View {

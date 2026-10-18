@@ -7,6 +7,9 @@ mod downloads;
 pub(super) use downloads::Ticket;
 #[path = "similarity_fetch_password.rs"]
 mod password_probe;
+#[path = "similarity_fetch_seekable.rs"]
+mod seekable;
+pub(super) use seekable::prepare as prepare_seekable;
 use crate::download_connections::Connections;
 use crate::{
     download_network::Network,
@@ -201,21 +204,37 @@ pub(super) struct Fetches {
     pub retrying: AtomicU64,
     pub active: AtomicU64,
     pub metadata: AtomicU64,
+    pub range_active: AtomicU64,
+    pub range_metadata: AtomicU64,
+    pub range_retrying: AtomicU64,
+    pub sampled_files: AtomicU64,
+    pub sampled_original_bytes: AtomicU64,
+    pub sampled_received_bytes: AtomicU64,
     pub limit: usize,
     pub memory: Arc<memory::Budget>,
     downloads: Arc<downloads::Downloads>,
     received_bytes: AtomicU64,
+    seekable_readers: AtomicU64,
     pub retry_forever: bool,
     pub control: filetwin_core::api::CancellationToken,
 }
 struct Permit<'a>(&'a Fetches);
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
-        let mut connections = self.0.connections.lock().unwrap();
-        connections.active -= 1;
-        if self.0.waiting.load(Ordering::Relaxed) == 0 {
-            connections.idle(Instant::now());
-        }
+        self.0.release_connection();
+    }
+}
+struct OwnedPermit(Arc<Fetches>);
+impl Drop for OwnedPermit {
+    fn drop(&mut self) { self.0.release_connection(); }
+}
+impl Permit<'_> {
+    fn retaining(self, owner: Arc<Fetches>) -> OwnedPermit {
+        assert!(std::ptr::eq(self.0, owner.as_ref()));
+        // Transfer the existing entitlement, without a second admission or
+        // releasing the only slot that can complete this original.
+        std::mem::forget(self);
+        OwnedPermit(owner)
     }
 }
 
@@ -233,6 +252,11 @@ impl Drop for Counter<'_> {
 }
 
 impl Fetches {
+    fn release_connection(&self) {
+        let mut connections = self.connections.lock().unwrap();
+        connections.active -= 1;
+        if self.waiting.load(Ordering::Relaxed) == 0 { connections.idle(Instant::now()); }
+    }
     #[cfg(test)]
     pub fn new(workers: usize) -> Self {
         Self::with_memory(workers, 256 << 20)
@@ -251,10 +275,17 @@ impl Fetches {
             retrying: AtomicU64::new(0),
             active: AtomicU64::new(0),
             metadata: AtomicU64::new(0),
+            range_active: AtomicU64::new(0),
+            range_metadata: AtomicU64::new(0),
+            range_retrying: AtomicU64::new(0),
+            sampled_files: AtomicU64::new(0),
+            sampled_original_bytes: AtomicU64::new(0),
+            sampled_received_bytes: AtomicU64::new(0),
             limit,
             memory: memory::Budget::new(memory_bytes),
             downloads: Arc::new(downloads::Downloads::default()),
             received_bytes: AtomicU64::new(0),
+            seekable_readers: AtomicU64::new(0),
             retry_forever: false,
             control: Default::default(),
         }

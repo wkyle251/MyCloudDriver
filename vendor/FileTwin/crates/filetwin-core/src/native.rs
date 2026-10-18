@@ -133,6 +133,7 @@ pub(crate) struct Pool {
     config: EncoderConfig,
     slots: Vec<Slot>,
     memory_per_worker: u64,
+    last_pause_tick: Option<Instant>,
 }
 
 struct Slot {
@@ -147,7 +148,7 @@ pub(crate) type Outcome = Result<protocol::Encoded>;
 fn reserved_memory(request: &protocol::Request) -> u64 {
     // Host originals have their own budget. Charge a potential native-reader
     // copy only while this decoder owns the request, including media readers.
-    request.memory_bytes.saturating_add(request.memory_input.as_ref().map_or(0, |input| input.bytes))
+    request.memory_bytes.saturating_add(request.memory_input.as_ref().map_or(0, |input| if input.range_only { 0 } else { input.bytes }))
 }
 
 impl Pool {
@@ -163,7 +164,22 @@ impl Pool {
                 })
                 .collect(),
             memory_per_worker: config.memory_bytes / n as u64,
+            last_pause_tick: None,
         }
+    }
+    /// User-paused I/O is not a decoder timeout. Only range-only requests can
+    /// block waiting for the host's pause; other inputs retain their deadlines.
+    pub fn pause_tick(&mut self, paused: bool) {
+        let now = Instant::now();
+        if let Some(previous) = self.last_pause_tick.take() {
+            let elapsed = now.saturating_duration_since(previous);
+            for slot in &mut self.slots {
+                if slot.prepared.as_ref().is_some_and(|p| p.request.memory_input.as_ref().is_some_and(|m| m.range_only)) {
+                    if let Some(process) = &mut slot.process { process.started += elapsed; }
+                }
+            }
+        }
+        if paused { self.last_pause_tick = Some(now); }
     }
     pub fn capacity(&self) -> usize {
         worker_count(&self.config)
@@ -183,6 +199,13 @@ impl Pool {
     }
     pub fn active(&self) -> usize {
         self.slots.iter().filter(|s| s.prepared.is_some()).count()
+    }
+    /// Cached models are useful when memory is available. Under critical
+    /// pressure release idle processes without interrupting an active input.
+    pub fn release_idle(&mut self) {
+        for slot in &mut self.slots {
+            if slot.prepared.is_none() { slot.process = None; }
+        }
     }
     pub fn staged_bytes(&self) -> u64 {
         self.slots

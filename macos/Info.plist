@@ -19,16 +19,18 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.3.0</string>
+	<string>2.3.1</string>
 	<key>CFBundleVersion</key>
-	<string>289</string>
+	<string>299</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
 			<string>com.wky.PikPakDownloader.verification</string>
 			<key>CFBundleURLSchemes</key>
-			<array><string>myclouddriver-verification</string></array>
+			<array>
+				<string>myclouddriver-verification</string>
+			</array>
 		</dict>
 	</array>
 	<key>LSApplicationCategoryType</key>

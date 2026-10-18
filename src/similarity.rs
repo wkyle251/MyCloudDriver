@@ -39,12 +39,18 @@ pub use grouping::{group_scores, GroupQuery};
 
 #[path = "similarity_acceleration.rs"]
 mod acceleration;
+#[path = "similarity_auto_memory.rs"]
+mod auto_memory;
 #[path = "similarity_checkpoint.rs"]
 mod checkpoint;
+#[path = "similarity_compare.rs"]
+mod comparison;
 #[path = "similarity_control.rs"]
 mod control;
 #[path = "similarity_discovery.rs"]
 mod discovery;
+#[path = "similarity_cloud_listing.rs"]
+mod cloud_listing;
 #[path = "similarity_encode.rs"]
 mod encoding;
 #[path = "similarity_fetch.rs"]
@@ -107,6 +113,9 @@ pub struct ExternalSource {
     pub path: String,
     pub size: u64,
     pub local_path: Option<PathBuf>,
+    /// Stable provider type, independent of the host's namespaced occurrence ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default)]
     pub revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,6 +171,8 @@ pub struct ScanResources {
     pub acceleration: acceleration::Mode,
     /// Admit by per-file memory reservations; `workers` is legacy only.
     pub memory_scheduling: bool,
+    /// App scans adapt to system pressure; old request files stay compatible.
+    pub automatic_memory: bool,
     pub workers: usize,
     pub memory_bytes: u64,
     /// Original buffers only. Native reader copies belong to analysis memory.
@@ -177,6 +188,7 @@ impl Default for ScanResources {
         Self {
             acceleration: acceleration::Mode::Cpu,
             memory_scheduling: false,
+            automatic_memory: false,
             workers: 2,
             memory_bytes: 1024 * 1024 * 1024,
             download_memory_bytes: None,
@@ -188,6 +200,9 @@ impl Default for ScanResources {
 
 impl ScanResources {
     fn validate(&self) -> Result<()> {
+        if self.automatic_memory {
+            return Ok(());
+        }
         if !self.memory_scheduling && !(1..=64).contains(&self.workers) {
             bail!("Similarity workers must be a whole number from 1 to 64.");
         }
@@ -212,6 +227,11 @@ impl ScanResources {
     /// Mirrors FileTwin's native admission rule; the allowance is not a hard
     /// ceiling for the entire process or its inference runtime's allocations.
     fn effective_workers(&self) -> usize {
+        if self.automatic_memory {
+            let cpus = std::thread::available_parallelism().map_or(1, |count| count.get());
+            return cpus
+                .min((auto_memory::physical_memory() / (128 << 20)).clamp(1, 8192) as usize);
+        }
         if self.memory_scheduling {
             return (self.analysis_budget() / (128 << 20)).clamp(1, 8192) as usize;
         }
@@ -220,10 +240,16 @@ impl ScanResources {
             .clamp(1, 64)
     }
     fn download_budget(&self) -> u64 {
+        if self.automatic_memory {
+            return auto_memory::initial_budget(auto_memory::physical_memory()) / 2;
+        }
         self.download_memory_bytes
             .unwrap_or((self.memory_bytes / 4).min(12 << 30))
     }
     fn analysis_budget(&self) -> u64 {
+        if self.automatic_memory {
+            return self.download_budget();
+        }
         self.memory_bytes.saturating_sub(self.download_budget())
     }
 }
@@ -249,12 +275,14 @@ impl ScanRequest {
         {
             bail!("Choose at least one supported content type.");
         }
+        let hybrid = !self.cloud_items.is_empty() && self.external_source_stream.is_some();
         match self.source {
             ScanSource::Local
                 if (self.local_paths.is_empty()
                     && self.external_sources.is_empty()
                     && self.external_source_stream.is_none())
-                    || !self.cloud_items.is_empty()
+                    || (!self.cloud_items.is_empty() && !hybrid)
+                    || (hybrid && (!self.local_paths.is_empty() || !self.external_sources.is_empty()))
                     || (!self.local_paths.is_empty()
                         && (!self.external_sources.is_empty()
                             || self.external_source_stream.is_some()))
@@ -271,9 +299,6 @@ impl ScanRequest {
                 bail!("Choose PikPak files or folders only for a cloud scan.")
             }
             _ => {}
-        }
-        if self.source == ScanSource::Cloud && self.external_source_stream.is_some() {
-            bail!("A PikPak scan cannot use a native drive inventory stream.");
         }
         if let Some(stream) = &self.external_source_stream {
             if !stream.is_absolute()
@@ -521,18 +546,8 @@ pub async fn scan(
     let started = Instant::now();
     let mut report = ScanReport {
         source: request.source,
-        scope: match request.source {
-            ScanSource::Local => request
-                .local_paths
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
-            ScanSource::Cloud => request
-                .cloud_items
-                .iter()
-                .map(|item| item.path.clone())
-                .collect(),
-        },
+        scope: request.local_paths.iter().map(|p| p.to_string_lossy().into_owned())
+            .chain(request.cloud_items.iter().map(|item| item.path.clone())).collect(),
         status: "completed".into(),
         threshold: request.threshold,
         scanned_files: 0,
@@ -627,7 +642,7 @@ async fn inventory_cloud(
     staged: &mut StagedCloud,
 ) -> Result<()> {
     let mut files = HashMap::new();
-    discover_cloud(request, client, temp, cancel, staged, &mut |item| {
+    discover_cloud(request, client, temp, cancel, &Default::default(), staged, &mut |item| {
         files.insert(temp.join(format!("cloud/{:08}", files.len())), item);
         Ok(())
     })
@@ -647,22 +662,6 @@ fn cloud_listing_error(error: &anyhow::Error) -> String {
         Some(crate::Error::Parse(_)) => "PikPak returned an unreadable folder listing. Try again or update the app.".into(),
         _ => "Could not read this PikPak folder. Check access and try again.".into(),
     }
-}
-
-async fn list_scan_folder(
-    client: &Client,
-    id: &str,
-    token: Option<&str>,
-    cancel: &AtomicBool,
-    retry_forever: bool,
-) -> Result<crate::types::FilePage> {
-    retry_scan_read(cancel, retry_forever, || async {
-        client
-            .list_folder_page(id, token, 500)
-            .await
-            .map_err(Into::into)
-    })
-    .await
 }
 
 async fn retry_scan_read<T, F, Fut>(
@@ -717,133 +716,12 @@ async fn discover_cloud(
     client: &Client,
     temp: &Path,
     cancel: &AtomicBool,
+    control: &filetwin_core::api::CancellationToken,
     staged: &mut StagedCloud,
     next: &mut dyn FnMut(CloudItem) -> Result<()>,
 ) -> Result<()> {
     let _ = temp;
-    let mut pending: VecDeque<_> = request.cloud_items.clone().into();
-    let direct_items: HashSet<_> = request
-        .cloud_items
-        .iter()
-        .filter(|f| !f.id.is_empty())
-        .map(|f| f.id.clone())
-        .collect();
-    let mut seen = HashSet::new();
-    while let Some(mut item) = pending.pop_front() {
-        check_cancel(cancel)?;
-        if !seen.insert(item.id.clone()) {
-            continue;
-        }
-        if item.name.starts_with('.') {
-            continue;
-        }
-        if direct_items.contains(&item.id) {
-            // Direct roots must still exist outside Trash. Fresh cloud
-            // metadata also validates reuse for directly selected files.
-            let revision = retry_scan_read(cancel, request.checkpoint_id.is_some(), || async {
-                client
-                    .similarity_file_revision(
-                        &item.id,
-                        item.ancestors
-                            .last()
-                            .map(|parent| parent.id.as_str())
-                            .unwrap_or(""),
-                    )
-                    .await
-                    .map_err(Into::into)
-            })
-            .await;
-            let (size, revision) = match revision {
-                Ok(value) => value,
-                Err(error) if cloud_item_missing(&error) => continue,
-                Err(error) => return Err(error),
-            };
-            item.size = size;
-            item.revision = revision;
-        }
-        if !item.is_folder {
-            staged.discovered += 1;
-            next(item)?;
-            continue;
-        }
-        let mut token: Option<String> = None;
-        let mut tokens = HashSet::new();
-        loop {
-            let page = list_scan_folder(
-                client,
-                &item.id,
-                token.as_deref(),
-                cancel,
-                request.checkpoint_id.is_some(),
-            )
-            .await;
-            let page = match page {
-                Ok(page) => {
-                    let _ = emit(&json!({"event":"network_wait","waiting":false}));
-                    page
-                }
-                Err(error) => {
-                    check_cancel(cancel)?;
-                    if cloud_item_missing(&error) {
-                        break;
-                    }
-                    if request.checkpoint_id.is_some() {
-                        return Err(error.context(
-                            "The drive could not finish finding files. Reconnect it, then resume.",
-                        ));
-                    }
-                    staged.skip(&item.path, &cloud_listing_error(&error));
-                    break;
-                }
-            };
-            for file in page.files {
-                check_cancel(cancel)?;
-                if file.name.starts_with('.') {
-                    continue;
-                }
-                let mut ancestors = item.ancestors.clone();
-                if !item.id.is_empty() {
-                    ancestors.push(CloudAncestor {
-                        id: item.id.clone(),
-                        name: item.name.clone(),
-                    });
-                }
-                let child =
-                    CloudItem {
-                        revision: file.hash.clone().filter(|s| !s.trim().is_empty()).or_else(
-                            || file.modified_time.clone().filter(|s| !s.trim().is_empty()),
-                        ),
-                        id: file.id,
-                        name: file.name.clone(),
-                        path: format!("{}/{}", item.path.trim_end_matches('/'), file.name),
-                        is_folder: file.kind.is_folder(),
-                        size: file.size,
-                        ancestors,
-                    };
-                if child.is_folder {
-                    pending.push_back(child);
-                } else if seen.insert(child.id.clone()) {
-                    staged.discovered += 1;
-                    // Feed this page to workers before requesting the next
-                    // page or descending into another folder.
-                    next(child)?;
-                }
-            }
-            token = page.next_page_token;
-            match &token {
-                None => break,
-                Some(next) if !tokens.insert(next.clone()) => {
-                    staged.skip(
-                        &item.path,
-                        "PikPak repeated a page token. This folder is incomplete.",
-                    );
-                    break;
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
+    cloud_listing::discover(request, client, cancel, control, staged, next).await
 }
 
 fn cloud_item_missing(error: &anyhow::Error) -> bool {
@@ -915,6 +793,9 @@ fn write_report(path: &Path, report: &ScanReport) -> Result<()> {
 #[cfg(test)]
 #[path = "similarity_adapter_tests.rs"]
 mod adapter_tests;
+#[cfg(test)]
+#[path = "similarity_hybrid_tests.rs"]
+mod hybrid_tests;
 
 #[cfg(test)]
 mod tests {
@@ -998,6 +879,7 @@ mod tests {
         request.local_paths.clear();
         request.external_sources = (0..100_137)
             .map(|i| ExternalSource {
+                provider: None,
                 content_kind: None,
                 id: format!("asset-{i}"),
                 name: format!("{i}.txt"),

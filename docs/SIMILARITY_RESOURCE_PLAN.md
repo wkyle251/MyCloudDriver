@@ -1,8 +1,9 @@
-# Similarity scan resources
+# Similarity scan resources — historical plan
 
-Status: hardware-derived defaults, Custom controls and demand-driven source
-loading are implemented. Memory/thermal adaptation inside FileTwin remains
-proposed future work.
+Status: superseded by automatic memory admission. See
+[Similarity originals in memory](SIMILARITY_MEMORY.md) and
+[automatic-memory tests](TESTING.md#automatic-memory-for-find-similar) for current
+behavior. The controls and proposed limits below describe the earlier design.
 
 ## Implemented controls
 

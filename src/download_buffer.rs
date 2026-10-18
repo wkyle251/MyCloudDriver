@@ -238,7 +238,7 @@ fn range_write_pressure_at(limit: usize, pressure: u32, reserved: usize) -> bool
     pressure >= 2 || reserved.saturating_add(RANGE_BATCH) >= limit
 }
 
-fn physical_memory() -> Option<usize> {
+pub(crate) fn physical_memory() -> Option<usize> {
     #[cfg(target_os = "macos")]
     {
         use std::ffi::{c_char, c_void};
@@ -265,7 +265,7 @@ impl Policy {
         Self::new(physical_memory(), bytes("MYCLOUDDRIVER_DOWNLOAD_RAM_LIMIT_BYTES"))
     }
 }
-fn memory_pressure() -> u32 {
+pub(crate) fn memory_pressure() -> u32 {
     #[cfg(target_os = "macos")]
     {
         use std::ffi::{c_char, c_void};

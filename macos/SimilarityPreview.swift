@@ -4,7 +4,7 @@ import SwiftUI
 @MainActor final class SimilarityPreviewModel: ObservableObject {
     let quickLook = QuickLookPreviewCoordinator()
     private var task: Task<Void, Never>?
-    private var directory: URL?
+    private var directory: NativePreviewDirectory?
     private var generation = UUID()
     private var file: SimilarityFile?
     private var prepare: ((SimilarityFile, URL) async throws -> URL)?
@@ -22,20 +22,29 @@ import SwiftUI
         task?.cancel(); generation = UUID(); let token = generation
         self.file = file; self.prepare = prepare
         quickLook.showLoading(fileID: file.id, name: file.name, in: window)
-        if let old = directory { try? FileManager.default.removeItem(at: old); directory = nil }
+        directory = nil
         task = Task { [weak self] in
             guard let self else { return }
-            var created: URL?
+            var created: NativePreviewDirectory?
             do {
                 let url: URL
                 if let path = file.localPath {
                     url = URL(fileURLWithPath: path)
-                    guard FileManager.default.fileExists(atPath: path) else { throw CloudDriveError.message("This file has moved or is no longer available. Run a new scan to update its location.") }
+                    let exists = try await NativeFileWork.run { FileManager.default.fileExists(atPath: path) }
+                    guard exists else { throw CloudDriveError.message("This file has moved or is no longer available. Run a new scan to update its location.") }
                 } else {
                     guard let prepare else { throw CloudDriveError.message("Open this file from its drive to preview it.") }
                     let folder = FileManager.default.temporaryDirectory.appendingPathComponent("MyCloudDriver-SimilarityPreview-\(UUID().uuidString)")
-                    try CloudDriveFiles.privateDirectory(folder); created = folder
-                    url = try await AutomaticRecovery.read { try await prepare(file, folder) }
+                    let staging = NativePreviewDirectory(folder); created = staging
+                    try await NativeFileWork.run {
+                        defer { withExtendedLifetime(staging) {} }
+                        try CloudDriveFiles.privateDirectory(staging.url)
+                    }
+                    try Task.checkCancellation()
+                    url = try await NativeFileWork.asyncRun(timeout: 300) {
+                        defer { withExtendedLifetime(staging) {} }
+                        return try await AutomaticRecovery.read { try await prepare(file, staging.url) }
+                    }
                 }
                 try Task.checkCancellation()
                 guard self.generation == token else { throw CancellationError() }
@@ -44,13 +53,13 @@ import SwiftUI
             } catch {
                 if !Task.isCancelled && self.generation == token { self.quickLook.showFailure(FileSearchIndex.redacted(error.localizedDescription)) }
             }
-            if let created { try? FileManager.default.removeItem(at: created) }
+            created = nil
         }
     }
     func close() {
         task?.cancel(); task = nil; generation = UUID(); file = nil; prepare = nil; move = nil
         quickLook.dismiss()
-        if let directory { try? FileManager.default.removeItem(at: directory) }; directory = nil
+        directory = nil
     }
 }
 

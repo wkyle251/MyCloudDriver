@@ -73,23 +73,72 @@ impl MemoryInput {
 }
 impl AsRef<[u8]> for MemoryInput { fn as_ref(&self) -> &[u8] { self.data.as_ref().as_ref() } }
 
+/// Use the same recognizer as the pipeline before choosing a media-only reader.
+pub fn supports_seekable_media(prefix: &[u8], name: &std::path::Path) -> bool {
+    crate::scan::detect_format(prefix, name).1 == "media"
+}
+
+/// A provider-verified original that can be read without retaining its complete
+/// contents. Implementations must validate each range against the same content
+/// identity, bound retained RAM, and promptly observe both cancellation sources.
+/// A GCID identity describes provider evidence, never a whole-original SHA-256.
+pub trait SeekableInput: Send + Sync {
+    fn len(&self) -> u64;
+    fn content_id(&self) -> &str;
+    fn read_at(&self, offset: u64, bytes: &mut [u8], stop: &AtomicBool) -> std::io::Result<usize>;
+    fn current(&self) -> bool { true }
+    /// A safe, typed reason for invalidation. It must not include remote URLs,
+    /// credentials, response bodies or original paths.
+    fn failure(&self) -> Option<crate::Error> { None }
+}
+
+pub struct SeekableReader {
+    input: Arc<dyn SeekableInput>,
+    position: u64,
+}
+impl Read for SeekableReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.input.read_at(self.position, bytes, &AtomicBool::new(false))?;
+        if n > bytes.len() { return Err(std::io::ErrorKind::InvalidData.into()); }
+        self.position = self.position.checked_add(n as u64).ok_or(std::io::ErrorKind::InvalidData)?;
+        Ok(n)
+    }
+}
+impl std::io::Seek for SeekableReader {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        let position = match from {
+            std::io::SeekFrom::Start(n) => i128::from(n),
+            std::io::SeekFrom::Current(n) => i128::from(self.position) + i128::from(n),
+            std::io::SeekFrom::End(n) => i128::from(self.input.len()) + i128::from(n),
+        };
+        self.position = u64::try_from(position).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+        Ok(self.position)
+    }
+}
+
 pub struct SharedInput(pub Arc<MemoryInput>);
 impl AsRef<[u8]> for SharedInput { fn as_ref(&self) -> &[u8] { self.0.as_ref().as_ref() } }
-pub enum Reader { File(std::fs::File), Memory(std::io::Cursor<SharedInput>) }
+pub enum Reader { File(std::fs::File), Memory(std::io::Cursor<SharedInput>), Seekable(SeekableReader) }
 impl Reader {
     pub fn memory(input: Arc<MemoryInput>) -> Self { Self::Memory(std::io::Cursor::new(SharedInput(input))) }
+    pub fn seekable(input: Arc<dyn SeekableInput>) -> Self { Self::Seekable(SeekableReader { input, position: 0 }) }
     pub fn data(&self) -> Option<Arc<MemoryInput>> { match self { Self::Memory(c)=>Some(c.get_ref().0.clone()), _=>None } }
 }
 impl Read for Reader {
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> { match self { Self::File(f)=>f.read(bytes), Self::Memory(c)=>c.read(bytes) } }
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> { match self { Self::File(f)=>f.read(bytes), Self::Memory(c)=>c.read(bytes), Self::Seekable(r)=>r.read(bytes) } }
 }
 impl std::io::Seek for Reader {
-    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> { match self { Self::File(f)=>f.seek(from), Self::Memory(c)=>c.seek(from) } }
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> { match self { Self::File(f)=>f.seek(from), Self::Memory(c)=>c.seek(from), Self::Seekable(r)=>r.seek(from) } }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MemoryLocation { pub url: String, pub bytes: u64 }
+pub struct MemoryLocation {
+    pub url: String,
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub range_only: bool,
+}
 
 pub struct MemoryServer {
     pub location: MemoryLocation,
@@ -102,8 +151,27 @@ pub struct MemoryServer {
 // limit so stalled clients cannot create an unbounded number of threads.
 const MAX_MEMORY_READERS: usize = 8;
 
+#[derive(Clone)]
+enum ServerInput { Memory(Arc<MemoryInput>), Seekable(Arc<dyn SeekableInput>) }
+impl ServerInput {
+    fn len(&self) -> u64 { match self { Self::Memory(m) => m.as_ref().as_ref().len() as u64, Self::Seekable(s) => s.len() } }
+    fn read_at(&self, offset: u64, bytes: &mut [u8], stop: &AtomicBool) -> std::io::Result<usize> {
+        match self {
+            Self::Memory(m) => {
+                let data = m.as_ref().as_ref();
+                let start = usize::try_from(offset).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+                let n = bytes.len().min(data.len().saturating_sub(start));
+                if n > 0 { bytes[..n].copy_from_slice(&data[start..start+n]); }
+                Ok(n)
+            }
+            Self::Seekable(s) => s.read_at(offset, bytes, stop),
+        }
+    }
+}
 impl MemoryServer {
-    pub fn new(input: Arc<MemoryInput>) -> std::io::Result<Self> {
+    pub fn new(input: Arc<MemoryInput>) -> std::io::Result<Self> { Self::start(ServerInput::Memory(input)) }
+    pub fn new_seekable(input: Arc<dyn SeekableInput>) -> std::io::Result<Self> { Self::start(ServerInput::Seekable(input)) }
+    fn start(input: ServerInput) -> std::io::Result<Self> {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
@@ -114,7 +182,7 @@ impl MemoryServer {
             return Err(std::io::Error::last_os_error());
         }
         let path = format!("/{}", random.iter().map(|b| format!("{b:02x}")).collect::<String>());
-        let location = MemoryLocation { url: format!("http://{address}{path}"), bytes: input.as_ref().as_ref().len() as u64 };
+        let location = MemoryLocation { url: format!("http://{address}{path}"), bytes: input.len(), range_only: matches!(input, ServerInput::Seekable(_)) };
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let thread = std::thread::Builder::new().name("filetwin-memory".into()).spawn(move || {
@@ -133,9 +201,10 @@ impl MemoryServer {
                         let input = input.clone();
                         let path = path.clone();
                         let stopping = stopping.clone();
+                        let reader_stack = if matches!(input, ServerInput::Seekable(_)) { 2 * 1024 * 1024 } else { 256 * 1024 };
                         if let Ok(reader) = std::thread::Builder::new()
-                            .name("filetwin-memory-read".into()).stack_size(256 * 1024)
-                            .spawn(move || { let _ = serve(&mut socket, &path, input.as_ref().as_ref(), &stopping); })
+                            .name("filetwin-memory-read".into()).stack_size(reader_stack)
+                            .spawn(move || { let _ = serve(&mut socket, &path, &input, &stopping); })
                         { readers.push(reader); }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
@@ -175,18 +244,18 @@ fn header(socket: &mut TcpStream, stop: Option<&AtomicBool>) -> std::io::Result<
     }
     Err(std::io::ErrorKind::InvalidData.into())
 }
-fn range(value: &str, len: usize) -> Option<(usize, usize)> {
+fn range(value: &str, len: u64) -> Option<(u64, u64)> {
     let (start, end) = value.strip_prefix("bytes=")?.split_once('-')?;
     if len == 0 { return None; }
     if start.is_empty() {
-        let tail = end.parse::<usize>().ok()?;
+        let tail = end.parse::<u64>().ok()?;
         return (tail > 0).then(|| (len.saturating_sub(tail), len));
     }
-    let start = start.parse::<usize>().ok()?;
-    let end = if end.is_empty() { len } else { end.parse::<usize>().ok()?.saturating_add(1).min(len) };
+    let start = start.parse::<u64>().ok()?;
+    let end = if end.is_empty() { len } else { end.parse::<u64>().ok()?.saturating_add(1).min(len) };
     (start < end && start < len).then_some((start, end))
 }
-fn serve(socket: &mut TcpStream, path: &str, bytes: &[u8], stop: &AtomicBool) -> std::io::Result<()> {
+fn serve(socket: &mut TcpStream, path: &str, input: &ServerInput, stop: &AtomicBool) -> std::io::Result<()> {
     socket.set_read_timeout(Some(Duration::from_millis(200)))?;
     socket.set_write_timeout(Some(Duration::from_millis(200)))?;
     let header = header(socket, Some(stop))?;
@@ -196,26 +265,34 @@ fn serve(socket: &mut TcpStream, path: &str, bytes: &[u8], stop: &AtomicBool) ->
     if !matches!(method, "GET" | "HEAD") || request.next() != Some(path) {
         return socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     }
+    let len = input.len();
     let wanted = lines.filter_map(|l| l.split_once(':')).find(|(k,_)| k.eq_ignore_ascii_case("range")).map(|(_,v)|v.trim());
     let (start, end) = match wanted {
-        Some(value) => match range(value, bytes.len()) {
+        Some(value) => match range(value, len) {
             Some(range) => range,
-            None => return write!(socket,"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", bytes.len()),
+            None => return write!(socket,"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", len),
         },
-        None => (0, bytes.len()),
+        None => (0, len),
     };
     write!(socket, "HTTP/1.1 {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nConnection: close\r\n", if wanted.is_some() {"206 Partial Content"} else {"200 OK"}, end-start)?;
-    if wanted.is_some() { write!(socket,"Content-Range: bytes {}-{}/{}\r\n", start,end-1,bytes.len())?; }
+    if wanted.is_some() { write!(socket,"Content-Range: bytes {}-{}/{}\r\n", start,end-1,len)?; }
     socket.write_all(b"\r\n")?;
     if method != "HEAD" {
-        for chunk in bytes[start..end].chunks(64*1024) {
+        let mut offset = start;
+        let mut chunk = [0u8; 64 * 1024];
+        while offset < end {
+            if stop.load(Ordering::Acquire) { return Ok(()); }
+            let wanted = chunk.len().min(usize::try_from(end - offset).unwrap_or(usize::MAX));
+            let n = input.read_at(offset, &mut chunk[..wanted], stop)?;
+            if n == 0 || n > wanted { return Err(std::io::ErrorKind::UnexpectedEof.into()); }
+            offset += n as u64;
             let mut written = 0;
             let started = std::time::Instant::now();
-            while written < chunk.len() {
+            while written < n {
                 if stop.load(Ordering::Acquire) { return Ok(()); }
-                match socket.write(&chunk[written..]) {
+                match socket.write(&chunk[written..n]) {
                     Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
-                    Ok(n) => written += n,
+                    Ok(count) => written += count,
                     Err(e) if matches!(e.kind(),std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted)
                         && started.elapsed() < Duration::from_secs(30) => {},
                     Err(e) => return Err(e),
@@ -237,6 +314,7 @@ impl MemoryLocation {
         Ok((std::net::SocketAddr::from(([127,0,0,1],port)),path))
     }
     pub fn read(&self) -> std::io::Result<Vec<u8>> {
+        if self.range_only { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "A range-only original cannot be materialised by a native reader")); }
         let (address,path) = self.address()?;
         let mut socket = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
         socket.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -418,7 +496,7 @@ mod tests {
     #[test]
     fn memory_transport_rejects_remote_or_non_token_urls() {
         for url in ["https://127.0.0.1:3/abc","http://localhost:3/abc","http://192.0.2.1:3/abc","http://127.0.0.1:3/../file"] {
-            assert!(MemoryLocation {url:url.into(),bytes:0}.address().is_err());
+            assert!(MemoryLocation {url:url.into(),bytes:0,range_only:false}.address().is_err());
         }
     }
     #[test]

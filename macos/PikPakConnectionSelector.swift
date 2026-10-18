@@ -34,6 +34,7 @@ struct PikPakConnectionSelector: View {
                 .accessibilityValue("\(model.accountDisplayName ?? "Not connected"), \(model.activeCredentialKind.loginTitle)")
                 .help("Switch PikPak account or choose normal login and token login")
                 .popover(isPresented: $isPresented, arrowEdge: .top) { choices }
+                .onReceive(NotificationCenter.default.publisher(for: FinderPopover.dismissAllNotification)) { _ in isPresented = false }
             if let error = model.accountSettingsError {
                 Text(error).font(.caption2).foregroundStyle(.orange).lineLimit(3).help(error)
             }

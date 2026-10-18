@@ -34,6 +34,7 @@ struct SimilarityFile: Codable, Identifiable {
     var engineId: String? = nil
     var state: String? = nil
     var nativeRevision: String? = nil
+    var nativeScopeID: String? = nil
     var scoreID: String { engineId ?? id }
     var symbol: String {
         switch family { case "image": return "photo"; case "audio": return "waveform"; case "video": return "film"; default: return "doc.text" }
@@ -133,6 +134,7 @@ struct SimilarityExternalSource: Encodable {
     let localPath: String?
     var revision: String? = nil
     var contentKind: String? = nil
+    var provider: String? = nil
 }
 
 struct SimilaritySourceRequest {
@@ -222,6 +224,11 @@ struct SimilarityScanProgress: Codable {
     var vectorsEncoded: UInt64 = 0
     var cacheHits: UInt64 = 0
     var foundFiles: UInt64 = 0
+    var listingFoldersDiscovered: UInt64? = nil
+    var listingFoldersCompleted: UInt64? = nil
+    var listingFoldersPending: UInt64? = nil
+    var listingPagesCompleted: UInt64? = nil
+    var listingFilesFound: UInt64? = nil
     var activeFiles: UInt64 = 0
     var fetchingFiles: UInt64 = 0
     var readingFiles: UInt64 = 0
@@ -251,7 +258,15 @@ struct SimilarityScanProgress: Codable {
     var retainedDownloadMinimum: UInt64 = 0
     var analysisMemoryLimit: UInt64 = 0
     var analysisMemoryBytes: UInt64 = 0
+    var memoryLimit: UInt64? = nil
+    var analysisMemoryRequired: UInt64? = nil
+    var analysisMemoryForecast: UInt64? = nil
+    var analysisGrowthBytes: UInt64? = nil
+    var analysisTransferBytes: UInt64? = nil
+    var stagingMemoryRequired: UInt64? = nil
+    var stagingMemoryLimit: UInt64? = nil
     var memoryScheduling = false
+    var memoryPressure: UInt64? = nil
     var analysisMemoryLabel: String { "\(Self.memoryGB(analysisMemoryBytes)) / \(Self.memoryGB(analysisMemoryLimit))" }
     var analysisMemoryFraction: Double {
         analysisMemoryLimit > 0 ? min(1, Double(analysisMemoryBytes) / Double(analysisMemoryLimit)) : 0
@@ -272,9 +287,16 @@ struct SimilarityScanProgress: Codable {
     var cloudBytesReady: UInt64?
     var cloudBytesTotal: UInt64?
     var cloudByteInventoryComplete = false
-    var usesCloudByteProgress: Bool { stage == .analysing && cloudBytesTotal != nil }
+    var cloudOnDemand: Bool? = nil
+    var sampledOriginals: UInt64? = nil
+    var sampledReceivedBytes: UInt64? = nil
+    var usesOnDemandCloudProgress: Bool { stage == .analysing && cloudOnDemand == true }
+    var usesCloudByteProgress: Bool { stage == .analysing && cloudBytesTotal != nil && cloudOnDemand != true }
     var progressTitle: String { usesCloudByteProgress ? "Cloud download progress" : "\(stage.stepTitle) progress" }
     var cloudByteLabel: String? {
+        if usesOnDemandCloudProgress {
+            return "\((sampledOriginals ?? 0).formatted()) sampled originals · \(Self.bytes(sampledReceivedBytes ?? 0)) range data fetched"
+        }
         guard let ready = cloudBytesReady, let total = cloudBytesTotal else { return nil }
         let amount = cloudByteInventoryComplete ? "\(Self.bytes(ready)) of \(Self.bytes(total))"
             : "\(Self.bytes(ready)) ready · \(Self.bytes(total)) found so far"
@@ -348,6 +370,13 @@ struct SimilarityScanProgress: Codable {
         return stage.title
     }
 
+    mutating func applyListing(_ event: [String: Any]) {
+        listingFoldersDiscovered = (event["folders_discovered"] as? NSNumber)?.uint64Value
+        listingFoldersCompleted = (event["folders_completed"] as? NSNumber)?.uint64Value
+        listingFoldersPending = (event["folders_pending"] as? NSNumber)?.uint64Value
+        listingPagesCompleted = (event["pages_completed"] as? NSNumber)?.uint64Value
+        listingFilesFound = (event["found"] as? NSNumber)?.uint64Value
+    }
     init() {}
     init(event: [String: Any]) {
         let rawStage = event["stage"] as? String ?? ""
@@ -396,6 +425,9 @@ struct SimilarityScanProgress: Codable {
             cloudBytesReady = (bytes["ready_bytes"] as? NSNumber)?.uint64Value
             cloudBytesTotal = (bytes["total_bytes"] as? NSNumber)?.uint64Value
             cloudByteInventoryComplete = bytes["inventory_complete"] as? Bool ?? false
+            cloudOnDemand = bytes["on_demand"] as? Bool
+            sampledOriginals = (bytes["sampled_files"] as? NSNumber)?.uint64Value
+            sampledReceivedBytes = (bytes["sampled_received_bytes"] as? NSNumber)?.uint64Value
         }
         foundFiles = (counts["files_discovered"] as? NSNumber)?.uint64Value ?? (stage == .inventory ? completed : total ?? 0)
         activeFiles = (event["active"] as? NSNumber)?.uint64Value ?? 0
@@ -426,7 +458,15 @@ struct SimilarityScanProgress: Codable {
             retainedDownloadMinimum = (work["retained_download_minimum"] as? NSNumber)?.uint64Value ?? 0
             analysisMemoryLimit = (work["analysis_memory_limit"] as? NSNumber)?.uint64Value ?? 0
             analysisMemoryBytes = (work["analysis_memory_bytes"] as? NSNumber)?.uint64Value ?? 0
+            memoryLimit = (work["memory_limit"] as? NSNumber)?.uint64Value
+            analysisMemoryRequired = (work["analysis_memory_required"] as? NSNumber)?.uint64Value
+            analysisMemoryForecast = (work["analysis_memory_forecast"] as? NSNumber)?.uint64Value
+            analysisGrowthBytes = (work["analysis_growth_bytes"] as? NSNumber)?.uint64Value
+            analysisTransferBytes = (work["analysis_transfer_bytes"] as? NSNumber)?.uint64Value
+            stagingMemoryRequired = (work["staging_memory_required"] as? NSNumber)?.uint64Value
+            stagingMemoryLimit = (work["staging_memory_limit"] as? NSNumber)?.uint64Value
             memoryScheduling = work["memory_scheduling"] as? Bool ?? false
+            memoryPressure = (work["memory_pressure"] as? NSNumber)?.uint64Value
             workerLimit = (work["worker_limit"] as? NSNumber)?.uint64Value ?? 0
         }
         discoveryComplete = event["discovery_complete"] as? Bool ?? (total != nil || stage == .comparison || stage == .finishing)
@@ -447,7 +487,10 @@ struct SimilarityScanProgress: Codable {
     var completedLabel: String {
         let count = total.map { "\(completed.formatted()) of \($0.formatted())" } ?? completed.formatted()
         switch stage {
-        case .checking: return "Looking for added, changed or removed files"
+        case .checking:
+            guard let folders = listingFoldersCompleted, let discovered = listingFoldersDiscovered,
+                  let pages = listingPagesCompleted else { return "Looking for added, changed or removed files" }
+            return "\(folders.formatted()) of \(discovered.formatted()) folders checked · \(pages.formatted()) pages · \((listingFilesFound ?? 0).formatted()) files found"
         case .inventory: return "\(count) files found"
         case .downloading: return "\(count) files processed"
         case .analysing: return discoveryComplete ? "\(count) items processed" : "\(foundFiles.formatted()) found · \(completed.formatted()) processed"
@@ -493,6 +536,9 @@ final class SimilarityScanModel: ObservableObject {
     var usesPhotosPreviews: Bool {
         nativeScope?.drive == .photos && photosPreviewsSupported && photosUsePreviews && !externalDuplicatesOnly
     }
+    var hasRemoteSources: Bool {
+        source == .cloud || nativeScope?.drive == .photos || acrossDriveScopes?.contains(where: { $0.drive == .pikpak || $0.drive == .photos }) == true
+    }
     var canChoosePhotosMode: Bool { !isRunning && !isPaused && savedSession == nil && report == nil }
     func choosePhotosPreviews(_ value: Bool) {
         guard canChoosePhotosMode else { return }
@@ -502,16 +548,17 @@ final class SimilarityScanModel: ObservableObject {
     func configurePhotosPreviews(supported: Bool, enabled: Bool) {
         photosPreviewsSupported = supported; photosUsePreviews = enabled
     }
-    @Published private(set) var isRunning = false { didSet { if oldValue != isRunning { recordProcessingSpeed(); onRunningChanged() } } }
-    @Published private(set) var isCancelling = false
-    @Published private(set) var isFinishing = false
-    @Published private(set) var isPaused = false
-    @Published private(set) var isPausing = false
+    @Published private(set) var isRunning = false { didSet { updateSleepPrevention(); if oldValue != isRunning { recordProcessingSpeed(); onRunningChanged() } } }
+    @Published private(set) var isCancelling = false { didSet { updateSleepPrevention() } }
+    @Published private(set) var isFinishing = false { didSet { updateSleepPrevention() } }
+    @Published private(set) var isPaused = false { didSet { updateSleepPrevention() } }
+    @Published private(set) var isPausing = false { didSet { updateSleepPrevention() } }
     @Published private(set) var interrupted = false
     @Published private(set) var waitingForNetwork = false
     @Published private(set) var recoverableSessions: [SimilaritySavedSession] = []
     private(set) var savedSession: SimilaritySavedSession?
     var nativeScope: SimilarityNativeScope?
+    var acrossDriveScopes: [SimilarityAcrossDriveScope]?
     private var preserveOnClose = false
     private var pauseReason: String?
     private var cancelRequested = false
@@ -540,7 +587,7 @@ final class SimilarityScanModel: ObservableObject {
     @Published private(set) var runResources: SimilarityResourceLimits?
     var externalTitle: String?
     var externalDuplicatesOnly = false
-    var externalScopeNames: [String] = []
+    @Published var externalScopeNames: [String] = []
     var prepareExternalScope: (() async throws -> [URL])?
     var inventoryExternalSources: (() async throws -> [SimilarityExternalSource])?
     var streamExternalSources: ((@escaping (SimilarityExternalSource) async throws -> Void) async throws -> Void)?
@@ -553,7 +600,7 @@ final class SimilarityScanModel: ObservableObject {
     // writers stop. A later Resume must never have its directory removed.
     var takeExternalScopeCleanup: (() -> (() -> Void)?)?
     var transformExternalReport: ((SimilarityReport) -> SimilarityReport)?
-    private var preparationTask: Task<Void, Never>?
+    private var preparationTask: Task<Void, Never>? { didSet { updateSleepPrevention() } }
     private var externalSources: [SimilarityExternalSource] = []
     private var externalSourceIDs: Set<String> = []
     private var sourceTasks: [String: Task<Void, Never>] = [:]
@@ -561,7 +608,10 @@ final class SimilarityScanModel: ObservableObject {
     private var sourceRequestRoot: URL?
     @Published private(set) var report: SimilarityReport?
     @Published var error: String?
-    private var process: Process?
+    private var process: Process? { didSet { updateSleepPrevention() } }
+    private let sleepPrevention: DownloadSleepPrevention
+    private var sleepWorkDepth = 0 { didSet { updateSleepPrevention() } }
+    private var retiringProviderWork = 0 { didSet { updateSleepPrevention() } }
     private var generation = UUID()
     private var scopes: [URL] = []
     var onRunningChanged: () -> Void = {}
@@ -588,7 +638,18 @@ final class SimilarityScanModel: ObservableObject {
         progress.analysed + progress.unsupportedFiles + progress.failedFiles + progress.pairsCompared
     }
 
-    init(source: SimilaritySource, activity: FinderTaskActivityStore) { self.source = source; self.activity = activity }
+    init(source: SimilaritySource, activity: FinderTaskActivityStore, sleepPrevention: DownloadSleepPrevention? = nil) {
+        self.source = source; self.activity = activity
+        self.sleepPrevention = sleepPrevention ?? DownloadSleepPrevention(fullWake: true,
+            reason: "MyCloudDriver is finding similar files or checking duplicates")
+    }
+    private func updateSleepPrevention() {
+        // A paused live helper owns volatile originals. After helper exit,
+        // retain protection until pipes, saved results and providers drain.
+        // A durable paused checkpoint without live work may sleep normally.
+        sleepPrevention.setActive(isRunning || isPausing || isCancelling || isFinishing || process != nil
+            || preparationTask != nil || retainsOriginalsInRAM || sleepWorkDepth > 0 || retiringProviderWork > 0)
+    }
     func elapsedSeconds(at date: Date) -> TimeInterval { scanClock.elapsed(at: date) }
 
     private func recordProcessingSpeed() {
@@ -701,6 +762,8 @@ final class SimilarityScanModel: ObservableObject {
 
     func start(_ configuration: SimilarityConfiguration, resuming session: SimilaritySavedSession? = nil) {
         guard !isRunning, session != nil || canStart else { return }
+        sleepWorkDepth += 1
+        defer { sleepWorkDepth -= 1 }
         let resumesCurrentSession = session != nil && session?.id == savedSession?.id
         if var session, session.id == savedSession?.id, let child = process, child.isRunning {
             guard let previous = resultConfiguration, SimilaritySessionStore.sameAccount(previous, configuration) else {
@@ -726,6 +789,7 @@ final class SimilarityScanModel: ObservableObject {
         }
         if let session {
             localURLs=session.localURLs; cloudRoots=session.cloudRoots; nativeScope=session.nativeScope
+            acrossDriveScopes = session.acrossDriveScopes
             families=session.families; threshold=session.threshold; exactDuplicates=session.exactDuplicates
             photosUsePreviews = session.nativeScope?.photosUsePreviews ?? false
             savedSession=session
@@ -748,10 +812,9 @@ final class SimilarityScanModel: ObservableObject {
         processingSpeed = processingHistory.snapshot(for: progress)
         readHistory = SimilarityReadHistory(); readSpeed = 0
         resultConfiguration = configuration; results.reset()
-        runResources = session?.resources ?? SimilarityResourceSettings.current.limits
-        // Older checkpoints retain their RAM amounts, but no longer impose a
-        // saved file-count limit. Encoding profiles remain pinned below.
-        runResources?.memoryScheduling = true
+        // Saved RAM preferences are migrated to the automatic governor.
+        // Keep only the checkpoint's backend so cached vectors stay compatible.
+        runResources = SimilarityResourceSettings.current.limits
         // Resource amounts may change on Resume; the encoding backend is
         // pinned by the original checkpoint to keep cached vectors compatible.
         if let session { runResources?.acceleration = session.resources.acceleration ?? .cpu }
@@ -766,6 +829,7 @@ final class SimilarityScanModel: ObservableObject {
             var saved=session ?? SimilaritySavedSession(id:UUID().uuidString,source:source,localURLs:localURLs,
                 cloudRoots:cloudRoots,nativeScope:nativeScope,scope:scopeLabel,families:families,threshold:threshold,
                 exactDuplicates:exactDuplicates,resources:runResources!,state:"running",startedAt:startedAt!,updatedAt:Date())
+            saved.acrossDriveScopes = acrossDriveScopes
             saved.state="running"; saved.updatedAt=Date(); saved.resources=runResources!
             saved.activeElapsedSeconds = scanClock.elapsed(at: saved.updatedAt)
             saved.progress = progress
@@ -867,7 +931,7 @@ final class SimilarityScanModel: ObservableObject {
             let writer = try streamURL.map { try SimilarityInventoryWriter(url: $0) }
             let request = SimilarityRequest(checkpointId:savedSession?.id,parentPid:ProcessInfo.processInfo.processIdentifier,
                 source: source, localPaths: source == .local ? localURLs.map(\.path) : [],
-                cloudItems: source == .cloud ? cloudRoots : [], externalSources: externalSources, externalSourceStream: streamURL?.path,
+                cloudItems: source == .cloud || acrossDriveScopes != nil ? cloudRoots : [], externalSources: externalSources, externalSourceStream: streamURL?.path,
                 families: families.sorted(), threshold: threshold,
                 exactDuplicates: exactDuplicates,
                 dataDir: configuration.dataDirectory.path, modelDir: configuration.models.path,
@@ -905,12 +969,17 @@ final class SimilarityScanModel: ObservableObject {
                     self.receive(event)
                 }
             }
-            child.terminationHandler = { [weak self] child in
+            let runSleepPrevention = sleepPrevention
+            child.terminationHandler = { [weak self, runSleepPrevention] child in
+                let exitCode = child.terminationStatus
+                child.terminationHandler = nil
                 // Wait for both pipes and decode the report away from the GUI.
-                reader.finish(reportURL: reportURL) { report, diagnostic in
-                    Task { @MainActor in
-                        guard let self, self.generation == runID else { return }
-                        self.finish(report, diagnostic: diagnostic, exitCode: child.terminationStatus, temporaryDirectory: directory)
+                // The run retains its activity even if its model/window closes.
+                reader.finish(reportURL: reportURL) { [weak self, runSleepPrevention] report, diagnostic in
+                    Task { @MainActor [weak self, runSleepPrevention] in
+                        guard let self else { runSleepPrevention.setActive(false); return }
+                        guard self.generation == runID else { self.updateSleepPrevention(); return }
+                        self.finish(report, diagnostic: diagnostic, exitCode: exitCode, temporaryDirectory: directory)
                     }
                 }
             }
@@ -1002,6 +1071,10 @@ final class SimilarityScanModel: ObservableObject {
             progress.total = nil; progress.discoveryComplete = false
             updateProgressStatus(); return
         }
+        if event["event"] as? String == "discovery_listing" {
+            progress.applyListing(event)
+            updateProgressStatus(); return
+        }
         if event["event"] as? String == "inventory_changed" {
             let count = (event["total"] as? NSNumber)?.uint64Value ?? 0
             let traffic = progress.downloadedBytes
@@ -1069,6 +1142,11 @@ final class SimilarityScanModel: ObservableObject {
         var event = event
         if externalTitle != nil && !preparing && event["stage"] as? String == "inventory" { event["stage"] = "analysing" }
         var next = SimilarityScanProgress(event: event)
+        next.listingFoldersDiscovered = progress.listingFoldersDiscovered
+        next.listingFoldersCompleted = progress.listingFoldersCompleted
+        next.listingFoldersPending = progress.listingFoldersPending
+        next.listingPagesCompleted = progress.listingPagesCompleted
+        next.listingFilesFound = progress.listingFilesFound
         liveFoundFiles = max(liveFoundFiles, next.foundFiles)
         liveDiscoveryComplete = liveDiscoveryComplete || next.discoveryComplete
         next.foundFiles = liveFoundFiles
@@ -1185,6 +1263,7 @@ final class SimilarityScanModel: ObservableObject {
     }
 
     private func retireProviders(temporaryDirectory: URL?) {
+        retiringProviderWork += 1
         let pending = Array(sourceTasks.values)
         let inventory = inventoryTask, preparation = preparationTask
         pending.forEach { $0.cancel() }; inventory?.cancel(); preparation?.cancel()
@@ -1200,10 +1279,13 @@ final class SimilarityScanModel: ObservableObject {
                 cleanup?()
                 heldScopes.forEach { $0.stopAccessingSecurityScopedResource() }
             }.value
+            self.retiringProviderWork -= 1
         }
     }
 
     private func finish(_ result: SimilarityReport?, diagnostic: String, exitCode: Int32, temporaryDirectory: URL? = nil) {
+        sleepWorkDepth += 1
+        defer { sleepWorkDepth -= 1 }
         retireProviders(temporaryDirectory: temporaryDirectory)
         let finishedEarly = isFinishing || result?.status == "finished"
         isFinishing = false
@@ -1330,6 +1412,8 @@ final class SimilarityScanModel: ObservableObject {
 
     func finishScan() {
         guard canFinish else { return }
+        sleepWorkDepth += 1
+        defer { sleepWorkDepth -= 1 }
         cancelAutoResume(resettingAttempts: true)
         guard var saved = savedSession, let configuration = resultConfiguration else { return }
         saved.state = "finished"; saved.updatedAt = Date(); saved.progress = progress
@@ -1349,6 +1433,8 @@ final class SimilarityScanModel: ObservableObject {
     func cancel() {
         cancelAutoResume(resettingAttempts: true)
         guard !isCancelling, isRunning || isPaused || process != nil else { return }
+        sleepWorkDepth += 1
+        defer { sleepWorkDepth -= 1 }
         cancelRequested = !resetWhenFinished
         isCancelling=true; isPausing=false; isPaused=false; isRunning=true
         interrupted=false; waitingForNetwork=false; pauseReason=nil; error=nil
@@ -1393,7 +1479,7 @@ final class SimilarityScanModel: ObservableObject {
     private func resetIdleState() {
         cancelAutoResume(resettingAttempts: true)
         processingLabel=""; processingBackend=nil; cancelRequested=false; isFinishing=false
-        nativeScope = nil; waitingForNetwork = false; isPausing = false; pauseReason = nil
+        nativeScope = nil; acrossDriveScopes = nil; waitingForNetwork = false; isPausing = false; pauseReason = nil
         results.reset(); resultConfiguration = nil
         report = nil; error = nil; message = "Ready to scan"; detail = ""
         fraction = nil; progress = SimilarityScanProgress(); startedAt = nil; runResources = nil
@@ -1425,7 +1511,7 @@ final class SimilarityScanModel: ObservableObject {
         // Worker/memory allowances are scheduling decisions. Encoding profiles
         // must stay compatible with the vectors already in this checkpoint.
         limits.acceleration = saved.resources.acceleration ?? .cpu
-        if retainsOriginalsInRAM && limits.downloadBudgetBytes < max(progress.retainedDownloadMinimum, progress.originalMemoryBytes) {
+        if limits.automaticMemory != true && retainsOriginalsInRAM && limits.downloadBudgetBytes < max(progress.retainedDownloadMinimum, progress.originalMemoryBytes) {
             throw CloudDriveError.message("Retained downloads need at least \(SimilarityScanProgress.memoryGB(max(progress.retainedDownloadMinimum, progress.originalMemoryBytes))) of Download RAM to finish. Resume before reducing it further.")
         }
         saved.resources = limits; saved.updatedAt = Date()
@@ -1439,6 +1525,8 @@ final class SimilarityScanModel: ObservableObject {
         // one keeps counting so a repeating fault still reaches its limit.
         cancelAutoResume(resettingAttempts: reason == nil)
         guard canPause, var saved=savedSession, let configuration=resultConfiguration else { return }
+        sleepWorkDepth += 1
+        defer { sleepWorkDepth -= 1 }
         saved.state="paused"; saved.updatedAt=Date()
         var pausedClock = scanClock; pausedClock.pause(at: saved.updatedAt)
         saved.activeElapsedSeconds = pausedClock.elapsed(at: saved.updatedAt)
@@ -1459,6 +1547,8 @@ final class SimilarityScanModel: ObservableObject {
     func preserveForShutdown() {
         cancelAutoResume(resettingAttempts: true)
         guard savedSession != nil else { return }
+        sleepWorkDepth += 1
+        defer { sleepWorkDepth -= 1 }
         pause()
         checkpointProgress(force: true)
         // App shutdown cannot retain volatile RAM. Keep the durable checkpoint
@@ -1490,7 +1580,8 @@ final class SimilarityScanModel: ObservableObject {
               let report=SimilaritySessionStore.loadReport(configuration,id:saved.id) else { return }
         if let current=savedSession, let previous=resultConfiguration { SimilaritySessionStore.release(previous,id:current.id) }
         savedSession=saved; resultConfiguration=configuration; localURLs=saved.localURLs; cloudRoots=saved.cloudRoots
-        nativeScope=saved.nativeScope; threshold=saved.threshold; exactDuplicates=saved.exactDuplicates; families=saved.families
+        nativeScope=saved.nativeScope; acrossDriveScopes=saved.acrossDriveScopes
+        threshold=saved.threshold; exactDuplicates=saved.exactDuplicates; families=saved.families
         photosUsePreviews = saved.nativeScope?.photosUsePreviews ?? false
         isPaused=false; isPausing=false; isFinishing=false; isCancelling=false; interrupted=false; cancelRequested=false; error=nil
         cancelAutoResume(resettingAttempts: true)
@@ -1553,7 +1644,7 @@ final class SimilarityScanModel: ObservableObject {
         receive(["event": "progress", "stage": "analysing", "counts": ["files_ready": analysed]])
     }
 
-    private var fixtureRetainsOriginalsInRAM = false
+    private var fixtureRetainsOriginalsInRAM = false { didSet { updateSleepPrevention() } }
     func setFixtureReport(_ value: SimilarityReport) { report = value; results.load(value, configuration: resultConfiguration); message = "\(value.analysedFiles) files ready to review" }
     func setFixtureProgress(_ event: [String: Any], paused: Bool = false) {
         report = nil; isRunning = !paused; isPaused = paused
@@ -1650,6 +1741,7 @@ final class FileSimilarityCoordinator: NSObject, ObservableObject, NSWindowDeleg
     weak var presentationHost: FileSimilarityCoordinator?
     var chooseDriveScope: ((SimilaritySource, Bool) -> Void)?
     var chooseFolderScope: (() -> Void)?
+    var newScanPresentation: (() -> Void)?
     var scopePickerButtonTitle = "Choose Folder…"
     @Published var scopePicker: SimilarityScopePicker?
     var revealInBrowser: ((SimilaritySource, SimilarityFile) -> Void)?
@@ -1657,6 +1749,9 @@ final class FileSimilarityCoordinator: NSObject, ObservableObject, NSWindowDeleg
     var keepSmallest: ((SimilarityKeepSmallestPlan) async throws -> Set<String>)?
     var configuration: (SimilaritySource) throws -> SimilarityConfiguration = { _ in throw CocoaError(.fileNoSuchFile) }
     var restoreNativeScope: ((SimilarityNativeScope) throws -> Void)?
+    var prepareScan: ((SimilarityScanModel) throws -> Void)?
+    var restoreAcrossDriveScopes: (([SimilarityAcrossDriveScope]) throws -> Void)?
+    weak var acrossDrives: SimilarityAcrossDrives?
     var cloudScope: (Bool) throws -> [SimilarityCloudRoot] = { _ in [] }
     var openCloudFile: (SimilarityFile) -> Void = { _ in }
     var externalTitle: String?
@@ -1719,6 +1814,7 @@ final class FileSimilarityCoordinator: NSObject, ObservableObject, NSWindowDeleg
                 target.chooseDriveScope?(option.source, false)
             }
         }
+        window?.title = target.duplicatesOnly ? "Check for Duplicates" : target.acrossDrives != nil ? "Find Similarity Across Drives" : "Find Similar Files"
     }
     func reveal(_ file: SimilarityFile) {
         preview.close()
@@ -1730,7 +1826,7 @@ final class FileSimilarityCoordinator: NSObject, ObservableObject, NSWindowDeleg
         catch { cloud.error = error.localizedDescription }
     }
     func start(_ model: SimilarityScanModel) {
-        do { model.start(try configuration(model.source)) }
+        do { try prepareScan?(model); model.start(try configuration(model.source)) }
         catch { model.error = error.localizedDescription }
     }
     func refreshRecovery() {
@@ -1756,6 +1852,10 @@ final class FileSimilarityCoordinator: NSObject, ObservableObject, NSWindowDeleg
         if !automatic { model.cancelAutoResume(resettingAttempts: true) }
         guard let saved=session ?? model.savedSession else { present(source:model.source); return }
         do {
+            if let scopes = saved.acrossDriveScopes, !model.retainsOriginalsInRAM {
+                guard let restoreAcrossDriveScopes else { throw CloudDriveError.message("Open Across Drives to resume this scan.") }
+                try restoreAcrossDriveScopes(scopes)
+            }
             let config=try configuration(model.source)
             if model.savedSession != nil, let previous=model.resultConfiguration, !SimilaritySessionStore.sameAccount(previous,config) {
                 throw CloudDriveError.message("Switch back to the account that started this scan, then resume.")
@@ -1793,6 +1893,10 @@ final class FileSimilarityCoordinator: NSObject, ObservableObject, NSWindowDeleg
         if let host = presentationHost, host !== self { host.presentDrive(id); return }
         presentDrive(id)
     }
+    func presentNewScan() {
+        if let newScanPresentation { newScanPresentation() }
+        else { present() }
+    }
     func presentDrive(_ id: String) {
         selectDrive(id)
         if window == nil {
@@ -1806,7 +1910,7 @@ final class FileSimilarityCoordinator: NSObject, ObservableObject, NSWindowDeleg
             window.contentView = NSHostingView(rootView: FileSimilarityView(coordinator: self))
             window.center(); self.window = window
         }
-        window?.title = activeCoordinator.duplicatesOnly ? "Check for Duplicates" : "Find Similar Files"
+        window?.title = activeCoordinator.duplicatesOnly ? "Check for Duplicates" : activeCoordinator.acrossDrives != nil ? "Find Similarity Across Drives" : "Find Similar Files"
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }

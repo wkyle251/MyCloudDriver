@@ -34,7 +34,67 @@ struct CloudDriveActivityRecord: Identifiable {
 
 @MainActor private final class NativeExportCheckpoint { var ids = Set<String>() }
 
+/// Original metadata stays off AppKit and is shared by cached root searches
+/// and fresh visible-row searches for one captured provider connection.
+private actor NativeSearchSource {
+    nonisolated let provider: any NativeCloudDrive
+    nonisolated let root: CloudDriveLocation
+    private var items: [String: CloudDriveItem] = [:]
+    private var runToken: UUID?
+    private var seen = Set<String>()
+    init(provider: any NativeCloudDrive) { self.provider = provider; root = provider.root }
+    func record(_ values: [CloudDriveItem]) { for item in values { items[item.id] = item } }
+    func page(folderID: String, offset: Int, token: UUID) async throws -> NativeFileSearchPage {
+        try Task.checkCancellation()
+        if folderID == root.id && offset == 0 { runToken = token; seen.removeAll(keepingCapacity: true) }
+        guard runToken == token else { throw CancellationError() }
+        let location: CloudDriveLocation
+        if folderID == root.id { location = root }
+        else {
+            guard let folder = items[folderID], folder.isFolder else { throw CloudDriveError.message("This search folder is no longer available.") }
+            location = folder.location
+        }
+        let page = try await provider.searchPage(location, offset: offset)
+        try Task.checkCancellation()
+        guard runToken == token else { throw CancellationError() }
+        record(page.items)
+        seen.formUnion(page.items.map(\.id))
+        return .init(items: page.items.map(Self.searchItem), nextOffset: page.nextOffset)
+    }
+    func finish(token: UUID) {
+        guard runToken == token else { return }
+        items = items.filter { seen.contains($0.key) }
+    }
+    func navigation(_ navigation: FileSearchNavigation) throws -> (CloudDriveItem, [CloudDriveItem], [CloudDriveItem]) {
+        guard let target = items[navigation.match.item.id] else { throw CloudDriveError.message("This search result is no longer available. Scan again.") }
+        let ancestors = try navigation.ancestors.map { ancestor -> CloudDriveItem in
+            guard let item = items[ancestor.id], item.isFolder else { throw CloudDriveError.message("This result's original folder is no longer available. Scan again.") }
+            return item
+        }
+        let siblings = try navigation.items.map { value -> CloudDriveItem in
+            guard let item = items[value.id] else { throw CloudDriveError.message("This folder's cached listing is incomplete. Scan again.") }
+            return item
+        }
+        return (target, ancestors, siblings)
+    }
+    nonisolated static func searchItem(_ item: CloudDriveItem) -> FileSearchItem {
+        .init(id: item.id, name: item.name, kind: item.isFolder ? "drive#folder" : "drive#file",
+            size: item.bytes ?? 0, mimeType: nil, modifiedTime: nil)
+    }
+}
+
+/// Delay the terminal callback until metadata pruning and the corresponding
+/// finished event have both reached the index's serial worker.
+private final class NativeSearchCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+    func store(_ task: Task<Void, Never>) { lock.lock(); self.task = task; lock.unlock() }
+    private func pending() -> Task<Void, Never>? { lock.lock(); defer { lock.unlock() }; return task }
+    func wait() async { await pending()?.value }
+}
+
 @MainActor final class NativeDriveModel: ObservableObject {
+    private static let checkingAvailabilityMessage = "Checking drive access…"
     let kind: CloudDriveKind
     let activity = CloudDriveActivityStore()
     let tree = NativeDriveTree()
@@ -43,7 +103,14 @@ struct CloudDriveActivityRecord: Identifiable {
     private lazy var folderThumbnails = NativeFolderThumbnailPrefetcher(cache: thumbnailCache)
     private var thumbnailPrefetchEnabled = true
     let similarity = FileSimilarityCoordinator(activity: FinderTaskActivityStore())
-    @Published private(set) var provider: (any NativeCloudDrive)?
+    let fileSearch = FileSearchModel()
+    private var searchContext = UUID()
+    private var searchSource: NativeSearchSource?
+    private var searchExpandedRows: [String: NativeDriveRowID] = [:]
+    private var searchRevealTask: Task<Void, Never>?
+    private var searchRevealID = UUID()
+    private var searchRevealLoadingID: UUID?
+    @Published private(set) var provider: (any NativeCloudDrive)? { didSet { resetFileSearch() } }
     @Published private(set) var history: [CloudDriveLocation] = []
     @Published private(set) var items: [CloudDriveItem] = []
     @Published var selection: Set<String> = [] {
@@ -90,6 +157,7 @@ struct CloudDriveActivityRecord: Identifiable {
     }
     @Published var zoom = 1.0
     @Published private(set) var isLoading = false
+    @Published private(set) var isCheckingAvailability = false
     @Published private(set) var isMutating = false
     @Published private(set) var total = 0
     @Published private(set) var nextOffset: Int?
@@ -122,30 +190,48 @@ struct CloudDriveActivityRecord: Identifiable {
         return items
     }
     private var filteredRowsCache: [NativeDriveRow]?
+    private var filteredRowIndices: [NativeDriveRowID: Int]?
     /// Folders the current type filter has left empty, and how many rows that removed. Built with `filteredRowsCache`.
     private var hiddenFolderIDs = Set<String>()
     private var hiddenFolderCount = 0
     private var selectedItemsCache: [CloudDriveItem]?
     private var fileExtensionsCache: [String]?
     private func invalidateRowCaches() {
-        filteredRowsCache = nil; selectedItemsCache = nil; fileExtensionsCache = nil
+        filteredRowsCache = nil; filteredRowIndices = nil; selectedItemsCache = nil; fileExtensionsCache = nil
     }
     private let preferences: UserDefaults
     /// Same answer as `visibleRows.contains { $0.id == id }` without scanning.
     private func isVisibleRow(_ id: NativeDriveRowID) -> Bool {
         guard let row = tree.rowByID[id], viewMode == 0 || id.path.count == 1 else { return false }
-        guard fileTypeFilter.isActive || hidesEmptyFolders else { return true }
+        guard fileTypeFilter.matches(row.item) else { return false }
+        // A file or a folder whose complete contents are not known cannot be
+        // removed by Hide Empty Folders. Avoid building an entire filtered
+        // listing to answer selection/focus for those common cases.
+        guard hidesEmptyFolders, row.item.isFolder, tree.completeFolderIDs.contains(row.item.id) else { return true }
         _ = visibleRows
-        return fileTypeFilter.matches(row.item) && !(row.item.isFolder && hiddenFolderIDs.contains(row.item.id))
+        return !hiddenFolderIDs.contains(row.item.id)
+    }
+    private func visibleRow(forItemID id: String) -> NativeDriveRow? {
+        let rowID = viewMode == 0 ? tree.firstRowIDs[id] : NativeDriveRowID(path: [id])
+        guard let rowID, isVisibleRow(rowID) else { return nil }
+        return tree.rowByID[rowID]
+    }
+    private func visibleIndex(of id: NativeDriveRowID) -> Int? {
+        let rows = visibleRows, unfiltered = viewMode == 0 ? tree.rows : tree.rootRows
+        if rows.count == unfiltered.count { return (viewMode == 0 ? tree.rowIndices : tree.rootRowIndices)[id] }
+        if filteredRowIndices == nil {
+            filteredRowIndices = Dictionary(uniqueKeysWithValues: rows.enumerated().map { ($0.element.id, $0.offset) })
+        }
+        return filteredRowIndices?[id]
     }
     var visibleRows: [NativeDriveRow] {
         let rows = viewMode == 0 ? tree.rows : tree.rootRows
         guard fileTypeFilter.isActive || hidesEmptyFolders else { return rows }
         if let filteredRowsCache { return filteredRowsCache }
-        let matched = rows.filter { fileTypeFilter.matches($0.item) }
+        let matched = fileTypeFilter.isActive ? rows.filter { fileTypeFilter.matches($0.item) } : rows
         // Folders the filter left empty: judged from listings already read, including collapsed folders'.
         let empty = hidesEmptyFolders
-            ? BrowserEmptyFolders.emptyFolderIDs(among: Set(matched.lazy.filter { $0.item.isFolder }.map { $0.item.id }),
+            ? BrowserEmptyFolders.emptyFolderIDs(among: (viewMode == 0 ? tree.folderIDs : tree.rootFolderIDs).intersection(tree.completeFolderIDs),
                 children: { [tree] in tree.knownChildren(ofFolderID: $0) }, id: \.id, isFolder: \.isFolder,
                 matches: { [fileTypeFilter] in fileTypeFilter.matches($0) })
             : []
@@ -173,9 +259,20 @@ struct CloudDriveActivityRecord: Identifiable {
     private var volumeObservers: [NSObjectProtocol] = []
     var isBusy: Bool { isMutating || !jobs.isEmpty || similarity.local.isRunning || similarity.local.isPausing || similarity.local.retainsOriginalsInRAM }
     var scanConfiguration: (() throws -> SimilarityConfiguration)?
+    var presentAcrossDriveSimilarity: (([CloudDriveItem], any NativeCloudDrive, CloudDriveLocation) -> Void)?
     var onSendToPikPak: (([URL]) -> Void)?
     private var loadTask: Task<Void, Never>?
     private var loadID = UUID()
+    private var closed = false
+    private var availabilityTask: Task<Void, Error>?
+    private var availabilityRefresh: Task<Void, Never>?
+    private var availabilityID = UUID()
+    private let availabilityValidation: @Sendable (ICloudDriveProvider) throws -> Void
+    private let availabilityTimeout: TimeInterval
+    private var bookmarkTask: Task<Void, Never>?
+    private var bookmarkRequest = UUID()
+    var bookmarkWriteTask: Task<Void, Never>?
+    var bookmarkWriteRequest = UUID()
     private var jobs: [UUID: Task<Void, Never>] = [:]
     private var transferControls: [UUID: NativeTransferControl] = [:]
     private enum TransferPhase { case waiting, running, retrying }
@@ -211,7 +308,9 @@ struct CloudDriveActivityRecord: Identifiable {
     var focusedRowID: NativeDriveRowID? {
         if let selectionCursor, selection.contains(selectionCursor.itemID),
            isVisibleRow(selectionCursor) { return selectionCursor }
-        return visibleRows.first { selection.contains($0.item.id) }?.id
+        return selection.compactMap { visibleRow(forItemID: $0) }.min {
+            (tree.rowIndices[$0.id] ?? Int.max) < (tree.rowIndices[$1.id] ?? Int.max)
+        }?.id
     }
     var focusedItemID: String? { focusedRowID?.itemID }
     var focusedItem: CloudDriveItem? { focusedRowID.flatMap { tree.rowByID[$0]?.item } }
@@ -224,9 +323,13 @@ struct CloudDriveActivityRecord: Identifiable {
 
     init(kind: CloudDriveKind, temporaryRoot: URL? = nil, playbackSettings: MediaPlaybackSettings? = nil,
          transferAdmission: NativeTransferAdmission = .shared, thumbnailCache: NativeThumbnailCache? = nil,
-         preferences: UserDefaults = .standard) {
+         preferences: UserDefaults = .standard,
+         availabilityTimeout: TimeInterval = 30,
+         availabilityValidation: @escaping @Sendable (ICloudDriveProvider) throws -> Void = { try $0.validateAccess() }) {
         self.kind = kind
         self.preferences = preferences
+        self.availabilityTimeout = availabilityTimeout
+        self.availabilityValidation = availabilityValidation
         hidesEmptyFolders = BrowserEmptyFolders.preference(in: preferences)
         self.transferAdmission = transferAdmission
         self.thumbnailCache = thumbnailCache ?? .shared
@@ -304,6 +407,7 @@ struct CloudDriveActivityRecord: Identifiable {
     }
     func connect(_ provider: any NativeCloudDrive) {
         guard !isBusy else { error = "Finish or cancel this drive’s active work before reconnecting."; return }
+        cancelAvailability(); cancelBookmarkNavigation(); cancelBookmarkWrites()
         folderThumbnails.cancel()
         similarity.local.detachPausedForRecovery()
         closePreview(); mediaPreview.clear(); self.provider = provider; history = [provider.root]; query = ""; undoStack = []; redoStack = []
@@ -313,21 +417,89 @@ struct CloudDriveActivityRecord: Identifiable {
         scanItemsByPath = [:]; scanItemsByID = [:]
         diskTrashItems = []; diskTrashSelection = []; diskTrashReady = false
         refreshDiskTrash(prepare: true)
-        refreshAvailability(reloadWhenAvailable: false)
-        if isConnected { reload() }
+        availabilityMessage = provider is ICloudDriveProvider ? Self.checkingAvailabilityMessage : nil
+        reload()
+    }
+
+    /// Mark asynchronous provider construction as part of connecting, before
+    /// the Hub schedules its worker. Keep an existing connection usable.
+    func beginConnectionCheck() {
+        cancelSearchReveal()
+        loadTask?.cancel(); loadTask = nil; loadID = UUID()
+        cancelAvailability(); cancelBookmarkNavigation(); cancelBookmarkWrites()
+        isLoading = true; isCheckingAvailability = true; error = nil
+    }
+
+    func finishConnectionCheck(error: Error? = nil) {
+        isLoading = false; isCheckingAvailability = false
+        if let error {
+            self.error = error.localizedDescription
+            if provider == nil { availabilityMessage = error.localizedDescription }
+        }
+        // A second connection attempt can cancel the first provider's initial
+        // validation. If it fails, do not leave that retained provider stuck
+        // behind a checking marker with no worker left to complete it.
+        if !closed, provider != nil, availabilityMessage == Self.checkingAvailabilityMessage { reload() }
+    }
+
+    private func cancelAvailability() {
+        availabilityTask?.cancel(); availabilityTask = nil
+        availabilityRefresh?.cancel(); availabilityRefresh = nil
+        availabilityID = UUID(); isCheckingAvailability = false
+    }
+
+    /// All root identity and metadata validation stays on the bounded file
+    /// worker. Concurrent reload/mount notifications share the pending check.
+    private func checkAvailability(_ disk: ICloudDriveProvider) async throws {
+        while true {
+            try Task.checkCancellation()
+            guard (provider as? ICloudDriveProvider) === disk else { throw CancellationError() }
+            let request: UUID, work: Task<Void, Error>
+            if let pending = availabilityTask { request = availabilityID; work = pending }
+            else {
+                request = UUID(); availabilityID = request; isCheckingAvailability = true
+                let validate = availabilityValidation, timeout = availabilityTimeout
+                work = Task { try await NativeFileWork.run(timeout: timeout) { try validate(disk) } }
+                availabilityTask = work
+            }
+            let result = await work.result
+            guard (provider as? ICloudDriveProvider) === disk else { throw CancellationError() }
+            // Another waiter may have completed this check and a new reload
+            // started the next one while we resumed. Follow that check rather
+            // than treating a newer request as a canceled drive connection.
+            guard availabilityID == request else { try Task.checkCancellation(); continue }
+            availabilityTask = nil; isCheckingAvailability = false
+            try Task.checkCancellation()
+            switch result {
+            case .success:
+                availabilityMessage = nil
+                return
+            case .failure(let error):
+                if !(error is CancellationError) {
+                    availabilityMessage = error.localizedDescription
+                    folderThumbnails.cancel(); closePreview(); mediaPreview.clear()
+                    items = []; selection = []; total = 0; nextOffset = nil
+                    tree.reset(provider: provider); selectionAnchor = nil; selectionCursor = nil
+                }
+                throw error
+            }
+        }
     }
 
     func refreshAvailability(reloadWhenAvailable: Bool = true) {
         guard let disk = provider as? ICloudDriveProvider else { availabilityMessage = nil; return }
         let previous = availabilityMessage
-        do { try disk.validateAccess(); availabilityMessage = nil }
-        catch { availabilityMessage = error.localizedDescription }
-        if availabilityMessage != nil {
-            folderThumbnails.cancel()
-            loadTask?.cancel(); loadTask = nil; loadID = UUID(); isLoading = false
-            closePreview(); mediaPreview.clear(); items = []; selection = []; total = 0; nextOffset = nil
-            tree.reset(provider: provider); selectionAnchor = nil; selectionCursor = nil
-        } else if previous != nil && reloadWhenAvailable { reload() }
+        availabilityRefresh?.cancel()
+        availabilityRefresh = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.checkAvailability(disk)
+                if previous != nil && reloadWhenAvailable && !self.isLoading { self.reload() }
+            } catch {
+                guard !(error is CancellationError), !Task.isCancelled, (self.provider as? ICloudDriveProvider) === disk else { return }
+                self.loadTask?.cancel(); self.loadTask = nil; self.loadID = UUID(); self.isLoading = false
+            }
+        }
     }
 
     func sendToPikPak(_ items: [CloudDriveItem]) {
@@ -340,13 +512,14 @@ struct CloudDriveActivityRecord: Identifiable {
         if let item = scanItemsByID[file.id] { return item }
         let path = file.localPath ?? (file.path.hasPrefix("/") ? file.path : nil)
         return CloudDriveItem(id:file.id,name:file.name,isFolder:false,bytes:file.bytes,
-            url:kind == .photos ? nil : path.map { URL(fileURLWithPath:$0) },
+            url:kind == .photos ? nil : path.map { URL(fileURLWithPath: $0, isDirectory: false) },
             mediaType:file.family,canRename:kind != .photos,revision:file.nativeRevision)
     }
 
     func disconnect() {
         guard !isBusy else { error = "Finish or cancel this drive’s active work before disconnecting."; return }
         folderThumbnails.cancel()
+        cancelAvailability(); cancelBookmarkNavigation(); cancelBookmarkWrites()
         similarity.local.detachPausedForRecovery()
         loadTask?.cancel(); loadTask = nil; loadID = UUID(); isLoading = false
         closePreview(); mediaPreview.clear(); availabilityMessage = nil; provider = nil; history = []; items = []; selection = []; query = ""
@@ -358,8 +531,9 @@ struct CloudDriveActivityRecord: Identifiable {
         diskTrashItems = []; diskTrashSelection = []; diskTrashReady = false; diskTrashLoading = false; diskTrashError = nil
     }
     func reload(append: Bool = false) {
-        refreshAvailability(reloadWhenAvailable: false)
-        guard isConnected, let provider else { return }
+        guard let provider else { return }
+        cancelSearchReveal()
+        cancelBookmarkNavigation()
         if !append { folderThumbnails.cancel() }
         loadTask?.cancel(); let id = UUID(); loadID = id
         let location = location, query = query, offset = append ? nextOffset ?? 0 : 0
@@ -367,6 +541,11 @@ struct CloudDriveActivityRecord: Identifiable {
         isLoading = true; error = nil
         loadTask = Task { [weak self] in
             do {
+                if let disk = provider as? ICloudDriveProvider {
+                    guard let self else { return }
+                    try await self.checkAvailability(disk)
+                }
+                try Task.checkCancellation()
                 if !query.isEmpty { try await Task.sleep(nanoseconds: 180_000_000) }
                 let page = try await AutomaticRecovery.read(onRetry: { [weak self] failure, delay in
                     guard self?.loadID == id else { return }
@@ -374,16 +553,25 @@ struct CloudDriveActivityRecord: Identifiable {
                 }) { try await provider.list(location, offset: offset, search: query) }
                 try Task.checkCancellation()
                 guard let self, self.loadID == id else { return }
-                var seen = Set<String>()
-                let merged = ((append ? self.items : []) + page.items).filter { seen.insert($0.id).inserted }
+                let previous = append ? self.items : []
+                let merged = await Task.detached(priority: .userInitiated) {
+                    var seen = Set<String>()
+                    return (previous + page.items).filter { seen.insert($0.id).inserted }
+                }.value
                 while true {
                     let mode = self.sortMode, direction = self.browserSortDirection
                     let sorted = await Task.detached(priority: .userInitiated) { NativeDriveTree.sorted(merged, by: mode, direction: direction) }.value
                     try Task.checkCancellation()
                     guard self.loadID == id else { return }
                     if mode != self.sortMode || direction != self.browserSortDirection { continue }
-                    self.sortRequest = UUID(); self.items = sorted
-                    self.tree.replaceRoots(sorted, refreshChildren: !append)
+                    self.sortRequest = UUID()
+                    let published = await self.tree.replaceRootsPrepared(sorted, refreshChildren: !append) {
+                        self.loadID == id && self.sortMode == mode && self.browserSortDirection == direction
+                    }
+                    guard self.loadID == id, !Task.isCancelled else { return }
+                    if mode != self.sortMode || direction != self.browserSortDirection { continue }
+                    if !published { continue }
+                    self.items = sorted
                     break
                 }
                 self.total = page.total; self.nextOffset = page.nextOffset; self.isLoading = false; self.error = nil
@@ -421,56 +609,94 @@ struct CloudDriveActivityRecord: Identifiable {
     }
     func root() { guard let root = provider?.root else { return }; history = [root]; resetLocation() }
 
+    private struct BookmarkNavigation {
+        let route: [CloudDriveLocation]
+        let targetID: String
+        let updated: FinderBookmark?
+    }
+
+    private func cancelBookmarkNavigation() {
+        if bookmarkTask != nil { isLoading = false }
+        bookmarkTask?.cancel(); bookmarkTask = nil; bookmarkRequest = UUID()
+    }
+
+    /// True means the request was accepted. Disk/bookmark resolution completes
+    /// asynchronously, so a disconnected share cannot stop keyboard input.
     @discardableResult
     func openBookmark(_ bookmark: FinderBookmark, store requestedStore: FinderBookmarkStore? = nil) -> Bool {
         guard let provider, isConnected, !isMutating, bookmark.provider == kind.rawValue,
               bookmark.scope == bookmarkScope else { return false }
         let store = requestedStore ?? .shared
-        do {
-            var targetID = bookmark.itemID
-            if kind == .local || kind == .icloud {
-                var stale = false
-                let resolved = bookmark.fileBookmark.flatMap {
-                    try? URL(resolvingBookmarkData: $0, options: [.withoutUI, .withoutMounting], bookmarkDataIsStale: &stale)
-                } ?? bookmark.url
-                guard let resolved, let root = provider.root.url else { throw CloudDriveError.message("This bookmark has no folder location.") }
-                let url = resolved.standardizedFileURL.resolvingSymlinksInPath()
-                let prefix = root.path == "/" ? "/" : root.path + "/"
-                guard url == root || url.path.hasPrefix(prefix) else { throw CloudDriveError.message("This bookmarked item has moved outside the connected folder. Connect its new folder to open it.") }
-                var isDirectory = ObjCBool(false)
-                guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue == bookmark.isFolder else {
-                    throw CloudDriveError.message("This bookmarked item is no longer available. Reconnect its disk or remove it from Bookmarks.")
+        cancelSearchReveal()
+        cancelBookmarkNavigation()
+        loadTask?.cancel(); loadTask = nil; loadID = UUID()
+        let request = UUID(); bookmarkRequest = request
+        isLoading = true; error = nil
+        bookmarkTask = Task { [weak self] in
+            do {
+                let navigation: BookmarkNavigation
+                if let disk = provider as? ICloudDriveProvider {
+                    navigation = try await NativeFileWork.run {
+                        // Recheck the mounted disk's identity rather than trust
+                        // a path retained from the previous connection.
+                        try disk.validateAccess()
+                        var stale = false
+                        let resolved = bookmark.fileBookmark.flatMap {
+                            try? URL(resolvingBookmarkData: $0, options: [.withoutUI, .withoutMounting], bookmarkDataIsStale: &stale)
+                        } ?? bookmark.url
+                        guard let resolved, let root = provider.root.url else { throw CloudDriveError.message("This bookmark has no folder location.") }
+                        let url = resolved.standardizedFileURL.resolvingSymlinksInPath()
+                        let prefix = root.path == "/" ? "/" : root.path + "/"
+                        guard url.path == root.path || url.path.hasPrefix(prefix) else {
+                            throw CloudDriveError.message("This bookmarked item has moved outside the connected folder. Connect its new folder to open it.")
+                        }
+                        var isDirectory = ObjCBool(false)
+                        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue == bookmark.isFolder else {
+                            throw CloudDriveError.message("This bookmarked item is no longer available. Reconnect its disk or remove it from Bookmarks.")
+                        }
+                        let folder = bookmark.isFolder ? url : url.deletingLastPathComponent()
+                        let suffix = folder.path == root.path ? "" : String(folder.path.dropFirst(prefix.count))
+                        var route = [provider.root], cursor = root
+                        for component in suffix.split(separator: "/") {
+                            cursor.appendPathComponent(String(component), isDirectory: true)
+                            route.append(.init(id: cursor.absoluteString, title: String(component), url: cursor))
+                        }
+                        let updated: FinderBookmark?
+                        if url != bookmark.url || stale {
+                            updated = FinderBookmark(provider: bookmark.provider, scope: bookmark.scope, itemID: url.absoluteString,
+                                name: url.lastPathComponent, isFolder: bookmark.isFolder,
+                                parents: (bookmark.isFolder ? Array(route.dropLast()) : route).map { .init(id: $0.id, name: $0.title, path: $0.url?.path ?? $0.title, url: $0.url) },
+                                url: url, fileBookmark: try? url.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil), addedAt: bookmark.addedAt)
+                        } else { updated = nil }
+                        return BookmarkNavigation(route: route, targetID: url.absoluteString, updated: updated)
+                    }
+                } else {
+                    var route = [provider.root] + bookmark.parents.filter { $0.id != provider.root.id }.map {
+                        CloudDriveLocation(id: $0.id, title: $0.name, url: $0.url)
+                    }
+                    if bookmark.isFolder { route.append(.init(id: bookmark.itemID, title: bookmark.name)) }
+                    navigation = BookmarkNavigation(route: route, targetID: bookmark.itemID, updated: nil)
                 }
-                let folder = bookmark.isFolder ? url : url.deletingLastPathComponent()
-                let suffix = folder == root ? "" : String(folder.path.dropFirst(prefix.count))
-                var route = [provider.root], cursor = root
-                for component in suffix.split(separator: "/") {
-                    cursor.appendPathComponent(String(component), isDirectory: true)
-                    route.append(.init(id: cursor.absoluteString, title: String(component), url: cursor))
-                }
-                history = route
-                targetID = url.absoluteString
-                if url != bookmark.url || stale {
-                    let updated = FinderBookmark(provider: bookmark.provider, scope: bookmark.scope, itemID: targetID,
-                        name: url.lastPathComponent, isFolder: bookmark.isFolder,
-                        parents: (bookmark.isFolder ? Array(route.dropLast()) : route).map { .init(id: $0.id, name: $0.title, path: $0.url?.path ?? $0.title, url: $0.url) },
-                        url: url, fileBookmark: try? url.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil), addedAt: bookmark.addedAt)
+                try Task.checkCancellation()
+                guard let self, self.bookmarkRequest == request, self.provider === provider else { return }
+                self.bookmarkTask = nil
+                if let updated = navigation.updated, store.bookmarks.contains(bookmark) {
                     store.remove(bookmark); store.add(updated)
                 }
-            } else {
-                history = [provider.root] + bookmark.parents.filter { $0.id != provider.root.id }.map {
-                    .init(id: $0.id, title: $0.name, url: $0.url)
+                self.history = navigation.route; self.fileTypeFilter = .all
+                self.resetLocation(); self.mediaPreview.clear()
+                if !bookmark.isFolder {
+                    self.pendingSimilarityRevealID = navigation.targetID; self.bookmarkRevealedItemID = navigation.targetID
                 }
-                if bookmark.isFolder { history.append(.init(id: bookmark.itemID, title: bookmark.name)) }
+            } catch {
+                guard let self, !Task.isCancelled, self.bookmarkRequest == request, self.provider === provider else { return }
+                self.bookmarkTask = nil; self.error = error.localizedDescription; self.isLoading = false
             }
-            fileTypeFilter = .all
-            resetLocation()
-            mediaPreview.clear()
-            if !bookmark.isFolder { pendingSimilarityRevealID = targetID; bookmarkRevealedItemID = targetID }
-            return true
-        } catch { self.error = error.localizedDescription; return false }
+        }
+        return true
     }
     private func resetLocation() {
+        cancelBookmarkNavigation()
         folderThumbnails.cancel()
         bookmarkRevealedItemID = nil
         collapsedFolderFocus = nil
@@ -480,8 +706,9 @@ struct CloudDriveActivityRecord: Identifiable {
     }
     func contextSelection(_ ids: Set<String>) -> [CloudDriveItem] {
         guard !ids.isEmpty else { return [] }
-        var seen = Set<String>()
-        return visibleRows.compactMap { ids.contains($0.item.id) && seen.insert($0.item.id).inserted ? $0.item : nil }
+        return ids.compactMap { visibleRow(forItemID: $0) }.sorted {
+            (tree.rowIndices[$0.id] ?? Int.max) < (tree.rowIndices[$1.id] ?? Int.max)
+        }.map(\.item)
     }
 
     private func reconcileSelection() {
@@ -492,7 +719,7 @@ struct CloudDriveActivityRecord: Identifiable {
             deletedSelection = deleted.navigation
             return
         }
-        if !selection.isEmpty { selection.formIntersection(Set(visibleRows.map { $0.item.id })) }
+        if !selection.isEmpty { selection = selection.filter { visibleRow(forItemID: $0) != nil } }
         if let cursor = selectionCursor, !isVisibleRow(cursor) {
             var parent = cursor.parent
             while let candidate = parent {
@@ -621,18 +848,25 @@ struct CloudDriveActivityRecord: Identifiable {
         Task {
             let sorted = await Task.detached(priority: .userInitiated) { NativeDriveTree.sorted(current, by: mode, direction: direction) }.value
             guard provider != nil, loadID == generation, sortRequest == request else { return }
-            items = sorted; tree.replaceRoots(sorted)
+            guard await tree.replaceRootsPrepared(sorted, isCurrent: {
+                self.provider != nil && self.loadID == generation && self.sortRequest == request
+            }), provider != nil, loadID == generation, sortRequest == request else { return }
+            items = sorted
         }
     }
     func select(_ item: CloudDriveItem, extending: Bool, toggling: Bool) {
-        if let row = visibleRows.first(where: { $0.item.id == item.id }) { select(row, extending: extending, toggling: toggling) }
+        if let row = visibleRow(forItemID: item.id) { select(row, extending: extending, toggling: toggling) }
     }
     func select(_ row: NativeDriveRow, extending: Bool, toggling: Bool, requestsPreview: Bool = true) {
-        let rows = visibleRows, item = row.item
-        guard rows.contains(where: { $0.id == row.id }) else { return }
+        let item = row.item
+        guard isVisibleRow(row.id) else { return }
+        // A row chosen while a disk bookmark is still resolving supersedes
+        // that request. Programmatic bookmark reveal runs after its task ends.
+        cancelBookmarkNavigation()
         if requestsPreview { bookmarkRevealedItemID = nil }
         collapsedFolderFocus = nil
-        if extending, let anchor = selectionAnchor, let a = rows.firstIndex(where: { $0.id == anchor }), let b = rows.firstIndex(where: { $0.id == row.id }) {
+        if extending, let anchor = selectionAnchor, let a = visibleIndex(of: anchor), let b = visibleIndex(of: row.id) {
+            let rows = visibleRows
             selection = Set(rows[min(a, b)...max(a, b)].map { $0.item.id })
         } else if toggling {
             if selection.contains(item.id) { selection.remove(item.id) } else { selection.insert(item.id) }; selectionAnchor = row.id
@@ -654,8 +888,11 @@ struct CloudDriveActivityRecord: Identifiable {
         }
         let context = NativeFolderThumbnailPrefetcher.Context(kind: kind, rootID: provider.root.id,
             folderID: folder.id, query: query)
-        let first = row.map { [$0.item] } ?? []
-        folderThumbnails.start(context: context, items: first + NativeFolderThumbnailPrefetcher.order(siblings, startingAt: row?.item.id), nextOffset: offset) { offset in
+        // A selection in the same folder does not restart its prefetch. Check
+        // before touching the full sibling array, including on every arrow.
+        guard folderThumbnails.context != context else { return }
+        folderThumbnails.start(context: context, items: siblings, nextOffset: offset,
+                               startingAt: row?.item.id, preferred: row?.item) { offset in
             let page = try await provider.list(folder, offset: offset, search: context.query)
             try Task.checkCancellation()
             return .init(items: page.items, nextOffset: page.nextOffset)
@@ -676,7 +913,7 @@ struct CloudDriveActivityRecord: Identifiable {
             select(rows[index], extending: false, toggling: false)
             return
         }
-        let current = currentID.flatMap { id in rows.firstIndex(where: { $0.id == id }) } ?? -1
+        let current = currentID.flatMap { visibleIndex(of: $0) } ?? -1
         let target = rows[min(rows.count - 1, max(0, current + offset))]
         if extending, selectionAnchor == nil || !selection.contains(selectionAnchor!.itemID) {
             selectionAnchor = currentID ?? target.id
@@ -892,8 +1129,9 @@ struct CloudDriveActivityRecord: Identifiable {
         diskTrashLoading = true; diskTrashError = nil
         diskTrashLoad = Task { [weak self] in
             var preparationError: String?
+            var migrated = false
             if prepare {
-                do { try await store.prepare() }
+                do { migrated = try await store.prepare() }
                 catch { preparationError = error.localizedDescription }
             }
             do {
@@ -903,6 +1141,7 @@ struct CloudDriveActivityRecord: Identifiable {
                 self.diskTrashSelection.formIntersection(Set(items.map(\.id)))
                 self.diskTrashReady = preparationError == nil
                 self.diskTrashError = preparationError
+                if migrated { self.reload() }
                 let available = Set(items.map(\.id))
                 self.undoStack.removeAll { !$0.diskTrashEntryIDs.isEmpty && !$0.diskTrashEntryIDs.isSubset(of: available) }
                 self.redoStack.removeAll { !$0.diskTrashEntryIDs.isEmpty && !$0.diskTrashEntryIDs.isSubset(of: available) }
@@ -963,7 +1202,7 @@ struct CloudDriveActivityRecord: Identifiable {
         func verifiedItem(_ file: SimilarityFile) throws -> CloudDriveItem {
             var value = try item(file)
             guard let revision = file.nativeRevision ?? scanItemsByID[file.id]?.revision else {
-                throw CloudDriveError.message("This saved comparison cannot verify file changes. Scan the group again before using Keep Smallest.")
+                throw CloudDriveError.message("This saved comparison cannot verify file changes. Scan the group again before using \(plan.actionTitle).")
             }
             value.revision = revision
             return value
@@ -975,7 +1214,7 @@ struct CloudDriveActivityRecord: Identifiable {
         }
         closePreview(); similarity.preview.close()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            run("Keep Smallest", mutating: true, using: provider, completion: { continuation.resume(with: $0) }) { provider, progress in
+            run(plan.actionTitle, mutating: true, using: provider, completion: { continuation.resume(with: $0) }) { provider, progress in
                 let candidates = keepers + removals
                 let fresh = try await provider.refreshedItems(candidates)
                 guard fresh.count == candidates.count, zip(fresh, candidates).allSatisfy({
@@ -990,6 +1229,69 @@ struct CloudDriveActivityRecord: Identifiable {
             }
         }
         return plan.removalIDs
+    }
+    /// Cross-drive callers capture a provider and decode its original IDs.
+    /// Never resolve these files through this model's current browser or scan.
+    @discardableResult
+    func preflightSimilarityFiles(_ files: [SimilarityFile], provider: any NativeCloudDrive) async throws -> [CloudDriveItem] {
+        guard !closed, provider.kind == kind, Set(files.map(\.id)).count == files.count else {
+            throw CloudDriveError.message("The compared files no longer belong to this drive. Scan the group again.")
+        }
+        let candidates = try files.map { file -> CloudDriveItem in
+            guard file.cloudId == nil, let revision = file.nativeRevision else {
+                throw CloudDriveError.message("This saved comparison cannot verify file changes. Scan the group again.")
+            }
+            let url = file.localPath.map { URL(fileURLWithPath: $0) }
+            guard kind == .photos || url != nil else {
+                throw CloudDriveError.message("An original file is no longer available in the scan's drive.")
+            }
+            return CloudDriveItem(id: file.id, name: file.name, isFolder: false, bytes: file.bytes,
+                url: kind == .photos ? nil : url, mediaType: file.family, canRename: kind != .photos, revision: revision)
+        }
+        try Task.checkCancellation()
+        let fresh = try await provider.refreshedItems(candidates)
+        guard !closed, fresh.count == candidates.count, zip(fresh, candidates).allSatisfy({
+            $0.id == $1.id && !$0.isFolder && $0.revision != nil && $0.revision == $1.revision
+                && ($0.bytes == nil || $0.bytes == $1.bytes)
+        }) else {
+            throw CloudDriveError.message("A compared file is missing or has changed. No files were moved to Trash. Scan the group again.")
+        }
+        try Task.checkCancellation()
+        return fresh
+    }
+    func trashCrossDriveSimilarityFiles(_ removals: [SimilarityFile], keeping keepers: [SimilarityFile],
+                                       provider: any NativeCloudDrive, results: SimilarityResultsModel,
+                                       session: UUID, resultIDs: Set<String>) async throws -> Set<String> {
+        func validateRows() throws {
+            guard !closed, results.sessionToken == session, !removals.isEmpty,
+                  Set(removals.map(\.id)).count == removals.count,
+                  resultIDs == Set(removals.map { SimilarityAcrossDrives.fileID(drive: kind, originalID: $0.id) }),
+                  removals.allSatisfy({ file in
+                      let id = SimilarityAcrossDrives.fileID(drive: kind, originalID: file.id)
+                      guard let stored = results.index?.byID[id] else { return false }
+                      return !results.trashedIDs.contains(id) && stored.bytes == file.bytes && stored.cloudId == nil
+                          && stored.nativeRevision == file.nativeRevision
+                          && stored.localPath.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+                              == file.localPath.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+                  }), Set(keepers.map(\.id)).isDisjoint(with: Set(removals.map(\.id))) else {
+                throw CloudDriveError.message("These files no longer belong to the reviewed scan. Review the group and try again.")
+            }
+        }
+        try validateRows()
+        closePreview(); similarity.preview.close()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            run(kind == .photos ? "Move to Recently Deleted" : "Move to Trash", mutating: true, using: provider,
+                completion: { continuation.resume(with: $0) }) { provider, progress in
+                let fresh = try await self.preflightSimilarityFiles(keepers + removals, provider: provider)
+                try validateRows()
+                let targets = Array(fresh.suffix(removals.count))
+                guard targets.allSatisfy({ $0.canDelete }) else { throw CloudDriveError.message("A compared file cannot be moved to Trash.") }
+                try Task.checkCancellation()
+                let undo = try await provider.deleteVerified(targets, progress: progress)
+                return undo.map { Self.similarityUndo($0, fileIDs: resultIDs, results: results, session: session, restoring: true) }
+            }
+        }
+        return resultIDs
     }
     private static func similarityUndo(_ undo: CloudDriveUndo, fileIDs: Set<String>, results: SimilarityResultsModel,
                                        session: UUID, restoring: Bool) -> CloudDriveUndo {
@@ -1149,22 +1451,163 @@ struct CloudDriveActivityRecord: Identifiable {
         }
     }
 
+    var usesFileSearchPalette: Bool { kind != .photos && provider?.root.url != nil }
+    private func cancelSearchReveal() {
+        searchRevealID = UUID()
+        searchRevealTask?.cancel(); searchRevealTask = nil
+        if searchRevealLoadingID != nil {
+            searchRevealLoadingID = nil; isLoading = false
+        }
+    }
+    private func finishSearchReveal(_ request: UUID) {
+        guard searchRevealID == request else { return }
+        searchRevealTask = nil
+        if searchRevealLoadingID == request {
+            searchRevealLoadingID = nil; isLoading = false
+        }
+    }
+    private func resetFileSearch() {
+        searchContext = UUID(); cancelSearchReveal()
+        searchSource = nil; searchExpandedRows = [:]; fileSearch.reset()
+    }
+    @discardableResult
+    func presentFileSearch(scope: FileSearchScope = .expanded) -> Bool {
+        guard !closed, kind != .photos else { return false }
+        guard let provider else {
+            fileSearch.presentNative(scope: scope, contextID: searchContext.uuidString, contextName: "Disconnected drive",
+                sourceName: kind.title, symbol: kind.symbol, failure: "Reconnect \(kind.title) before searching its file and folder names.")
+            return true
+        }
+        guard usesFileSearchPalette else { return false }
+        let source = searchSource ?? NativeSearchSource(provider: provider)
+        searchSource = source
+        let rows = scope == .expanded ? visibleRows : []
+        let base = history.dropFirst().map { FileSearchAncestor(id: $0.id, name: $0.title) }
+        var matches: [FileSearchMatch] = []
+        searchExpandedRows = [:]
+        if scope == .expanded {
+            matches = rows.map { row in
+                searchExpandedRows[row.item.id] = row.id
+                var ancestors = base
+                for count in 1..<row.id.path.count {
+                    if let parent = tree.rowByID[.init(path: Array(row.id.path.prefix(count)))] {
+                        ancestors.append(.init(id: parent.item.id, name: parent.item.name))
+                    }
+                }
+                return .init(item: NativeSearchSource.searchItem(row.item), ancestors: ancestors, score: 0, sourceName: kind.title)
+            }
+        }
+        let factory: FileSearchScanFactory = { onEvent, onFinish in
+            let token = UUID(), completion = NativeSearchCompletion()
+            let scan = NativeFileSearch.scanFactory(rootID: provider.root.id) { folderID, offset in
+                try await source.page(folderID: folderID, offset: offset, token: token)
+            }
+            return scan({ event in
+                if event.event == "finished" && event.progress.failedFolders == 0 {
+                    completion.store(Task { await source.finish(token: token); onEvent(event) })
+                } else { onEvent(event) }
+            }, { code, diagnostic in
+                Task { await completion.wait(); onFinish(code, diagnostic) }
+            })
+        }
+        closePreview()
+        fileSearch.presentNative(scope: scope, contextID: searchContext.uuidString,
+            contextName: scope == .expanded ? "Browser · \(location.url?.path ?? location.title)" : provider.root.url?.path ?? provider.root.title,
+            sourceName: kind.title, symbol: kind.symbol, expandedItems: matches, scanFactory: factory)
+        return true
+    }
+    func revealFileSearch(_ navigation: FileSearchNavigation) {
+        guard !closed, let source = searchSource, let provider, source.provider === provider else { return }
+        cancelSearchReveal()
+        if navigation.scope == .expanded {
+            guard let id = searchExpandedRows[navigation.match.item.id], let row = tree.rowByID[id], visibleIndex(of: id) != nil else {
+                error = "This item is no longer visible. Search the current expanded items again."; return
+            }
+            section = 0; select(row, extending: false, toggling: false, requestsPreview: false)
+            return
+        }
+        let context = searchContext, request = UUID(); searchRevealID = request
+        searchRevealTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.finishSearchReveal(request) }
+            do {
+                let (target, ancestors, siblings) = try await source.navigation(navigation)
+                if let disk = provider as? ICloudDriveProvider { try await self.checkAvailability(disk) }
+                try Task.checkCancellation()
+                guard !self.closed, self.searchContext == context, self.searchRevealID == request, self.provider === provider else { return }
+                self.cancelBookmarkNavigation(); self.folderThumbnails.cancel(); self.closePreview()
+                self.loadTask?.cancel(); self.loadID = UUID()
+                self.query = ""; self.fileTypeFilter = .all; self.section = 0
+                self.history = [provider.root] + ancestors.map(\.location)
+                self.items = []; self.selection = []; self.selectionAnchor = nil; self.selectionCursor = nil
+                self.tree.reset(provider: provider)
+                if !navigation.hasLoadedDirectory {
+                    self.finishSearchReveal(request)
+                    self.pendingSimilarityRevealID = target.id; self.reload(); return
+                }
+                self.searchRevealLoadingID = request; self.isLoading = true
+                while true {
+                    let mode = self.sortMode, direction = self.browserSortDirection
+                    let sorted = await Task.detached(priority: .userInitiated) { NativeDriveTree.sorted(siblings, by: mode, direction: direction) }.value
+                    try Task.checkCancellation()
+                    guard !self.closed, self.searchContext == context, self.searchRevealID == request, self.provider === provider else { return }
+                    if mode != self.sortMode || direction != self.browserSortDirection { continue }
+                    let published = await self.tree.replaceRootsPrepared(sorted) {
+                        self.searchContext == context && self.searchRevealID == request && self.provider === provider
+                            && self.sortMode == mode && self.browserSortDirection == direction
+                    }
+                    guard self.searchContext == context, self.searchRevealID == request, self.provider === provider else { return }
+                    if mode != self.sortMode || direction != self.browserSortDirection { continue }
+                    guard published else { return }
+                    self.items = sorted; self.total = sorted.count
+                    break
+                }
+                self.nextOffset = navigation.nextPageToken.flatMap(Int.init); self.error = nil
+                self.finishSearchReveal(request)
+                if let row = self.visibleRows.first(where: { $0.item.id == target.id }) {
+                    self.select(row, extending: false, toggling: false, requestsPreview: false)
+                } else { self.pendingSimilarityRevealID = target.id; self.reload(append: self.nextOffset != nil) }
+            } catch {
+                guard self.searchContext == context, self.searchRevealID == request, !Task.isCancelled else { return }
+                self.error = error.localizedDescription
+            }
+        }
+    }
+
     /// Navigate to the file’s original container, then select it after all
     /// needed pages arrive. Photos uses the complete library collection.
-    func revealSimilarityFile(_ file: SimilarityFile) {
-        guard var provider = provider ?? (kind == .local ? similarityProvider : nil) else {
-            error = "Reconnect \(kind.title) to browse this file."; return
+    @discardableResult
+    func revealSimilarityFile(_ file: SimilarityFile, using capturedProvider: (any NativeCloudDrive)? = nil,
+                              scannedItem: CloudDriveItem? = nil) -> Bool {
+        guard !closed else { error = "This drive window has closed."; return false }
+        guard var provider = capturedProvider ?? provider ?? (kind == .local ? similarityProvider : nil) else {
+            error = "Reconnect \(kind.title) to browse this file."; return false
         }
-        fileTypeFilter = .all
         do {
             let item: CloudDriveItem
-            if let known = scanItemsByID[file.id] { item = known }
+            if capturedProvider != nil || scannedItem != nil {
+                guard capturedProvider != nil, let scannedItem, provider.kind == kind, file.cloudId == nil,
+                      scannedItem.id == file.id, !scannedItem.isFolder,
+                      scannedItem.bytes == nil || scannedItem.bytes == file.bytes,
+                      file.nativeRevision == nil || scannedItem.revision == file.nativeRevision else {
+                    throw CloudDriveError.message("This original no longer matches the reviewed result. Scan its location again.")
+                }
+                if kind == .photos {
+                    guard scannedItem.url == nil, file.localPath == nil else {
+                        throw CloudDriveError.message("This original no longer matches the reviewed result. Scan its location again.")
+                    }
+                } else {
+                    guard let expected = file.localPath.map({ URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath() }),
+                          scannedItem.url?.standardizedFileURL.resolvingSymlinksInPath() == expected else {
+                        throw CloudDriveError.message("This original no longer matches the reviewed result. Scan its location again.")
+                    }
+                }
+                item = scannedItem
+            } else if let known = scanItemsByID[file.id] { item = known }
             else if kind != .photos, let path = file.localPath {
                 item = try ICloudDriveProvider.item(URL(fileURLWithPath: path))
             } else { throw CloudDriveError.message("This file is no longer available in this scan’s drive.") }
-            if kind == .photos {
-                history = [provider.root, .init(id: "photos:all", title: "All Photos & Videos")]
-            } else {
+            if kind != .photos && capturedProvider == nil {
                 // The folder picker can scan another disk without reconnecting
                 // Browser. Only navigate there when a result is explicitly revealed.
                 if kind == .local, scanItemsByID[file.id] != nil,
@@ -1175,30 +1618,58 @@ struct CloudDriveActivityRecord: Identifiable {
                         folder == $0 || folder.path.hasPrefix($0.path == "/" ? "/" : $0.path + "/")
                     } ?? false
                     if self.provider == nil || !isWithinBrowser {
-                        provider = scanProvider; self.provider = scanProvider
+                        provider = scanProvider
                     }
                 }
+            }
+            func sameRoot(_ first: any NativeCloudDrive, _ second: any NativeCloudDrive) -> Bool {
+                guard first.kind == second.kind else { return false }
+                if let firstURL = first.root.url, let secondURL = second.root.url {
+                    return firstURL.standardizedFileURL.resolvingSymlinksInPath() == secondURL.standardizedFileURL.resolvingSymlinksInPath()
+                }
+                return first.root.url == nil && second.root.url == nil && first.root.id == second.root.id
+            }
+            let changesRoot = self.provider.map { !sameRoot($0, provider) } ?? true
+            guard !changesRoot || !isBusy else {
+                throw CloudDriveError.message("Finish or cancel this drive’s active work before browsing another scan location.")
+            }
+            if !changesRoot, let current = self.provider { provider = current }
+            let locations: [CloudDriveLocation]
+            if kind == .photos {
+                locations = [provider.root, .init(id: "photos:all", title: "All Photos & Videos")]
+            } else {
                 guard let folder = item.url?.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath(),
-                      let root = provider.root.url else { throw CloudDriveError.message("This file has no containing folder.") }
+                      let root = provider.root.url?.standardizedFileURL.resolvingSymlinksInPath() else { throw CloudDriveError.message("This file has no containing folder.") }
                 let prefix = root.path == "/" ? "/" : root.path + "/"
                 guard folder == root || folder.path.hasPrefix(prefix) else {
                     throw CloudDriveError.message("This file is outside the selected folder. Choose its disk or parent folder first.")
                 }
-                var locations = [provider.root], cursor = root
+                var route = [provider.root], cursor = root
                 let suffix = folder == root ? "" : String(folder.path.dropFirst(prefix.count))
                 for component in suffix.split(separator: "/") {
                     cursor.appendPathComponent(String(component), isDirectory: true)
-                    locations.append(.init(id: cursor.absoluteString, title: String(component), url: cursor))
+                    route.append(.init(id: cursor.absoluteString, title: String(component), url: cursor))
                 }
-                history = locations
+                locations = route
             }
+            if changesRoot {
+                cancelAvailability(); cancelBookmarkNavigation(); cancelBookmarkWrites()
+                folderThumbnails.cancel(); closePreview(); mediaPreview.clear()
+                self.provider = provider
+            }
+            fileTypeFilter = .all; history = locations
             section = 0; resetLocation(); pendingSimilarityRevealID = item.id
-        } catch { self.error = error.localizedDescription }
+            return true
+        } catch { self.error = error.localizedDescription; return false }
     }
 
     func findSimilar(_ selected: [CloudDriveItem]? = nil, exactOnly: Bool = false, presentWindow: Bool = true) {
         guard let provider else { return }
-        configureSimilarity(selected ?? selectedItems, provider: provider, location: location,
+        let selected = selected ?? selectedItems
+        if !exactOnly, presentWindow, let presentAcrossDriveSimilarity {
+            presentAcrossDriveSimilarity(selected, provider, location); return
+        }
+        configureSimilarity(selected, provider: provider, location: location,
                             exactOnly: exactOnly, presentWindow: presentWindow)
     }
 
@@ -1390,12 +1861,16 @@ struct CloudDriveActivityRecord: Identifiable {
                 self.scanItemsByID[file.id] = self.similarityItem(file)
             }
             let itemsByPath = self.scanItemsByPath, itemsByID = self.scanItemsByID, kind = self.kind
+            var mappedFiles: [String: SimilarityFile] = [:]
             func mapped(_ file: SimilarityFile) -> SimilarityFile {
-                let path = URL(fileURLWithPath: file.localPath ?? file.path).standardizedFileURL.path
-                guard let item = itemsByID[file.id] ?? itemsByPath[path] else { return file }
-                return SimilarityFile(id: item.id, name: item.name, path: item.url?.path ?? "\(kind.title)/\(location.title)/\(item.name)", bytes: file.bytes,
+                if let cached = mappedFiles[file.id] { return cached }
+                let item = itemsByID[file.id] ?? itemsByPath[URL(fileURLWithPath: file.localPath ?? file.path, isDirectory: false).standardizedFileURL.path]
+                guard let item else { return file }
+                let mapped = SimilarityFile(id: item.id, name: item.name, path: item.url?.path ?? "\(kind.title)/\(location.title)/\(item.name)", bytes: file.bytes,
                     family: file.family, localPath: kind != .photos ? item.url?.path : nil, cloudId: nil, ancestors: [],
                     engineIndex: file.engineIndex, engineId: file.scoreID, state: file.state, nativeRevision: file.nativeRevision ?? item.revision)
+                mappedFiles[file.id] = mapped
+                return mapped
             }
             let groups = report.groups.filter { !exactOnly || $0.isExact }.map { group in
                 SimilarityGroup(id: group.id, matchKind: group.matchKind, family: group.family, minimumScore: group.minimumScore,
@@ -1473,6 +1948,9 @@ struct CloudDriveActivityRecord: Identifiable {
             symbol: "doc.text.magnifyingglass", processing: similarity.local.resourceProcessing)]
     }
     func close() {
+        closed = true; isLoading = false
+        resetFileSearch()
+        cancelAvailability(); cancelBookmarkNavigation(); cancelBookmarkWrites()
         diskTrashLoad?.cancel(); diskTrashLoad = nil; diskTrashLoadID = UUID()
         folderThumbnails.cancel()
         for observer in volumeObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }

@@ -17,6 +17,7 @@ pub struct Fixture {
     pub share_status: Arc<Mutex<String>>,
     pub user_available: Arc<AtomicBool>,
     pub user_link_override: Arc<Mutex<Option<String>>>,
+    pub user_url_missing_responses: Arc<AtomicUsize>,
     pub guest_denied: Arc<AtomicBool>,
     pub user_body_failures: Arc<AtomicUsize>,
     pub user_body_failure_status: Arc<AtomicUsize>,
@@ -53,6 +54,7 @@ impl Fixture {
         let share_status = Arc::new(Mutex::new("OK".to_string()));
         let user_available = Arc::new(AtomicBool::new(false));
         let user_link_override = Arc::new(Mutex::new(None::<String>));
+        let user_url_missing_responses = Arc::new(AtomicUsize::new(0));
         let guest_denied = Arc::new(AtomicBool::new(false));
         let user_body_failures = Arc::new(AtomicUsize::new(0));
         let user_body_failure_status = Arc::new(AtomicUsize::new(503));
@@ -73,6 +75,7 @@ impl Fixture {
             let share_inventory_delay_ms = share_inventory_delay_ms.clone();
             let user_available = user_available.clone();
             let user_link_override = user_link_override.clone();
+            let user_url_missing_responses = user_url_missing_responses.clone();
             let guest_denied = guest_denied.clone();
             let user_body_failures = user_body_failures.clone();
             let user_body_failure_status = user_body_failure_status.clone();
@@ -98,6 +101,7 @@ impl Fixture {
                             let trash_status = trash_status.clone();
                             let user_available = user_available.clone();
                             let user_link_override = user_link_override.clone();
+                            let user_url_missing_responses = user_url_missing_responses.clone();
                             let guest_denied = guest_denied.clone();
                             let user_body_failures = user_body_failures.clone();
                             let user_body_failure_status = user_body_failure_status.clone();
@@ -162,6 +166,7 @@ impl Fixture {
                                         if file.get("web_content_link").is_none() { file["web_content_link"] = json!(format!("{base}/guest-body/{version}")); }
                                         if file["web_content_link"].is_null() { file["web_content_link"] = json!(""); }
                                         if user { file["web_content_link"] = json!(user_link_override.lock().unwrap().clone().unwrap_or_else(|| format!("{base}/user-body/{version}"))); }
+                                        if user && user_url_missing_responses.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() { file["web_content_link"] = json!(""); }
                                         let status = if user || created { "OK".into() } else { share_status.lock().unwrap().clone() };
                                         json!({"share_status":status,"file_info":file}).to_string().into_bytes()
                                         }
@@ -214,6 +219,7 @@ impl Fixture {
                                                 br#"{"error":"file_in_recycle_bin", "error_code":9, "error_url":"", "error_description":"File or folder is already in recycler", "details":[]}"#.to_vec()
                                             } else {
                                                 file["web_content_link"] = json!(user_link_override.lock().unwrap().clone().unwrap_or_else(|| format!("{base}/user-body/1")));
+                                                if user_url_missing_responses.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() { file["web_content_link"] = json!(""); }
                                                 file.to_string().into_bytes()
                                             }
                                         } else {
@@ -256,6 +262,7 @@ impl Fixture {
             share_status,
             user_available,
             user_link_override,
+            user_url_missing_responses,
             guest_denied,
             user_body_failures,
             user_body_failure_status,
@@ -329,6 +336,7 @@ pub struct PartialConfig {
     pub user_name: Option<String>,
     pub user_byte: Option<u8>,
     pub user_available: bool,
+    pub user_metadata_failures: usize,
     pub guest_next_error: Option<u16>,
     pub guest_first_bounded_error: Option<u16>,
     pub guest_end_status: u16,
@@ -375,6 +383,7 @@ impl PartialFixture {
             user_name: None,
             user_byte: None,
             user_available: true,
+            user_metadata_failures: 0,
             guest_next_error: None,
             guest_first_bounded_error: None,
             guest_end_status: 416,
@@ -470,7 +479,17 @@ impl PartialFixture {
                                     },
                                     "/drive/v1/files/saved-id" => {
                                         assert!(user);
-                                        if !cfg.user_available {
+                                        let fail_metadata = {
+                                            let mut current = config.lock().unwrap();
+                                            let fail = current.user_metadata_failures > 0;
+                                            current.user_metadata_failures = current.user_metadata_failures.saturating_sub(1);
+                                            fail
+                                        };
+                                        if fail_metadata {
+                                            status = "503 Service Unavailable";
+                                            extra.push_str("Retry-After: 0\r\n");
+                                            b"generated temporary metadata failure".to_vec()
+                                        } else if !cfg.user_available {
                                             status = "400 Bad Request";
                                             br#"{"error_code":3,"error":"monthly_download_size_exceeded"}"#.to_vec()
                                         } else {

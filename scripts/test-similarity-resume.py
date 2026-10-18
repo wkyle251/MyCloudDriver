@@ -2,6 +2,7 @@
 """Real-process recovery of a paused and forcibly interrupted similarity matrix."""
 import argparse
 import json
+from contextlib import closing, contextmanager
 import os
 from pathlib import Path
 import selectors
@@ -18,10 +19,53 @@ args = parser.parse_args()
 resources = args.resources.resolve()
 environment = {k: v for k, v in os.environ.items() if not k.startswith('PIKPAK_')}
 
+
+@contextmanager
+def existing_database(path):
+    # Product recovery opens existing journals read/write so SQLite can repair
+    # hot journals or recreate WAL support files after helper termination.
+    # mode=rw and strict resolution still forbid creating a lookalike database.
+    path = path.resolve(strict=True)
+    assert path.is_file(), 'Expected an existing generated comparison database'
+    with closing(sqlite3.connect(path.as_uri() + '?mode=rw', uri=True, timeout=10)) as db:
+        yield db
+
+
+def comparison_database(checkpoint):
+    with existing_database(checkpoint / 'checkpoint.sqlite3') as journal:
+        generation = journal.execute("SELECT value FROM metadata WHERE key='comparison_directory'").fetchone()
+    if generation:
+        value = generation[0]
+        if isinstance(value, bytes):
+            value = value.decode('ascii')
+        assert str(uuid.UUID(value)) == value.lower(), 'Invalid generated comparison directory'
+        return checkpoint / value / 'matrix.sqlite3'
+    # Old checkpoints stored the row matrix directly beside the file journal.
+    return checkpoint / 'matrix.sqlite3'
+
+
+def saved_scores(db):
+    """Read schema and its durable count from one consistent SQLite snapshot."""
+    own_transaction = not db.in_transaction
+    if own_transaction:
+        db.execute('BEGIN')
+    try:
+        tables = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('comparison_progress','scores')")}
+        if 'comparison_progress' in tables:
+            row = db.execute('SELECT completed FROM comparison_progress WHERE singleton=1').fetchone()
+            assert row is not None and row[0] >= 0, 'Missing committed comparison progress'
+            return row[0]
+        assert 'scores' in tables, 'Selected database has no saved comparison format'
+        return db.execute('SELECT COUNT(*) FROM scores').fetchone()[0]
+    finally:
+        if own_transaction:
+            db.rollback()  # End this read snapshot before the next pause sample.
+
 with tempfile.TemporaryDirectory(prefix='mycloud-resume-matrix-') as temporary:
     root = Path(temporary).resolve()
     inputs = root / 'inputs'; inputs.mkdir()
-    count = 1200
+    count = 5000
     text = 'A green garden with trees and flowers, paths and places to enjoy the sunshine. ' * 20
     for index in range(count):
         (inputs / f'{index:04d}.txt').write_text(text)
@@ -61,7 +105,7 @@ with tempfile.TemporaryDirectory(prefix='mycloud-resume-matrix-') as temporary:
                 assert process.poll() is not None or time.monotonic() < deadline, 'Scan timed out'
                 code = process.wait(timeout=10)
                 if interrupt:
-                    assert stopped, 'The scan must be interrupted after a committed comparison checkpoint'
+                    assert stopped, ('No committed comparison interruption', code, (root / 'errors.log').read_text())
                     assert code == (0 if interrupt == signal.SIGTERM else -signal.SIGKILL), (code, (root / 'errors.log').read_text())
                 else:
                     assert code == 0, (code, (root / 'errors.log').read_text())
@@ -73,34 +117,58 @@ with tempfile.TemporaryDirectory(prefix='mycloud-resume-matrix-') as temporary:
     first = run(signal.SIGTERM)
     report = json.loads((root / 'report.json').read_text())
     assert report['status'] == 'paused', report['status']
-    with sqlite3.connect(checkpoint / 'matrix.sqlite3') as db:
-        paused_scores = db.execute('SELECT COUNT(*) FROM scores').fetchone()[0]
+    with existing_database(comparison_database(checkpoint)) as db:
+        paused_scores = saved_scores(db)
     assert 0 < paused_scores < count * (count - 1) // 2
-    # Comparison recovery uses the sealed vector inventory, with no originals.
-    inputs.rename(root / 'originals-unavailable')
+    # Resume still validates fresh scope metadata before/after comparison.
+    # Keep that metadata unchanged and prove originals are not read or hashed.
+    acquisition_fields = ('bytes_read', 'bytes_hashed')
+    first_comparison = next(event for event in first if event.get('stage') == 'comparison')
+    acquisition_before = {field: first_comparison['counts'][field] for field in acquisition_fields}
+    def input_revisions():
+        return [(stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                for stat in (path.stat() for path in sorted(inputs.iterdir()))]
+    original_revisions = input_revisions()
+    def comparison_only(events):
+        progress = [event for event in events if event.get('event') == 'progress']
+        assert not any(event.get('stage') in {'analysing', 'downloading'} for event in progress)
+        comparisons = [event for event in progress if event.get('stage') == 'comparison']
+        assert comparisons, 'Resume did not restore comparison progress'
+        assert all({field: event['counts'][field] for field in acquisition_fields} == acquisition_before
+                   for event in comparisons), 'Resume reread or rehashed original contents'
+        return comparisons
     (checkpoint / 'pause').unlink()
     request['resources'] = dict(memory_scheduling=True, workers=1, memory_bytes=1 << 30, download_memory_bytes=256 << 20)
     request_file.write_text(json.dumps(request))
     second = run(signal.SIGKILL, after=paused_scores)
-    second_progress = [event for event in second if event.get('event') == 'progress']
-    assert second_progress and all(event.get('stage') == 'comparison' for event in second_progress), second_progress[:1]
+    second_progress = comparison_only(second)
     assert second_progress[0]['completed'] == paused_scores
-    with sqlite3.connect(checkpoint / 'matrix.sqlite3') as db:
-        crashed_scores = db.execute('SELECT COUNT(*) FROM scores').fetchone()[0]
+    with existing_database(comparison_database(checkpoint)) as db:
+        crashed_scores = saved_scores(db)
     assert crashed_scores > paused_scores
     request['resources'] = dict(memory_scheduling=True, workers=6, memory_bytes=4 << 30, download_memory_bytes=1 << 30)
     request_file.write_text(json.dumps(request))
     third = run()
-    third_progress = [event for event in third if event.get('event') == 'progress']
-    assert third_progress and all(event.get('stage') in {'comparison', 'finishing'} for event in third_progress), third_progress[:1]
+    third_progress = comparison_only(third)
+    assert input_revisions() == original_revisions, 'Generated original metadata changed'
     assert third_progress[0]['stage'] == 'comparison' and third_progress[0]['completed'] == crashed_scores
     report = json.loads((root / 'report.json').read_text())
     expected = count * (count - 1) // 2
     assert report['status'] == 'completed' and report['scores_retained'] == expected, report
-    with sqlite3.connect(root / 'data/runs' / (report['run_id'] + '.sqlite3')) as db:
-        assert db.execute('SELECT COUNT(*) FROM scores').fetchone()[0] == expected
-        assert db.execute('SELECT COUNT(*) FROM scores WHERE score != 1.0').fetchone()[0] == 0
-    print(f'PASS Pause/SIGKILL/resume with changed RAM budgets during comparison: {paused_scores:,} → {crashed_scores:,} → {expected:,} scores, without originals')
+    with existing_database(root / 'data/runs' / (report['run_id'] + '.sqlite3')) as db:
+        assert saved_scores(db) == expected
+        compact = db.execute("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='score_chunks')").fetchone()[0]
+        if compact:
+            import struct
+            retained = 0
+            for n, data in db.execute('SELECT n,data FROM score_chunks'):
+                assert 0 < n <= 4096 and len(data) == n * 8
+                assert all(score == 1.0 for score in struct.unpack(f'<{n}d', data))
+                retained += n
+            assert retained == expected
+        else:
+            assert db.execute('SELECT COUNT(*) FROM scores WHERE score != 1.0').fetchone()[0] == 0
+    print(f'PASS Pause/SIGKILL/resume with changed RAM budgets during comparison: {paused_scores:,} → {crashed_scores:,} → {expected:,} scores, without rereading original content')
 
     # Simulate a GUI that dies while its helper is waiting for more inventory.
     # The helper must stop itself, even though no UI remains to send SIGTERM.

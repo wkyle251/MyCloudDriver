@@ -1,5 +1,13 @@
 import Foundation
 
+/// Transfer the last ownership of a large retired snapshot to a utility task.
+/// Keeping the box on the actor does not keep its released value alive there.
+private final class NativeDriveRetiredValue<Value>: @unchecked Sendable {
+    private var value: Value?
+    init(_ value: Value) { self.value = value }
+    func release() { value = nil }
+}
+
 /// A file can occur in several Photos albums. Identify its row by the full
 /// visible path, while file operations continue to use the provider's item ID.
 struct NativeDriveRowID: Hashable, Sendable {
@@ -38,6 +46,12 @@ struct NativeDriveRow: Identifiable, Sendable {
     private(set) var rootRows: [NativeDriveRow] = []
     private(set) var rows: [NativeDriveRow] = []
     private(set) var rowByID: [NativeDriveRowID: NativeDriveRow] = [:]
+    private(set) var rowIndices: [NativeDriveRowID: Int] = [:]
+    private(set) var rootRowIndices: [NativeDriveRowID: Int] = [:]
+    private(set) var firstRowIDs: [String: NativeDriveRowID] = [:]
+    private(set) var folderIDs: Set<String> = []
+    private(set) var rootFolderIDs: Set<String> = []
+    private(set) var completeFolderIDs: Set<String> = []
     private(set) var expanded: Set<NativeDriveRowID> = []
     /// Folders whose every level is being opened, in selection order. No root is nested under another.
     private(set) var expandingAllRoots: [NativeDriveRowID] = []
@@ -61,6 +75,50 @@ struct NativeDriveRow: Identifiable, Sendable {
     private var sortMode = 0
     private var direction = BrowserSortDirection.ascending
     private var sortRevision = UUID()
+    private var snapshotRevision = UUID()
+    private var rootRevision = UUID()
+
+    private struct Snapshot: Sendable {
+        let roots: [NativeDriveRow]
+        let rows: [NativeDriveRow]
+        let byID: [NativeDriveRowID: NativeDriveRow]
+        let indices: [NativeDriveRowID: Int]
+        let rootIndices: [NativeDriveRowID: Int]
+        let firstIDs: [String: NativeDriveRowID]
+        let folders: Set<String>
+        let rootFolders: Set<String>
+    }
+
+    nonisolated private static func indexed(roots: [NativeDriveRow], rows: [NativeDriveRow], flat: Bool) -> Snapshot {
+        var byID: [NativeDriveRowID: NativeDriveRow] = [:], indices: [NativeDriveRowID: Int] = [:]
+        var firstIDs: [String: NativeDriveRowID] = [:], folders = Set<String>()
+        byID.reserveCapacity(rows.count); indices.reserveCapacity(rows.count); firstIDs.reserveCapacity(rows.count)
+        for (index, row) in rows.enumerated() {
+            byID[row.id] = row; indices[row.id] = index
+            if firstIDs[row.item.id] == nil { firstIDs[row.item.id] = row.id }
+            if row.item.isFolder { folders.insert(row.item.id) }
+        }
+        return Snapshot(roots: roots, rows: rows, byID: byID, indices: indices,
+            rootIndices: flat ? indices : Dictionary(uniqueKeysWithValues: roots.enumerated().map { ($0.element.id, $0.offset) }),
+            firstIDs: firstIDs, folders: folders,
+            rootFolders: flat ? folders : Set(roots.lazy.filter { $0.item.isFolder }.map { $0.item.id }))
+    }
+
+    private func apply(_ snapshot: Snapshot) {
+        // Large old indexes can be expensive to release too. Keep their final
+        // reference on a utility task rather than destroying them during input.
+        let retireOffActor = rows.count >= 5_000
+        let previous = NativeDriveRetiredValue(Snapshot(roots: rootRows, rows: rows, byID: rowByID, indices: rowIndices,
+            rootIndices: rootRowIndices, firstIDs: firstRowIDs, folders: folderIDs, rootFolders: rootFolderIDs))
+        rootRows = snapshot.roots; rows = snapshot.rows; rowByID = snapshot.byID
+        rowIndices = snapshot.indices; rootRowIndices = snapshot.rootIndices; firstRowIDs = snapshot.firstIDs
+        folderIDs = snapshot.folders; rootFolderIDs = snapshot.rootFolders
+        if retireOffActor { Task.detached(priority: .utility) { previous.release() } }
+        else { previous.release() }
+        completeFolderIDs = Set(branches.compactMap { key, value in
+            value.loaded && value.error == nil && !value.isLoading && value.nextOffset == nil ? key : nil
+        })
+    }
 
     func branch(for item: CloudDriveItem) -> Branch { branches[item.id] ?? Branch() }
 
@@ -72,6 +130,7 @@ struct NativeDriveRow: Identifiable, Sendable {
     }
 
     func reset(provider: (any NativeCloudDrive)?, search: String = "") {
+        rootRevision = UUID()
         cancelRequests()
         self.provider = provider; self.search = search
         roots = []; branches = [:]; expanded = []; measuredSizes = [:]
@@ -79,6 +138,7 @@ struct NativeDriveRow: Identifiable, Sendable {
     }
 
     func replaceRoots(_ items: [CloudDriveItem], refreshChildren: Bool = false) {
+        rootRevision = UUID()
         roots = items
         if refreshChildren {
             cancelRequests()
@@ -92,6 +152,46 @@ struct NativeDriveRow: Identifiable, Sendable {
             }
         }
         rebuild()
+    }
+
+    /// A large flat listing needs no actor-owned outline walk. Build its rows
+    /// and indexes away from input, then publish only if this tree is current.
+    /// Expanded outlines retain their synchronous disclosure semantics.
+    @discardableResult
+    func replaceRootsPrepared(_ items: [CloudDriveItem], refreshChildren: Bool = false,
+                              isCurrent: () -> Bool = { true }) async -> Bool {
+        guard !Task.isCancelled, isCurrent() else { return false }
+        guard items.count >= 5_000, expanded.isEmpty else { replaceRoots(items, refreshChildren: refreshChildren); return true }
+        let generation = generation, revision = snapshotRevision, rootRevision = rootRevision
+        let work = Task.detached(priority: .userInitiated) { () -> Snapshot? in
+            guard !Task.isCancelled else { return nil }
+            var roots: [NativeDriveRow] = []; roots.reserveCapacity(items.count)
+            for (index, item) in items.enumerated() {
+                if index % 256 == 0, Task.isCancelled { return nil }
+                roots.append(.init(id: .init(path: [item.id]), item: item))
+            }
+            let snapshot = Self.indexed(roots: roots, rows: roots, flat: true)
+            return Task.isCancelled ? nil : snapshot
+        }
+        let snapshot = await withTaskCancellationHandler(operation: { await work.value }, onCancel: { work.cancel() })
+        guard let snapshot, !Task.isCancelled, self.generation == generation,
+              self.rootRevision == rootRevision, isCurrent() else { return false }
+        guard snapshotRevision == revision, expanded.isEmpty else {
+            replaceRoots(items, refreshChildren: refreshChildren); return true
+        }
+        roots = items
+        self.rootRevision = UUID()
+        if refreshChildren {
+            cancelRequests(); measuredSizes = [:]
+            for key in Array(branches.keys) {
+                branches[key]?.loaded = false; branches[key]?.error = nil; branches[key]?.nextOffset = nil
+            }
+        }
+        deferredPublication?.cancel(); deferredPublication = nil
+        snapshotRevision = UUID()
+        apply(snapshot)
+        onChange?()
+        return true
     }
 
     func toggle(_ row: NativeDriveRow) {
@@ -197,6 +297,7 @@ struct NativeDriveRow: Identifiable, Sendable {
         guard mode != sortMode || direction != self.direction else { return }
         sortMode = mode; self.direction = direction; sortRevision = UUID()
         let revision = sortRevision, snapshots = branches
+        guard !snapshots.isEmpty else { return }
         Task { [weak self] in
             let sorted = await Task.detached(priority: .userInitiated) {
                 snapshots.mapValues { Self.sorted($0.items, by: mode, direction: direction) }
@@ -205,7 +306,7 @@ struct NativeDriveRow: Identifiable, Sendable {
             for (key, items) in sorted where self.branches[key]?.revision == snapshots[key]?.revision {
                 self.branches[key]?.items = items
             }
-            self.rebuild()
+            if !self.expanded.isEmpty { self.rebuild() }
         }
     }
 
@@ -227,13 +328,14 @@ struct NativeDriveRow: Identifiable, Sendable {
     }
 
     private func rebuild() {
+        snapshotRevision = UUID()
         // Whatever was waiting to be published is included in this rebuild.
         deferredPublication?.cancel(); deferredPublication = nil
-        rootRows = roots.map { .init(id: .init(path: [$0.id]), item: $0) }
+        let nextRoots: [NativeDriveRow] = roots.map { .init(id: .init(path: [$0.id]), item: $0) }
         // Rows under an expanding root inherit its flag down the walk, so a selection of many folders
         // costs one set lookup per row instead of a path comparison against every root.
         let expandingRoots = Set(expandingAllRoots)
-        var stack = rootRows.reversed().map { (row: $0, recursive: false) }, visible: [NativeDriveRow] = []
+        var stack = nextRoots.reversed().map { (row: $0, recursive: false) }, visible: [NativeDriveRow] = []
         var pending = false
         while let (row, inherited) = stack.popLast() {
             visible.append(row)
@@ -255,14 +357,14 @@ struct NativeDriveRow: Identifiable, Sendable {
                 stack.append((.init(id: .init(path: row.id.path + [child.id]), item: child), recursive))
             }
         }
-        rows = visible; rowByID = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
-        let wanted = Set(rows.filter { $0.item.isFolder && expanded.contains($0.id) }.map { $0.item.id })
+        let wanted = Set(visible.lazy.filter { $0.item.isFolder && self.expanded.contains($0.id) }.map { $0.item.id })
         for key in Array(branches.keys) where !wanted.contains(key) {
             tasks.removeValue(forKey: key)?.cancel(); branches[key]?.request = nil
         }
         queue = Array(queue.dropFirst(queueOffset)).filter { wanted.contains($0.item.id) }; queueOffset = 0
         if !expandingAllRoots.isEmpty, !pending { expandingAllRoots = []; recursiveVisited = [] }
         startRequests()
+        apply(Self.indexed(roots: nextRoots, rows: visible, flat: expanded.isEmpty))
         onChange?()
     }
 

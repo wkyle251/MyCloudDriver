@@ -96,6 +96,7 @@ final class MediaVideoPlayerView: AVPlayerView {
     private var frameTask: Task<Void, Never>?
     private var generation = UUID()
     private var reportedFailure = false
+    private var reportedDisplay: Bool?
 
     func attach(_ next: AVPlayer) {
         guard player !== next else { return }
@@ -104,8 +105,9 @@ final class MediaVideoPlayerView: AVPlayerView {
         showsFullScreenToggleButton = false
         player = next
         let request = generation
+        let refreshQueue = MediaPlaybackRefreshQueue()
         let changed: () -> Void = { [weak self, weak next] in
-            Task { @MainActor in
+            refreshQueue.schedule { [weak self, weak next] in
                 guard let self, let next, self.generation == request, self.player === next else { return }
                 self.refreshDisplay()
             }
@@ -122,7 +124,10 @@ final class MediaVideoPlayerView: AVPlayerView {
     }
     private func refreshDisplay() {
         guard let player, let item = player.currentItem else { return }
-        onDisplayChanged?(player, isReadyForDisplay)
+        if reportedDisplay != isReadyForDisplay {
+            reportedDisplay = isReadyForDisplay
+            onDisplayChanged?(player, isReadyForDisplay)
+        }
         if item.status == .failed {
             frameTask?.cancel(); frameTask = nil
             if !reportedFailure {
@@ -144,7 +149,20 @@ final class MediaVideoPlayerView: AVPlayerView {
             try? await Task.sleep(nanoseconds: 250_000_000)
             guard !Task.isCancelled, let self, let player,
                   self.generation == request, self.player === player, !self.isReadyForDisplay else { return }
-            let hasVideo = item.tracks.contains { $0.isEnabled && $0.assetTrack?.mediaType == .video }
+            // Player-item tracks belong to the player's notification queue
+            // (main). Inspect asset-track properties through the bounded
+            // worker: their synchronous getters may wait for metadata I/O.
+            let tracks = item.tracks.compactMap { $0.isEnabled ? $0.assetTrack : nil }
+            let hasVideo: Bool
+            do { hasVideo = try await MediaVideoTracks.hasVideo(tracks) }
+            catch {
+                guard !Task.isCancelled, self.generation == request, self.player === player,
+                      self.window != nil, item.status == .readyToPlay, !self.isReadyForDisplay else { return }
+                self.reportedFailure = true; self.onFailure?(error, player)
+                return
+            }
+            guard !Task.isCancelled, self.generation == request, self.player === player,
+                  self.window != nil, item.status == .readyToPlay, !self.isReadyForDisplay else { return }
             if hasVideo {
                 if player.timeControlStatus == .paused, player.currentTime().seconds == 0 {
                     player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { _ in }
@@ -164,9 +182,24 @@ final class MediaVideoPlayerView: AVPlayerView {
     }
     func clear() {
         generation = UUID(); frameTask?.cancel(); frameTask = nil
-        observations.removeAll(); reportedFailure = false; player = nil
+        observations.removeAll(); reportedFailure = false; reportedDisplay = nil; player = nil
     }
     deinit { frameTask?.cancel() }
+}
+
+enum MediaVideoTracks {
+    static func hasVideo(_ tracks: [AVAssetTrack]) async throws -> Bool {
+        try Task.checkCancellation()
+        for track in tracks {
+            try Task.checkCancellation()
+            // This SDK has no AVAsyncProperty key for mediaType. Keep its
+            // synchronous accessor off AppKit and the cooperative executor.
+            let type = try await NativeFileWork.run { track.mediaType }
+            try Task.checkCancellation()
+            if type == .video { return true }
+        }
+        return false
+    }
 }
 
 struct MediaPreviewView: View {
@@ -187,7 +220,8 @@ struct MediaPreviewView: View {
                 } else if let player = playback.player {
                     MediaVideoSurface(player: player, onDisplayChanged: { source, ready in
                         guard source === playback.player else { return }
-                        displayedPlayer = ready ? source : nil
+                        let next = ready ? source : nil
+                        if displayedPlayer !== next { displayedPlayer = next }
                     }, onFailure: { error, source in
                         guard source === playback.player else { return }
                         failedPlayer = source; onVideoFailure?(error, source)

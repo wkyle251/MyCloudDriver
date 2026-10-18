@@ -7,7 +7,7 @@ final class VideoPreviewCopy: @unchecked Sendable {
     let url: URL
     private let directory: URL
     init(url: URL, directory: URL) { self.url = url; self.directory = directory }
-    deinit { try? FileManager.default.removeItem(at: directory) }
+    deinit { NativeFileWork.cleanup(directory) }
 }
 
 enum VideoPreviewPreparation {

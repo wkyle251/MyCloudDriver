@@ -11,6 +11,7 @@ import tempfile
 
 parser = argparse.ArgumentParser()
 parser.add_argument('resources', type=Path)
+parser.add_argument('--automatic', action='store_true', help='Exercise automatic RAM and acceleration with ignored legacy limits')
 args = parser.parse_args()
 resources = args.resources.resolve()
 spec = importlib.util.spec_from_file_location('fixtures', Path(__file__).with_name('test-similarity-native.py'))
@@ -34,10 +35,13 @@ with tempfile.TemporaryDirectory(prefix='mycloud-memory-images-') as temporary:
                    runtime=dict(worker_path=str(resources / 'filetwin-worker'), ffmpeg_path=ffmpeg,
                                 ffprobe_path=ffprobe, onnxruntime_path=str(models / 'runtime/libonnxruntime.dylib'),
                                 pdfium_path=str(models / 'runtime/libpdfium.dylib')))
+    if args.automatic:
+        request['resources'].update(automatic_memory=True, acceleration='automatic', workers=0,
+                                    memory_bytes=1, download_memory_bytes=0, batch_files=0, batch_bytes=0)
     request_file = root / 'request.json'; request_file.write_text(json.dumps(request))
     environment = {k:v for k,v in os.environ.items() if not k.startswith('PIKPAK_')}
     run = subprocess.run([str(resources / 'pikpak'), 'similarity-scan', '--request-file', str(request_file)],
-                         env=environment, cwd=root, capture_output=True, text=True, timeout=60)
+                         env=environment, cwd=root, capture_output=True, text=True, timeout=120)
     assert run.returncode == 0, run.stderr
     report = json.loads((root / 'report.json').read_text())
     assert report['analysed_files'] == 3 and report['skipped_files'] == 0, report['issues']
@@ -45,4 +49,9 @@ with tempfile.TemporaryDirectory(prefix='mycloud-memory-images-') as temporary:
         details = [json.loads(row[0]) for row in db.execute('SELECT extraction FROM files')]
     assert len(details) == 3 and all(e['input_storage'] == 'memory' for e in details)
     assert not any((root / 'temp').iterdir())
+    if args.automatic:
+        work = [event['work'] for line in run.stdout.splitlines() if (event := json.loads(line)).get('work')]
+        assert work and all(event.get('automatic_memory') for event in work)
+        assert all(event['memory_limit'] > 1 for event in work), 'Legacy RAM setting constrained automatic admission'
+        print('PASS automatic RAM/acceleration, ignored legacy limits and live allowances in packaged helper')
     print('PASS memory-admitted JPEG, HEIC and AVIF decoded from RAM; no failures or leftover processing data')

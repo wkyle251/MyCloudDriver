@@ -61,6 +61,7 @@ struct CloudDriveProgress: Sendable {
     var bytes: UInt64 = 0
     var fileSize: UInt64 = 0
     var activity: Activity? = nil
+    var folderSize: FolderSizeProgress? = nil
 }
 typealias CloudDriveProgressHandler = @Sendable (CloudDriveProgress) -> Void
 
@@ -88,6 +89,8 @@ protocol NativeCloudDrive: AnyObject, Sendable {
     var supportsSimilarityPreviews: Bool { get }
     func previewForSimilarity(_ item: CloudDriveItem, progress: @escaping CloudDriveProgressHandler) async throws -> Data
     func list(_ location: CloudDriveLocation, offset: Int, search: String) async throws -> CloudDrivePage
+    /// Name search needs folder metadata, never original content or file revisions.
+    func searchPage(_ location: CloudDriveLocation, offset: Int) async throws -> CloudDrivePage
     func materialize(_ item: CloudDriveItem, directory: URL, progress: @escaping CloudDriveProgressHandler) async throws -> URL
     func scanItems(_ items: [CloudDriveItem], location: CloudDriveLocation, progress: @escaping CloudDriveProgressHandler) async throws -> [CloudDriveItem]
     func discoverItems(_ items: [CloudDriveItem], location: CloudDriveLocation, progress: @escaping CloudDriveProgressHandler,
@@ -109,6 +112,9 @@ protocol NativeCloudDrive: AnyObject, Sendable {
 
 extension NativeCloudDrive {
     var supportsSimilarityPreviews: Bool { false }
+    func searchPage(_ location: CloudDriveLocation, offset: Int) async throws -> CloudDrivePage {
+        try await list(location, offset: offset, search: "")
+    }
     /// A drive that publishes no size for an item fetches the original first.
     func measureFiles(_ items: [CloudDriveItem], location: CloudDriveLocation, directory: URL,
                       progress: @escaping CloudDriveProgressHandler) async throws -> CloudDriveMeasurement {
@@ -161,7 +167,7 @@ extension NativeCloudDrive {
             while let chunk = try source.read(upToCount: 1 << 20), !chunk.isEmpty {
                 try CloudDriveFiles.checkCancellation()
                 guard sent + UInt64(chunk.count) <= capacity else {
-                    throw CloudDriveError.message("This original needs more RAM. Increase Scan Resources and retry.")
+                    throw PhotosMemoryCapacityExceeded(requiredBytes: sent + UInt64(chunk.count))
                 }
                 try SimilarityMemoryPipe.write(chunk, to: destination)
                 sent += UInt64(chunk.count)

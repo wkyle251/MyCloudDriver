@@ -8,13 +8,16 @@ struct DuplicateLocalIdentity: Codable, Hashable {
     let size: UInt64
     let modifiedSeconds: Int64
     let modifiedNanoseconds: Int64
+    var changedSeconds: Int64? = nil
+    var changedNanoseconds: Int64? = nil
 
     static func read(_ path: String) -> Self? {
         var value = stat()
         guard lstat(path, &value) == 0, value.st_mode & S_IFMT == S_IFREG else { return nil }
         return .init(device: UInt64(UInt32(bitPattern: value.st_dev)), inode: UInt64(value.st_ino),
             size: UInt64(max(0, value.st_size)), modifiedSeconds: Int64(value.st_mtimespec.tv_sec),
-            modifiedNanoseconds: Int64(value.st_mtimespec.tv_nsec))
+            modifiedNanoseconds: Int64(value.st_mtimespec.tv_nsec),
+            changedSeconds: Int64(value.st_ctimespec.tv_sec), changedNanoseconds: Int64(value.st_ctimespec.tv_nsec))
     }
 }
 
@@ -30,7 +33,10 @@ enum CrossDriveScope {
 
 enum CrossDriveDuplicatePolicy {
     static func recommendedIDs(_ files: [DuplicateFile]) -> [String] {
-        let sorted = files.sorted { a, b in
+        // Only the keeper matters. Sorting every redundant copy is unnecessary,
+        // especially when a single content hash has tens of thousands of files.
+        if files.contains(where: \.isLocal) { return files.filter { !$0.isLocal }.map(\.id) }
+        let keeper = files.min { a, b in
             if a.isLocal != b.isLocal { return a.isLocal }
             if a.folderCreatedTime != b.folderCreatedTime {
                 if let a = a.folderCreatedTime, let b = b.folderCreatedTime { return a < b }
@@ -39,7 +45,7 @@ enum CrossDriveDuplicatePolicy {
             let order = a.path.localizedStandardCompare(b.path)
             return order == .orderedSame ? a.id < b.id : order == .orderedAscending
         }
-        return sorted.dropFirst().filter { !$0.isLocal }.map(\.id)
+        return files.filter { $0.id != keeper?.id }.map(\.id)
     }
 
     static func validateKeepers(_ scan: DuplicateScan?, selected: Set<String>) throws {
@@ -130,11 +136,11 @@ struct CrossDriveDuplicateScopeView: View {
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack {
                 Spacer()
-                Button("Cancel") { model.showsCrossDriveDuplicateScope = false }.keyboardShortcut(.cancelAction)
+                Button("Cancel", action: model.cancelCrossDriveDuplicateScope).keyboardShortcut(.cancelAction)
                 Button("Check Duplicates") {
-                    model.startCrossDriveDuplicateScan()
-                    model.taskActivity.showsDetails = true
+                    _ = model.startCrossDriveDuplicateScan()
                 }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("cross-drive-duplicates-start")
                     .disabled(model.duplicateScopeCloudFolders.isEmpty && model.duplicateScopeLocalFolders.isEmpty)
             }
         }.padding(22).frame(width: 680)

@@ -84,14 +84,14 @@ struct FinderSearchCommands: Commands {
 
     var body: some Commands {
         CommandGroup(after: .textEditing) {
-            Button(sessions.searchDrive == .pikpak ? "Find in Expanded Items…" : "Find in This Drive…") {
+            Button(sessions.searchDrive == .photos ? "Find in This Drive…" : "Find in Expanded Items…") {
                 sessions.presentSearch(scope: .expanded)
             }
             .keyboardShortcut("f", modifiers: .command)
             .disabled(sessions.searchDrive == nil || model.isLoginPresented)
-            Button("Find from PikPak Root…") { sessions.presentSearch(scope: .root) }
+            Button("Find from \(sessions.searchDrive?.title ?? "Drive") Root…") { sessions.presentSearch(scope: .root) }
                 .keyboardShortcut("f", modifiers: [.command, .shift])
-                .disabled(sessions.searchDrive != .pikpak || model.isLoginPresented)
+                .disabled(sessions.searchDrive == nil || sessions.searchDrive == .photos || model.isLoginPresented)
         }
     }
 }
@@ -140,9 +140,9 @@ struct FinderCommands: Commands {
                 .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(actions?.canTrash != true)
             Divider()
-            Button("Find Similar Files…") {
-                if let actions { actions.findSimilarFiles() }
-                else { sessions?.presentSimilarity() }
+            Button("Find Similarity Across Drives…") {
+                if let sessions { sessions.activeHub.presentAcrossDriveSimilarity() }
+                else { actions?.findSimilarFiles() }
             }
                 .disabled(actions == nil && sessions?.canPresentSimilarity != true)
             Button("Check Duplicates Across Drives…") { sessions?.activeHub.presentCrossDriveDuplicates() }

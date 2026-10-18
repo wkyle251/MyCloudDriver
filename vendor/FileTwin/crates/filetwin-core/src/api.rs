@@ -63,6 +63,11 @@ pub struct EncoderConfig {
     pub inference_cache_dir: Option<PathBuf>,
     /// Shared native admission allowance, not a hard total RSS/GPU memory ceiling.
     pub memory_bytes: u64,
+    /// Automatic admission may wait above its current allowance, up to this
+    /// physical ceiling. Fixed-budget hosts leave these fields unset.
+    pub memory_ceiling: Option<u64>,
+    pub total_memory_bytes: Option<u64>,
+    pub external_memory: Option<Arc<crate::memory_control::ExternalMemory>>,
     /// Maximum simultaneous private source copies, including protocol reserves.
     pub staging_bytes: u64,
     /// Stage local native inputs in RAM in encode_sources/encode_stream.
@@ -92,6 +97,9 @@ impl EncoderConfig {
             accelerator_workers: 2,
             inference_cache_dir: None,
             memory_bytes: 2 << 30,
+            memory_ceiling: None,
+            total_memory_bytes: None,
+            external_memory: None,
             staging_bytes: 10 << 30,
             memory_staging: false,
         }
@@ -124,6 +132,7 @@ pub struct EncodeSource {
     pub key: PathBuf,
     pub path: PathBuf,
     pub(crate) memory: Option<Arc<crate::memory_input::MemoryInput>>,
+    pub(crate) seekable: Option<Arc<dyn crate::memory_input::SeekableInput>>,
     guards: Vec<Box<dyn std::any::Any + Send>>,
     resolver: Option<Box<dyn FnOnce(&CancellationToken) -> Result<EncodeSource> + Send>>,
     pub(crate) families: Option<Vec<String>>,
@@ -142,6 +151,7 @@ impl EncodeSource {
             key: key.into(),
             path: path.into(),
             memory: None,
+            seekable: None,
             guards: Vec::new(),
             resolver: None,
             families: None,
@@ -151,6 +161,14 @@ impl EncodeSource {
         let key = key.into();
         let mut source = Self::new(key.clone(), key);
         source.memory = Some(memory);
+        source
+    }
+    /// Provider-verified seekable media. The implementation owns and bounds its
+    /// range cache; this source does not imply a complete original in RAM.
+    pub fn from_seekable(key: impl Into<PathBuf>, input: Arc<dyn crate::memory_input::SeekableInput>) -> Self {
+        let key = key.into();
+        let mut source = Self::new(key.clone(), key);
+        source.seekable = Some(input);
         source
     }
     pub fn retaining(mut self, guard: impl std::any::Any + Send) -> Self {
@@ -186,10 +204,16 @@ pub struct LiveResources {
     pub workers: usize,
     pub memory_bytes: u64,
     pub staging_bytes: u64,
+    pub total_memory_bytes: Option<u64>,
+    pub acquisition_paused: bool,
+    /// Applied by the coordinator after its source allowance changes, so the
+    /// two source banks cannot spend the same borrowed capacity concurrently.
+    pub external_memory_bytes: Option<u64>,
 }
 #[derive(Debug, Default)]
 struct LiveControl {
     paused: AtomicBool,
+    memory_draining: AtomicBool,
     finishing: AtomicBool,
     resources: Mutex<Option<LiveResources>>,
 }
@@ -198,6 +222,9 @@ pub struct CancellationToken(Arc<AtomicBool>, Arc<LiveControl>);
 impl CancellationToken {
     pub fn set_paused(&self, paused: bool) { self.1.paused.store(paused, Ordering::Release); }
     pub fn is_paused(&self) -> bool { self.1.paused.load(Ordering::Acquire) }
+    /// Host pressure may drain held inputs one at a time without user-pausing.
+    pub fn set_memory_draining(&self, draining: bool) { self.1.memory_draining.store(draining, Ordering::Release); }
+    pub fn is_memory_draining(&self) -> bool { self.1.memory_draining.load(Ordering::Acquire) }
     /// Stop admission, finish already analysing inputs and return a partial vector file.
     /// Unlike cancellation, completed vectors remain eligible for comparison.
     pub fn request_finish(&self) {
@@ -356,6 +383,20 @@ pub struct WorkCounts {
     /// Bytes acquired from source files, excluding hashing and decoder reads.
     #[serde(default)]
     pub original_bytes_read: u64,
+    /// Current source/analysis admission demand, including held reservations.
+    #[serde(default)]
+    pub staging_memory_required: u64,
+    #[serde(default)]
+    pub analysis_memory_required: u64,
+    /// Original bytes in the next analysis job; handoff does not copy them.
+    #[serde(default)]
+    pub analysis_transfer_bytes: u64,
+    #[serde(default)]
+    pub analysis_memory_forecast: u64,
+    #[serde(default)]
+    pub analysis_growth_bytes: u64,
+    #[serde(default)]
+    pub staging_memory_limit: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

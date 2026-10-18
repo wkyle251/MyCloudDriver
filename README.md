@@ -30,6 +30,13 @@ tokens, create an `.env` file, or configure account credentials manually.
 PikPak **Transfers → Download** always uses **Dynamic Mode**. Downloads try
 Guest access first; if only part is accessible, they retain verified Guest bytes
 and fetch the remaining ranges through your selected account connection.
+An unavailable Guest original URL also triggers User access. If User metadata
+still has no usable original URL, one fresh authenticated lookup runs before
+the normal bounded retry policy reports the file unavailable. Confirmed file
+failures also stop automatic retries of their parent request; manual Retry or
+Return Interrupted to Queue remains available. Restored queue entries that
+omitted their GCID can recognize an already completed download from its matching
+receipt before requesting another URL.
 For account files whose original share is missing, expired or unavailable,
 downloads reuse an existing public link or create one for the saved copy in
 My Shares, then resolve its content anonymously. Activity Log shows the reason
@@ -151,8 +158,14 @@ support session Undo. Existing PikPak Undo coverage is described below.
 - **Folder sizes:** a folder's **Size** cell reads **Calculate** until it is measured. Click it
   (or choose **Recalculate Folder Size**) and the cell shows a spinner while the folder is walked.
   The task card shows what has been counted so far ("1,204,331 files · 412 GB so far"). When
-  several folders are selected it also shows a bar that advances as each one finishes. A single
-  folder has no honest percentage, because its total is unknown until the walk ends.
+  several folders are selected it also shows a bar that advances as each one finishes. Selecting
+  a whole disk (or all items at its root) instead shows scanned bytes over approximate used disk
+  space, a byte-based progress bar and estimated time left. Scan speed shows counted bytes and
+  files per second. For other folders the total size, and therefore time left, remain unknown
+  until the walk ends. Disk estimates can differ from file sizes because of hidden files,
+  filesystem overhead and compression.
+  Once every selected item has been scanned, the task says **Finalizing folder sizes** while
+  subfolder totals are assembled, and reaches 100% only when those totals are ready.
   One pass sizes that folder and every subfolder below it, including folders you expand later,
   on iCloud Drive, Local Disk and external disks. Several selected folders are measured together.
   Sizes belong to the listing they were measured from, so a refresh or a file change clears them.
@@ -302,9 +315,20 @@ support session Undo. Existing PikPak Undo coverage is described below.
   appears in the status area. In Dynamic Mode, cloud extraction uses a saved
   Normal login for the same account when available. Other tasks keep their
   selected connection. Cloud extraction always requires account authentication.
-- **Content similarity:** open **File → Find Similar Files…** to compare actual
-  content. The command also works on **All Drives**, where you can choose the
-  scan drive directly. Results use an expandable file tree and a ranked match pane with actual
+- **Name search:** PikPak, Local Disk, external/network disks and iCloud Drive use
+  the same search palette. **Command-F** searches names in the current expanded
+  outline without reading storage. **Command-Shift-F** searches files and folders
+  recursively from the connected drive's starting location. Results appear while
+  scanning, use the same ranked/Unicode matching, and support arrow keys, Return,
+  Show More, Stop Scan and Scan Again. Typing searches cached names without
+  changing the Browser filter or rereading a folder on every keystroke.
+  Native search reads metadata only and keeps up to two folder requests active;
+  incomplete scans retain partial matches and expose failed branches for retry.
+  Changing the connected folder or disk clears its search cache. Photos keeps
+  its existing album search.
+- **Content similarity:** open **File → Find Similarity Across Drives…** to compare actual
+  content. Add multiple folders, disks or cloud locations to compare their files
+  together, or choose one drive for a separate scan. Results use an expandable file tree and a ranked match pane with actual
   pair scores, paths and Preview/Open actions. Change the 5–100% minimum score
   without rescanning. Use the expand/collapse buttons beside group search to
   open or close all groups. **Show in Folder** brings the file's original drive
@@ -324,6 +348,9 @@ support session Undo. Existing PikPak Undo coverage is described below.
   a new scan for original-content and byte-identical checks. Saved scans keep
   their mode. Preview scans cannot verify identical originals or choose the
   smallest original; see [Photos scan modes](docs/APPLE_PHOTOS_DOWNLOAD_PERFORMANCE.md).
+- **Disk Trash:** external and network disks keep deleted items in hidden storage with an
+  opaque UUID folder name. Use the disk’s **Trash** tab to Put Back or Empty Trash.
+  Existing app-owned trash migrates to the hidden container while preserving restore and Undo.
 - **Undo and Redo:** reverse supported Trash, move, upload, rename, and new-folder
   actions. History lasts for the current account's app session. Cleanup tools,
   share imports, and extractions are outside this history.
@@ -603,11 +630,15 @@ process.
    **Calculate** runs each folder-size calculation independently, including
    multiple links with the same root ID, while browsing and transfers continue.
 
-Duplicate checks fetch current PikPak folder metadata on every run. Local Disk,
-external disks, network shares, iCloud Drive and Apple Photos checks read candidate
-files again each time. Files are first grouped by size, and only files whose size
-matches another file are hashed. Duplicate checks do not save or reuse folder
-snapshots or file hashes.
+Duplicate checks fetch current PikPak folder metadata on every run. Files are
+first grouped by size, and only files whose size matches another file need hashes.
+Cross-drive checks trust valid GCIDs in completed download receipts, assuming
+downloaded contents have not changed. They do not rehash those files when their
+timestamps, inode or mount identity change, including over SMB. Files without a
+receipt GCID reuse verified disk hashes when their identity, size and timestamps
+still match, or fall back to reading the file. Native Local Disk, iCloud Drive and Apple Photos
+checks read candidate contents each time. Both scanners automatically test fewer
+and more readers to find useful throughput without a manual RAM limit.
 
 Saving files selected directly from **Links** skips exact hash-and-size matches
 already in the account inventory collected while browsing. Only matching cached
@@ -620,13 +651,22 @@ Use **File → Check Duplicates Across Drives…** to compare several PikPak fol
 with folders on one or more external disks. Disk copies are kept; recommended
 deletions prefer redundant PikPak files in newer folders (by folder creation
 date). Disk contents are hashed locally only when their size could match another
-selected file. PikPak's content hash and an MD5 are computed together in one read
-on every check. Before Trash, the app checks that any disk copy being kept is still
-connected and unchanged. The CLI
+selected file and neither a receipt GCID nor a verified cache entry is available.
+Receipt GCIDs take priority even when MD5 would otherwise require a read; MD5 is
+calculated only for files without a receipt GCID that need that cloud fallback.
+Verified APFS/HFS cache entries tolerate changed temporary device numbers after
+a remount while still requiring matching inode, size and timestamps. Before
+Trash, the app checks that any disk copy being kept is still connected and has
+not changed since this scan. The CLI
 accepts repeated `--local-path` arguments. Run `pikpak duplicates` with optional
 `--parent-id` and `--root-path` to check PikPak folders using current metadata.
 If PikPak reports a shared save is still processing, check for duplicates again
 after the save finishes.
+
+Large duplicate reports are prepared in the background. Result details show
+200 files per page, and large groups in the file tree use ranges of 200 files.
+Selections persist across pages; recommended selections and group cleanup
+actions still apply to the full result set.
 
 **Bookmarks** opens as a Finder-style virtual folder, with sortable Name, Kind,
 Location and Date Added columns, thumbnails, search and item zoom. Double-click a
@@ -708,6 +748,8 @@ your saved sidebar preference. The home screen and short sidebars scroll as need
 | Show Transfers | Command-Shift-T |
 | List / Thumbnails | Command-1 / 2 |
 | Quick Look | Space; Up/Down changes the selected item |
+| Find names in current expanded items | Command-F |
+| Find names recursively from the connected drive root | Command-Shift-F |
 | Close Quick Look | Space or Escape |
 | Upload files or folders | Command-Shift-U |
 | Add selection to download queue | Command-Option-D |
@@ -719,20 +761,30 @@ your saved sidebar preference. The home screen and short sidebars scroll as need
 
 ## Find similar files
 
-1. Choose **File → Find Similar Files…**.
-2. Choose **PikPak**, **iCloud Drive**, **Apple Photos** or **Local Disk** in the
-   scan-drive menu. **Choose Folder…** browses folders directly in PikPak or
-   iCloud Drive, and opens a native folder picker for Local Disk. Photos offers
-   **Choose Album or Library…**. Choosing a scan location does not change Browser.
-   The scope shows the selected path or album.
-   Folders include descendants. Each drive keeps a separate scope and result set;
-   files from different drives are not mixed into one scan. Cloud originals load
+1. Choose **File → Find Similarity Across Drives…**.
+2. In **Locations**, use **Add…** to choose PikPak folders, disk folders,
+   iCloud folders or Photos albums. Disk folders can be on this Mac, external
+   disks or network disks. Selected locations appear in a compact list.
+   A single location compares the files within it; additional locations are
+   compared together. Photos uses originals so
+   size-based cleanup and exact-copy evidence remain accurate. Each result keeps
+   its original drive for Preview, Open and Trash. File changes keep that drive's
+   Undo support; Photos assets can be restored from Recently Deleted.
+   Unchanged files reuse their per-file analysis when the selection changes:
+   scanning A+B, then A+C, reuses A and analyses C before comparing A+C.
+   Changing a file's revision or the analysis profile invalidates its cached analysis.
+   Across Drives opens by default, with no scan-drive selector. Each selected
+   folder has a remove button; longer lists scroll within the Locations section.
+   Choosing a scan location does not change Browser.
+   The scope shows the selected paths or albums. Folders include descendants.
+   Cloud originals load
    into a bounded RAM queue while analysis processes ready files. Local Disk
    requires no PikPak login.
 3. Set a minimum score from **5% to 100%**. All supported document, image, audio
    and video types are included automatically. **Include byte-identical copies**
-   also checks SHA-256 for formats without a similarity decoder. **Scan Resources…**
-   offers hardware-based defaults or custom worker and memory limits.
+   retains exact-copy evidence even for formats without a similarity decoder:
+   full-content SHA-256 or trusted PikPak GCID plus original byte size. **Processing Options…**
+   chooses automatic acceleration or CPU processing. RAM is managed automatically.
 4. Start the scan. Browsing, transfers and other background tasks remain
    available. Discovery feeds a metadata queue while available workers analyse
    files already found. The progress panel shows found, queued, downloading,
@@ -762,8 +814,12 @@ your saved sidebar preference. The home screen and short sidebars scroll as need
 
 Cloud analysis reads originals, including full-resolution images; it does not
 use Browser thumbnails for similarity scores or identical-copy checks.
-PikPak folder listing retries transient errors and reports access failures in
-scan coverage. If no files can be analysed, the scan shows the failure reason
+PikPak metadata discovery overlaps up to eight independent folder-page or
+selected-file requests per helper. Pages within a folder remain sequential;
+retries share provider cooldowns. Files feed analysis before discovery finishes.
+Complete metadata checks still run before and after comparison to detect source
+changes. Folder/page/file progress makes those validation passes visible.
+Listing reports access failures in scan coverage. If no files can be analysed, the scan shows the failure reason
 instead of presenting an empty successful result.
 PikPak scan download connections start at up to four and trial higher concurrency
 only while queued work and RAM allow it. Increases are retained when measured
@@ -777,43 +833,65 @@ cooldown longer than five minutes for a later retry. Waiting and retrying downlo
 progress and do not count as failures before retries finish. Large downloads
 use connection/inactivity limits rather than the short metadata timeout.
 Similarity scans keep application-owned originals **in RAM**, without a disk
-fallback. PikPak downloads go into bounded buffers. Photos streams through a
+fallback. PikPak images, documents and other complete inputs download into
+bounded buffers. Supported PikPak audio/video originals with a verified GCID
+and size can instead serve validated byte ranges to the decoder as it samples
+content. Missing identity, unsupported containers or unsupported initial ranges
+use the complete-original path. Range-backed analysis does not download or
+SHA-256-hash the entire original; its content ID records GCID and size explicitly.
+The transfer display reports bytes actually fetched for sampling, without a
+whole-file download percentage or ETA. Photos streams through a
 private pipe (which stores no file content); local/iCloud inputs are read directly
 and native decoder copies stay in RAM. Videos can seek through memory without
 creating a temporary media file. Buffers are released after completion, cache
 reuse, failure or cancellation. A separate download pool feeds completed
 originals into a bounded RAM queue. Connections grow after successful downloads
-and back off when the provider is busy; downloads and retry waits do not occupy
-analysis slots. Known file sizes and recent delivery rates govern RAM admission.
+and back off when the provider is busy; waiting complete-original downloads do
+not occupy analysis slots. Range-backed decoders perform source I/O during
+analysis using bounded, leased blocks and a retained scan transport entitlement.
+Known file sizes and recent delivery rates govern complete-original RAM admission.
 A file waiting to start holds no connection, so smaller files can proceed when
 they fit.
 
 Photos originals with unknown sizes start with one eighth of Download RAM as
 their possible maximum, allowing up to eight concurrent original requests.
 They reserve small receive windows as bytes arrive. A larger original releases
-its partial buffer and retries with a larger allowance, up to the full pool;
-this can repeat part of the fetch. The RAM limit remains enforced. See
+its partial buffer and retries with a larger capacity; the automatic allowance
+grows as needed. This can repeat part of the fetch. Receive-window admission
+remains enforced. See
 [Apple Photos download performance](docs/APPLE_PHOTOS_DOWNLOAD_PERFORMANCE.md).
 
-**Scan Resources → Download RAM** controls the original-buffer allowance in GB.
-Together with **Analysis RAM**, it forms the total scan allowance, whose maximum
-is the Mac's full physical RAM. For example, 12 GB Download RAM and 52 GB
-Analysis RAM use a 64 GB total. Receive windows account for incoming bytes once;
-decoder copies use analysis memory only while processing. Files wait for a safe
-receive window before fetching more content. An original that cannot fit reports an actionable memory
-issue; increase Download RAM to retry. There is no cumulative cloud download
-cap. macOS can swap RAM to disk, and iCloud/Photos may retain their own managed
-copies; this is not a guarantee of zero operating-system storage activity.
-Derived vectors, saved comparisons, run metadata and model caches still use
-storage. This policy applies to similarity scans, not user-requested Downloads
-or originals opened in another application.
+Find Similar automatically manages a shared RAM allowance for acquisition and
+analysis. It starts small, grows when files need more space, and rebalances the
+two stages as originals become ready. macOS memory pressure stops new downloads
+at warning level and pauses acquisition at critical level while active analysis
+finishes. Retained buffers stay in RAM; growth resumes after a recovery period.
+At warning level, one already-buffered file can receive enough decoder headroom
+to finish and release its original. New original buffers remain blocked while
+that file drains, preventing a stalled scan from waiting for memory it holds.
+There is no user RAM limit to tune. Saved manual amounts are ignored when a
+scan starts or resumes, while the saved processing backend remains compatible.
 
-**Scan Resources…** offers Automatic or Custom Analysis RAM and Download RAM.
-Memory uses GB, with decimal entries such as 0.5 or 1.5 accepted. Automatic derives
-its RAM defaults from physical memory while reserving capacity for other work.
-Older saved settings retain their RAM amounts, with a default download budget
-of one quarter of the total, capped at 12 GB. Worker and batch preferences are
-accepted for compatibility but no longer constrain new or resumed app scans.
+Downloads, Find Similarity and Check Duplicates prevent idle system sleep,
+display sleep and App Nap while work is active. Protection continues while
+workers shut down, checkpoints finish or a paused scan retains originals in RAM.
+An inactive, durably saved scan releases its protection. Each window owns its
+activity independently. On the remote Mac, the installed AC-only full-wake guard
+also prevents closed-lid sleep during this work and restores the prior sleep
+policy afterwards; its app heartbeat contains only counts, a PID and timestamps.
+
+Receive windows account for incoming bytes once; decoder copies use analysis
+memory while processing. Admission preserves enough headroom to finish buffered
+files, so prefetch cannot consume every byte needed by their readers. Files wait
+for capacity rather than fail when the current automatic allowance is small.
+A file that cannot fit with its decoder within system capacity reports a memory
+issue. There is no cumulative cloud download cap or disk fallback. macOS can
+swap RAM to disk, and iCloud/Photos may retain their own managed copies; this is
+not a guarantee of zero operating-system storage activity. Derived vectors,
+saved comparisons, run metadata and model caches still use storage. This policy
+applies to similarity scans, not user-requested Downloads or originals opened
+in another application.
+
 A separate ready queue holds downloaded originals within Download RAM. Ready
 files start when their estimated reading/decoder memory fits Analysis RAM;
 text and documents start with smaller allowances than images and media. Native
@@ -823,10 +901,9 @@ block smaller ready files that fit. There is no input batch to fill or wait for.
 The dedicated scan helper also reserves file-handle capacity for its worker
 pipes, open originals and connections. It raises its own soft limit within the
 existing hard limit; if the environment prevents this, it admits fewer workers
-instead of failing queued files. System limits and saved resource settings are
-unchanged.
+instead of failing queued files. System file-handle limits stay unchanged.
 
-**Scan Resources → Processing** offers **Automatic** and **CPU Only**.
+**Processing Options…** offers **Automatic** and **CPU Only**.
 Automatic checks CoreML for image/video vectors on Apple Silicon, falling back
 to CPU when unavailable. Persistent visual workers share the GPU /
 Neural Engine through CoreML while CPU work continues. Visual capacity grows
@@ -836,16 +913,15 @@ allowance. Existing scans retain their backend on Resume; CPU and CoreML visual
 vectors have distinct profiles. One encoder invocation retains its
 worker pool and loaded models across the scan. FileTwin 0.2 returns content IDs
 and vectors; MyCloudDriver saves their compatible comparisons for review. New
-scans reread and hash current content, then reuse saved vectors when the content
-and profile match, even after a rename. Progress shows newly analysed and reused
-files separately. Resource settings are captured when a scan starts. To change
-an active scan, choose **Pause & Adjust Resources…**. The editor opens after the
-helper stops and saves its progress. Adjust Analysis RAM or Download RAM,
-then choose **Save & Resume**, or **Save** to keep it paused. You can also pause
-first and open **Scan Resources…**. These changes belong to this scan and survive
-app restarts; other scans and defaults for new scans keep their settings. The
-processing backend stays fixed to preserve compatible vectors. The memory
-allowance controls estimated admission; model caches and shared pages mean it
+scans reuse unchanged source revisions before fetching originals. Within the
+same account, trusted PikPak GCID, exact size and analysis profile also allow
+reuse across different cloud file IDs. Other cache misses read and hash complete
+content, then reuse vectors when content and profile match, even after a rename.
+Range-backed media retains its GCID identity rather than inventing a SHA-256.
+Valid cache hits avoid recompression and unnecessary database writes. Progress shows newly analysed and reused
+files separately. The processing backend stays fixed on Resume to preserve
+compatible vectors. Memory admission continues adapting while running or paused.
+The memory allowance controls estimated admission; model caches and shared pages mean it
 is not a hard ceiling on total process RAM. Decoder and operating-system limits
 still apply. Progress shows **Analysis RAM reserved** and an **Analysing** count
 without a worker quota. Slow downloads, hashing, vector reuse and larger decoder
@@ -880,6 +956,13 @@ uses sampled frames, without audio or sequence order. Scores are experimental
 cosine similarity, not a probability or a guarantee that files are duplicates.
 Groups require every member pair to meet the cutoff.
 
+In results, **Group Actions** offers **Keep Smallest** and **Keep Largest** across
+all groups at the current similarity, including groups hidden by search. Each
+action keeps one original per group and moves the other copies to Trash. Equal
+sizes are resolved by path, then file ID; originals retained by any overlapping
+group are protected. Files are checked again before removal. Fast Previews cannot
+use these actions because original file sizes are unavailable.
+
 Files and folders whose names start with a dot, such as `.gitignore`, `.DS_Store`
 and `.git`, are always ignored by similarity scans. They are not analysed or
 counted as skipped-file warnings. Ordinary names such as `photo.edit.jpg` remain
@@ -891,14 +974,19 @@ Check **Scan Coverage** before treating an empty result as
 exhaustive. Cancelled scans keep their analysed inventory even if comparisons
 never started, and are clearly marked incomplete. Scans have no fixed file-count
 limit. Cloud/provider metadata queues use temporary disk storage while original
-contents remain governed by the configured RAM budgets. The displayed/exported
+contents remain governed by automatic RAM admission. The displayed/exported
 inventory summary is bounded to 40 MiB and issue details to 500; the saved matrix
 retains the full file inventory. Exact-copy evidence in the scan
-summary is bounded to 2,000 groups/20,000 members. Saved-matrix grouping supports
-up to four million qualifying pairs per request. New scans retain up to four
-million compatible scores; larger scans report incomplete comparison coverage
-and should be split into smaller scopes for complete results. The app's saved
-matrices and private vector cache
+summary is bounded to 2,000 groups/20,000 members. Saved comparisons and
+threshold grouping have no fixed pair-count limit. Bounded CPU workers compute
+every compatible pair in deterministic order, storing exact float64 scores in
+compact chunks. Grouping sorts qualifying edges and tracks cluster links in
+private temporary SQLite storage, with bounded RAM caches. Exhaustive comparison
+still requires quadratic work and roughly eight score bytes per pair, plus
+metadata; large scopes need corresponding time and free disk space. Disk errors
+are reported rather than silently omitting the remaining pairs. Old score
+snapshots remain readable, and unfinished row-based checkpoints are validated
+before conversion. The app's saved matrices and private vector cache
 are stored under the app's Application Support `Similarity` directory,
 separately for each account and local scans. They can include file names and
 paths; keep this directory private. Older FileTwin 0.1 score catalogs remain
@@ -914,11 +1002,12 @@ cache updates under an account-local lock. See
 [cache format and validation](docs/SIMILARITY_VECTOR_CACHE.md) and
 [resource defaults and future scheduling work](docs/SIMILARITY_RESOURCE_PLAN.md).
 
-Workers are a shared limit for fetching, reading/hashing and analysis. These
-stages overlap; plain text is processed concurrently too. Only metadata waits
-in the discovery queue, and an original is fetched when a processing slot is
-available. Identical files share an in-flight result without blocking unrelated
-work. Native readers can borrow unused memory within the scan allowance for
+Acquisition, reading/hashing and analysis have separate bounded admission and
+share the automatic memory allowance. These stages overlap; plain text is
+processed concurrently too. Only metadata waits in the discovery queue.
+Complete originals enter a bounded ready queue, while verified seekable media
+fetches leased ranges during decoding. Ready dispatch has no per-file sleep.
+Identical files share an in-flight result without blocking unrelated work. Native readers can borrow unused memory within the scan allowance for
 larger files. Progress shows the actual phase counts and any memory/reuse waits.
 See the [pipeline investigation and implementation](docs/SIMILARITY_CONCURRENCY_PLAN.md).
 

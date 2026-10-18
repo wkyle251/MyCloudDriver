@@ -46,6 +46,7 @@ struct SimilarityResourceLimits: Codable, Equatable {
     var downloadMemoryBytes: UInt64? = nil
     var acceleration: SimilarityAcceleration? = nil
     var memoryScheduling: Bool? = nil
+    var automaticMemory: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
         case workers
@@ -55,12 +56,13 @@ struct SimilarityResourceLimits: Codable, Equatable {
         case downloadMemoryBytes = "download_memory_bytes"
         case acceleration
         case memoryScheduling = "memory_scheduling"
+        case automaticMemory = "automatic_memory"
     }
 
     var downloadBudgetBytes: UInt64 { downloadMemoryBytes ?? min(12 << 30, memoryBytes / 4) }
     var analysisMemoryBytes: UInt64 { memoryBytes > downloadBudgetBytes ? memoryBytes - downloadBudgetBytes : 0 }
     var effectiveWorkers: Int {
-        memoryScheduling == true ? max(1, min(8_192, Int(analysisMemoryBytes / (128 << 20))))
+        memoryScheduling == true ? max(1, min(automaticMemory == true ? workers : 8_192, Int(analysisMemoryBytes / (128 << 20))))
             : min(workers, max(1, Int(analysisMemoryBytes / (512 << 20))))
     }
     var memoryMiB: Int { Int(memoryBytes / (1_024 * 1_024)) }
@@ -86,17 +88,13 @@ struct SimilarityHardware: Equatable {
                     memoryBytes: ProcessInfo.processInfo.physicalMemory, gpuName: gpuName)
     }()
 
-    /// Leave two logical cores for the interface/other work, then allow two
-    /// inference threads per worker. Two windows can therefore scan without
-    /// each independently claiming every core or most of the Mac's memory.
+    /// A starting allowance only. The helper grows it on demand and responds
+    /// to system pressure; these values never set a fixed scan RAM ceiling.
     var recommendedLimits: SimilarityResourceLimits {
-        let memoryMiB = max(512, min(16_384, Int(memoryBytes / (4 * 1_024 * 1_024))))
-        let cpuWorkers = max(1, (cpuCount - 2) / 2)
-        let workers = min(12, cpuWorkers, max(1, memoryMiB / 512))
-        return SimilarityResourceLimits(workers: workers,
-                                        memoryBytes: UInt64(memoryMiB) * 1_024 * 1_024,
-                                        batchFiles: max(32, min(512, workers * 16)),
-                                        batchBytes: UInt64(max(256, min(4_096, memoryMiB / 2))) * 1_024 * 1_024)
+        let initial = min(memoryBytes, max(512 << 20, min(2 << 30, memoryBytes / 8)))
+        return SimilarityResourceLimits(workers: max(1, min(cpuCount, Int(memoryBytes / (128 << 20)))),
+                                        memoryBytes: initial, batchFiles: 128, batchBytes: 1 << 30,
+                                        downloadMemoryBytes: initial / 2, memoryScheduling: true, automaticMemory: true)
     }
 
     var maximumMemoryMiB: Int { max(512, min(1_048_576, Int(memoryBytes / (1_024 * 1_024)))) }
@@ -107,13 +105,13 @@ struct SimilarityHardware: Equatable {
     }
 
     var backendDescription: String {
-        if let gpuName { return "Automatic checks CoreML for image and video analysis on \(gpuName). CPU and accelerated tasks share Analysis RAM. Concurrency adapts to this allowance and each file’s decoding needs." }
+        if let gpuName { return "Automatic checks CoreML for image and video analysis on \(gpuName). Memory and processing concurrency adapt to each file’s needs and system memory pressure." }
         return "Automatic uses CPU processing when CoreML acceleration is unavailable."
     }
 }
 
-/// Persisted app-wide defaults. A scan snapshots `limits`, so changing these
-/// controls never mutates the settings of a running scan.
+/// Processing preferences. Legacy RAM fields remain decodable, but every
+/// app scan now uses automatic memory admission.
 struct SimilarityResourceSettings: Codable, Equatable {
     var usesAutomatic: Bool
     var workers: Int
@@ -159,10 +157,9 @@ struct SimilarityResourceSettings: Codable, Equatable {
         batchMiB = recommended.batchMiB
     }
 
-    /// Edit the paused scan's own allowance, independent of other windows or
-    /// defaults that may have changed since it started.
+    /// Preserve the encoding backend of a saved scan. Old RAM amounts are ignored.
     init(limits: SimilarityResourceLimits) {
-        usesAutomatic = false
+        usesAutomatic = true
         workers = limits.workers
         memoryMiB = limits.memoryMiB
         batchFiles = limits.batchFiles
@@ -174,40 +171,26 @@ struct SimilarityResourceSettings: Codable, Equatable {
     static var current: Self {
         guard let data = UserDefaults.standard.data(forKey: storageKey),
               let saved = try? JSONDecoder().decode(Self.self, from: data) else { return Self() }
-        return saved
+        var automatic = Self()
+        automatic.processingMode = saved.processingMode
+        return automatic
     }
 
     var limits: SimilarityResourceLimits { limits(for: .current) }
 
     func limits(for hardware: SimilarityHardware) -> SimilarityResourceLimits {
-        if usesAutomatic {
-            var limits = hardware.recommendedLimits; limits.acceleration = processingMode; limits.memoryScheduling = true; return limits
-        }
-        let total = max(512, min(hardware.maximumMemoryMiB, memoryMiB))
-        let downloads = downloadMemoryMiB ?? min(12_288, total / 4)
-        return SimilarityResourceLimits(workers: max(1, min(64, workers)),
-                                        memoryBytes: UInt64(total) * 1_024 * 1_024,
-                                        batchFiles: max(1, min(4_096, batchFiles)),
-                                        batchBytes: UInt64(max(1, min(1_048_576, batchMiB))) * 1_024 * 1_024,
-                                        downloadMemoryBytes: UInt64(max(1, min(total - 1, downloads))) * 1_024 * 1_024,
-                                        acceleration: processingMode, memoryScheduling: true)
+        var limits = hardware.recommendedLimits
+        limits.acceleration = processingMode
+        return limits
     }
 
-    var validationMessage: String? { validationMessage(for: .current) }
-
-    func validationMessage(for hardware: SimilarityHardware) -> String? {
-        guard !usesAutomatic else { return nil }
-        if !(512...hardware.maximumMemoryMiB).contains(memoryMiB) {
-            return "Total scan memory must be from 0.5 to \(SimilarityGigabytes.text(mib: hardware.maximumMemoryMiB)) GB on this Mac."
-        }
-        if let downloadMemoryMiB, !(1..<memoryMiB).contains(downloadMemoryMiB) {
-            return "Download RAM must be greater than zero and smaller than total scan memory."
-        }
-        return nil
-    }
+    var validationMessage: String? { nil }
+    func validationMessage(for hardware: SimilarityHardware) -> String? { nil }
 
     func save() {
-        guard validationMessage == nil, let data = try? JSONEncoder().encode(self) else { return }
+        var automatic = Self()
+        automatic.processingMode = processingMode
+        guard let data = try? JSONEncoder().encode(automatic) else { return }
         UserDefaults.standard.set(data, forKey: Self.storageKey)
     }
 }

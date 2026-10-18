@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import Foundation
 
 @main @MainActor struct MediaPlaybackTests {
@@ -10,6 +11,15 @@ import Foundation
         precondition(check(), "Timed out waiting for AVFoundation")
     }
     static func main() async throws {
+        let refreshQueue = MediaPlaybackRefreshQueue()
+        var refreshes = 0
+        for _ in 0..<1_000 { refreshQueue.schedule { refreshes += 1 } }
+        precondition(refreshes == 0)
+        await wait { refreshes == 1 }
+        for _ in 0..<1_000 { refreshQueue.schedule { refreshes += 1 } }
+        await wait { refreshes == 2 }
+        print("PASS playback observer bursts coalesce without losing the next refresh")
+
         let suite = "MyCloudDriver.MediaTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -54,6 +64,29 @@ import Foundation
         precondition(abs(controller.duration - 3) < 0.01)
         precondition(abs(first.volume - 0.37) < 0.001 && first.defaultRate == 1.5)
         precondition(first.rate == 0)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        var publications = 0
+        let changes = controller.objectWillChange.sink { publications += 1 }
+        try await Task.sleep(nanoseconds: 800_000_000)
+        precondition(publications == 0, "Paused periodic observations must not redraw unchanged playback state")
+        let memory = PreviewResourceCacheSnapshot(cachedBytes: 16, contentLength: 32, ranges: [0..<16])
+        controller.updateMemoryBuffer(memory)
+        publications = 0
+        for _ in 0..<100 { controller.updateMemoryBuffer(memory) }
+        precondition(publications == 0, "Identical memory-buffer snapshots must not publish")
+        controller.updateMemoryBuffer(nil)
+        withExtendedLifetime(changes) {}
+        let audioTracks = try await AVURLAsset(url: url).loadTracks(withMediaType: .audio)
+        precondition(!audioTracks.isEmpty)
+        let hasVideo = try await MediaVideoTracks.hasVideo(audioTracks)
+        precondition(!hasVideo)
+        let cancelledInspection = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await MediaVideoTracks.hasVideo(audioTracks)
+        }
+        do { _ = try await cancelledInspection.value; preconditionFailure("Cancelled track inspection must stop") }
+        catch is CancellationError {}
+        print("PASS paused playback and unchanged buffers avoid publications; bounded background track inspection rejects audio-only and cancelled sources")
         settings.toggleMute(); settings.setSpeed(0.75)
         await wait { first.isMuted && first.defaultRate == 0.75 }
         precondition(first.rate == 0, "Preference changes must not start a paused video")

@@ -11,6 +11,7 @@ struct SimilarityDownload: Identifiable, Codable {
     let retrySeconds: UInt64
     var isPhotosRequest: Bool? = nil
     var providerFraction: Double? = nil
+    var onDemand: Bool? = nil
 
     init?(event: [String: Any]) {
         guard let name = event["name"] as? String,
@@ -20,6 +21,7 @@ struct SimilarityDownload: Identifiable, Codable {
         let rate = (event["speed"] as? NSNumber)?.doubleValue ?? 0
         speed = rate.isFinite ? max(0, rate) : 0
         state = event["state"] as? String ?? "connecting"
+        onDemand = event["on_demand"] as? Bool
         attempt = Self.count(event["attempt"]); retrySeconds = Self.count(event["retry_seconds"])
     }
     static func count(_ value: Any?) -> UInt64 {
@@ -27,10 +29,12 @@ struct SimilarityDownload: Identifiable, Codable {
         return number.uint64Value
     }
     var fraction: Double? {
+        if onDemand == true { return nil }
         if isPhotosRequest == true && received == 0 { return providerFraction }
         return total > 0 ? min(1, Double(received) / Double(total)) : nil
     }
     var byteLabel: String {
+        if onDemand == true { return "\(SimilarityScanProgress.bytes(received)) fetched as needed" }
         if isPhotosRequest == true && received == 0 {
             return providerFraction.map { "\(Int($0 * 100))% from iCloud" } ?? "Not received yet"
         }
@@ -45,7 +49,7 @@ struct SimilarityDownload: Identifiable, Codable {
         return SimilarityScanProgress.bytes(UInt64(min(rate, Double(Int64.max)))) + "/s"
     }
     func remainingLabel(speed: Double) -> String {
-        guard total > received, speed >= 1 else { return "—" }
+        guard onDemand != true, total > received, speed >= 1 else { return "—" }
         let seconds = Double(total - received) / speed
         guard seconds < 604_800 else { return "> 7 days" }
         let rounded = max(1, Int(seconds.rounded(.up)))
@@ -62,6 +66,7 @@ struct SimilarityDownload: Identifiable, Codable {
             let remaining = max(0, Int(clamping: retrySeconds) - Int(max(0, age)))
             return remaining > 0 ? "Retrying in \(remaining)s" : "Retrying…"
         case "downloading":
+            if onDemand == true { return age < 5 ? "Fetching ranges" : "Waiting for analysis…" }
             if isPhotosRequest == true {
                 if received > 0 { return age < 5 ? "Reading into RAM" : "Waiting for Photos" }
                 return providerFraction == nil ? "Waiting for Photos" : "Fetching from iCloud"
@@ -141,7 +146,9 @@ struct SimilarityDownloadsView: View {
                     Divider()
                     HStack(spacing: 6) {
                         Image(systemName: "memorychip")
-                        if progress.downloadForecastSeconds > 0 {
+                        if progress.usesOnDemandCloudProgress {
+                            Text("Media ranges are fetched into RAM as analysis needs them.")
+                        } else if progress.downloadForecastSeconds > 0 {
                             Text("\(SimilarityScanProgress.memoryGB(progress.downloadForecastBytes)) projected over the next \(Int(progress.downloadForecastSeconds)) seconds · \(SimilarityScanProgress.memoryGB(progress.originalMemoryLimit)) limit")
                         } else {
                             Text("Complete originals move to Analysis RAM before hashing.")
@@ -169,7 +176,8 @@ struct SimilarityDownloadsView: View {
                     ProgressView(value: fraction).progressViewStyle(.linear)
                         .accessibilityLabel("\(download.name): \(Int(fraction * 100)) percent downloaded")
                 } else {
-                    ProgressView().progressViewStyle(.linear).accessibilityLabel("Downloading \(download.name); size unknown")
+                    ProgressView().progressViewStyle(.linear).accessibilityLabel(download.onDemand == true
+                        ? "Fetching ranges for \(download.name)" : "Downloading \(download.name); size unknown")
                 }
             }.frame(maxWidth: .infinity, alignment: .leading)
             Text(download.byteLabel).frame(width: 160, alignment: .trailing)

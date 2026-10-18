@@ -16,8 +16,14 @@ struct DiskTrashItem: Identifiable, Hashable, Sendable {
 final class DiskTrash: @unchecked Sendable {
     let volumeRoot: URL
     let volumeID: String?
-    var folder: URL { volumeRoot.appendingPathComponent("Trash", isDirectory: true) }
+    // Keep this opaque UUID stable: every window and installation must find
+    // the same on-disk store after a restart or a disk reconnect.
+    private static let folderName = ".1db0a2b4-73f6-4ed6-9b77-b33ab3241437"
+    private let usesLegacyStorage: Bool
+    var folder: URL { usesLegacyStorage ? legacyFolder : volumeRoot.appendingPathComponent(Self.folderName, isDirectory: true) }
     var storage: URL { folder.appendingPathComponent("MyCloudDriver", isDirectory: true) }
+    private var legacyFolder: URL { volumeRoot.appendingPathComponent("Trash", isDirectory: true) }
+    private var legacyStorage: URL { legacyFolder.appendingPathComponent("MyCloudDriver", isDirectory: true) }
     private let fm = FileManager.default
 
     private struct Marker: Codable {
@@ -35,35 +41,70 @@ final class DiskTrash: @unchecked Sendable {
         let bytes: UInt64?
     }
     private static let format = "com.wky.MyCloudDriver.disk-trash.v1"
+    private static let containerFormat = "com.wky.MyCloudDriver.disk-trash-container.v1"
+    private static let containerMarkerName = ".container.json"
+    private static let lockName = ".MyCloudDriver.lock"
     private static let recordName = ".original-location.json"
 
-    init(volumeRoot: URL, volumeID: String?) {
+    convenience init(volumeRoot: URL, volumeID: String?) {
+        self.init(volumeRoot: volumeRoot, volumeID: volumeID, legacy: false)
+    }
+
+    private init(volumeRoot: URL, volumeID: String?, legacy: Bool) {
         self.volumeRoot = volumeRoot.standardizedFileURL
         self.volumeID = volumeID
+        usesLegacyStorage = legacy
     }
 
     func contains(_ url: URL) -> Bool {
         let path = url.standardizedFileURL.path
-        return path == storage.path || path.hasPrefix(storage.path + "/")
+        if !usesLegacyStorage, path == folder.path || path.hasPrefix(folder.path + "/") {
+            return Self.isOwnedContainer(folder)
+        }
+        return (path == legacyStorage.path || path.hasPrefix(legacyStorage.path + "/")) && Self.isManagedStorage(legacyStorage)
     }
 
     static func isManagedStorage(_ url: URL) -> Bool {
-        guard url.lastPathComponent == "MyCloudDriver", url.deletingLastPathComponent().lastPathComponent == "Trash" else { return false }
-        let marker = url.appendingPathComponent(".store.json", isDirectory: false)
-        var value = stat()
-        guard lstat(marker.path, &value) == 0, value.st_mode & S_IFMT == S_IFREG, value.st_size <= 4_096,
-              let data = try? Data(contentsOf: marker), let stored = try? JSONDecoder().decode(Marker.self, from: data) else { return false }
-        return stored.format == format
+        if url.lastPathComponent == folderName { return isOwnedContainer(url) }
+        guard url.lastPathComponent == "MyCloudDriver" else { return false }
+        let parent = url.deletingLastPathComponent()
+        guard parent.lastPathComponent == "Trash" || parent.lastPathComponent == folderName,
+              isDirectory(parent), isDirectory(url) else { return false }
+        return marker(at: url.appendingPathComponent(".store.json", isDirectory: false))?.format == format
     }
 
-    func prepare() async throws {
-        try await CloudDriveFiles.detached { try self.locked(create: true, writing: true) { } }
+    private static func isDirectory(_ url: URL) -> Bool {
+        var value = stat()
+        return lstat(url.path, &value) == 0 && value.st_mode & S_IFMT == S_IFDIR
+    }
+
+    private static func marker(at url: URL) -> Marker? {
+        var value = stat()
+        guard lstat(url.path, &value) == 0, value.st_mode & S_IFMT == S_IFREG, value.st_size <= 4_096,
+              let data = try? Data(contentsOf: url), let stored = try? JSONDecoder().decode(Marker.self, from: data) else { return nil }
+        return stored
+    }
+
+    private static func isOwnedContainer(_ url: URL) -> Bool {
+        isDirectory(url) && marker(at: url.appendingPathComponent(containerMarkerName, isDirectory: false))?.format == containerFormat
+    }
+
+    @discardableResult func prepare() async throws -> Bool {
+        try await CloudDriveFiles.detached {
+            var migrated = false
+            try self.locked(create: true, writing: true, onMigration: { migrated = true }) { }
+            return migrated
+        }
     }
 
     func list() async throws -> [DiskTrashItem] {
         try await CloudDriveFiles.detached {
-            try self.locked(create: false, writing: false) {
-                try self.records().map { record in
+            // A read-only disk can still show its old Trash before a writable
+            // connection migrates it. Reading never creates or renames storage.
+            let store = !self.usesLegacyStorage && self.info(self.storage) == nil && Self.isManagedStorage(self.legacyStorage)
+                ? DiskTrash(volumeRoot: self.volumeRoot, volumeID: self.volumeID, legacy: true) : self
+            return try store.locked(create: false, writing: false) {
+                try store.records().map { record in
                     DiskTrashItem(id: record.id, name: record.name,
                         originalPath: "/" + record.components.joined(separator: "/"), deletedAt: record.deletedAt,
                         isFolder: record.isFolder, bytes: record.bytes)
@@ -184,16 +225,108 @@ final class DiskTrash: @unchecked Sendable {
         } else { throw CloudDriveError.message("This disk’s Trash is unavailable. Reconnect the disk and try again.") }
     }
 
-    private func locked<T>(create: Bool, writing: Bool, _ operation: () throws -> T) throws -> T {
+    private func locked<T>(create: Bool, writing: Bool, onMigration: () -> Void = {}, _ operation: () throws -> T) throws -> T {
         try CloudDriveFiles.checkCancellation()
         try validateVolume(writing: writing)
-        try safeDirectory(folder, create: create)
-        let lockURL = folder.appendingPathComponent(".MyCloudDriver.lock", isDirectory: false)
+        if usesLegacyStorage { try safeDirectory(folder) }
+        else {
+            if info(folder) == nil, create || (writing && Self.isManagedStorage(legacyStorage)) { try createContainer() }
+            guard Self.isOwnedContainer(folder) else {
+                throw CloudDriveError.message("This disk’s Trash location is unavailable or was not created by this app. Existing contents have been left unchanged.")
+            }
+        }
+        return try withFolderLock(folder, writing: writing) {
+            try validateVolume(writing: writing)
+            if !usesLegacyStorage, writing, Self.isManagedStorage(legacyStorage) {
+                if try migrateLegacyStorage() { onMigration() }
+            }
+            let marker = storage.appendingPathComponent(".store.json", isDirectory: false)
+            if info(storage) == nil, create {
+                try safeDirectory(storage, create: true)
+                do { try JSONEncoder().encode(Marker(format: Self.format, id: UUID())).write(to: marker, options: .atomic) }
+                catch { try? fm.removeItem(at: storage); throw error }
+            }
+            try safeDirectory(storage)
+            guard Self.marker(at: marker)?.format == Self.format else {
+                throw CloudDriveError.message("This disk’s Trash storage was not created by this app. Existing contents have been left unchanged.")
+            }
+            return try operation()
+        }
+    }
+
+    /// Publish a complete, marked container in one rename, so another window
+    /// never mistakes partially initialized storage for an unrelated folder.
+    private func createContainer() throws {
+        let staging = volumeRoot.appendingPathComponent(".\(UUID().uuidString)", isDirectory: true)
+        guard mkdir(staging.path, 0o700) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { if info(staging) != nil { try? fm.removeItem(at: staging) } }
+        try JSONEncoder().encode(Marker(format: Self.containerFormat, id: UUID()))
+            .write(to: staging.appendingPathComponent(Self.containerMarkerName, isDirectory: false), options: .atomic)
+        let descriptor = open(staging.appendingPathComponent(Self.lockName).path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        close(descriptor)
+        do { try fm.moveItem(at: staging, to: folder) }
+        catch {
+            // A concurrent window may have published the same container first.
+            guard Self.isOwnedContainer(folder) else { throw error }
+        }
+    }
+
+    private func migrateLegacyStorage() throws -> Bool {
+        try safeDirectory(legacyFolder)
+        return try withFolderLock(legacyFolder, writing: true) {
+            guard Self.isManagedStorage(legacyStorage) else { return false }
+            try LocalFileAccess.validate(legacyStorage, volumeID: volumeID, directory: true, writing: true)
+            if info(storage) == nil {
+                try move(legacyStorage, storage)
+                removeLegacyWrapper()
+                return true
+            }
+            try safeDirectory(storage)
+            guard Self.marker(at: storage.appendingPathComponent(".store.json"))?.format == Self.format else {
+                throw CloudDriveError.message("This disk’s Trash storage was not created by this app. Existing contents have been left unchanged.")
+            }
+            // An older app can leave more entries after the first migration.
+            // Merge verified journals without replacing IDs or rewriting them.
+            let legacy = DiskTrash(volumeRoot: volumeRoot, volumeID: volumeID, legacy: true)
+            let records = try legacy.records()
+            for record in records {
+                guard info(directory(record.id)) == nil else {
+                    throw CloudDriveError.message("Two Trash entries have the same ID. Their contents have been kept; resolve the duplicate before continuing.")
+                }
+            }
+            for record in records {
+                try CloudDriveFiles.checkCancellation()
+                try move(legacy.directory(record.id), directory(record.id))
+            }
+            let names = try fm.contentsOfDirectory(atPath: legacyStorage.path)
+            if names == [".store.json"] {
+                try fm.removeItem(at: legacyStorage.appendingPathComponent(".store.json"))
+                _ = rmdir(legacyStorage.path)
+            }
+            let removed = info(legacyStorage) == nil
+            if removed { removeLegacyWrapper() }
+            return !records.isEmpty || removed
+        }
+    }
+
+    private func removeLegacyWrapper() {
+        let lock = legacyFolder.appendingPathComponent(Self.lockName, isDirectory: false)
+        if let value = info(lock), value.st_mode & S_IFMT == S_IFREG, value.st_size == 0 {
+            try? fm.removeItem(at: lock)
+        }
+        // Only an empty old wrapper can disappear. Unrelated siblings in
+        // a user's Trash folder keep that folder visible and untouched.
+        _ = rmdir(legacyFolder.path)
+    }
+
+    private func withFolderLock<T>(_ folder: URL, writing: Bool, _ operation: () throws -> T) throws -> T {
+        let lockURL = folder.appendingPathComponent(Self.lockName, isDirectory: false)
         let descriptor = open(lockURL.path, (writing ? O_RDWR | O_CREAT : O_RDONLY) | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard descriptor >= 0 else { throw CloudDriveError.message("Cannot access this disk’s Trash. Check its connection and write permissions.") }
         defer { close(descriptor) }
         var value = stat()
-        guard fstat(descriptor, &value) == 0, value.st_mode & S_IFMT == S_IFREG else {
+        guard fstat(descriptor, &value) == 0, value.st_mode & S_IFMT == S_IFREG, value.st_size == 0 else {
             throw CloudDriveError.message("The Trash lock is unavailable. Its contents have been left unchanged.")
         }
         while flock(descriptor, (writing ? LOCK_EX : LOCK_SH) | LOCK_NB) != 0 {
@@ -202,18 +335,6 @@ final class DiskTrash: @unchecked Sendable {
             Thread.sleep(forTimeInterval: 0.02)
         }
         defer { flock(descriptor, LOCK_UN) }
-        try validateVolume(writing: writing)
-        let marker = storage.appendingPathComponent(".store.json", isDirectory: false)
-        if info(storage) == nil, create {
-            try safeDirectory(storage, create: true)
-            do { try JSONEncoder().encode(Marker(format: Self.format, id: UUID())).write(to: marker, options: .atomic) }
-            catch { try? fm.removeItem(at: storage); throw error }
-        }
-        try safeDirectory(storage)
-        guard let markerInfo = info(marker), markerInfo.st_mode & S_IFMT == S_IFREG, markerInfo.st_size <= 4_096,
-              let data = try? Data(contentsOf: marker), let stored = try? JSONDecoder().decode(Marker.self, from: data), stored.format == Self.format else {
-            throw CloudDriveError.message("Trash/MyCloudDriver was not created by this app. Its existing contents have been left unchanged.")
-        }
         return try operation()
     }
 

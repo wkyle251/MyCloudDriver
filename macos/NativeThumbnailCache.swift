@@ -89,23 +89,33 @@ import AppKit
             active.insert(id)
             job.task = Task(priority: job.visible ? .userInitiated : .utility) { [weak self] in
                 let image = await load(identity)
-                self?.finish(identity, id: id, image: Task.isCancelled ? nil : image)
+                await self?.finish(identity, id: id, image: Task.isCancelled ? nil : image)
             }
         }
     }
 
-    private func finish(_ identity: NativeMediaSourceIdentity, id: UUID, image: NSImage?) {
+    private func finish(_ identity: NativeMediaSourceIdentity, id: UUID, image: NSImage?) async {
+        // A newly loaded image is not published until its bitmap has been
+        // inspected off main. Keep the reader slot while that work runs.
+        let prepared: NativeThumbnailBitmap.Prepared?
+        if let image, jobs[identity]?.id == id {
+            // Consumer cancellation returns through its waiter immediately.
+            // Let this bounded conversion finish (or hit its deadline) before
+            // admitting another reader; a decode may ignore cancellation.
+            let conversion = Task { try? await NativeFileWork.run { NativeThumbnailBitmap.prepare(image) } }
+            prepared = await conversion.value
+        } else { prepared = nil }
         active.remove(id)
         defer { pump() }
         guard let job = jobs[identity], job.id == id else { return }
         jobs.removeValue(forKey: identity)
-        if let image {
+        let validated = Task.isCancelled ? nil : prepared
+        let image = validated?.image
+        if let prepared = validated {
+            let image = prepared.image, cost = prepared.cost
             failures.removeValue(forKey: identity)
-            let bitmap = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
-            let cost = bitmap.map { $0.bytesPerRow * $0.height }
-                ?? max(1, Int(image.size.width * image.size.height * 4))
             if cost <= memoryLimit {
-                while memoryUsed + cost > memoryLimit || images.count >= entryLimit {
+                while cost > memoryLimit - memoryUsed || images.count >= entryLimit {
                     guard let oldest = images.min(by: { $0.value.accessed < $1.value.accessed }) else { break }
                     memoryUsed -= oldest.value.cost; images.removeValue(forKey: oldest.key)
                 }
@@ -118,6 +128,23 @@ import AppKit
             failures[identity] = Date()
         }
         for waiter in job.waiters.values { waiter.continuation.resume(returning: image) }
+    }
+}
+
+private enum NativeThumbnailBitmap {
+    struct Prepared {
+        let image: NSImage
+        let cost: Int
+    }
+    static func prepare(_ image: NSImage) -> Prepared? {
+        let representations = image.representations
+        let alreadyBitmap = representations.count == 1 && representations[0] is NSBitmapImageRep
+        guard let bitmap = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let (cost, overflow) = bitmap.bytesPerRow.multipliedReportingOverflow(by: bitmap.height)
+        // Drawing handlers, PDFs and other lazy representations can run again
+        // during SwiftUI drawing. Publish a bitmap-only image in those cases.
+        let prepared = alreadyBitmap ? image : NSImage(cgImage: bitmap, size: image.size)
+        return Prepared(image: prepared, cost: overflow ? Int.max : max(1, cost))
     }
 }
 
@@ -156,6 +183,7 @@ import AppKit
     }
 
     func start(context: Context, items: [CloudDriveItem], nextOffset: Int?,
+               startingAt itemID: String? = nil, preferred: CloudDriveItem? = nil,
                loadPage: @escaping (Int) async throws -> Page) {
         guard self.context != context else { return }
         cancel(); self.context = context; isRunning = true
@@ -163,10 +191,25 @@ import AppKit
         task = Task { [weak self] in
             var page = Page(items: items, nextOffset: nextOffset)
             var seen = Set<NativeMediaSourceIdentity>(), offsets = Set<Int>()
+            // Folder-only pages have no loadable images and used to walk the
+            // whole listing without suspending. Bound discovery as well as
+            // decoding; visible cells still load anything outside this window.
+            let maximumVisited = max(1_024, maximumLoads * 16)
+            var visited = 0, firstPage = true
             do {
                 while !Task.isCancelled {
-                    for item in page.items {
+                    let start = firstPage ? itemID.flatMap { id in page.items.firstIndex { $0.id == id } } ?? 0 : 0
+                    let first = firstPage ? preferred : nil
+                    let extra = first == nil ? 0 : 1
+                    firstPage = false
+                    for step in 0..<(page.items.count + extra) {
                         try Task.checkCancellation()
+                        if visited >= maximumVisited { page = Page(items: [], nextOffset: nil); break }
+                        if visited % 64 == 0 { await Task.yield(); try Task.checkCancellation() }
+                        let item: CloudDriveItem
+                        if step == 0, let first { item = first }
+                        else { item = page.items[(start + step - extra) % page.items.count] }
+                        visited += 1
                         let identity = NativeMediaSourceIdentity(item: item, kind: context.kind, rootID: context.rootID)
                         if NativeThumbnailCache.canLoad(identity), seen.insert(identity).inserted {
                             _ = await cache.image(for: identity, priority: .prefetch)

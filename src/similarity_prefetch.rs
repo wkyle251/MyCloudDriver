@@ -4,14 +4,34 @@ use super::*;
 use std::sync::{
     atomic::AtomicU64,
     mpsc::{self, Receiver, SyncSender, TrySendError},
-    Mutex,
+    Condvar, Mutex,
 };
+
+#[derive(Default)]
+struct Wake {
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+impl Wake {
+    fn generation(&self) -> u64 { *self.generation.lock().unwrap() }
+    fn notify(&self) {
+        let mut generation = self.generation.lock().unwrap();
+        *generation = generation.wrapping_add(1);
+        self.changed.notify_all();
+    }
+    fn wait(&self, observed: u64, timeout: Duration) {
+        let generation = self.generation.lock().unwrap();
+        let _ = self.changed.wait_timeout_while(generation, timeout, |generation| *generation == observed).unwrap();
+    }
+}
 
 #[derive(Default)]
 pub(super) struct State {
     pub resolving: AtomicU64,
+    pub cloud_resolving: AtomicU64,
     pub ready: AtomicU64,
     pub resolved_bytes: AtomicU64,
+    pub resolved_cloud_bytes: AtomicU64,
     pub inventory: Arc<discovery::State>,
 }
 struct ReadyCount(Arc<State>);
@@ -34,11 +54,13 @@ pub(super) struct Prefetch<T> {
     pub state: Arc<State>,
     pub discovery: Arc<discovery::State>,
     stop: Arc<AtomicBool>,
+    wake: Arc<Wake>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 impl<T> Drop for Prefetch<T> {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.wake.notify();
         if let Some(worker) = self.worker.take() {
             let deadline = Instant::now() + Duration::from_millis(200);
             while !worker.is_finished() && Instant::now() < deadline {
@@ -52,7 +74,7 @@ impl<T> Drop for Prefetch<T> {
 impl<T> Prefetch<T> {
     pub fn poll(&self) -> Result<Option<Event<T>>> {
         match self.receive.try_recv() {
-            Ok(value) => Ok(Some(value)),
+            Ok(value) => { self.wake.notify(); Ok(Some(value)) },
             Err(mpsc::TryRecvError::Empty) => Ok(None),
             Err(mpsc::TryRecvError::Disconnected) => {
                 bail!("Original acquisition stopped before completing its inventory.")
@@ -60,15 +82,16 @@ impl<T> Prefetch<T> {
         }
     }
 }
-fn send<T>(sender: &SyncSender<T>, mut value: T, stop: &AtomicBool) -> Result<()> {
+fn send<T>(sender: &SyncSender<T>, mut value: T, stop: &AtomicBool, wake: &Wake) -> Result<()> {
     loop {
         check_cancel(stop)?;
+        let observed = wake.generation();
         match sender.try_send(value) {
             Ok(()) => return Ok(()),
             Err(TrySendError::Disconnected(_)) => bail!("Original acquisition stopped"),
             Err(TrySendError::Full(v)) => {
                 value = v;
-                std::thread::sleep(Duration::from_millis(5));
+                wake.wait(observed, Duration::from_millis(25));
             }
         }
     }
@@ -86,14 +109,18 @@ pub(super) fn start<T: Send + 'static>(
         ..State::default()
     });
     let stop = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new(Wake::default());
     let (send_ready, receive) = mpsc::sync_channel(ready_limit.max(1));
     let discovery_state = discovery.state.clone();
     let shared = state.clone();
     let stopped = stop.clone();
+    let activity = wake.clone();
     let worker = std::thread::spawn(move || {
         // Cancellation is relayed even while discovery/ready queues are full.
         std::thread::scope(|scope| {
-            let (send_work, receive_work) = mpsc::sync_channel::<scope::InputFile>(0);
+            // Only metadata waits here; originals still require the existing
+            // byte leases. A bounded queue lets fast resolvers receive bursts.
+            let (send_work, receive_work) = mpsc::sync_channel::<scope::InputFile>(downloads.max(1));
             let receive_work = Arc::new(Mutex::new(receive_work));
             let mut workers = Vec::new();
             for _ in 0..downloads.max(1) {
@@ -102,6 +129,7 @@ pub(super) fn start<T: Send + 'static>(
                 let send_ready = &send_ready;
                 let shared = &shared;
                 let stopped = &stopped;
+                let activity = &activity;
                 workers.push(scope.spawn(move || loop {
                     if stopped.load(Ordering::Acquire) {
                         return;
@@ -115,7 +143,10 @@ pub(super) fn start<T: Send + 'static>(
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     };
+                    activity.notify();
                     shared.resolving.fetch_add(1, Ordering::AcqRel);
+                    let cloud = file.cloud.is_some();
+                    if cloud { shared.cloud_resolving.fetch_add(1, Ordering::AcqRel); }
                     let listed_bytes = file.display.bytes;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         resolve(&mut file, stopped)
@@ -143,15 +174,24 @@ pub(super) fn start<T: Send + 'static>(
                         shared
                             .resolved_bytes
                             .fetch_add(file.display.bytes, Ordering::AcqRel);
+                        if cloud {
+                            if file.display.bytes >= listed_bytes {
+                                shared.inventory.cloud_file_bytes.fetch_add(file.display.bytes - listed_bytes, Ordering::AcqRel);
+                            } else {
+                                shared.inventory.cloud_file_bytes.fetch_sub(listed_bytes - file.display.bytes, Ordering::AcqRel);
+                            }
+                            shared.resolved_cloud_bytes.fetch_add(file.display.bytes, Ordering::AcqRel);
+                        }
                     }
                     shared.ready.fetch_add(1, Ordering::AcqRel);
                     shared.resolving.fetch_sub(1, Ordering::AcqRel);
+                    if cloud { shared.cloud_resolving.fetch_sub(1, Ordering::AcqRel); }
                     let value = Event::File(Prepared {
                         file,
                         result,
                         _count: ReadyCount(shared.clone()),
                     });
-                    if send(send_ready, value, stopped).is_err() {
+                    if send(send_ready, value, stopped, activity).is_err() {
                         return;
                     }
                 }));
@@ -159,6 +199,8 @@ pub(super) fn start<T: Send + 'static>(
             let mut pending = None;
             let mut inventory = None;
             loop {
+                let observed = activity.generation();
+                let mut advanced = false;
                 if cancel.load(Ordering::Acquire) {
                     stopped.store(true, Ordering::Release);
                 }
@@ -167,7 +209,7 @@ pub(super) fn start<T: Send + 'static>(
                 }
                 if pending.is_none() && inventory.is_none() {
                     match discovery.poll() {
-                        Ok(Some(discovery::Event::File(file))) => pending = Some(file),
+                        Ok(Some(discovery::Event::File(file))) => { pending = Some(file); advanced = true; },
                         Ok(Some(discovery::Event::Finished(report))) => inventory = Some(report),
                         Ok(None) => {}
                         Err(_) => {
@@ -178,7 +220,7 @@ pub(super) fn start<T: Send + 'static>(
                 }
                 if let Some(file) = pending.take() {
                     match send_work.try_send(file) {
-                        Ok(()) => {}
+                        Ok(()) => { advanced = true; }
                         Err(TrySendError::Full(file)) => pending = Some(file),
                         Err(TrySendError::Disconnected(_)) => {
                             stopped.store(true, Ordering::Release);
@@ -191,7 +233,12 @@ pub(super) fn start<T: Send + 'static>(
                 if inventory.is_some() {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(2));
+                if !advanced {
+                    // Capacity changes wake immediately. Discovery itself may
+                    // be waiting on a provider, so retain a short bounded poll
+                    // for new metadata and cancellation without pacing files.
+                    activity.wait(observed, Duration::from_millis(5));
+                }
             }
             drop(send_work);
             while workers.iter().any(|worker| !worker.is_finished()) {
@@ -216,7 +263,8 @@ pub(super) fn start<T: Send + 'static>(
                         Err(TrySendError::Disconnected(_)) => break,
                         Err(TrySendError::Full(value)) => {
                             event = value;
-                            std::thread::sleep(Duration::from_millis(5));
+                            let observed = activity.generation();
+                            activity.wait(observed, Duration::from_millis(25));
                         }
                     }
                 }
@@ -228,6 +276,7 @@ pub(super) fn start<T: Send + 'static>(
         state,
         discovery: discovery_state,
         stop,
+        wake,
         worker: Some(worker),
     }
 }
@@ -317,6 +366,7 @@ mod tests {
                     workers: 4,
                     memory_bytes: 512 << 20,
                     staging_bytes: 64 << 20,
+                    total_memory_bytes: None, acquisition_paused: false, external_memory_bytes: None,
                 });
                 std::thread::sleep(Duration::from_millis(100));
                 assert_eq!(budget.used(), 4096);

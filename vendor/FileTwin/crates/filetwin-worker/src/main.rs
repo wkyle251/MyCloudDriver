@@ -62,6 +62,9 @@ fn main() {
             }
             let mut encoded = encode(&request)?;
             encoded.extraction["input_storage"] = serde_json::json!(if request.memory_input.is_some() { "memory" } else { "file" });
+            if request.memory_input.as_ref().is_some_and(|input| input.range_only) {
+                encoded.extraction["input_acquisition"] = serde_json::json!("verified_original_ranges");
+            }
             encoded.extraction["worker_seconds"] =
                 serde_json::json!(started.elapsed().as_secs_f64());
             Ok(encoded)

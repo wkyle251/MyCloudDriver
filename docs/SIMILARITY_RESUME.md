@@ -54,7 +54,7 @@ keeps the original newly-analysed/reused classification across cache replay.
 Older sessions remain resumable; transfer totals discarded before this feature
 cannot be reconstructed exactly.
 
-During cloud acquisition, **Cloud download progress** uses bytes of file content
+During complete-original cloud acquisition, **Cloud download progress** uses bytes of file content
 ready over the inventory's total file size. It includes every active partial
 download, including rows omitted from the bounded display, and counts cached,
 excluded and otherwise finished acquisition work once. Retry traffic and header
@@ -66,7 +66,8 @@ as found so far and the bar stays indeterminate. Once cloud data is ready, analy
 may still finish; comparison progress continues to use pairs. Local analysis
 continues to use file counts.
 
-The cloud progress bar also shows an estimated download time: remaining content
+For complete-original transfers, the cloud progress bar also shows an estimated
+download time: remaining content
 bytes divided by the helper's smoothed aggregate download speed. It waits for a
 complete inventory and fresh speed telemetry, uses all transfers (including rows
 outside the visible list), and excludes cached/skipped content from the remaining
@@ -78,6 +79,14 @@ Only unit values greater than one appear; a single larger unit carries into the
 next smaller unit, so 1 hour 30 minutes appears as 90 mins. A duration under two
 minutes displays “Less than 2 mins”.
 
+Supported PikPak audio/video may fetch sampled original ranges during analysis.
+Those transfers report actual fetched bytes and range-read states; the amount
+needed depends on the container and decoder seeks, so they have no whole-file
+percentage or download ETA. A sampled read is not recorded as a complete
+original download or a full-file SHA-256 pass. Completed vectors remain reusable
+through trusted GCID, original size and exact analysis profile within the same
+account, including across different cloud file IDs.
+
 Each scan has its own checkpoint under its existing drive/account data folder.
 Completed inventories are sealed as ordered, individually compressed database
 rows, so Resume has neither a 100,000-file ceiling nor the old aggregate 256 MiB
@@ -87,13 +96,28 @@ rediscovers the full scope using its saved per-file analyses. Its expanded
 inventory receives a separate comparison checkpoint, preserving the old scores
 without attaching them to different file ordinals. An active older helper needs
 an app restart and Resume to use the expanded discovery policy.
+PikPak discovery and each validation pass overlap up to eight independent
+metadata requests per helper, including direct selected-file validation.
+Pagination within a folder remains sequential, and provider retry delays are
+shared with other requests. Complete inventories are still checked both before
+and after comparison; concurrency shortens those passes without treating an
+incomplete or failed listing as proof that files disappeared. Checking progress
+reports completed/queued folders, pages and files, including empty folder trees.
+
 No credentials, signed download URLs or original content are checkpointed.
 Completed per-file vectors and source revisions are written transactionally as
 files finish. In-app Resume continues the existing helper and inventory, retaining
 partial and ready originals in RAM. After a helper/app restart, Resume inventories
 the scope again, reuses unchanged completed files, and retries unfinished files. Changes in source revision invalidate reuse.
 Once analysis finishes, comparisons use that saved inventory and resume from
-the last committed range of pairs. A user-finished, unsealed inventory receives
+the last committed range of pairs. Exact float64 score chunks and their
+canonical progress cursor commit together; resume does not reread every saved
+score merely to count completed work. Old row-based checkpoints are converted
+transactionally only after file-axis and exact-score validation against the
+saved vectors. Interruption rolls the conversion back to the previous format.
+Older published snapshots remain readable. There is no fixed comparison or
+qualifying-edge limit; exhaustive comparison still has quadratic time and disk
+cost. A user-finished, unsealed inventory receives
 a fresh comparison matrix on Resume, so scores cannot be assigned to new file
 ordinals; completed per-file analysis is still reused. A process lock prevents two windows from
 resuming the same checkpoint simultaneously.
@@ -110,7 +134,12 @@ ETag and validated Content-Range allow a byte-range continuation. A server witho
 safe range support may retransmit the prefix; it is verified against retained RAM
 before new bytes are appended. Changed originals are never joined across versions.
 Partial buffers keep their connection entitlement during retries so their RAM
-cannot strand a download behind connections that need its memory. Photos retains
+cannot strand a download behind connections that need its memory. Seekable
+media also retains its admitted block cache and scan transport entitlement.
+Pausing cancels its current HTTP attempt before waiting, retains completed
+blocks, and retries the unfinished block on Resume. Native range decoder
+deadlines exclude paused time. A helper restart releases those volatile blocks;
+finished derived vectors remain reusable. Photos retains
 the same FIFO, buffer and provider task; paused time does not count toward its
 provider timeout. No original is checkpointed to disk.
 
@@ -135,26 +164,18 @@ revision, account-isolation, native-decoder and UI verification.
 The processing backend is pinned when a scan starts. Automatic checks CoreML
 with a synthetic in-memory image, then selects CoreML or CPU before acquiring
 user originals. Resuming keeps that selection, including older CPU checkpoints.
-Changing Processing in Scan Resources applies only to new scans. While running,
-**Pause & Adjust Resources…** pauses the helper and opens the editor after its
-pause is acknowledged. RAM admission and the progress display update in place,
-including while paused. Active decoders retain their processes and original buffers;
-queued files can start under the new allowance on Resume without waiting for every
-old decoder to finish. If existing reservations exceed a reduced allowance, new
-analysis waits until those files release enough RAM. An already paused scan exposes
-**Scan Resources…** directly. The editor starts with this scan's saved Analysis
-RAM and Download RAM amounts. **Save** keeps it paused; **Save & Resume**
-continues immediately with the new allowances. Cancel leaves it paused with its
-previous limits.
+Processing Options applies only to new scans. RAM admission is automatic for
+new scans and recovery, and the app exposes no RAM editor. Old manual amounts
+are ignored while the checkpoint's processing backend stays pinned.
 
-The session descriptor is updated atomically before Resume. Edits reject a
-running helper, a stale session ID or invalid memory split. Resume reads the
-descriptor's resource limits, not app-wide preferences; another window changing
-defaults cannot silently change this scan. Reducing or increasing RAM allowances
-preserves completed analysis and committed comparisons. Legacy worker limits
-are ignored when a saved scan resumes with memory-based admission. Downloaded originals
-remain in RAM when limits change. Download RAM cannot shrink below the amount
-needed for a safe completion order of retained partials. Impossible analysis
-reservations report a resource error instead of waiting forever.
-Restoring Automatic derives amounts from current hardware while preserving the
-scan's original processing mode. Only Clear removes the checkpoint and results.
+Pause retains partial downloads, queued originals and active analysis leases in
+the same helper. Resume continues those buffers without reacquiring them. The
+automatic governor rebalances admission without discarding data or overriding
+the user's Pause. Shrinkage can leave held reservations above a current soft
+allowance; new work waits while existing analysis drains. A temporary reduction
+does not turn otherwise admissible queued files into failures. Files that cannot
+fit with their decoder inside system capacity report a resource issue.
+
+The session descriptor is saved atomically before Resume. Completed analysis
+and comparisons remain reusable across automatic allowance changes. Legacy
+worker limits are ignored. Only Clear removes the checkpoint and results.

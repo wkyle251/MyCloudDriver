@@ -3,6 +3,13 @@ use std::os::unix::fs::{symlink, MetadataExt};
 
 #[tokio::test]
 async fn cloud_downloads_continue_while_every_analysis_worker_is_busy() {
+    cloud_pipeline_overlap(false).await;
+}
+#[tokio::test]
+async fn automatic_cloud_downloads_overlap_analysis_and_keep_all_results() {
+    cloud_pipeline_overlap(true).await;
+}
+async fn cloud_pipeline_overlap(automatic: bool) {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicUsize;
     use tokio::io::AsyncReadExt;
@@ -14,6 +21,7 @@ async fn cloud_downloads_continue_while_every_analysis_worker_is_busy() {
     r.families = vec!["image".into()];
     r.resources.workers = 2;
     r.resources.memory_bytes = 2 << 30;
+    r.resources.automatic_memory = automatic;
     std::fs::create_dir_all(&r.model_dir).unwrap();
     std::fs::write(
         r.model_dir.join(filetwin_core::profile::SSCD_MODEL_FILE),
@@ -228,6 +236,10 @@ fn coverage_reasons_distinguish_binary_text_media_duration_memory_and_worker_err
     assert!(reason(WorkerFailed, "worker", "Private diagnostic").contains("worker"));
     assert!(!reason(WorkerFailed, "worker", "Private diagnostic").contains("Private"));
     assert!(reason(ResourceBudgetTooSmall, "image", "Memory limit").contains("RAM"));
+    let mut contention = Error::new(ResourceBudgetTooSmall, "memory", "Private diagnostic");
+    contention.details = Box::new(json!({"retry_after_drain":true}));
+    let message = encoding::error_reason(Some(&contention));
+    assert!(message.contains("Retry this file") && !message.contains("Increase") && !message.contains("Private"));
     assert!(reason(IoError, "fetching", "Access denied").contains("fetch"));
 }
 fn summary(r: &ScanRequest, report: &ScanReport) -> Value {
@@ -411,6 +423,7 @@ async fn unavailable_external_originals_report_failure_and_continue_the_queue() 
     r.external_sources = ["one", "two"]
         .into_iter()
         .map(|id| ExternalSource {
+            provider: None,
             content_kind: None,
             revision: None,
             id: id.into(),
@@ -501,6 +514,7 @@ async fn custom_resources_keep_files_larger_than_batch_target_and_publish_actual
     r.resources = ScanResources {
         acceleration: acceleration::Mode::Cpu,
         memory_scheduling: false,
+        automatic_memory: false,
         workers: 64,
         memory_bytes: 512 << 20,
         download_memory_bytes: None,

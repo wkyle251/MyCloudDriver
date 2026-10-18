@@ -122,6 +122,8 @@ pub struct Connections {
     coordinator: Option<Participant>,
     generation: Option<u64>,
     trial_outcome: Option<TrialOutcome>,
+    bidirectional: bool,
+    lower_next: bool,
 }
 
 impl Connections {
@@ -148,6 +150,8 @@ impl Connections {
             coordinator: None,
             generation: None,
             trial_outcome: None,
+            bidirectional: false,
+            lower_next: false,
         }
     }
     /// Normal downloads retain a trial only when aggregate throughput increases
@@ -155,6 +159,13 @@ impl Connections {
     /// Call when constructing the controller, before collecting measurements.
     pub fn with_absolute_gain(mut self) -> Self {
         self.minimum_gain = MinimumGain::OneMegabytePerSecond;
+        self
+    }
+    /// File reads can get slower with more readers (especially on rotating
+    /// disks). Alternate growth with smaller trials; an equal-rate smaller
+    /// pool is useful because it leaves the disk and host less contention.
+    pub fn with_bidirectional_trials(mut self) -> Self {
+        self.bidirectional = true;
         self
     }
     pub fn with_coordinator(mut self, coordinator: Arc<Coordinator>) -> Self {
@@ -264,7 +275,9 @@ impl Connections {
             return;
         }
         if self.probe.is_none() {
-            if self.limit >= self.ceiling.min(self.resource_limit) {
+            if self.limit >= self.ceiling.min(self.resource_limit)
+                && !(self.bidirectional && self.limit > 1)
+            {
                 if let Some(coordinator) = &self.coordinator {
                     coordinator.withdraw();
                 }
@@ -297,16 +310,17 @@ impl Connections {
         }
 
         if let Some(probe) = &self.probe {
-            let minimum_rate = match self.minimum_gain {
+            let smaller = self.limit < probe.previous_limit;
+            let minimum_rate = if smaller { probe.baseline_rate * 0.98 } else { match self.minimum_gain {
                 MinimumGain::TenPercent => probe.baseline_rate * MIN_RELATIVE_GAIN,
                 MinimumGain::OneMegabytePerSecond => probe.baseline_rate + MIN_ABSOLUTE_GAIN,
-            };
+            } };
             if rate.mean < minimum_rate {
                 self.reject(now);
             } else {
                 self.probe = None;
                 self.plateau = None;
-                self.proven_gain = true;
+                self.proven_gain = !smaller;
                 self.trial_outcome = Some(TrialOutcome::Accepted(self.limit));
                 // This measured window is valid for the next standalone trial.
                 // Coordinated controllers must first observe the new generation.
@@ -345,7 +359,12 @@ impl Connections {
             started: now,
             lease,
         });
-        self.limit = if self.proven_gain || self.limit < INITIAL_CONNECTIONS {
+        let smaller = self.bidirectional && self.limit > 1
+            && (self.lower_next || self.limit >= self.ceiling.min(self.resource_limit));
+        if self.bidirectional { self.lower_next = !smaller; }
+        self.limit = if smaller {
+            (self.limit / 2).max(1)
+        } else if self.proven_gain || self.limit < INITIAL_CONNECTIONS {
             self.limit.saturating_mul(2)
         } else {
             self.limit.saturating_add((self.limit / 4).max(2))

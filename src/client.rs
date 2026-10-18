@@ -739,6 +739,27 @@ impl Client {
         page_token: Option<&str>,
         limit: usize,
     ) -> Result<FilePage> {
+        self.list_folder_page_with_retry(parent_id, page_token, limit, true).await
+    }
+
+    /// Similarity's coordinator owns bounded retries and serving-origin
+    /// cooldowns. Keep the same parsing, auth refresh and metadata cache path.
+    pub(crate) async fn list_similarity_folder_page(
+        &self,
+        parent_id: &str,
+        page_token: Option<&str>,
+        limit: usize,
+    ) -> Result<FilePage> {
+        self.list_folder_page_with_retry(parent_id, page_token, limit, false).await
+    }
+
+    async fn list_folder_page_with_retry(
+        &self,
+        parent_id: &str,
+        page_token: Option<&str>,
+        limit: usize,
+        retry_network: bool,
+    ) -> Result<FilePage> {
         if page_token.filter(|token| !token.is_empty()).is_none() {
             // A fresh interactive pass can reveal external removals. Until a
             // complete snapshot is available, old rows are hints rather than a
@@ -763,7 +784,9 @@ impl Client {
             params.push(("page_token", token.to_string()));
         }
 
-        let resp = self.drive_get(&url, action, &params).await?;
+        let resp = self.drive_request_with_retry(
+            reqwest::Method::GET, &url, action, &params, None, retry_network,
+        ).await?;
         if self.content_mode.tries_guest() {
             self.guest.remember_listing(&resp);
         }
@@ -1810,6 +1833,23 @@ impl Client {
         file_id: &str,
         parent_id: &str,
     ) -> Result<(u64, Option<String>)> {
+        self.similarity_file_revision_with_retry(file_id, parent_id, true).await
+    }
+
+    pub(crate) async fn similarity_scan_file_revision(
+        &self,
+        file_id: &str,
+        parent_id: &str,
+    ) -> Result<(u64, Option<String>)> {
+        self.similarity_file_revision_with_retry(file_id, parent_id, false).await
+    }
+
+    async fn similarity_file_revision_with_retry(
+        &self,
+        file_id: &str,
+        parent_id: &str,
+        retry_network: bool,
+    ) -> Result<(u64, Option<String>)> {
         if self.content_mode.tries_guest() {
             if let Some(file) = self
                 .content_mode
@@ -1824,7 +1864,7 @@ impl Client {
                 ));
             }
         }
-        let body = self.get_file_detail(file_id).await?;
+        let body = self.get_file_detail_with_retry(file_id, retry_network).await?;
         if body.trashed {
             return Err(Error::Api {
                 status: 404,
@@ -1853,7 +1893,7 @@ impl Client {
                 return Ok((download, file.info.hash));
             }
         }
-        let body = self.get_file_detail(file_id).await?;
+        let (body, original_url) = self.get_original_file_detail(file_id).await?;
         if body.trashed {
             return Err(Error::Api {
                 status: 404,
@@ -1866,7 +1906,7 @@ impl Client {
             .or_else(|| body.modified_time.filter(|s| !s.trim().is_empty()));
         Ok((
             DownloadInfo {
-                web_content_link: original_download_url(&body.medias, &body.web_content_link).ok_or(Error::InvalidDownloadUrl)?,
+                web_content_link: original_url,
                 name: body.name,
                 size: body.size,
                 source_revision: download_revision(revision.as_deref(), None),
@@ -1885,12 +1925,12 @@ impl Client {
                 return Ok(download);
             }
         }
-        let body = self.get_file_detail(file_id).await?;
+        let (body, original_url) = self.get_original_file_detail(file_id).await?;
 
         let source_revision =
             download_revision(body.hash.as_deref(), body.modified_time.as_deref());
         Ok(DownloadInfo {
-            web_content_link: original_download_url(&body.medias, &body.web_content_link).ok_or(Error::InvalidDownloadUrl)?,
+            web_content_link: original_url,
             name: body.name,
             size: body.size,
             source_revision,
@@ -1971,11 +2011,11 @@ impl Client {
         }
         // Use the saved account ID after a failed guest lookup, never an
         // unverified original-share ID. Do not repeat the guest attempt here.
-        let body = self.get_file_detail(&file.id).await?;
+        let (body, original_url) = self.get_original_file_detail(&file.id).await?;
         let source_revision =
             download_revision(body.hash.as_deref(), body.modified_time.as_deref());
         Ok(DownloadInfo {
-            web_content_link: original_download_url(&body.medias, &body.web_content_link).ok_or(Error::InvalidDownloadUrl)?,
+            web_content_link: original_url,
             name: body.name,
             size: body.size,
             source_revision,
@@ -2050,7 +2090,23 @@ impl Client {
         }
     }
 
+    /// Missing/expired original links can be a stale FETCH response. Make one
+    /// fresh authenticated lookup before reporting an unavailable original.
+    /// API/permission/throttling errors retain their own retry policy.
+    async fn get_original_file_detail(&self, file_id: &str) -> Result<(FileDetailResponse, String)> {
+        for _ in 0..2 {
+            let body = self.get_file_detail(file_id).await?;
+            if body.trashed { return Err(Error::Api { status: 404, message: "The original is in Trash".into() }); }
+            if let Some(url) = original_download_url(&body.medias, &body.web_content_link) { return Ok((body, url)); }
+        }
+        Err(Error::InvalidDownloadUrl)
+    }
+
     async fn get_file_detail(&self, file_id: &str) -> Result<FileDetailResponse> {
+        self.get_file_detail_with_retry(file_id, true).await
+    }
+
+    async fn get_file_detail_with_retry(&self, file_id: &str, retry_network: bool) -> Result<FileDetailResponse> {
         let cache_generation = self.duplicate_cache_generation().await;
         let action = "GET:/drive/v1/files/:id";
         let url = format!(
@@ -2067,7 +2123,9 @@ impl Client {
             // looks valid but is rejected when AVPlayer opens it.
             ("usage", "FETCH".to_string()),
         ];
-        let resp = self.drive_get(&url, action, &query).await?;
+        let resp = self.drive_request_with_retry(
+            reqwest::Method::GET, &url, action, &query, None, retry_network,
+        ).await?;
         let detail = serde_json::from_str(&resp)?;
         if let Some((cache, generation)) = cache_generation {
             if let Ok(value) = serde_json::from_str::<Value>(&resp) {

@@ -60,9 +60,11 @@ import Foundation
         resourcesEdit.usesAutomatic = false
         resourcesEdit.memoryMiB = 1024; resourcesEdit.downloadMemoryMiB = 64
         try scan.updatePausedResources(resourcesEdit, sessionID: scan.savedSession!.id)
-        try await until { scan.progress.originalMemoryLimit == 64 << 20 && scan.progress.analysisMemoryLimit == 960 << 20 }
+        precondition(scan.savedSession?.resources.automaticMemory == true)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        precondition(scan.progress.originalMemoryLimit != 64 << 20, "Legacy manual limits must be ignored")
         precondition(scan.isPaused && scan.processIdentifier == pid && written == pausedWritten,
-            "Applying new RAM limits must retain the same paused provider and helper")
+            "Automatic memory migration must retain the same paused provider and helper")
         owner.resume(scan)
         precondition(scan.processIdentifier == pid)
         try await until { !scan.isRunning }
@@ -70,6 +72,6 @@ import Foundation
         precondition(starts == 1 && written == content.count, "Pause restarted the provider")
         precondition(!FileManager.default.fileExists(atPath: pipeURL!.path))
         scan.clearSession()
-        print("PASS Photos partial FIFO/RAM bytes survive pause, resource edits and same-helper resume; provider starts once; no original file created")
+        print("PASS Photos partial FIFO/RAM bytes survive pause, automatic memory and same-helper resume; provider starts once; no original file created")
     }
 }

@@ -390,19 +390,19 @@ impl ShareClient {
 
     async fn get_download_url_inner(&self, file_id: &str) -> Result<DownloadInfo> {
         let _stage = crate::download_waits::Stage::enter(crate::download_waits::Kind::DownloadUrl);
-        let detail = self.get_file_detail(file_id).await?;
-        let web_content_link = original_content_link(&detail)
-            .ok_or(Error::InvalidDownloadUrl)?;
-        let source_revision = crate::client::download_revision(
-            detail.info.hash.as_deref(),
-            detail.info.modified_time.as_deref(),
-        );
-        Ok(DownloadInfo {
-            web_content_link,
-            name: detail.info.name,
-            size: detail.info.size,
-            source_revision,
-        })
+        // Guest remains one lookup. An authenticated response without an
+        // original gets one fresh lookup before the retry queue sees it.
+        let attempts = if self.inner.account.is_some() { 2 } else { 1 };
+        for _ in 0..attempts {
+            let detail = self.get_file_detail(file_id).await?;
+            if let Some(web_content_link) = original_content_link(&detail) {
+                let source_revision = crate::client::download_revision(
+                    detail.info.hash.as_deref(), detail.info.modified_time.as_deref());
+                return Ok(DownloadInfo { web_content_link, name: detail.info.name,
+                    size: detail.info.size, source_revision });
+            }
+        }
+        Err(Error::InvalidDownloadUrl)
     }
 
     pub async fn get_preview_info(&self, file_id: &str) -> Result<PreviewInfo> {

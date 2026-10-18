@@ -8,9 +8,17 @@ struct SimilarityResultsView: View {
     @State private var selectedMatchID: String?
     @State private var showsCoverage = false
     @State private var visibleMatchCount = 200
+    @State private var groupPage = 0
     @State private var pendingTrash: SimilarityFile?
     @FocusState private var searchFocused: Bool
     private var photos: Bool { coordinator.externalTitle == CloudDriveKind.photos.title }
+    private var destination: String { coordinator.acrossDrives?.cleanupDestination ?? (photos ? "Recently Deleted" : "Trash") }
+    private func isPhotos(_ file: SimilarityFile) -> Bool { photos || SimilarityAcrossDrives.origin(file)?.0 == .photos }
+    private func thumbnailFile(_ file: SimilarityFile) -> SimilarityFile {
+        guard let (_, id) = SimilarityAcrossDrives.origin(file) else { return file }
+        return SimilarityFile(id: id, name: file.name, path: file.path, bytes: file.bytes, family: file.family,
+            localPath: file.localPath, cloudId: nil, ancestors: [])
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -55,24 +63,26 @@ struct SimilarityResultsView: View {
             HStack(spacing: 7) {
                 if results.isGrouping { ProgressView().controlSize(.small) }
                 else { Image(systemName: report.status == "completed" ? "checkmark.circle" : "info.circle") }
-                Text(results.isGrouping ? "Regrouping saved comparisons…" : report.status == "cancelled"
+                Text(results.isGrouping ? (coordinator.duplicatesOnly ? "Preparing duplicate groups…" : "Regrouping saved comparisons…") : report.status == "cancelled"
                      ? "Scan cancelled. Files analysed so far are available; comparisons may be incomplete."
                      : report.status == "failed" ? "The scan could not finish. Review coverage before interpreting these results."
                      : coordinator.duplicatesOnly ? "Select a group or file to review identical copies."
                      : "Adjust 5–100% to regroup saved comparisons. No rescan needed.")
                     .font(.caption).fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
+                if results.preparingSizeBasedPlans { ProgressView().controlSize(.small).help("Preparing cleanup actions…") }
                 if results.browseGroups, coordinator.keepSmallest != nil {
                     Menu {
                         if let plan = results.keepSmallestPlan() {
-                            Button("Keep Smallest in \(plan.groupIDs.count == 1 ? "1 Group" : "All \(plan.groupIDs.count) Groups") — Move \(plan.removals.count) to \(photos ? "Recently Deleted" : "Trash")") {
-                                keepSmallest(plan)
-                            }
+                            sizeCleanupButton(plan)
+                        }
+                        if let plan = results.keepLargestPlan() {
+                            sizeCleanupButton(plan)
                         }
                     } label: {
                         Label("Group Actions", systemImage: "ellipsis.circle")
                     }.fixedSize().controlSize(.small)
-                        .disabled(results.keepSmallestPlan() == nil)
+                        .disabled(results.keepSmallestPlan() == nil && results.keepLargestPlan() == nil)
                         .help("Applies to every group at this similarity, including groups hidden by search")
                 }
             }.foregroundStyle(report.status == "cancelled" || report.status == "failed" ? Color.orange : Color.secondary)
@@ -81,7 +91,7 @@ struct SimilarityResultsView: View {
                 HStack(spacing: 8) {
                     if !results.trashingIDs.isEmpty { ProgressView().controlSize(.small) }
                     else { Image(systemName: results.fileActionError == nil ? "checkmark.circle" : "exclamationmark.triangle") }
-                    Text(!results.trashingIDs.isEmpty ? "Moving \(results.trashingIDs.count) \(results.trashingIDs.count == 1 ? "file" : "files") to \(photos ? "Recently Deleted" : "Trash")…"
+                    Text(!results.trashingIDs.isEmpty ? "Moving \(results.trashingIDs.count) \(results.trashingIDs.count == 1 ? "file" : "files") to \(destination)…"
                          : results.fileActionError ?? results.fileActionMessage ?? "")
                         .font(.caption).textSelection(.enabled)
                     Spacer(minLength: 4)
@@ -139,7 +149,7 @@ struct SimilarityResultsView: View {
                                 if results.browseGroups { Button("Browse All Files") { results.showAllFiles() }.padding(.bottom, 18) }
                             }
                         } else {
-                            SimilarityFileTree(roots: results.roots, selectedID: results.selectedNodeID, searching: !results.query.isEmpty,
+                            SimilarityFileTree(snapshot: results.tree, selectedID: results.selectedNodeID, searching: !results.query.isEmpty,
                                 groupExpansion: results.browseGroups ? results.groupExpansion : nil,
                                 select: { selectedMatchID = nil; results.selectNode($0) }, preview: { preview($0) })
                                 .disabled(results.browseGroups && results.isGrouping)
@@ -166,10 +176,11 @@ struct SimilarityResultsView: View {
         }
         .onChange(of: results.minimumScore) { _ in visibleMatchCount = 200 }
         .onChange(of: results.identicalOnly) { _ in visibleMatchCount = 200 }
-        .confirmationDialog(photos ? "Move to Recently Deleted?" : "Move to Trash?",
+        .onChange(of: results.selectedGroupID) { _ in groupPage = 0 }
+        .confirmationDialog(pendingTrash.map(isPhotos) == true ? "Move to Recently Deleted?" : "Move to Trash?",
             isPresented: Binding(get: { pendingTrash != nil }, set: { if !$0 { pendingTrash = nil } }),
             titleVisibility: .visible, presenting: pendingTrash) { file in
-                Button(photos ? "Move to Recently Deleted" : "Move to Trash", role: .destructive) {
+                Button(isPhotos(file) ? "Move to Recently Deleted" : "Move to Trash", role: .destructive) {
                     pendingTrash = nil
                     guard let operation = coordinator.moveToTrash else { return }
                     coordinator.preview.close()
@@ -188,7 +199,7 @@ struct SimilarityResultsView: View {
         } else if let file = results.selectedFile {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(alignment: .center, spacing: 14) {
-                    SimilarityFileThumbnail(file: file, photos: photos).frame(width: 84, height: 84)
+                    SimilarityFileThumbnail(file: thumbnailFile(file), photos: isPhotos(file)).frame(width: 84, height: 84)
                     VStack(alignment: .leading, spacing: 6) {
                         Text("REFERENCE FILE").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
                         Text(file.name).font(.headline).lineLimit(2).truncationMode(.middle).textSelection(.enabled)
@@ -240,7 +251,7 @@ struct SimilarityResultsView: View {
                     Divider()
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 12) {
-                            SimilarityFileThumbnail(file: match.file, photos: photos).frame(width: 60, height: 60)
+                            SimilarityFileThumbnail(file: thumbnailFile(match.file), photos: isPhotos(match.file)).frame(width: 60, height: 60)
                             VStack(alignment: .leading, spacing: 5) {
                                 Text(match.file.name).font(.callout.weight(.semibold)).lineLimit(1).truncationMode(.middle)
                                 Text(match.file.path).font(.caption).foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle)
@@ -275,14 +286,15 @@ struct SimilarityResultsView: View {
     }
 
     private func groupDetail(_ group: SimilarityResultGroup) -> some View {
-        let smallest = SimilarityKeepSmallestPlan.smallest(in: group.members)
+        let smallest = results.smallestFile(inGroup: group.id)
+        let page = ResultPage(total: group.members.count, requestedPage: groupPage)
         return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 12) {
                 Image(systemName: group.identical ? "doc.on.doc" : "square.stack.3d.up")
                     .font(.system(size: 25)).foregroundStyle(FinderAppearance.accent)
                     .frame(width: 50, height: 50).background(FinderAppearance.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("Group \((results.groups.firstIndex(where: { $0.id == group.id }) ?? 0) + 1)").font(.title3.weight(.semibold))
+                    Text("Group \(results.groupNumber(group.id))").font(.title3.weight(.semibold))
                     Text("\(group.members.count) files · \(group.strengthLabel)").font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -292,7 +304,7 @@ struct SimilarityResultsView: View {
                  : "Every pair in this group meets the selected similarity. Select a file to review its individual comparisons.")
                 .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.bottom, 14)
             if !results.allowsSizeBasedCleanup {
-                Text("Original sizes are unavailable in Fast Previews. Use an Originals scan to choose the smallest file.")
+                Text("Original sizes are unavailable in Fast Previews. Use an Originals scan to choose which file size to keep.")
                     .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.bottom, 14)
             }
             if coordinator.keepSmallest != nil, results.allowsSizeBasedCleanup, let keeper = smallest {
@@ -300,25 +312,25 @@ struct SimilarityResultsView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Keep \(keeper.name)").font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
                             .help(keeper.path)
-                        Text("Smallest: \(SimilarityScanProgress.bytes(keeper.bytes)) · Move \(group.members.count - 1) \(group.members.count == 2 ? "other file" : "other files") to \(photos ? "Recently Deleted" : "Trash")")
+                        Text("Smallest: \(SimilarityScanProgress.bytes(keeper.bytes)) · Move \(group.members.count - 1) \(group.members.count == 2 ? "other file" : "other files") to \(destination)")
                             .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer(minLength: 0)
                     Button {
-                        if let plan = results.keepSmallestPlan(groupID: group.id) { keepSmallest(plan) }
+                        if let plan = results.keepSmallestPlan(groupID: group.id) { applySizeCleanup(plan) }
                     } label: { Label("Keep Smallest", systemImage: "trash") }
                         .disabled(results.keepSmallestPlan(groupID: group.id) == nil)
-                        .help("Keep the displayed file and move the others in this group to \(photos ? "Recently Deleted" : "Trash"). Equal sizes are resolved by path, then file ID.")
+                        .help("Keep the displayed file and move the others in this group to \(destination). Equal sizes are resolved by path, then file ID.")
                 }.padding(12).background(FinderAppearance.accent.opacity(0.045), in: RoundedRectangle(cornerRadius: 9))
                     .padding(.horizontal, 16).padding(.bottom, 14)
             }
             Divider()
             ScrollView {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 185), spacing: 12)], alignment: .leading, spacing: 12) {
-                    ForEach(group.members) { file in
+                    ForEach(group.members[page.range]) { file in
                         Button { selectReference(file.id) } label: {
                             VStack(alignment: .leading, spacing: 9) {
-                                SimilarityFileThumbnail(file: file, photos: photos).frame(maxWidth: .infinity).frame(height: 95)
+                                SimilarityFileThumbnail(file: thumbnailFile(file), photos: isPhotos(file)).frame(maxWidth: .infinity).frame(height: 95)
                                     .background(FinderAppearance.accent.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
                                 Text(file.name).font(.callout.weight(.semibold)).lineLimit(2).truncationMode(.middle).foregroundStyle(.primary)
                                 Text(file.path).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
@@ -346,15 +358,25 @@ struct SimilarityResultsView: View {
                 }.padding(14)
             }.disabled(results.isGrouping)
             Divider()
+            if page.count > 1 {
+                ResultPageControls(page: page, selection: $groupPage).padding(12)
+                Divider()
+            }
             Text("Groups are a review aid. Matching pairs can also exist across different groups; selecting a file always shows all its matches.")
                 .font(.caption2).foregroundStyle(.secondary).padding(12)
         }
     }
 
-    private func keepSmallest(_ plan: SimilarityKeepSmallestPlan) {
+    private func sizeCleanupButton(_ plan: SimilarityKeepSmallestPlan) -> some View {
+        Button("\(plan.actionTitle) in \(plan.groupIDs.count == 1 ? "1 Group" : "All \(plan.groupIDs.count) Groups") — Move \(plan.removals.count) to \(destination)") {
+            applySizeCleanup(plan)
+        }
+    }
+
+    private func applySizeCleanup(_ plan: SimilarityKeepSmallestPlan) {
         guard let operation = coordinator.keepSmallest else { return }
         coordinator.preview.close()
-        results.keepSmallest(plan, destination: photos ? "Recently Deleted" : "Trash", using: operation)
+        results.keepSmallest(plan, destination: destination, using: operation)
     }
 
     private func matchRow(_ match: SimilarityRelatedFile) -> some View {
@@ -414,11 +436,11 @@ struct SimilarityResultsView: View {
     private func trashButton(_ file: SimilarityFile, iconOnly: Bool = false) -> some View {
         Button(role: .destructive) { requestTrash(file) } label: {
             if iconOnly { Image(systemName: "trash") }
-            else { Label("Move to Trash", systemImage: "trash") }
+            else { Label(isPhotos(file) ? "Move to Recently Deleted" : "Move to Trash", systemImage: "trash") }
         }
         .disabled(!canTrash(file))
-        .help("Move \(file.name) to \(photos ? "Recently Deleted in Apple Photos" : "Trash")")
-        .accessibilityLabel("Move \(file.name) to Trash")
+        .help("Move \(file.name) to \(isPhotos(file) ? "Recently Deleted in Apple Photos" : "Trash")")
+        .accessibilityLabel("Move \(file.name) to \(isPhotos(file) ? "Recently Deleted" : "Trash")")
     }
     private var trashSelection: SimilarityFile? {
         guard !results.isIndexing, !(results.browseGroups && results.isGrouping), results.selectedGroup == nil else { return nil }
@@ -438,9 +460,9 @@ struct SimilarityResultsView: View {
         pendingTrash = file
     }
     private func trashConfirmation(_ file: SimilarityFile) -> String {
-        if photos { return "Move “\(file.name)” to Recently Deleted in Apple Photos? This also affects iCloud Photos if enabled. Restore it from Photos → Recently Deleted." }
+        if isPhotos(file) { return "Move “\(file.name)” to Recently Deleted in Apple Photos? This also affects iCloud Photos if enabled. Restore it from Photos → Recently Deleted." }
         if file.cloudId != nil { return "Move “\(file.name)” to PikPak Trash? You can undo this change in its drive window with Command-Z." }
-        let sync = coordinator.externalTitle == CloudDriveKind.icloud.title ? " This change will sync to iCloud." : ""
+        let sync = coordinator.externalTitle == CloudDriveKind.icloud.title || SimilarityAcrossDrives.origin(file)?.0 == .icloud ? " This change will sync to iCloud." : ""
         return "Move “\(file.name)” to Trash?\(sync) External and network disks keep deleted items in their own Trash folder. Use the disk’s Trash tab to Put Back, or Command-Z in its drive window."
     }
     private func preview(_ file: SimilarityFile) {

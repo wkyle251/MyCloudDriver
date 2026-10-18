@@ -61,8 +61,13 @@ impl SourceCache {
                 seen_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(identity,revision,reader)) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY, stamp TEXT) WITHOUT ROWID;")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS content_aliases(gcid TEXT,size INTEGER,profile TEXT,digest TEXT NOT NULL,
+            seen_at INTEGER NOT NULL,PRIMARY KEY(gcid,size,profile)) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS content_aliases_digest ON content_aliases(digest,profile);
+            CREATE INDEX IF NOT EXISTS sources_digest ON sources(digest,profile);")?;
         Self::date_existing_entries(&db)?;
         let cache = Self { db: Mutex::new(db) };
+        cache.import_content_aliases()?;
         // Older versions saved the necessary identity in checkpoints, but the
         // aggregate vector file kept only content hashes. Import derived data
         // without reading originals or changing any existing scan.
@@ -134,10 +139,12 @@ impl SourceCache {
                 outcomes: tx.execute("DELETE FROM outcomes WHERE seen_at < ?1", [cutoff])?,
                 vectors: 0,
             };
+            tx.execute("DELETE FROM content_aliases WHERE seen_at < ?1", [cutoff])?;
             // Content that no saved file points at stays until it is old, so a renamed or moved copy still reuses it.
             pruned.vectors += tx.execute(
                 "DELETE FROM vectors WHERE seen_at < ?1 AND NOT EXISTS (
-                    SELECT 1 FROM sources s WHERE s.digest = vectors.digest AND s.profile = vectors.profile)",
+                    SELECT 1 FROM sources s WHERE s.digest = vectors.digest AND s.profile = vectors.profile)
+                    AND NOT EXISTS (SELECT 1 FROM content_aliases a WHERE a.digest=vectors.digest AND a.profile=vectors.profile)",
                 [cutoff],
             )?;
             let total: i64 = tx.query_row("SELECT coalesce(sum(length(payload)),0) FROM vectors", [], |row| row.get(0))?;
@@ -163,6 +170,8 @@ impl SourceCache {
                     SELECT 1 FROM vectors v WHERE v.digest = sources.digest AND v.profile = sources.profile)",
                 [],
             )?;
+            tx.execute("DELETE FROM content_aliases WHERE NOT EXISTS (
+                SELECT 1 FROM vectors v WHERE v.digest=content_aliases.digest AND v.profile=content_aliases.profile)", [])?;
             tx.execute("INSERT OR REPLACE INTO meta VALUES('last_pruned', ?1)", [now])?;
             tx.commit()?;
             Ok(pruned)
@@ -184,17 +193,17 @@ impl SourceCache {
         let now = self.now();
         let db = self.db.lock().unwrap();
         let mut query = db.prepare_cached(
-            "SELECT v.digest,v.payload,s.seen_at FROM sources s JOIN vectors v
+            "SELECT v.digest,v.payload,s.seen_at,v.seen_at FROM sources s JOIN vectors v
             ON s.digest=v.digest AND s.profile=v.profile
             WHERE s.identity=?1 AND s.revision=?2 AND s.profile=?3 AND length(v.payload)<=4194304",
         )?;
         for p in profiles.iter().filter(|p| families.contains(&p.family)) {
-            let saved: Option<(String, Vec<u8>, i64)> = query
+            let saved: Option<(String, Vec<u8>, i64, i64)> = query
                 .query_row(params![identity, revision, p.profile_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                 })
                 .optional()?;
-            let Some((digest, payload, seen_at)) = saved else {
+            let Some((digest, payload, seen_at, vector_seen)) = saved else {
                 continue;
             };
             // Treat damaged/obsolete entries as cache misses, never as failures
@@ -212,11 +221,41 @@ impl SourceCache {
             }
             record.path = FilePath::Utf8(file.display.id.clone());
             record.reused = true;
+            if let Some((gcid, size)) = cloud_content(file) {
+                Self::remember_content_alias(&db, &gcid, size, &record, now)?;
+            }
             if now - seen_at >= TOUCH_AFTER {
                 db.execute("UPDATE sources SET seen_at=?4 WHERE identity=?1 AND revision=?2 AND profile=?3", params![identity, revision, p.profile_id, now])?;
-                db.execute("UPDATE vectors SET seen_at=?3 WHERE digest=?1 AND profile=?2", params![digest, p.profile_id, now])?;
+            }
+            if now - vector_seen >= TOUCH_AFTER {
+                db.execute("UPDATE vectors SET seen_at=?3 WHERE digest=?1 AND profile=?2", params![digest,p.profile_id,now])?;
             }
             return Ok(Some(record));
+        }
+        // Different PikPak IDs may represent the same original. Only a real
+        // GCID, exact byte size and the immutable analysis profile can prove
+        // that reuse; timestamps and arbitrary provider revisions cannot.
+        if let Some((gcid, size)) = cloud_content(file) {
+            for p in profiles.iter().filter(|p| families.contains(&p.family)) {
+                let saved: Option<(String, Vec<u8>, i64, i64)> = db.query_row(
+                    "SELECT v.digest,v.payload,a.seen_at,v.seen_at FROM content_aliases a JOIN vectors v
+                     ON a.digest=v.digest AND a.profile=v.profile WHERE a.gcid=?1 AND a.size=?2
+                     AND a.profile=?3 AND length(v.payload)<=4194304",
+                    params![gcid, size as i64, p.profile_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+                ).optional()?;
+                let Some((digest, payload, seen, vector_seen)) = saved else { continue; };
+                let Ok(mut record) = unpack(&payload) else { continue; };
+                if record.file_id.as_deref()!=Some(&digest) || record.profile_id.as_deref()!=Some(&p.profile_id)
+                    || !alias_content_matches(&record,&gcid,size) { continue; }
+                if seen <= now - TOUCH_AFTER {
+                    db.execute("UPDATE content_aliases SET seen_at=?4 WHERE gcid=?1 AND size=?2 AND profile=?3", params![gcid,size as i64,p.profile_id,now])?;
+                }
+                if vector_seen <= now-TOUCH_AFTER {
+                    db.execute("UPDATE vectors SET seen_at=?3 WHERE digest=?1 AND profile=?2 AND seen_at<=?4", params![digest,p.profile_id,now,now-TOUCH_AFTER])?;
+                }
+                record.path=FilePath::Utf8(file.display.id.clone()); record.reused=true;
+                return Ok(Some(record));
+            }
         }
         // Unknown binary/archive content has no vector, but its complete hash
         // and classification are final work too. Keep exact-copy evidence and
@@ -272,7 +311,71 @@ impl SourceCache {
                 "encoding", "Binary or unsupported content has no similarity reader; exact-content hash retained"));
             return self.remember_outcome(file, &revision, &reader_key(file), saved);
         }
-        self.remember(file, &revision, record)
+        self.remember(file, &revision, record)?;
+        if let Some((gcid, size)) = cloud_content(file) {
+            Self::remember_content_alias(&self.db.lock().unwrap(), &gcid, size, record, self.now())?;
+        }
+        Ok(())
+    }
+
+    fn remember_content_alias(db: &Connection, gcid: &str, size: u64, record: &FileRecord, now: i64) -> Result<()> {
+        if size == 0 || size > i64::MAX as u64 || !alias_content_matches(record,gcid,size) || vector_cache::validate_record(record).is_err() {
+            return Ok(());
+        }
+        let previous: Option<(String, i64)> = db.query_row(
+            "SELECT v.digest,a.seen_at FROM content_aliases a JOIN vectors v
+             ON a.digest=v.digest AND a.profile=v.profile WHERE a.gcid=?1 AND a.size=?2
+             AND a.profile=?3 AND length(v.payload)<=4194304",
+            params![gcid,size as i64,record.profile_id], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        if let Some((digest,seen))=previous {
+            // The caller just validated or persisted this very vector under
+            // the cache lock. Its existing alias needs no second blob read or
+            // decompression on a primary source-cache hit.
+            let valid = if record.file_id.as_ref()==Some(&digest) {
+                true
+            } else {
+                let payload:Vec<u8>=db.query_row("SELECT payload FROM vectors WHERE digest=?1 AND profile=?2",
+                    params![digest,record.profile_id],|row|row.get(0))?;
+                unpack(&payload).is_ok_and(|old| old.file_id.as_ref()==Some(&digest)
+                    && old.profile_id==record.profile_id && alias_content_matches(&old,gcid,size))
+            };
+            if valid {
+                if seen <= now-TOUCH_AFTER {
+                    db.execute("UPDATE content_aliases SET seen_at=?4 WHERE gcid=?1 AND size=?2 AND profile=?3",params![gcid,size as i64,record.profile_id,now])?;
+                }
+                return Ok(());
+            }
+        }
+        // Replace only a missing or invalid alias. The first valid mapping is
+        // stable across full SHA-256 and range-backed GCID representations.
+        db.execute("INSERT INTO content_aliases VALUES(?1,?2,?3,?4,?5)
+            ON CONFLICT(gcid,size,profile) DO UPDATE SET digest=excluded.digest,seen_at=excluded.seen_at",
+            params![gcid,size as i64,record.profile_id,record.file_id,now])?;
+        Ok(())
+    }
+
+    fn import_content_aliases(&self) -> Result<()> {
+        let mut db=self.db.lock().unwrap();
+        if db.query_row("SELECT value FROM meta WHERE key='content_aliases_v1'",[],|r|r.get::<_,i64>(0)).optional()?.is_some() { return Ok(()); }
+        let tx=db.transaction()?;
+        {
+            let mut query=tx.prepare("SELECT s.revision,s.profile,s.digest,v.payload,s.seen_at FROM sources s JOIN vectors v
+                ON s.digest=v.digest AND s.profile=v.profile WHERE s.identity LIKE 'pikpak:%' AND length(v.payload)<=4194304")?;
+            let mut rows=query.query([])?;
+            while let Some(row)=rows.next()? {
+                let revision:String=row.get(0)?;
+                let Some((gcid,size))=cloud_revision_content(&revision) else {continue;};
+                let profile:String=row.get(1)?; let digest:String=row.get(2)?; let payload:Vec<u8>=row.get(3)?;
+                let Ok(record)=unpack(&payload) else {continue;};
+                if record.profile_id.as_ref()==Some(&profile) && record.file_id.as_ref()==Some(&digest) {
+                    Self::remember_content_alias(&tx,&gcid,size,&record,row.get(4)?)?;
+                }
+            }
+        }
+        tx.execute("INSERT OR REPLACE INTO meta VALUES('content_aliases_v1',1)",[])?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn remember_outcome(
@@ -284,19 +387,65 @@ impl SourceCache {
     ) -> Result<()> {
         saved.path = FilePath::Utf8("cached".into());
         saved.reused = false;
+        let data = serde_json::to_vec(&saved)?;
+        let now = self.now();
+        let identity = identity(file);
+        let db = self.db.lock().unwrap();
+        let previous: Option<(Vec<u8>, i64)> = db.query_row(
+            "SELECT payload,seen_at FROM outcomes WHERE identity=?1 AND revision=?2 AND reader=?3 AND length(payload)<=4194304",
+            params![identity, revision, reader], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        if previous.as_ref().is_some_and(|(payload, _)| decompress(payload).is_ok_and(|old| old == data)) {
+            if previous.unwrap().1 <= now - TOUCH_AFTER {
+                db.execute("UPDATE outcomes SET seen_at=?4 WHERE identity=?1 AND revision=?2 AND reader=?3", params![identity, revision, reader, now])?;
+            }
+            return Ok(());
+        }
         let mut encoder = zstd::stream::Encoder::new(Vec::new(), 6)?;
         encoder.include_checksum(true)?;
-        encoder.write_all(&serde_json::to_vec(&saved)?)?;
+        encoder.write_all(&data)?;
         let payload = encoder.finish()?;
-        self.db.lock().unwrap().execute(
+        db.execute(
             "INSERT OR REPLACE INTO outcomes(identity,revision,reader,payload,seen_at) VALUES(?1,?2,?3,?4,?5)",
-            params![identity(file), revision, reader, payload, self.now()],
+            params![identity, revision, reader, payload, now],
         )?;
         Ok(())
     }
 
     fn remember(&self, file: &scope::InputFile, revision: &str, record: &FileRecord) -> Result<()> {
         if vector_cache::validate_record(record).is_err() {
+            return Ok(());
+        }
+        let mut db = self.db.lock().unwrap();
+        let now = self.now();
+        let identity = identity(file);
+        let previous: Option<(Vec<u8>, i64)> = db.query_row(
+            "SELECT payload,seen_at FROM vectors WHERE digest=?1 AND profile=?2 AND length(payload)<=4194304",
+            params![record.file_id, record.profile_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        // Reused work is already durable. Verify its stored payload before
+        // avoiding compression, so a fresh analysis can still repair damage.
+        if let Some((_, seen_at)) = previous.as_ref().filter(|(payload, _)| {
+            unpack(payload).is_ok_and(|old| old.file_id == record.file_id
+                && old.profile_id == record.profile_id
+                && old.vector_sha256 == record.vector_sha256 && old.bytes == record.bytes)
+        }) {
+            let source: Option<(String, i64)> = db.query_row(
+                "SELECT digest,seen_at FROM sources WHERE identity=?1 AND revision=?2 AND profile=?3",
+                params![identity, revision, record.profile_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            if *seen_at > now - TOUCH_AFTER && source.as_ref().is_some_and(|(digest, used)|
+                Some(digest) == record.file_id.as_ref() && *used > now - TOUCH_AFTER) {
+                return Ok(());
+            }
+            let tx = db.transaction()?;
+            tx.execute("UPDATE vectors SET seen_at=?3 WHERE digest=?1 AND profile=?2 AND seen_at<=?4",
+                params![record.file_id, record.profile_id, now, now - TOUCH_AFTER])?;
+            tx.execute("INSERT INTO sources(identity,revision,profile,digest,seen_at) VALUES(?1,?2,?3,?4,?5)
+                ON CONFLICT(identity,revision,profile) DO UPDATE SET digest=excluded.digest,seen_at=excluded.seen_at
+                WHERE sources.digest<>excluded.digest OR sources.seen_at<=?6",
+                params![identity, revision, record.profile_id, record.file_id, now, now - TOUCH_AFTER])?;
+            tx.commit()?;
             return Ok(());
         }
         let mut record = record.clone();
@@ -307,16 +456,14 @@ impl SourceCache {
             vector_cache::encode_payload(vec![record.clone()])?.as_slice(),
             6,
         )?;
-        let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
-        let now = self.now();
         tx.execute(
             "INSERT OR REPLACE INTO vectors(digest,profile,payload,seen_at) VALUES(?1,?2,?3,?4)",
             params![record.file_id, record.profile_id, payload, now],
         )?;
         tx.execute(
             "INSERT OR REPLACE INTO sources(identity,revision,profile,digest,seen_at) VALUES(?1,?2,?3,?4,?5)",
-            params![identity(file), revision, record.profile_id, record.file_id, now],
+            params![identity, revision, record.profile_id, record.file_id, now],
         )?;
         tx.commit()?;
         Ok(())
@@ -376,6 +523,20 @@ impl SourceCache {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         db.busy_timeout(Duration::from_millis(100))?;
+        // A logical generation is unaffected by opening or checkpointing the
+        // WAL. Filesystem stamps remain the compatibility fallback for legacy
+        // journals which have not yet been opened by this version.
+        let has_metadata: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata')", [], |row| row.get(0),
+        )?;
+        let generation: Option<i64> = if has_metadata {
+            db.query_row("SELECT value FROM metadata WHERE key='source_cache_generation'", [], |row| row.get(0)).optional()?
+        } else { None };
+        if let Some(generation) = generation {
+            let metadata = std::fs::symlink_metadata(directory.join("checkpoint.sqlite3"))?;
+            stamp = format!("all-records-v4;{};{}:{};generation:{generation};", password::CACHE_KEY, metadata.dev(), metadata.ino());
+            if previous.as_ref() == Some(&stamp) { return Ok(()); }
+        }
         let mut rows = db.prepare("SELECT revision,payload FROM files WHERE revision IS NOT NULL AND length(payload)<=4194304")?;
         let mut rows = rows.query([])?;
         while let Some(row) = rows.next()? {
@@ -399,6 +560,9 @@ impl SourceCache {
                     )?;
                 } else {
                     self.remember(&saved, &revision, record)?;
+                    if let Some((gcid,size))=cloud_content(&saved) {
+                        Self::remember_content_alias(&self.db.lock().unwrap(),&gcid,size,record,self.now())?;
+                    }
                 }
             }
         }
@@ -458,6 +622,26 @@ fn identity(file: &scope::InputFile) -> String {
         "local"
     };
     format!("{namespace}:{}", file.display.id)
+}
+
+fn cloud_content(file: &scope::InputFile) -> Option<(String,u64)> {
+    let cloud=file.cloud.as_ref()?;
+    let gcid=cloud.revision.as_deref()?.trim();
+    (cloud.size>0 && cloud.size<=i64::MAX as u64 && gcid.len()==40 && gcid.bytes().all(|b|b.is_ascii_hexdigit()))
+        .then(||(gcid.to_ascii_lowercase(),cloud.size))
+}
+fn cloud_revision_content(revision: &str) -> Option<(String,u64)> {
+    let mut parts=revision.rsplitn(3,':');
+    let gcid=parts.next()?;
+    let size=parts.next()?.parse::<u64>().ok()?;
+    let id=parts.next()?.strip_prefix("cloud:")?;
+    (!id.is_empty() && size>0 && size<=i64::MAX as u64 && gcid.len()==40 && gcid.bytes().all(|b|b.is_ascii_hexdigit()))
+        .then(||(gcid.to_ascii_lowercase(),size))
+}
+fn alias_content_matches(record:&FileRecord,gcid:&str,size:u64)->bool {
+    record.bytes==Some(size) && record.file_id.as_deref().is_some_and(|id| {
+        id.strip_prefix("gcid:").is_none_or(|value|value==format!("{gcid}:{size}"))
+    })
 }
 
 fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -534,6 +718,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cache = SourceCache::open(root.path()).unwrap();
         let original = scope::InputFile::external(ExternalSource {
+            provider: None,
             id: "asset:photo".into(),
             name: "photo.jpg".into(),
             path: "Photos/photo.jpg".into(),
@@ -1107,6 +1292,7 @@ mod tests {
         let first = SourceCache::open(root.path()).unwrap();
         let second = SourceCache::open(root.path()).unwrap();
         let mut file = scope::InputFile::external(ExternalSource {
+            provider: None,
             content_kind: None,
             id: "asset:photos-test".into(),
             name: "photo.png".into(),
@@ -1130,6 +1316,7 @@ mod tests {
         request.local_paths.clear();
         request.families = vec!["image".into()];
         let item = ExternalSource {
+            provider: None,
             content_kind: None,
             id: "asset:cached-image".into(),
             name: "photo.png".into(),
@@ -1248,6 +1435,134 @@ mod tests {
         cache.db.lock().unwrap().execute("UPDATE sources SET seen_at=?1", [saved - 2 * DAY]).unwrap();
         assert!(reuse(&cache, &item).is_some());
         assert!(seen(&cache) >= saved, "a reuse after a day refreshes it, so used work is never pruned");
+    }
+
+    #[test]
+    fn completed_reuse_and_content_aliases_do_not_rewrite_vectors() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = SourceCache::open(root.path()).unwrap();
+        let item = file();
+        let original = record(Backend::Cpu, "text");
+        cache.completed(&item, &original).unwrap();
+        let before = cache.db.lock().unwrap().total_changes();
+        let reused = reuse(&cache, &item).unwrap();
+        cache.completed(&item, &reused).unwrap();
+        assert_eq!(cache.db.lock().unwrap().total_changes(), before);
+        cache.db.lock().unwrap().execute_batch("CREATE TRIGGER no_vector_rewrite BEFORE INSERT ON vectors BEGIN SELECT RAISE(ABORT,'unexpected vector rewrite'); END;").unwrap();
+        let mut alias = item.clone();
+        alias.display.id = "different-occurrence".into();
+        cache.completed(&alias, &original).unwrap();
+        assert!(reuse(&cache, &alias).is_some());
+        assert_eq!(rows(&cache, "vectors"), 1);
+        assert_eq!(rows(&cache, "sources"), 2);
+    }
+
+    #[test]
+    fn completed_analysis_repairs_corrupt_saved_vectors() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = SourceCache::open(root.path()).unwrap();
+        let item = file();
+        let original = record(Backend::Cpu, "text");
+        cache.completed(&item, &original).unwrap();
+        cache.db.lock().unwrap().execute("UPDATE vectors SET payload=x'0000'", []).unwrap();
+        assert!(reuse(&cache, &item).is_none());
+        cache.completed(&item, &original).unwrap();
+        assert_eq!(reuse(&cache, &item).unwrap().vector, original.vector);
+        let mut wrong = original.clone();
+        wrong.file_id = Some(format!("sha256:{:064x}", 2));
+        let payload = zstd::stream::encode_all(vector_cache::encode_payload(vec![wrong]).unwrap().as_slice(), 6).unwrap();
+        cache.db.lock().unwrap().execute("UPDATE vectors SET payload=?1", [payload]).unwrap();
+        assert!(reuse(&cache, &item).is_none());
+        cache.completed(&item, &original).unwrap();
+        assert_eq!(reuse(&cache, &item).unwrap().file_id, original.file_id);
+    }
+
+    #[test]
+    fn trusted_gcid_reuses_vectors_across_cloud_ids_without_cache_writes() {
+        let root=tempfile::tempdir().unwrap();
+        let cache=SourceCache::open(root.path()).unwrap();
+        let mut first=file(); first.cloud.as_mut().unwrap().revision=Some("AB".repeat(20));
+        let original=record(Backend::Cpu,"image"); cache.completed(&first,&original).unwrap();
+        let mut copy=first.clone(); copy.cloud.as_mut().unwrap().id="another-cloud-id".into(); copy.display.id="different-occurrence".into();
+        let before=cache.db.lock().unwrap().total_changes();
+        let reused=cache.reused(&copy,Backend::Cpu,&["image".into()]).unwrap().unwrap();
+        assert!(reused.reused); assert_eq!(reused.file_id,original.file_id); assert_eq!(reused.vector,original.vector);
+        assert_eq!(cache.db.lock().unwrap().total_changes(),before);
+        assert!(cache.reused(&copy,Backend::Coreml,&["image".into()]).unwrap().is_none());
+        for revision in [Some("CD".repeat(20)),Some("2026-10-14T00:00:00Z".into()),None] {
+            copy.cloud.as_mut().unwrap().revision=revision;
+            assert!(cache.reused(&copy,Backend::Cpu,&["image".into()]).unwrap().is_none());
+        }
+        copy.cloud.as_mut().unwrap().revision=first.cloud.as_ref().unwrap().revision.clone();
+        copy.cloud.as_mut().unwrap().size+=1; copy.display.bytes+=1;
+        assert!(cache.reused(&copy,Backend::Cpu,&["image".into()]).unwrap().is_none());
+    }
+
+    #[test]
+    fn old_source_rows_migrate_gcid_aliases_and_pruning_drops_dangling_aliases() {
+        let root=tempfile::tempdir().unwrap();
+        let cache=SourceCache::open(root.path()).unwrap();
+        let mut first=file(); first.cloud.as_mut().unwrap().revision=Some("AB".repeat(20));
+        cache.completed(&first,&record(Backend::Cpu,"text")).unwrap();
+        cache.db.lock().unwrap().execute_batch("DELETE FROM content_aliases; DELETE FROM meta WHERE key='content_aliases_v1';").unwrap();
+        drop(cache);
+        let cache=SourceCache::open(root.path()).unwrap();
+        let mut copy=first.clone(); copy.cloud.as_mut().unwrap().id="copy".into(); copy.display.id="copy-occurrence".into();
+        assert!(reuse(&cache,&copy).is_some()); assert_eq!(rows(&cache,"content_aliases"),1);
+        cache.prune_with_limit(cache.now(),0);
+        assert_eq!(rows(&cache,"content_aliases"),0); assert!(reuse(&cache,&copy).is_none());
+    }
+
+    #[test]
+    fn timestamp_revisions_do_not_create_gcid_aliases() {
+        let root=tempfile::tempdir().unwrap();
+        let cache=SourceCache::open(root.path()).unwrap();
+        let mut source=file(); source.cloud.as_mut().unwrap().revision=Some("2026-10-14T00:00:00Z".into());
+        cache.completed(&source,&record(Backend::Cpu,"text")).unwrap();
+        assert_eq!(rows(&cache,"content_aliases"),0);
+    }
+
+    #[test]
+    fn gcid_alias_migration_preserves_age_and_reuse_refreshes_vector_age() {
+        let root=tempfile::tempdir().unwrap(); let cache=SourceCache::open(root.path()).unwrap();
+        let mut first=file(); first.cloud.as_mut().unwrap().revision=Some("AB".repeat(20));
+        cache.completed(&first,&record(Backend::Cpu,"text")).unwrap();
+        let old=cache.now()-2*24*60*60;
+        cache.db.lock().unwrap().execute("UPDATE vectors SET seen_at=?1",[old]).unwrap();
+        let mut copy=first.clone(); copy.cloud.as_mut().unwrap().id="copy".into(); copy.display.id="copy-occurrence".into();
+        assert!(reuse(&cache,&copy).is_some());
+        let refreshed:i64=cache.db.lock().unwrap().query_row("SELECT seen_at FROM vectors",[],|r|r.get(0)).unwrap();
+        assert!(refreshed>old);
+        let expired=cache.now()-100*24*60*60;
+        {let db=cache.db.lock().unwrap(); db.execute("UPDATE sources SET seen_at=?1",[expired]).unwrap(); db.execute("UPDATE vectors SET seen_at=?1",[expired]).unwrap();
+         db.execute_batch("DELETE FROM content_aliases; DELETE FROM meta WHERE key='content_aliases_v1';").unwrap();}
+        cache.import_content_aliases().unwrap();
+        let migrated:i64=cache.db.lock().unwrap().query_row("SELECT seen_at FROM content_aliases",[],|r|r.get(0)).unwrap();
+        assert_eq!(migrated,expired);
+        cache.prune_at(cache.now()); assert_eq!(rows(&cache,"content_aliases"),0); assert_eq!(rows(&cache,"vectors"),0);
+    }
+
+    #[test]
+    fn checkpoint_import_generation_survives_wal_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut request = super::super::tests::request(root.path());
+        request.checkpoint_id = Some("12345678-1234-1234-1234-123456789abc".into());
+        let checkpoint = checkpoint::Checkpoint::open(&request).unwrap().unwrap();
+        let item = file();
+        checkpoint.completed(&item, &record(Backend::Cpu, "text")).unwrap();
+        let cache = SourceCache::open(&request.data_dir).unwrap();
+        let before = cache.db.lock().unwrap().total_changes();
+        cache.import_checkpoints(&request.data_dir).unwrap();
+        assert_eq!(cache.db.lock().unwrap().total_changes(), before);
+        drop(checkpoint);
+        cache.import_checkpoints(&request.data_dir).unwrap();
+        assert_eq!(cache.db.lock().unwrap().total_changes(), before);
+        let checkpoint = checkpoint::Checkpoint::open(&request).unwrap().unwrap();
+        let mut changed = item.clone();
+        changed.cloud.as_mut().unwrap().revision = Some("next-revision".into());
+        checkpoint.completed(&changed, &record(Backend::Cpu, "text")).unwrap();
+        cache.import_checkpoints(&request.data_dir).unwrap();
+        assert!(reuse(&cache, &changed).is_some());
     }
 
     #[test]

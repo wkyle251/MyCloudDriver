@@ -1027,6 +1027,9 @@ private struct DuplicateProgressEvent: Decodable {
     let attempt: Int?
     let maxAttempts: Int?
     let retryInMillis: UInt64?
+    let hashedBytes: UInt64?
+    let activeFiles: Int?
+    let pendingFiles: Int?
 }
 
 private struct TrashResult: Codable {
@@ -2225,10 +2228,22 @@ final class DownloaderModel: ObservableObject {
     })
     var imagePreviewRequestGeneration: UUID { previewLoadGeneration }
     private var pendingFileSearchNavigation: FileSearchNavigation?
-    private var pendingSimilarityTrash: (files: [SimilarityFile], keepers: [SimilarityFile], session: UUID, completion: (Result<Set<String>, Error>) -> Void)?
+    private var pendingSimilarityTrash: (files: [SimilarityFile], keepers: [SimilarityFile], results: SimilarityResultsModel,
+        session: UUID, accountID: UUID?, completion: (Result<Set<String>, Error>) -> Void)?
+    private final class SimilarityTrashResultsOwner {
+        weak var results: SimilarityResultsModel?
+        let session: UUID
+        let accountID: UUID?
+        init(results: SimilarityResultsModel, session: UUID, accountID: UUID?) {
+            self.results = results; self.session = session; self.accountID = accountID
+        }
+    }
+    private var similarityTrashResultsOwners: [UUID: SimilarityTrashResultsOwner] = [:]
     #if FINDER_WORKSPACE_TESTS
     private var isFinderWorkspaceFixture = false
     var similarityTrashFixtureResponse: (exitCode: Int32, output: String, error: String)?
+    var similarityPreflightFixtureError: Error?
+    var similarityTrashFixtureSwitchAccountBeforeAcknowledgement = false
     private var finderFixtureFolders: [String: [BrowserItem]] = [:]
     private var quickLookFixtureURL: URL?
     private var quickLookFixtureURLs: [String: URL] = [:]
@@ -2818,12 +2833,28 @@ final class DownloaderModel: ObservableObject {
     let taskActivity = FinderTaskActivityStore()
     @Published private(set) var duplicateScan: DuplicateScan? {
         didSet {
+            if duplicateScan == nil {
+                duplicateResultGeneration = UUID(); duplicateResultTask?.cancel(); duplicateResultTask = nil
+                isPreparingDuplicateResults = false
+                duplicateResultsIndex = .empty; duplicateSelectionSummary = .init()
+            }
             if duplicateScan == nil, oldValue != nil { taskActivity.dismiss(.duplicates) }
         }
     }
-    @Published private(set) var isScanningDuplicates = false
+    @Published private(set) var isPreparingDuplicateResults = false
+    private(set) var duplicateResultsIndex = DuplicateResultsIndex.empty
+    private var duplicateSelectionSummary = DuplicateSelectionSummary()
+    private var duplicateResultGeneration = UUID()
+    private var duplicateResultTask: Task<Void, Never>?
+    @Published private(set) var isScanningDuplicates = false {
+        didSet { duplicateSleepPrevention.setActive(isScanningDuplicates) }
+    }
     @Published private(set) var isDeletingDuplicates = false
     private(set) var duplicateScannedFiles = 0
+    private(set) var duplicateDiscoveringLocalFiles = false
+    private(set) var duplicateHashedBytes: UInt64?
+    private(set) var duplicateActiveHashFiles = 0
+    private(set) var duplicatePendingHashFiles = 0
     private(set) var duplicateScannedFolders = 0
     private(set) var duplicateDiscoveredFolders = 0
     private(set) var duplicatePendingFolders = 0
@@ -2833,8 +2864,16 @@ final class DownloaderModel: ObservableObject {
     private(set) var duplicateRetryInMillis: UInt64 = 0
     private(set) var duplicateCurrentPath = ""
     private(set) var duplicateScanRootPath = ""
-    @Published private(set) var selectedDuplicateFileIDs = Set<String>()
+    // Publish explicitly around edits. A @Published value-type Set copies the
+    // entire selection through its setter for each individual checkbox toggle.
+    private(set) var selectedDuplicateFileIDs = Set<String>()
     @Published var showsCrossDriveDuplicateScope = false
+    private enum CrossDriveDuplicateHandoff {
+        case scope(generation: UUID, account: UUID?)
+        case progress(generation: UUID, account: UUID?)
+    }
+    private var crossDriveDuplicatePresentationGeneration = UUID()
+    private var crossDriveDuplicateHandoff: CrossDriveDuplicateHandoff?
     @Published var duplicateScopeCloudFolders: [BrowserLocation] = []
     @Published var duplicateScopeLocalFolders: [URL] = []
     @Published var duplicateScopePicker: SimilarityScopePicker?
@@ -3056,6 +3095,7 @@ final class DownloaderModel: ObservableObject {
     private var pendingUploadOutputLines: [String] = []
     private var uploadOutputFlushScheduled = false
     private var duplicateProcess: Process?
+    private var duplicateSleepPrevention = DownloadSleepPrevention(reason: "MyCloudDriver is checking duplicate files")
     private var duplicateScanWasCancelled = false
     private var pendingDuplicateProgressLines: [String] = []
     private var duplicateProgressFlushScheduled = false
@@ -3633,7 +3673,7 @@ final class DownloaderModel: ObservableObject {
     /// Extraction runs on PikPak and never occupies this local work lane.
     /// Source-specific checks protect an archive while unrelated work continues.
     private var hasExclusiveBackgroundTask: Bool {
-        isScanningDuplicates || isMaintenanceScanRunning || isMergingFolders
+        isScanningDuplicates || isPreparingDuplicateResults || isMaintenanceScanRunning || isMergingFolders
     }
 
     var canOpenShareLink: Bool {
@@ -4221,17 +4261,14 @@ final class DownloaderModel: ObservableObject {
     }
 
     var selectedDuplicateFiles: [DuplicateFile] {
-        guard let duplicateScan else { return [] }
-        return duplicateScan.groups
-            .flatMap(\.files)
-            .filter { selectedDuplicateFileIDs.contains($0.id) }
+        selectedDuplicateFileIDs.compactMap { duplicateResultsIndex.filesByID[$0] }
     }
 
     var selectedDuplicateBytes: UInt64 {
-        selectedDuplicateFiles.reduce(UInt64(0)) {
-            addingWithoutOverflow($0, $1.size)
-        }
+        duplicateSelectionSummary.bytes
     }
+
+    func selectedDuplicateCount(in groupID: String) -> Int { duplicateSelectionSummary.groupCounts[groupID] ?? 0 }
 
     var canDeleteSelectedDuplicates: Bool {
         !isRunning
@@ -5707,6 +5744,8 @@ final class DownloaderModel: ObservableObject {
         mergeRequestedFolders = []; mergeDestination = nil; mergeCompletedSourceIDs = []
         resetFolderMergeProgress(sourceCount: 0, status: "No folder merge has been started.")
         duplicateScannedFiles = 0; duplicateScannedFolders = 0; duplicateDiscoveredFolders = 0
+        duplicateDiscoveringLocalFiles = false
+        duplicateHashedBytes = nil; duplicateActiveHashFiles = 0; duplicatePendingHashFiles = 0
         duplicatePendingFolders = 0; duplicateFailedFolders = 0; duplicateCurrentPath = ""; duplicateScanRootPath = ""
         emptyFolderScannedFolders = 0; emptyFolderDiscoveredFolders = 0; emptyFolderCandidateCount = 0
         emptyFolderCheckedFolders = 0; emptyFolderRemovedFolders = 0; emptyFolderSkippedFolders = 0
@@ -7828,6 +7867,8 @@ final class DownloaderModel: ObservableObject {
         selectedDuplicateFileIDs = []
         duplicateScannedFiles = 0
         duplicateScannedFolders = 0
+        duplicateDiscoveringLocalFiles = false
+        duplicateHashedBytes = nil; duplicateActiveHashFiles = 0; duplicatePendingHashFiles = 0
         duplicateDiscoveredFolders = 1
         duplicatePendingFolders = 1
         duplicateFailedFolders = 0
@@ -7847,22 +7888,137 @@ final class DownloaderModel: ObservableObject {
 
     func presentCrossDriveDuplicateScope(localFolders: [URL] = [], reusingScan: Bool = false) {
         guard canCheckCrossDriveDuplicates else { return }
+        FinderPopover.dismissAll()
+        taskActivity.showsDetails = false; extractionActivity.showsActivity = false
+        crossDriveDuplicatePresentationGeneration = UUID()
+        crossDriveDuplicateHandoff = nil
         let accountFolder = isBrowsingSharedLink ? accountBrowserWorkspace?.stack.last : browserStack.last
         duplicateScopeCloudFolders = reusingScan && !duplicateScanCloudFolders.isEmpty
             ? duplicateScanCloudFolders : [accountFolder ?? .root]
         duplicateScopeLocalFolders = reusingScan ? duplicateScanLocalFolders : localFolders
-        taskActivity.showsDuplicateResults = false
-        showsCrossDriveDuplicateScope = true
+        if taskActivity.showsDuplicateResults {
+            crossDriveDuplicateHandoff = .scope(generation: crossDriveDuplicatePresentationGeneration, account: activeAccountID)
+            taskActivity.showsDuplicateResults = false
+        } else { showsCrossDriveDuplicateScope = true }
     }
 
-    func startCrossDriveDuplicateScan() {
+    @discardableResult
+    func startCrossDriveDuplicateScan() -> Bool {
         guard canCheckCrossDriveDuplicates, validateConfiguration(),
-              !duplicateScopeCloudFolders.isEmpty || !duplicateScopeLocalFolders.isEmpty else { return }
+              !duplicateScopeCloudFolders.isEmpty || !duplicateScopeLocalFolders.isEmpty else { return false }
+        FinderPopover.dismissAll()
+        taskActivity.showsDetails = false; extractionActivity.showsActivity = false
         duplicateScanCloudFolders = duplicateScopeCloudFolders
         duplicateScanLocalFolders = duplicateScopeLocalFolders
         showsCrossDriveDuplicateScope = false
         prepareDuplicateScan(scope: duplicateScanCloudFolders.first ?? .root)
+        guard isScanningDuplicates else { return false }
+        crossDriveDuplicateHandoff = .progress(generation: crossDriveDuplicatePresentationGeneration, account: activeAccountID)
+        return true
     }
+
+    func cancelCrossDriveDuplicateScope() {
+        crossDriveDuplicatePresentationGeneration = UUID(); crossDriveDuplicateHandoff = nil
+        showsCrossDriveDuplicateScope = false
+    }
+
+    func crossDriveDuplicateResultsDidDismiss() {
+        guard case let .scope(generation, account) = crossDriveDuplicateHandoff else { return }
+        crossDriveDuplicateHandoff = nil
+        guard generation == crossDriveDuplicatePresentationGeneration, account == activeAccountID,
+              !taskActivity.showsDuplicateResults, !showsCrossDriveDuplicateScope, canCheckCrossDriveDuplicates else { return }
+        showsCrossDriveDuplicateScope = true
+    }
+
+    func crossDriveDuplicateScopeDidDismiss() {
+        guard case let .progress(generation, account) = crossDriveDuplicateHandoff else { return }
+        crossDriveDuplicateHandoff = nil
+        guard generation == crossDriveDuplicatePresentationGeneration, account == activeAccountID,
+              !showsCrossDriveDuplicateScope, !taskActivity.showsDuplicateResults,
+              !isClosingWindow, !isLoginPresented, hasUsableSession,
+              let task = taskActivity.tasks.first(where: { $0.kind == .duplicates }),
+              task.state != .cancelled, task.state != .stopping else { return }
+        taskActivity.showsDetails = true
+    }
+
+    #if FINDER_WORKSPACE_TESTS
+    func loadDuplicateResultFixture(_ output: String) {
+        taskActivity.begin(.duplicates, scope: "/Generated", message: "Checking generated duplicates…")
+        finishDuplicateScan(output: output, scope: .root)
+    }
+    func clearDuplicateResultFixture() { duplicateScan = nil; selectedDuplicateFileIDs = [] }
+    func updateDuplicateResultFixture(_ scan: DuplicateScan, selected: Set<String>) { updateDuplicateResults(scan, selected: selected) }
+
+    static func testCrossDriveDuplicatePresentation() {
+        let model = finderWorkspaceFixture()
+        defer { model.stopForWindowClose() }
+        func ready() {
+            model.configureTaskActivityInspection("ready")
+            model.cancelCrossDriveDuplicateScope()
+        }
+        ready()
+        model.taskActivity.showsDetails = true; model.extractionActivity.showsActivity = true
+        model.presentCrossDriveDuplicateScope()
+        precondition(model.showsCrossDriveDuplicateScope && !model.taskActivity.showsDetails && !model.extractionActivity.showsActivity)
+        precondition(model.startCrossDriveDuplicateScan())
+        precondition(!model.showsCrossDriveDuplicateScope && !model.taskActivity.showsDetails && model.isScanningDuplicates,
+            "The scope button must not open progress while its sheet is dismissing")
+        model.crossDriveDuplicateScopeDidDismiss()
+        precondition(model.taskActivity.showsDetails)
+        model.taskActivity.showsDetails = false
+        model.crossDriveDuplicateScopeDidDismiss()
+        precondition(!model.taskActivity.showsDetails, "The dismissal handoff must be consumed once")
+
+        ready(); model.taskActivity.showsDuplicateResults = true
+        model.presentCrossDriveDuplicateScope(reusingScan: true)
+        precondition(!model.taskActivity.showsDuplicateResults && !model.showsCrossDriveDuplicateScope,
+            "Change Drives must finish dismissing results before presenting scope")
+        model.crossDriveDuplicateResultsDidDismiss()
+        precondition(model.showsCrossDriveDuplicateScope)
+        model.cancelCrossDriveDuplicateScope(); model.crossDriveDuplicateScopeDidDismiss()
+        precondition(!model.taskActivity.showsDetails)
+
+        ready(); model.presentCrossDriveDuplicateScope()
+        model.duplicateScopeCloudFolders = []; model.duplicateScopeLocalFolders = []
+        precondition(!model.startCrossDriveDuplicateScan() && model.showsCrossDriveDuplicateScope)
+        model.crossDriveDuplicateScopeDidDismiss()
+        precondition(!model.taskActivity.showsDetails)
+        model.duplicateScopeCloudFolders = [.root]
+        let credential = model.refreshToken
+        model.refreshToken = "Bearer generated-invalid-access-token"
+        precondition(!model.startCrossDriveDuplicateScan() && model.showsCrossDriveDuplicateScope)
+        model.crossDriveDuplicateScopeDidDismiss()
+        precondition(!model.taskActivity.showsDetails, "A validation failure must not open progress beneath its sheet")
+        model.refreshToken = ""
+        precondition(!model.startCrossDriveDuplicateScan() && model.showsCrossDriveDuplicateScope)
+        model.refreshToken = credential
+
+        ready(); model.presentCrossDriveDuplicateScope()
+        precondition(model.startCrossDriveDuplicateScan())
+        model.cancelDuplicateScan(); model.crossDriveDuplicateScopeDidDismiss()
+        precondition(!model.taskActivity.showsDetails, "Cancelling before dismissal must not reopen progress")
+
+        ready(); model.presentCrossDriveDuplicateScope()
+        precondition(model.startCrossDriveDuplicateScan())
+        model.configureTaskActivityInspection("ready")
+        model.presentCrossDriveDuplicateScope()
+        model.crossDriveDuplicateScopeDidDismiss()
+        precondition(model.showsCrossDriveDuplicateScope && !model.taskActivity.showsDetails,
+            "An old sheet dismissal must not consume a new presentation")
+
+        ready(); model.presentCrossDriveDuplicateScope()
+        precondition(model.startCrossDriveDuplicateScan())
+        model.activeAccountID = UUID(); model.crossDriveDuplicateScopeDidDismiss()
+        precondition(!model.taskActivity.showsDetails, "Changing account invalidates queued progress")
+        model.activeAccountID = nil
+
+        ready(); model.presentCrossDriveDuplicateScope()
+        precondition(model.startCrossDriveDuplicateScan())
+        model.isClosingWindow = true; model.crossDriveDuplicateScopeDidDismiss()
+        precondition(!model.taskActivity.showsDetails, "Closing the owner window discards queued progress")
+        print("PASS cross-drive duplicate presentation: successful scope dismissal, one-shot progress, Change Drives handoff, cancel, validation/no-auth, stale generation/account and window-close guards")
+    }
+    #endif
 
     func chooseDuplicateCloudFolder() {
         guard canCheckCrossDriveDuplicates else { return }
@@ -7906,38 +8062,37 @@ final class DownloaderModel: ObservableObject {
     }
 
     func setDuplicateFileSelected(_ fileID: String, selected: Bool) {
-        guard let duplicateScan,
-              let group = duplicateScan.groups.first(where: { group in
-                  group.files.contains(where: { $0.id == fileID && !$0.isLocal })
-              })
+        guard let file = duplicateResultsIndex.filesByID[fileID], !file.isLocal,
+              let groupIDs = duplicateResultsIndex.groupsForFile[fileID],
+              selectedDuplicateFileIDs.contains(fileID) != selected
         else { return }
 
         if selected {
-            let selectedInGroup = group.files.filter {
-                selectedDuplicateFileIDs.contains($0.id)
-            }.count
-            guard selectedInGroup < max(group.files.count - 1, 0) else {
+            guard groupIDs.allSatisfy({ selectedDuplicateCount(in: $0) < max((duplicateResultsIndex.groupSizes[$0] ?? 0) - 1, 0) }) else {
                 setError("Keep at least one copy from each duplicate group.")
                 return
             }
+            objectWillChange.send()
+            duplicateSelectionSummary.update(file, groups: groupIDs, selected: true)
             selectedDuplicateFileIDs.insert(fileID)
         } else {
+            objectWillChange.send()
+            duplicateSelectionSummary.update(file, groups: groupIDs, selected: false)
             selectedDuplicateFileIDs.remove(fileID)
         }
     }
 
     func selectRecommendedDuplicates() {
-        guard let duplicateScan else { return }
-        selectedDuplicateFileIDs = Set(
-            duplicateScan.groups
-                .filter { $0.matchKind == .exactContent }
-                .flatMap { CrossDriveDuplicatePolicy.recommendedIDs($0.files) }
-        )
+        guard duplicateScan != nil else { return }
+        objectWillChange.send()
+        duplicateSelectionSummary = duplicateResultsIndex.recommendedSelection
+        selectedDuplicateFileIDs = duplicateResultsIndex.recommendedIDs
         setStatus("Selected redundant PikPak copies, preferring newer folders and keeping disk copies")
     }
 
     func clearDuplicateSelection() {
-        selectedDuplicateFileIDs = []
+        objectWillChange.send()
+        duplicateSelectionSummary = .init(); selectedDuplicateFileIDs = []
     }
 
     func deleteSelectedDuplicates() {
@@ -7966,11 +8121,49 @@ final class DownloaderModel: ObservableObject {
             throw CloudDriveError.message("PikPak did not confirm that this file was moved to Trash.")
         }
     }
-    private func trashSimilarityFiles(_ files: [SimilarityFile], keeping keepers: [SimilarityFile]) async throws -> Set<String> {
+    /// All origins are checked by the cross-drive controller before its first
+    /// mutation. This endpoint also rechecks this account just before its batch.
+    func preflightCrossDriveSimilarityFiles(_ files: [SimilarityFile], accountID: UUID?) async throws {
+        guard activeAccountID == accountID, hasUsableSession, !isClosingWindow,
+              files.allSatisfy({ $0.cloudId?.isEmpty == false }),
+              Set(files.compactMap(\.cloudId)).count == files.count else {
+            throw CloudDriveError.message("Reconnect the PikPak account that owns these compared files before changing them.")
+        }
+        try Task.checkCancellation()
+        #if FINDER_WORKSPACE_TESTS
+        if isFinderWorkspaceFixture {
+            if let error = similarityPreflightFixtureError { throw error }
+            return
+        }
+        #endif
+        let configuration = try similarityConfiguration(.cloud)
+        let input = try JSONSerialization.data(withJSONObject: files.map { ["id": $0.cloudId!, "size": $0.bytes] as [String: Any] })
+        let data = try await SimilarityHelper.request(configuration: configuration, command: "similarity-preflight", input: input)
+        struct Reply: Decodable { let verified_ids: [String] }
+        let reply = try JSONDecoder().decode(Reply.self, from: data)
+        guard activeAccountID == accountID, !isClosingWindow,
+              SimilaritySessionStore.sameAccount(configuration, try similarityConfiguration(.cloud)),
+              reply.verified_ids.count == files.count, Set(reply.verified_ids) == Set(files.compactMap(\.cloudId)) else {
+            throw CloudDriveError.message("The compared PikPak files or account changed. Review the group and try again.")
+        }
+        try Task.checkCancellation()
+    }
+    func trashCrossDriveSimilarityFiles(_ files: [SimilarityFile], keeping keepers: [SimilarityFile],
+                                       results: SimilarityResultsModel, session: UUID, accountID: UUID?) async throws -> Set<String> {
+        guard results.sessionToken == session else { throw CancellationError() }
+        try await preflightCrossDriveSimilarityFiles(files + keepers, accountID: accountID)
+        guard activeAccountID == accountID, results.sessionToken == session else { throw CancellationError() }
+        return try await trashSimilarityFiles(files, keeping: keepers, results: results, session: session)
+    }
+    private func trashSimilarityFiles(_ files: [SimilarityFile], keeping keepers: [SimilarityFile],
+                                      results suppliedResults: SimilarityResultsModel? = nil, session suppliedSession: UUID? = nil) async throws -> Set<String> {
+        let results = suppliedResults ?? fileSimilarity.cloud.results
+        let session = suppliedSession ?? results.sessionToken
         guard !files.isEmpty, (files + keepers).allSatisfy({ file in
             guard let id = file.cloudId, !id.isEmpty else { return false }
-            return fileSimilarity.cloud.results.index?.byID[file.id]?.cloudId == id
-        }), Set(files.compactMap(\.cloudId)).isDisjoint(with: Set(keepers.compactMap(\.cloudId))) else {
+            return results.index?.byID[file.id]?.cloudId == id && !results.trashedIDs.contains(file.id)
+        }), results.sessionToken == session,
+            Set(files.compactMap(\.cloudId)).isDisjoint(with: Set(keepers.compactMap(\.cloudId))) else {
             throw CloudDriveError.message("This result no longer belongs to the current PikPak scan. Open the file’s account and scan again.")
         }
         let ids = files.compactMap(\.cloudId)
@@ -7979,12 +8172,16 @@ final class DownloaderModel: ObservableObject {
         }
         fileSimilarity.preview.close(); cancelAutomaticPreviewNavigation(); _ = cancelQuickLook()
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Set<String>, Error>) in
-            pendingSimilarityTrash = (files, keepers, fileSimilarity.cloud.results.sessionToken, { continuation.resume(with: $0) })
+            pendingSimilarityTrash = (files, keepers, results, session, activeAccountID, { continuation.resume(with: $0) })
             #if FINDER_WORKSPACE_TESTS
             if isFinderWorkspaceFixture {
                 operation = .trashBrowserItems(ids: ids); isRunning = true
                 let output = try! JSONSerialization.data(withJSONObject: ["trashed_ids": ids])
                 let response = similarityTrashFixtureResponse
+                if similarityTrashFixtureSwitchAccountBeforeAcknowledgement {
+                    similarityTrashFixtureSwitchAccountBeforeAcknowledgement = false
+                    activeAccountID = UUID()
+                }
                 finishProcess(exitCode: response?.exitCode ?? 0, structuredOutput: response?.output ?? String(decoding: output, as: UTF8.self),
                               errorOutput: response?.error ?? "")
                 return
@@ -8001,8 +8198,17 @@ final class DownloaderModel: ObservableObject {
     }
     private func synchronizeSimilarityTrash(_ changes: [FinderFileMutation]) {
         let trash = changes.filter { $0.kind == .trash }
-        fileSimilarity.cloud.results.setCloudFilesTrashed(Set(trash.filter { $0.after == "true" }.map(\.fileId)), true)
-        fileSimilarity.cloud.results.setCloudFilesTrashed(Set(trash.filter { $0.after == "false" }.map(\.fileId)), false)
+        let removed = Set(trash.filter { $0.after == "true" }.map(\.fileId))
+        let restored = Set(trash.filter { $0.after == "false" }.map(\.fileId))
+        fileSimilarity.cloud.results.setCloudFilesTrashed(removed, true)
+        fileSimilarity.cloud.results.setCloudFilesTrashed(restored, false)
+        similarityTrashResultsOwners = similarityTrashResultsOwners.filter { _, owner in
+            owner.results?.sessionToken == owner.session && owner.accountID == activeAccountID
+        }
+        for owner in similarityTrashResultsOwners.values {
+            guard let results = owner.results, results !== fileSimilarity.cloud.results else { continue }
+            results.setCloudFilesTrashed(removed, true); results.setCloudFilesTrashed(restored, false)
+        }
     }
 
     private var canPerformFileUndo: Bool {
@@ -8791,6 +8997,7 @@ final class DownloaderModel: ObservableObject {
 
     func removeArchiveTask(_ id: UUID) {
         guard let task = archiveTasks.first(where: { $0.id == id }), !task.isInspecting, !task.isExtracting else { return }
+        if archiveTasks.count == 1 { extractionActivity.showsActivity = false }
         cancelAutomaticArchiveRetry(id, resettingAttempts: true)
         if extractionActivity.passwordRequest?.taskID == id { extractionActivity.passwordRequest = nil }
         archiveTasks.removeAll { $0.id == id }
@@ -9292,7 +9499,7 @@ final class DownloaderModel: ObservableObject {
             return
         }
         guard wasWaiting, !downloadDestinationRestartPending, !downloadsPaused, !cancelAllDownloadsRequested else { return }
-        if !isDownloading && !interruptedDownloadRequests.isEmpty { requeueInterruptedDownloads() }
+        if !isDownloading && !interruptedDownloadRequests.isEmpty { requeueInterruptedDownloads(automatic: true) }
         _ = startNextPendingDownloadIfNeeded()
     }
 
@@ -9398,7 +9605,7 @@ final class DownloaderModel: ObservableObject {
     func startPendingDownloads() {
         let resuming = downloadsPaused && downloadProcess?.isRunning == true
         downloadsPaused = false
-        if !interruptedDownloadRequests.isEmpty { requeueInterruptedDownloads() }
+        if !interruptedDownloadRequests.isEmpty { requeueInterruptedDownloads(automatic: true) }
         writeDownloadControls()
         if resuming { setStatus("Cloud reception resumed; the RAM buffer and disk work continue.") }
         if !startNextPendingDownloadIfNeeded() && !isDownloading && pendingDownloadRequests.isEmpty {
@@ -9678,14 +9885,30 @@ final class DownloaderModel: ObservableObject {
         _ = persistTransfersSynchronously()
     }
 
-    func requeueInterruptedDownloads() {
+    /// Complete discovery plus only confirmed final failures leaves nothing
+    /// for an automatic retry. Retain the request for manual recovery instead
+    /// of replaying its parent and bypassing the per-file failure policy.
+    private func interruptedDownloadNeedsAutomaticRetry(_ request: PendingDownloadRequest) -> Bool {
+        let roots = Set(request.pendingItems.map(\.id))
+        guard !roots.isEmpty, roots.isSubset(of: fullyDiscoveredDownloadRequestIDs) else { return true }
+        let failures = failedDownloadTransfers.filter { transfer in
+            guard let root = downloadRequestIDsByFileID[transfer.id] else { return false }
+            return roots.contains { downloadRoot(root, belongsTo: $0) }
+        }
+        return failures.isEmpty || failures.contains { $0.finalFailureReason == nil }
+    }
+
+    func requeueInterruptedDownloads(automatic: Bool = false) {
         guard transferStateReady, !interruptedDownloadRequests.isEmpty else { return }
+        let retrying = interruptedDownloadRequests.filter { !automatic || interruptedDownloadNeedsAutomaticRetry($0) }
+        guard !retrying.isEmpty else { return }
         let existing = Set(pendingDownloadRequests.map(\.deduplicationKey))
-        pendingDownloadRequests.insert(contentsOf: interruptedDownloadRequests.filter {
+        pendingDownloadRequests.insert(contentsOf: retrying.filter {
             !existing.contains($0.deduplicationKey)
         }, at: 0)
-        interruptedDownloadRequests = []
-        interruptedDownloadCount = 0
+        let keys = Set(retrying.map(\.deduplicationKey))
+        interruptedDownloadRequests.removeAll { keys.contains($0.deduplicationKey) }
+        interruptedDownloadCount = interruptedDownloadRequests.reduce(0) { $0 + $1.itemCount }
         restoredDownloadQueue = true
         synchronizePendingDownloadQueue()
         _ = persistTransfersSynchronously()
@@ -9878,7 +10101,7 @@ final class DownloaderModel: ObservableObject {
     private func prepareAutomaticDownloadRetry() -> Bool {
         guard !downloadsPaused, !cancelAllDownloadsRequested, !downloadRequestedStop else { return true }
         let candidates = automaticDownloadRetryCandidates()
-        if !(isDownloading && liveDownloadRun), candidates.isEmpty { requeueInterruptedDownloads(); return true }
+        if !(isDownloading && liveDownloadRun), candidates.isEmpty { requeueInterruptedDownloads(automatic: true); return true }
         let previousPending = pendingDownloadRequests, previousInterrupted = interruptedDownloadRequests
         let previousOrigins = automaticDownloadRetryOrigins
         let previousTargets = downloadRetryTargets
@@ -9913,7 +10136,7 @@ final class DownloaderModel: ObservableObject {
         }
         let remaining = pendingDownloadRequests + activeDownloadRequests + interruptedDownloadRequests
         let retrying = interruptedDownloadRequests.filter { request in
-            !downloadRequestIsPaused(request) && !request.pendingItems.contains { original in
+            interruptedDownloadNeedsAutomaticRetry(request) && !downloadRequestIsPaused(request) && !request.pendingItems.contains { original in
                 remaining.flatMap(\.pendingItems).contains { child in child.id != original.id && downloadRoot(child.id, belongsTo: original.id) }
             }
         }
@@ -9956,7 +10179,7 @@ final class DownloaderModel: ObservableObject {
     /// user paused stays held through its persisted resume intent.
     private func resumeRestoredTransfers() {
         guard transferStateReady, !isClosingWindow, hasUsableSession else { return }
-        if !interruptedDownloadRequests.isEmpty { requeueInterruptedDownloads() }
+        if !interruptedDownloadRequests.isEmpty { requeueInterruptedDownloads(automatic: true) }
         _ = startNextPendingDownloadIfNeeded()
         // Links may have been restored before the account was usable, in which
         // case their first automatic attempt found no session and gave up.
@@ -10975,6 +11198,42 @@ final class DownloaderModel: ObservableObject {
         second.setActive(false)
         precondition(begins == ends, "Deallocation and completion both release their owned activity")
         print("PASS download sleep prevention: active reception, idempotent heartbeats, Pause with RAM/verification/checkpoints, Resume, individual pauses, safe Quit and close")
+    }
+
+    static func testDuplicateSleepPreventionLifecycle() throws {
+        let suite = "DuplicateSleepPrevention-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        var model: DownloaderModel? = downloadRetryFixture(defaults: defaults, directory: directory)
+        let peer = downloadRetryFixture(defaults: defaults, directory: directory)
+        var begins = 0, ends = 0
+        model!.duplicateSleepPrevention = DownloadSleepPrevention(begin: { begins += 1; return NSObject() }, end: { _ in ends += 1 })
+        peer.duplicateSleepPrevention = DownloadSleepPrevention(begin: { begins += 1; return NSObject() }, end: { _ in ends += 1 })
+        model!.isScanningDuplicates = true
+        for _ in 0..<20 { model!.isScanningDuplicates = true }
+        precondition(begins == 1 && ends == 0, "Duplicate progress retains one activity")
+        peer.isScanningDuplicates = true
+        let completion = model!.duplicateSleepPreventionCompletion()
+        model!.stopForWindowClose()
+        precondition(model!.duplicateSleepPrevention.isActive && ends == 0,
+            "Closing the workspace must not release a child that is still stopping")
+        weak var releasedModel = model
+        model = nil
+        precondition(releasedModel == nil && ends == 0,
+            "The child completion must own its activity independently of the closed model")
+        completion()
+        completion()
+        precondition(ends == 1 && peer.duplicateSleepPrevention.isActive,
+            "A drained child releases once without releasing another workspace")
+        peer.isScanningDuplicates = false
+        precondition(begins == ends)
+        peer.isScanningDuplicates = true
+        peer.isScanningDuplicates = false
+        precondition(begins == ends, "A failed process launch releases its activity")
+        peer.stopForWindowClose()
+        print("PASS duplicate sleep prevention: one activity per job, close/cancellation drain, model-independent completion and independent workspaces")
     }
 
     static func testDownloadPauseKeepsHelperAndQuitRestoresPausedQueue() async throws {
@@ -12530,7 +12789,33 @@ final class DownloaderModel: ObservableObject {
             && !model.retryingDownloadTransfers.contains { $0.id == invalid.id }
             && model.automaticDownloadRetryStatus(invalid) == nil && model.canRetryFailedDownload(invalid),
             "Repeated fresh metadata with a malformed original URL stops automatic retries while allowing a manual retry")
-        print("PASS permanent failures: transient causes stay in Retry, three consecutive reports move a file to Failed with its reason, malformed original URLs stop looping, other outcomes and manual retries reset the count, and rows without source details explain themselves")
+        let transient = row("T.bin")!
+        model.automaticDownloadRetry?.cancel(); model.automaticDownloadRetry = nil
+        model.activeDownloadRequests = []; model.pendingDownloadRequests = []
+        model.interruptedDownloadRequests = [folder]; model.interruptedDownloadCount = 1
+        model.isDownloading = false; model.liveDownloadRun = false
+        model.fullyDiscoveredDownloadRequestIDs.insert(root)
+        model.failedDownloadTransfers = [invalid]
+        model.scheduleAutomaticDownloadRetry()
+        precondition(model.automaticDownloadRetry == nil && model.prepareAutomaticDownloadRetry()
+            && model.pendingDownloadRequests.isEmpty && model.interruptedDownloadRequests.count == 1,
+            "A confirmed final file failure must not be replayed through its interrupted parent")
+        model.requeueInterruptedDownloads(automatic: true)
+        precondition(model.pendingDownloadRequests.isEmpty && model.interruptedDownloadRequests.count == 1)
+        model.fullyDiscoveredDownloadRequestIDs.remove(root)
+        model.scheduleAutomaticDownloadRetry()
+        precondition(model.automaticDownloadRetry != nil, "Incomplete discovery must keep retrying")
+        model.automaticDownloadRetry?.cancel(); model.automaticDownloadRetry = nil
+        model.fullyDiscoveredDownloadRequestIDs.insert(root)
+        model.failedDownloadTransfers.append(transient)
+        model.scheduleAutomaticDownloadRetry()
+        precondition(model.automaticDownloadRetry != nil, "A transient sibling must still recover automatically")
+        model.automaticDownloadRetry?.cancel(); model.automaticDownloadRetry = nil
+        model.failedDownloadTransfers = [invalid]
+        model.requeueInterruptedDownloads()
+        precondition(model.pendingDownloadRequests.count == 1 && model.interruptedDownloadRequests.isEmpty,
+            "Explicit Return Interrupted to Queue must remain available for manual recovery")
+        print("PASS permanent failures: transient causes stay in Retry, confirmed failures stop both file and parent retries, manual retries remain available, and incomplete discovery keeps retrying")
     }
 
     static func testAutomaticFailedDownloadRecovery() async throws {
@@ -14023,7 +14308,7 @@ final class DownloaderModel: ObservableObject {
         for file in queuedDownloadTransfers + Array(activeDownloadTransfers.values) where liveDownloadRun ? downloadRequestIDsByFileID[file.id].map({ downloadRoot($0, belongsTo: item.id) }) == true : (file.remotePath == item.remotePath || file.remotePath?.hasPrefix(item.remotePath + "/") == true) {
             pausedDownloadIDs.remove(file.id)
         }
-        if !isDownloading { requeueInterruptedDownloads() }
+        if !isDownloading { requeueInterruptedDownloads(automatic: true) }
         writeDownloadControls(); _ = startNextPendingDownloadIfNeeded()
         scheduleAutomaticDownloadRetry()
     }
@@ -15690,12 +15975,17 @@ final class DownloaderModel: ObservableObject {
     /// Duplicate discovery can take minutes on a large account, so it owns a
     /// separate process from short Browser and preview requests. Downloads and
     /// independent folder calculations continue while the scanner reads metadata.
+    private func duplicateSleepPreventionCompletion() -> @MainActor () -> Void {
+        let activity = duplicateSleepPrevention
+        return { activity.setActive(false) }
+    }
+
     private func runDuplicateScan(scope: BrowserLocation) {
         guard hasUsableSession else {
             presentLogin(reason: "Complete the desktop-session sign-in before accessing PikPak.")
             return
         }
-        guard duplicateProcess?.isRunning != true else { return }
+        guard !isScanningDuplicates, duplicateProcess?.isRunning != true else { return }
         taskActivity.begin(.duplicates, scope: scope.path, message: "Checking \(scope.name) for duplicate files…")
         guard let engineURL = Bundle.main.url(forResource: "pikpak", withExtension: nil) else {
             let message = "The bundled download engine is missing. Rebuild the app."
@@ -15764,7 +16054,10 @@ final class DownloaderModel: ObservableObject {
             }
 
             let completedScopeURL = scopeInputURL
-            process.terminationHandler = { [weak self] finishedProcess in
+            // A closing workspace can release its model before the child has
+            // stopped. Keep this job's activity through termination and drain.
+            let completeSleepPrevention = duplicateSleepPreventionCompletion()
+            process.terminationHandler = { [weak self, completeSleepPrevention] finishedProcess in
                 if let completedScopeURL { try? FileManager.default.removeItem(at: completedScopeURL) }
                 stdout.fileHandleForReading.readabilityHandler = nil
                 stderr.fileHandleForReading.readabilityHandler = nil
@@ -15778,6 +16071,7 @@ final class DownloaderModel: ObservableObject {
                 let structuredOutput = stdoutBuffer.string()
                 let errorOutput = stderrBuffer.string()
                 DispatchQueue.main.async {
+                    defer { completeSleepPrevention() }
                     guard let self else { return }
                     self.enqueueDuplicateProgressLines(trailingLines)
                     self.flushAllDuplicateProgressLines()
@@ -16911,7 +17205,7 @@ final class DownloaderModel: ObservableObject {
         } else if downloadDestinationRestartPending {
             downloadDestinationRestartPending = false
             if !downloadsPaused && !wasCancelled {
-                requeueInterruptedDownloads()
+                requeueInterruptedDownloads(automatic: true)
                 _ = startNextPendingDownloadIfNeeded()
             }
         } else if !wasStopped {
@@ -16954,7 +17248,9 @@ final class DownloaderModel: ObservableObject {
               !downloadRequestedStop, !downloadDestinationRestartPending,
               automaticDownloadRetry == nil,
               (!(automaticDownloadRetryCandidates().isEmpty)
-                || (interruptedDownloadRequests + pendingDownloadRequests).contains(where: { !downloadRequestIsPaused($0) })) else { return }
+                || (interruptedDownloadRequests + pendingDownloadRequests).contains(where: {
+                    !downloadRequestIsPaused($0) && interruptedDownloadNeedsAutomaticRetry($0)
+                })) else { return }
         let account = transferAccountID
         let delay = max(AutomaticRecovery.delay(attempt: downloadRetryAttempt, schedule: [5, 15, 30, 60]), Double(downloadFailureRetryDelay) / 1_000)
         if statusIsError { status += " Retrying automatically in \(Int(min(delay, 86_400)))s." }
@@ -17881,6 +18177,9 @@ final class DownloaderModel: ObservableObject {
         switch operation {
         case .measure, .shareMeasure:
             runFolderMeasurementEngine(arguments: arguments, operation: operation)
+            return
+        case .duplicates(let scope):
+            runDuplicateScan(scope: scope)
             return
         default: break
         }
@@ -19306,6 +19605,8 @@ final class DownloaderModel: ObservableObject {
         defer { publishDuplicateActivity() }
         switch event.event {
         case "scan_started":
+            duplicateDiscoveringLocalFiles = false
+            duplicateHashedBytes = nil; duplicateActiveHashFiles = 0; duplicatePendingHashFiles = 0
             duplicateScannedFiles = 0
             duplicateScannedFolders = 0
             duplicateDiscoveredFolders = max(event.discoveredFolders ?? 1, 1)
@@ -19315,7 +19616,11 @@ final class DownloaderModel: ObservableObject {
             duplicateRetryMaxAttempts = 0
             duplicateRetryInMillis = 0
             duplicateCurrentPath = event.rootPath ?? duplicateScanRootPath
-        case "scan_progress":
+        case "scan_progress", "local_discovery_progress", "local_hash_progress":
+            duplicateDiscoveringLocalFiles = event.event == "local_discovery_progress"
+            duplicateHashedBytes = event.hashedBytes
+            duplicateActiveHashFiles = max(event.activeFiles ?? 0, 0)
+            duplicatePendingHashFiles = max(event.pendingFiles ?? 0, 0)
             duplicateScannedFiles = max(event.scannedFiles ?? duplicateScannedFiles, 0)
             duplicateScannedFolders = max(event.scannedFolders ?? duplicateScannedFolders, 0)
             duplicateDiscoveredFolders = max(
@@ -23385,45 +23690,107 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func finishDuplicateScan(output: String, scope: BrowserLocation) {
-        do {
-            let decoder = JSONDecoder()
-            decoder.keyDecodingStrategy = .convertFromSnakeCase
-            let scan = try decoder.decode(DuplicateScan.self, from: Data(output.utf8))
-            duplicateScan = scan
-            duplicateScannedFiles = scan.scannedFiles
-            duplicateScannedFolders = scan.scannedFolders
-            duplicateDiscoveredFolders = max(
-                scan.scannedFolders + scan.failedFolders,
-                1
-            )
-            duplicatePendingFolders = 0
-            duplicateFailedFolders = scan.failedFolders
-            duplicateRetryAttempt = 0
-            duplicateRetryMaxAttempts = 0
-            duplicateRetryInMillis = 0
-            duplicateCurrentPath = scan.rootPath
-            duplicateScanRootPath = scan.rootPath
-            selectedDuplicateFileIDs = Set(
-                scan.groups
-                    .filter { $0.matchKind == .exactContent }
-                    .flatMap { CrossDriveDuplicatePolicy.recommendedIDs($0.files) }
-            )
-            let message: String
-            if scan.failedFolders > 0 {
-                message = "Duplicate scan completed with partial results; \(scan.failedFolders.formatted()) folder(s) were unavailable"
-            } else if scan.groups.isEmpty {
-                message = "No duplicate files found in \(scope.name)"
-            } else {
-                message = "Found \(scan.groups.count) duplicate group(s) in \(scope.name)"
+        duplicateResultTask?.cancel(); duplicateResultGeneration = UUID()
+        isPreparingDuplicateResults = false
+        let token = duplicateResultGeneration
+        // Keep tiny responses immediate; large decoding and selection/index
+        // preparation must not freeze the browser when the scanner finishes.
+        if output.utf8.count <= 256_000 {
+            do {
+                let prepared = try Self.prepareDuplicateResults(output)
+                completeDuplicateScan(prepared.0, index: prepared.1, scope: scope)
+            } catch { failDuplicateResults(error) }
+            return
+        }
+        isPreparingDuplicateResults = true
+        taskActivity.update(.duplicates, message: "Preparing duplicate results…")
+        duplicateResultTask = Task { [weak self] in
+            do {
+                let prepared = try await Task.detached(priority: .userInitiated) {
+                    try Self.prepareDuplicateResults(output)
+                }.value
+                guard let self, !Task.isCancelled, self.duplicateResultGeneration == token, !self.isClosingWindow else { return }
+                self.duplicateResultTask = nil; self.isPreparingDuplicateResults = false
+                self.completeDuplicateScan(prepared.0, index: prepared.1, scope: scope)
+            } catch {
+                guard let self, !Task.isCancelled, self.duplicateResultGeneration == token else { return }
+                self.duplicateResultTask = nil; self.isPreparingDuplicateResults = false
+                self.failDuplicateResults(error)
             }
-            taskActivity.finish(.duplicates, state: scan.failedFolders > 0 ? .partial : .completed,
-                message: message, detail: "\(scan.scannedFiles.formatted()) files checked in \(scan.scannedFolders.formatted()) folders")
-            if !isRunning { setStatus(message) }
-        } catch {
-            appendOutput("Could not decode duplicate scan data: \(error.localizedDescription)\n")
-            let message = "PikPak returned duplicate data this app could not read."
-            taskActivity.finish(.duplicates, state: .failed, message: message)
-            setError(message)
+        }
+    }
+
+    private nonisolated static func prepareDuplicateResults(_ output: String) throws -> (DuplicateScan, DuplicateResultsIndex) {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let scan = try decoder.decode(DuplicateScan.self, from: Data(output.utf8))
+        return (scan, DuplicateResultsIndex(groups: scan.groups))
+    }
+
+    private func completeDuplicateScan(_ scan: DuplicateScan, index: DuplicateResultsIndex, scope: BrowserLocation) {
+        duplicateResultsIndex = index
+        duplicateSelectionSummary = index.recommendedSelection
+        duplicateScan = scan
+        duplicateScannedFiles = scan.scannedFiles
+        duplicateScannedFolders = scan.scannedFolders
+        duplicateDiscoveredFolders = max(
+            scan.scannedFolders + scan.failedFolders,
+            1
+        )
+        duplicatePendingFolders = 0
+        duplicateFailedFolders = scan.failedFolders
+        duplicateRetryAttempt = 0
+        duplicateRetryMaxAttempts = 0
+        duplicateRetryInMillis = 0
+        duplicateCurrentPath = scan.rootPath
+        duplicateScanRootPath = scan.rootPath
+        selectedDuplicateFileIDs = index.recommendedIDs
+        let message: String
+        if scan.failedFolders > 0 {
+            message = "Duplicate scan completed with partial results; \(scan.failedFolders.formatted()) folder(s) were unavailable"
+        } else if scan.groups.isEmpty {
+            message = "No duplicate files found in \(scope.name)"
+        } else {
+            message = "Found \(scan.groups.count) duplicate group(s) in \(scope.name)"
+        }
+        taskActivity.finish(.duplicates, state: scan.failedFolders > 0 ? .partial : .completed,
+            message: message, detail: "\(scan.scannedFiles.formatted()) files checked in \(scan.scannedFolders.formatted()) folders")
+        if !isRunning { setStatus(message) }
+    }
+
+    private func failDuplicateResults(_ error: Error) {
+        appendOutput("Could not decode duplicate scan data: \(error.localizedDescription)\n")
+        let message = "PikPak returned duplicate data this app could not read."
+        taskActivity.finish(.duplicates, state: .failed, message: message)
+        setError(message)
+    }
+
+    private func updateDuplicateResults(_ scan: DuplicateScan, selected: Set<String>) {
+        duplicateResultTask?.cancel(); duplicateResultGeneration = UUID()
+        isPreparingDuplicateResults = false
+        let token = duplicateResultGeneration
+        let install: (DuplicateResultsIndex, DuplicateSelectionSummary, Set<String>) -> Void = { [weak self] index, summary, selected in
+            guard let self else { return }
+            self.duplicateResultsIndex = index; self.duplicateSelectionSummary = summary
+            self.duplicateScan = scan; self.selectedDuplicateFileIDs = selected
+        }
+        let prepare: @Sendable () -> (DuplicateResultsIndex, DuplicateSelectionSummary, Set<String>) = {
+            let index = DuplicateResultsIndex(groups: scan.groups)
+            let selected = selected.intersection(index.filesByID.keys)
+            var summary = DuplicateSelectionSummary()
+            for id in selected {
+                if let file = index.filesByID[id] { summary.update(file, groups: index.groupsForFile[id] ?? [], selected: true) }
+            }
+            return (index, summary, selected)
+        }
+        if scan.duplicateFiles <= 1_000 {
+            let prepared = prepare(); install(prepared.0, prepared.1, prepared.2); return
+        }
+        isPreparingDuplicateResults = true
+        duplicateResultTask = Task { [weak self] in
+            let prepared = await Task.detached(priority: .userInitiated, operation: prepare).value
+            guard let self, !Task.isCancelled, self.duplicateResultGeneration == token, !self.isClosingWindow else { return }
+            self.duplicateResultTask = nil; self.isPreparingDuplicateResults = false
+            install(prepared.0, prepared.1, prepared.2)
         }
     }
 
@@ -23473,10 +23840,24 @@ final class DownloaderModel: ObservableObject {
                 return
             }
 
+            // An external account change can race an already-issued batch.
+            // Its receipt belongs to the captured owner, never the new account's
+            // browser or Undo history. Return confirmed IDs to that caller only.
+            if let pending = pendingSimilarityTrash, pending.accountID != activeAccountID {
+                completeSimilarityTrash(.success(Set(pending.files.filter { $0.cloudId.map(trashed.contains) == true }.map(\.id))))
+                return
+            }
+
             let focusedID = isBrowsingSharedLink ? nil : selectedBrowserItemID
             let navigation = DeletedBrowserSelection(visibleIDs: browserFilterSelectionItems.map(\.id), selectedID: focusedID)
             recordTrashUndo(ids: requestedIDs.filter { trashed.contains($0) })
-            if pendingSimilarityTrash == nil || pendingSimilarityTrash?.session == fileSimilarity.cloud.results.sessionToken {
+            if let pending = pendingSimilarityTrash {
+                if pending.results.sessionToken == pending.session && pending.accountID == activeAccountID {
+                    pending.results.setCloudFilesTrashed(trashed, true)
+                    similarityTrashResultsOwners[pending.session] = SimilarityTrashResultsOwner(results: pending.results,
+                        session: pending.session, accountID: pending.accountID)
+                }
+            } else {
                 fileSimilarity.cloud.results.setCloudFilesTrashed(trashed, true)
             }
             if pendingSimilarityTrash != nil {
@@ -23975,7 +24356,7 @@ final class DownloaderModel: ObservableObject {
                     .reduce(UInt64(0)) {
                         addingWithoutOverflow($0, $1.reclaimableBytes)
                     }
-                duplicateScan = DuplicateScan(
+                let remaining = DuplicateScan(
                     rootPath: scan.rootPath,
                     scannedFiles: scan.scannedFiles >= trashed.count
                         ? scan.scannedFiles - trashed.count
@@ -23988,6 +24369,7 @@ final class DownloaderModel: ObservableObject {
                     reclaimableBytes: reclaimableBytes,
                     groups: groups
                 )
+                updateDuplicateResults(remaining, selected: selectedDuplicateFileIDs.subtracting(trashed))
             }
 
             selectedDuplicateFileIDs.subtract(trashed)
@@ -24113,28 +24495,35 @@ final class DownloaderModel: ObservableObject {
         let coordinator = fileSimilarity
         guard !coordinator.cloud.isRunning else { return }
         do {
-            let configuration = try similarityConfiguration(.cloud), account = activeAccountID
+            let account = activeAccountID
             let session = coordinator.cloud.sessionID
-            coordinator.scopePicker = SimilarityScopePicker(title: "Choose a PikPak Folder",
-                root: .init(id: "", title: "PikPak"), load: { [weak self] folder, token in
-                    guard let self, self.activeAccountID == account else { throw CancellationError() }
-                    var arguments = ["--parent-id", folder.id, "--limit", "500"]
-                    if let token { arguments += ["--page-token", token] }
-                    let data = try await SimilarityHelper.request(configuration: configuration, command: "browse", input: Data(), arguments: arguments)
-                    guard self.activeAccountID == account else { throw CancellationError() }
-                    let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
-                    let page = try decoder.decode(BrowserPage.self, from: data)
-                    return .init(folders: page.files.filter { $0.isFolder && !$0.name.hasPrefix(".") }
-                        .map { .init(id: $0.id, title: $0.name) }, nextPage: page.nextPageToken)
-                }, accept: { [weak self] route in
+            coordinator.scopePicker = try makeSimilarityCloudFolderPicker { [weak self] roots in
                     guard let self, self.activeAccountID == account, self.fileSimilarity.cloud.sessionID == session,
-                          !self.fileSimilarity.cloud.isRunning, let folder = route.last else { return }
-                    self.fileSimilarity.cloud.cloudRoots = [.init(id: folder.id, name: folder.title,
-                        path: route.count == 1 ? "/" : "/" + route.dropFirst().map(\.title).joined(separator: "/"),
-                        isFolder: true, size: 0, ancestors: route.dropFirst().dropLast().map { .init(id: $0.id, name: $0.title) })]
+                          !self.fileSimilarity.cloud.isRunning else { return }
+                    self.fileSimilarity.cloud.cloudRoots = roots
                     self.fileSimilarity.cloud.error = nil
-                })
+            }
         } catch { coordinator.cloud.error = error.localizedDescription }
+    }
+    func makeSimilarityCloudFolderPicker(accept: @escaping ([SimilarityCloudRoot]) -> Void) throws -> SimilarityScopePicker {
+        let configuration = try similarityConfiguration(.cloud), account = activeAccountID
+        return SimilarityScopePicker(title: "Choose a PikPak Folder",
+            root: .init(id: "", title: "PikPak"), load: { [weak self] folder, token in
+                guard let self, self.activeAccountID == account else { throw CancellationError() }
+                var arguments = ["--parent-id", folder.id, "--limit", "500"]
+                if let token { arguments += ["--page-token", token] }
+                let data = try await SimilarityHelper.request(configuration: configuration, command: "browse", input: Data(), arguments: arguments)
+                guard self.activeAccountID == account else { throw CancellationError() }
+                let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+                let page = try decoder.decode(BrowserPage.self, from: data)
+                return .init(folders: page.files.filter { $0.isFolder && !$0.name.hasPrefix(".") }
+                    .map { .init(id: $0.id, title: $0.name) }, nextPage: page.nextPageToken)
+            }, accept: { [weak self] route in
+                guard let self, self.activeAccountID == account, let folder = route.last else { return }
+                accept([.init(id: folder.id, name: folder.title,
+                    path: route.count == 1 ? "/" : "/" + route.dropFirst().map(\.title).joined(separator: "/"),
+                    isFolder: true, size: 0, ancestors: route.dropFirst().dropLast().map { .init(id: $0.id, name: $0.title) })])
+            })
     }
 
     private func prepareSimilarityPreview(_ file: SimilarityFile, directory: URL) async throws -> URL {
@@ -25006,10 +25395,17 @@ final class DownloaderModel: ObservableObject {
         let message: String
         if duplicateRetryAttempt > 0 {
             message = "Retrying folder request \(duplicateRetryAttempt) of \(duplicateRetryMaxAttempts)…"
+        } else if duplicateDiscoveringLocalFiles {
+            message = "Discovering files: \(duplicateScannedFiles.formatted()) files in \(duplicateScannedFolders.formatted()) folders…"
         } else {
             message = "Checking duplicates: \(duplicateScannedFiles.formatted()) files in \(duplicateScannedFolders.formatted()) folders…"
         }
         var detail = "\(duplicatePendingFolders.formatted()) folders queued"
+        if duplicateDiscoveringLocalFiles { detail = "Reading local folder metadata · " + detail }
+        if let bytes = duplicateHashedBytes {
+            let read = ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .binary)
+            detail = "\(read) read · \(duplicateActiveHashFiles.formatted()) files active · \(duplicatePendingHashFiles.formatted()) queued"
+        }
         if duplicateFailedFolders > 0 { detail += " · \(duplicateFailedFolders.formatted()) unavailable" }
         if duplicateRetryInMillis > 0 { detail += " · Retry in \(String(format: "%.1f", Double(duplicateRetryInMillis) / 1000))s" }
         if !duplicateCurrentPath.isEmpty { detail += "\n" + duplicateCurrentPath }
@@ -25424,6 +25820,9 @@ extension DownloaderModel {
         precondition(model.previewPlaybackError != nil && model.compatiblePreviewTask == nil,
             "A generated copy must not cause a conversion loop")
         model.clearPreview()
+        for _ in 0..<200 where FileManager.default.fileExists(atPath: output.path) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
         precondition(!FileManager.default.fileExists(atPath: output.path))
         model.previewFileID = item.id; model.previewSources = [second]; model.previewFixtureMediaURL = nil
         let bufferedBytes = try Data(contentsOf: unsupported)
@@ -25532,6 +25931,9 @@ extension DownloaderModel {
         precondition((model.previewPlayer?.currentItem?.asset as? AVURLAsset)?.url == url)
         precondition(model.previewSourceLabel == "Compatible preview • temporary copy" && !model.previewUsesRetainedCache)
         model.clearPreview()
+        for _ in 0..<200 where FileManager.default.fileExists(atPath: url.path) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
         precondition(!FileManager.default.fileExists(atPath: url.path))
         print("PASS cloud AVI routing, cloud-transcode preference/fallback, cancellation and playable MP4 handoff")
     }
@@ -25627,7 +26029,12 @@ extension DownloaderModel {
                 precondition(model.compatiblePreviewTask == nil && model.previewPlaybackError != nil)
             }
             model.clearPreview(); model.clearPreviewResourceCaches()
-            if let output { precondition(!FileManager.default.fileExists(atPath: output.path)) }
+            if let output {
+                for _ in 0..<200 where FileManager.default.fileExists(atPath: output.path) {
+                    try await Task.sleep(nanoseconds: 10_000_000)
+                }
+                precondition(!FileManager.default.fileExists(atPath: output.path))
+            }
             print(repairRanges
                 ? "PASS MP4: real parser failure, one cache retry, full download/conversion, decoded frame, autoplay/seek, bounded fallback and cleanup"
                 : "PASS MP4: real parser failure repairs a damaged retained cache without conversion or unwanted autoplay")
@@ -25640,15 +26047,16 @@ extension DownloaderModel {
         print("PASS MP4: network errors keep their diagnostic without cache or conversion retries")
     }
 
-    static func testPreviewPreparationProgress(defaults: UserDefaults, remote: URL, bytes: Data) async throws {
+    static func testPreviewPreparationProgress(defaults: UserDefaults, remote: URL, bytes: Data,
+                                               releaseDownload: () async throws -> Void) async throws {
         let model = finderWorkspaceFixture(defaults: defaults)
         defer { model.clearPreview(); model.clearPreviewResourceCaches() }
-        func wait(_ condition: () -> Bool) async throws {
+        func wait(line: Int = #line, _ condition: () -> Bool) async throws {
             for _ in 0..<600 {
                 if condition() { return }
                 try await Task.sleep(nanoseconds: 25_000_000)
             }
-            preconditionFailure("Timed out waiting for preview preparation progress")
+            preconditionFailure("Timed out waiting for preview preparation progress at test line \(line)")
         }
         let item = BrowserItem(id: "progress-fixture", name: "Progress.mp4", size: UInt64(bytes.count), kind: .file,
             parentId: "", mimeType: "video/mp4", createdTime: nil, modifiedTime: nil, fileExtension: "mp4",
@@ -25677,8 +26085,10 @@ extension DownloaderModel {
                     "An unknown-length download still reports bytes and speed without inventing a percentage")
             }
             try await wait { model.previewPreparationBytesPerSecond == 0 }
-            precondition(model.previewPreparationProgress?.bytes == progress.bytes && model.isPreviewLoading,
+            let stalledBytes = model.previewPreparationProgress?.bytes ?? 0
+            precondition(stalledBytes >= progress.bytes && stalledBytes < UInt64(bytes.count) && model.isPreviewLoading,
                 "Download speed must decay to zero while a server stalls")
+            try await releaseDownload()
             try await wait { model.mediaPlayback.canSeek || model.previewPlaybackError != nil }
             precondition(model.previewPlaybackError == nil, model.previewPlaybackError ?? "")
             precondition(model.previewPreparationProgress == nil && model.previewPreparationBytesPerSecond == nil,
@@ -25714,6 +26124,8 @@ extension DownloaderModel {
 
     static func testMergeFolderSelection(defaults: UserDefaults) throws {
         let model = finderWorkspaceFixture(defaults: defaults)
+        // Test merge eligibility independently of the saved visibility filter.
+        model.hidesEmptyFolders = false
         model.selectedBrowserItemIDs = ["Projects"]
         precondition(!model.canMergeSelectedFolders)
         model.selectedBrowserItemIDs = ["Projects", "Notes"]
@@ -27159,6 +27571,20 @@ extension DownloaderModel {
         precondition(browserUpdates == 0 && footerUpdates == 1, "live progress refreshes only the footer")
         model.setStatus("Loaded 4 item(s)")
         precondition(model.taskActivity.summary?.contains("1,400") == true, "browsing cannot overwrite scan progress")
+        browserUpdates = 0
+        model.handleDuplicateStderrLine(duplicateProgressPrefix + #"{"event":"local_discovery_progress","scanned_files":1500,"scanned_folders":96,"discovered_folders":104,"pending_folders":8,"current_path":"/Generated/G7xQ2"}"#)
+        precondition(model.duplicateDiscoveringLocalFiles && model.taskActivity.summary?.contains("Discovering files") == true)
+        precondition(model.taskActivity.tasks.first?.detail.contains("Reading local folder metadata") == true)
+        model.handleDuplicateStderrLine(duplicateProgressPrefix + #"{"event":"scan_progress","scanned_files":1400,"scanned_folders":104,"pending_folders":0,"current_path":"/Generated/K4mP8"}"#)
+        precondition(!model.duplicateDiscoveringLocalFiles && model.taskActivity.summary?.contains("Checking duplicates") == true,
+                     "Content checks must replace discovery counts and clear its phase")
+        model.handleDuplicateStderrLine(duplicateProgressPrefix + #"{"event":"local_hash_progress","scanned_files":1400,"scanned_folders":104,"pending_folders":0,"current_path":"/Generated/K4mP8","hashed_bytes":1048576,"active_files":4,"pending_files":12}"#)
+        let firstHashDetail = model.taskActivity.tasks.first!.detail
+        precondition(model.duplicateHashedBytes == 1048576 && firstHashDetail.contains("4 files active") && firstHashDetail.contains("12 queued"))
+        model.handleDuplicateStderrLine(duplicateProgressPrefix + #"{"event":"local_hash_progress","scanned_files":1400,"hashed_bytes":2097152,"active_files":4,"pending_files":12}"#)
+        precondition(model.duplicateScannedFiles == 1400 && model.taskActivity.tasks.first!.detail != firstHashDetail,
+                     "Visible read progress must advance without waiting for a large file to finish")
+        precondition(browserUpdates == 0, "discovery progress must refresh only the footer")
         model.handleDuplicateStderrLine(duplicateProgressPrefix + #"{"event":"folder_retrying","attempt":2,"max_attempts":4,"retry_in_millis":1500}"#)
         precondition(model.taskActivity.tasks.first?.detail.contains("1.5s") == true)
         model.cancelDuplicateScan()

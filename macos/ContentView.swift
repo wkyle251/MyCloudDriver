@@ -185,7 +185,8 @@ private struct FinderFooterStatus: View {
             }
         }
         #endif
-        .popover(isPresented: $activity.showsDetails, arrowEdge: .top) {
+        .finderPopover(isPresented: $activity.showsDetails, contentSize: .init(width: 460, height: 520),
+                       presentationID: ObjectIdentifier(activity), arrowEdge: .top) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     Text(title).font(.headline)
@@ -210,8 +211,7 @@ private struct FinderFooterStatus: View {
                     }
                     .fixedSize(horizontal: false, vertical: true)
                 }
-                .frame(maxHeight: activity.tasks.isEmpty ? 260 : 420)
-                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxHeight: .infinity)
                 HStack {
                     Button {
                         activity.showsDetails = false
@@ -239,7 +239,7 @@ private struct FinderFooterStatus: View {
                 .font(.caption)
             }
             .padding(16)
-            .frame(width: activity.tasks.isEmpty ? 400 : 460)
+            .frame(width: 460, height: 520)
             .background(Color(nsColor: .controlBackgroundColor))
             .tint(FinderAppearance.accent)
         }
@@ -319,7 +319,6 @@ private struct WindowMinimumSizeController: NSViewRepresentable {
         _ nsView: WindowMinimumSizeControllerView,
         context: Context
     ) {
-        nsView.enforceMinimumSize()
         nsView.scheduleMinimumSizeReset()
     }
 }
@@ -328,6 +327,7 @@ private final class WindowMinimumSizeControllerView: NSView {
     private weak var observedWindow: NSWindow?
     private var updateObserver: NSObjectProtocol?
     private var resetScheduled = false
+    private var resetID = UUID()
 
     override var intrinsicContentSize: NSSize {
         .zero
@@ -344,7 +344,6 @@ private final class WindowMinimumSizeControllerView: NSView {
 
     override func layout() {
         super.layout()
-        enforceMinimumSize()
         scheduleMinimumSizeReset()
     }
 
@@ -362,16 +361,24 @@ private final class WindowMinimumSizeControllerView: NSView {
     }
 
     fileprivate func scheduleMinimumSizeReset() {
-        guard !resetScheduled else { return }
+        guard !resetScheduled, let window, observedWindow === window else { return }
+        let nativeChromeSize = window.frameRect(forContentRect: .zero).size
+        guard window.contentMinSize != .zero || window.minSize != nativeChromeSize else { return }
         resetScheduled = true
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+        let request = resetID
+        // SwiftUI can reinstall its minimum during layout. Adjust it once
+        // after that update, without mutating window geometry in the callback.
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, self.resetID == request else { return }
             self.resetScheduled = false
+            guard let window, self.window === window, self.observedWindow === window,
+                  window.isVisible else { return }
             self.enforceMinimumSize()
         }
     }
 
     private func attachToCurrentWindow() {
+        resetID = UUID(); resetScheduled = false
         if let updateObserver {
             NotificationCenter.default.removeObserver(updateObserver)
             self.updateObserver = nil
@@ -385,10 +392,9 @@ private final class WindowMinimumSizeControllerView: NSView {
             object: window,
             queue: .main
         ) { [weak self] _ in
-            self?.enforceMinimumSize()
+            self?.scheduleMinimumSizeReset()
         }
 
-        enforceMinimumSize()
         scheduleMinimumSizeReset()
     }
 
@@ -881,7 +887,7 @@ struct ContentView: View {
                 model.scanCurrentFolderForDuplicates()
                 showTaskStatusAfterPresentation()
             },
-            findSimilarFiles: { model.fileSimilarity.present() },
+            findSimilarFiles: { model.fileSimilarity.presentNewScan() },
             reviewDuplicates: { model.taskActivity.showsDuplicateResults = true },
             removeEmptyFolders: requestEmptyFolderCleanup,
             removeDSStoreFiles: requestDSStoreCleanup,
@@ -5525,7 +5531,7 @@ private struct FinderDuplicateResultsPresentation: View {
 
     var body: some View {
         Color.clear.frame(width: 0, height: 0)
-            .sheet(isPresented: $activity.showsDuplicateResults) {
+            .sheet(isPresented: $activity.showsDuplicateResults, onDismiss: model.crossDriveDuplicateResultsDidDismiss) {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack {
                         Text("Duplicate Results").font(.title3.weight(.semibold))
@@ -5540,7 +5546,7 @@ private struct FinderDuplicateResultsPresentation: View {
                 .background(Color(nsColor: .windowBackgroundColor))
                 .tint(FinderAppearance.accent)
             }
-            .sheet(isPresented: $model.showsCrossDriveDuplicateScope) {
+            .sheet(isPresented: $model.showsCrossDriveDuplicateScope, onDismiss: model.crossDriveDuplicateScopeDidDismiss) {
                 CrossDriveDuplicateScopeView(model: model)
             }
     }
@@ -5549,6 +5555,7 @@ private struct FinderDuplicateResultsPresentation: View {
 private struct DuplicateResultsView: View {
     @ObservedObject var model: DownloaderModel
     @State private var isDeleteConfirmationPresented = false
+    @State private var resultPage = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -5558,7 +5565,9 @@ private struct DuplicateResultsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            if let scan = model.duplicateScan {
+            if model.isPreparingDuplicateResults {
+                ProgressView("Preparing duplicate results…").frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let scan = model.duplicateScan {
                 scanSummary(scan)
                 if scan.failedFolders > 0 {
                     partialScanNotice(scan)
@@ -5574,6 +5583,7 @@ private struct DuplicateResultsView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .onChange(of: model.duplicateResultsIndex.id) { _ in resultPage = 0 }
         .alert("Move Selected Duplicates to Trash?", isPresented: $isDeleteConfirmationPresented) {
             Button("Move to Trash", role: .destructive) {
                 model.deleteSelectedDuplicates()
@@ -5683,7 +5693,8 @@ private struct DuplicateResultsView: View {
     }
 
     private func results(_ scan: DuplicateScan) -> some View {
-        VStack(spacing: 0) {
+        let page = ResultPage(total: model.duplicateResultsIndex.fileCount, requestedPage: resultPage)
+        return VStack(spacing: 0) {
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("\(model.selectedDuplicateFileIDs.count.formatted()) selected")
@@ -5721,13 +5732,13 @@ private struct DuplicateResultsView: View {
             Divider()
 
             List {
-                ForEach(scan.groups) { group in
+                ForEach(model.duplicateResultsIndex.slices(for: page)) { slice in
                     Section {
-                        ForEach(group.files) { file in
-                            duplicateFileRow(file, in: group)
+                        ForEach(slice.group.files[slice.range]) { file in
+                            duplicateFileRow(file, in: slice.group)
                         }
                     } header: {
-                        duplicateGroupHeader(group)
+                        duplicateGroupHeader(slice.group)
                             .padding(.vertical, 5)
                     }
                 }
@@ -5735,6 +5746,11 @@ private struct DuplicateResultsView: View {
             .listStyle(.inset)
 
             Divider()
+
+            if page.count > 1 {
+                ResultPageControls(page: page, selection: $resultPage).padding(12)
+                Divider()
+            }
 
             HStack(spacing: 8) {
                 Image(systemName: scan.possibleGroups > 0 ? "info.circle.fill" : "checkmark.shield.fill")
@@ -5893,7 +5909,7 @@ private struct DuplicateResultsView: View {
     }
 
     private func selectedCount(in group: DuplicateGroup) -> Int {
-        group.files.filter { model.selectedDuplicateFileIDs.contains($0.id) }.count
+        model.selectedDuplicateCount(in: group.id)
     }
 
     private func selectionLabel(for file: DuplicateFile, in group: DuplicateGroup) -> String {

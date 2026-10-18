@@ -3,8 +3,12 @@
 MyCloudDriver uses RAM for its own similarity-scan originals. This applies
 to full-resolution originals; thumbnails are still not used for matching.
 
-- PikPak: resolve a fresh download URL, reserve RAM, then stream into a bounded
-  buffer. Retry drops the incomplete buffer; it never creates an original file.
+- PikPak complete inputs: resolve a fresh download URL, reserve RAM, then stream
+  into a bounded buffer. Retries retain validated partial bytes when safe; no
+  original file is created. Supported audio/video with trusted GCID and size
+  instead exposes validated original ranges to the decoder. Its bounded RAM
+  block cache does not hold or hash the whole original. Unsupported identity,
+  container or initial range responses fall back to complete acquisition.
   Confirmed password exclusions are reused before resolving or downloading an
   original. New ZIP candidates receive small encryption-header probes before
   original-memory admission; inconclusive probes fall back to normal analysis.
@@ -33,10 +37,20 @@ to full-resolution originals; thumbnails are still not used for matching.
 hashing starts, **Analysis RAM** reserves the original plus calculation/decoder working
 memory before returning the original's Download RAM reservation. This handoff
 keeps the same buffer and frees download capacity immediately. The original's
-analysis lease stays with the buffer until its last reader drops. Their calculated total accepts the Mac's full
-physical RAM (64 GB on a 64 GB Mac). A 64 GB total with 12 GB Download RAM leaves
-52 GB for analysis. Downloads reserve small windows as bytes arrive. Native
+analysis lease stays with the buffer until its last reader drops. Their shared
+allowance grows on demand, rebalances between the stages, and responds to macOS
+memory pressure, with physical RAM as the outer resource boundary. Downloads
+reserve small windows as bytes arrive. Native
 reader copies are included in the prepaid analysis allowance.
+Range-backed media keeps independently evictable blocks in Download RAM while
+its decoder uses Analysis RAM. The first block and a retained scan transport
+entitlement are admitted together; a waiter releases its block if transport is
+unavailable. Later reads claim extra blocks only from immediately available
+spare capacity, otherwise reusing an existing admitted block. Pressure shrinks
+the cache toward one block. A decoder therefore never waits for another RAM
+claim or scan connection needed by a partial complete-original download.
+Range requests still obey origin throttling, retries, pause and cancellation.
+
 Images and documents that use `open_input()` need a complete worker-side copy;
 FFmpeg video/audio and HEIF/AVIF readers seek the shared original and need no
 second full-file copy allowance. Plain UTF-8 also reads the original directly.
@@ -54,11 +68,22 @@ closes its attempt and reports a minimum capacity; the helper releases the
 partial buffer and retries with a larger allowance, capped by the pool. Only
 receive windows are reserved initially. Generic unknown-length streams still
 claim the whole allowance and admit one unfinished stream at a time.
-Unused claims are released at completion. Oversized originals report a RAM-limit reason with
-an instruction to increase Download RAM. There is no disk fallback.
-Existing preferences without a download budget use one quarter of the total,
-capped at 12 GB; the prior total is preserved. Legacy worker and batch settings
-remain readable but do not constrain new or resumed app scans.
+Unused claims are released at completion. Large originals wait for automatic
+allowance growth; files that cannot fit with their decoder in system capacity
+report a memory issue. There is no disk fallback or manual RAM setting. Saved
+manual amounts are ignored by new and resumed app scans. Both acquisition banks
+preserve a completion order through reader copies and decoding, preventing a
+full queue of originals from blocking analysis. Low-level fixed-budget requests
+remain supported for compatibility.
+
+If a large decoder retry needs RAM held by an incomplete original, acquisition
+gets enough allowance to finish that original first. A bounded read lookahead
+admits smaller ready files even when processing slots contain waiting retries.
+Critical pressure also releases idle model processes without interrupting active
+decoders. If the physical working set still cannot progress, the largest blocking
+retry reports a per-file memory issue so other files can finish. That file can be
+retried after the rest of the scan; temporary soft reductions do not trigger this
+fallback. Shared accounting includes only granted receive windows.
 
 Starting with 2.2.11, cloud acquisition has its own pool of producers.
 Discovery sends metadata to that pool; a producer reserves RAM, finishes the
@@ -89,14 +114,17 @@ size reserved before the read begins. A full reservation does not mean the file
 has already arrived in RAM. Reading and hashing have separate counters.
 Completed originals move to Analysis RAM before their first hash read.
 **Download speed** measures bytes arriving from the source (including external
-and network disks), excluding hashing RAM, decoder reads and file completions.
+and network disks and on-demand media ranges), excluding hashing and decoder
+reads from retained RAM or file completions.
 It remains visible when the processed-file counter has not increased.
 
-Progress shows reserved Download RAM in GB, its configured capacity, free
+Progress shows reserved Download RAM in GB, its current automatic allowance, free
 capacity, the remaining analysis budget, and a separate downloading-file count.
-Reserved Download RAM covers incoming/queued originals and small receive windows, not measured
-process RSS or cumulative bytes transferred. The Downloads to RAM list shows
-individual progress, speed, remaining time and wait/retry states. Progress also separates waiting to read, fully acquired originals ready for analysis, reading, hashing,
+Reserved Download RAM covers incoming/queued originals, cached media ranges and
+small receive windows, not measured process RSS or cumulative bytes transferred. The Downloads to RAM list shows
+individual progress, speed, remaining time and wait/retry states for complete
+originals. Range-backed analysis reports sampled source bytes and read states;
+it does not claim whole-original completion, a whole-file ETA or SHA-256 hashing. Progress also separates waiting to read, fully acquired originals ready for analysis, reading, hashing,
 analysis, connecting, retries, and RAM waits. **Analysing** counts hashing and encoding work
 only, without a worker quota. **Analysis RAM reserved** includes handed-off
 originals and admitted processing allowances; source throughput, hashing, cache hits and decoder RAM can all lower
@@ -120,8 +148,10 @@ Vector caches, comparison databases, scan metadata, FIFO directory entries, and
 model/runtime caches still use storage. User-requested Downloads and Open With
 are separate operations and retain their normal storage behavior.
 
-The vendored FileTwin change uses native protocol v4; install the helper and
-worker together. Encoding profiles are unchanged, so compatible saved vectors
+The vendored FileTwin change uses native protocol v5; install the helper and
+worker together. The new `range_only` transport field defaults to false when
+absent; helper and worker protocol versions must still match. Range originals use a validated `gcid:<hash>:<size>`
+content ID, distinct from complete-content `sha256:<hash>` IDs. Encoding profiles are unchanged, so compatible saved vectors
 remain reusable. Standalone FileTwin retains its default disk-staging API;
 `memory_staging` is available on `encode_sources`/`encode_stream`, and directory
 `encode` rejects that option rather than silently writing a source copy.
@@ -132,12 +162,14 @@ synthetic Photos pipe handoff. Personal Photos access is not required by tests.
 
 ## Queue liveness audit
 
-The download and analysis pools have a one-way dependency: acquisition reserves
-receive windows under a Banker's safety check, sends complete originals to the
-ready queue, and analysis
-releases it. No analysis job waits for discovery to finish, for another download
-to finish, or for more bytes from the original pool. Network metadata permits
-are released before waiting for RAM. Analysis reader copies use the separate
+For complete originals, acquisition reserves receive windows under a Banker's
+safety check, sends completed buffers to the ready queue, and analysis releases
+them. Analysis does not wait for discovery or another complete download.
+Seekable media deliberately fetches original bytes during analysis, but holds
+its admitted first block and scan transport entitlement, reusing blocks when
+spare memory is unavailable. This avoids a dependency cycle with partial
+complete-original downloads. Network metadata permits are released before
+waiting for RAM. Analysis reader copies use the separate
 analysis allowance. A file too large for either allowance is reported instead
 of being admitted into a wait which can never succeed.
 
@@ -173,8 +205,11 @@ forecast, hard buffer grants, connection growth and progress list.
 [Pause and recovery](SIMILARITY_RESUME.md) describes the live helper lifecycle.
 Pause stops download consumption and new analysis admission without dropping RAM
 leases. The download list remains visible with its retained byte counts and paused
-rates. Resource edits resize the same download budget and reconfigure analysis
-at a safe boundary. Shrinking Download RAM must preserve a safe completion order;
-this uses the existing Banker calculation, not just current received bytes.
+rates. The automatic governor changes admission at safe boundaries while
+retaining those leases. Warning pressure stops new downloads; critical pressure
+also pauses new incoming payloads and local copies. Active decoders may finish
+using retained ranges; new seekable originals wait for admission.
+normal operation resumes after pressure eases. Temporary reductions retain
+queued files instead of failing them.
 Clear releases all memory; actual application/helper termination still requires
 refetching unfinished originals because original bytes are never written to disk.

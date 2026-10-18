@@ -17,6 +17,16 @@ pub(crate) fn is_sha(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// A full-original digest or explicit provider GCID evidence. GCID identities
+/// include the verified original length and are never labelled as SHA-256.
+pub fn valid_content_id(value: &str, bytes: Option<u64>) -> bool {
+    if value.strip_prefix("sha256:").is_some_and(is_sha) { return true; }
+    value.strip_prefix("gcid:").and_then(|v| v.split_once(':')).is_some_and(|(gcid, size)| {
+        gcid.len() == 40 && gcid.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            && size.parse::<u64>().ok().filter(|n| *n > 0 && n.to_string() == size).is_some_and(|n| Some(n) == bytes)
+    })
+}
+
 pub(crate) fn validate(bundle: &VectorFile) -> Result<()> {
     if bundle.format != VECTOR_FILE_FORMAT {
         return Err(invalid("Expected a FileTwin vector file"));
@@ -46,10 +56,10 @@ pub(crate) fn validate(bundle: &VectorFile) -> Result<()> {
         if record
             .file_id
             .as_ref()
-            .is_some_and(|s| !s.strip_prefix("sha256:").is_some_and(is_sha))
+            .is_some_and(|s| !valid_content_id(s, record.bytes))
         {
             return Err(invalid(
-                "file_id must be sha256: followed by 64 lowercase hex digits",
+                "file_id must be a canonical whole-original SHA-256 or provider GCID and length",
             ));
         }
         if record.state != FileState::Ready {

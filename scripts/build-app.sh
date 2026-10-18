@@ -95,6 +95,7 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/PikPakTransferQuota.swift" \
     "${PROJECT_ROOT}/macos/PikPakTransferQuotaView.swift" \
     "${PROJECT_ROOT}/macos/PikPakConnectionSelector.swift" \
+    "${PROJECT_ROOT}/macos/FinderPopover.swift" \
     "${PROJECT_ROOT}/macos/CredentialParser.swift" \
     "${PROJECT_ROOT}/macos/PreviewTransport.swift" \
     "${PROJECT_ROOT}/macos/MediaFileDownload.swift" \
@@ -106,6 +107,8 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/MediaContainer.swift" \
     "${PROJECT_ROOT}/macos/ExternalMediaPlayer.swift" \
     "${PROJECT_ROOT}/macos/CloudDriveTypes.swift" \
+    "${PROJECT_ROOT}/macos/FolderSizeProgress.swift" \
+    "${PROJECT_ROOT}/macos/NativeFileWork.swift" \
     "${PROJECT_ROOT}/macos/LocalFileAccess.swift" \
     "${PROJECT_ROOT}/macos/DiskTrash.swift" \
     "${PROJECT_ROOT}/macos/NativeDiskTrashView.swift" \
@@ -141,6 +144,7 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/BrowserEmptyFolders.swift" \
     "${PROJECT_ROOT}/macos/NativeDriveDuplicates.swift" \
     "${PROJECT_ROOT}/macos/CrossDriveDuplicates.swift" \
+    "${PROJECT_ROOT}/macos/DuplicateResultsPresentation.swift" \
     "${PROJECT_ROOT}/macos/NativeDriveWorkspace.swift" \
     "${PROJECT_ROOT}/macos/NativeMediaThumbnail.swift" \
     "${PROJECT_ROOT}/macos/NativeThumbnailCache.swift" \
@@ -158,6 +162,7 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/SimilarityProcessingSpeed.swift" \
     "${PROJECT_ROOT}/macos/SimilarityDownloadsView.swift" \
     "${PROJECT_ROOT}/macos/SimilarityDriveRouting.swift" \
+    "${PROJECT_ROOT}/macos/SimilarityAcrossDrives.swift" \
     "${PROJECT_ROOT}/macos/FileSimilarityView.swift" \
     "${PROJECT_ROOT}/macos/SimilarityResults.swift" \
     "${PROJECT_ROOT}/macos/SimilarityKeepSmallest.swift" \
@@ -165,6 +170,7 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/SimilarityResultsView.swift" \
     "${PROJECT_ROOT}/macos/SimilarityPreview.swift" \
     "${PROJECT_ROOT}/macos/FileSearch.swift" \
+    "${PROJECT_ROOT}/macos/NativeFileSearch.swift" \
     "${PROJECT_ROOT}/macos/FileSearchView.swift" \
     "${PROJECT_ROOT}/macos/TransferScheduling.swift" \
     "${PROJECT_ROOT}/macos/DownloadSpeedHistory.swift" \

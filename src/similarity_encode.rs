@@ -10,7 +10,6 @@ use filetwin_core::{
 };
 use scope::{issue, InputFile};
 
-const MAX_SAVED_SCORES: u64 = 4_000_000;
 const NATIVE_PREPARERS: usize = 8;
 
 #[cfg(test)]
@@ -25,6 +24,12 @@ fn config(request: &ScanRequest, temporary: &Path) -> EncoderConfig {
     config.memory_bytes = request.resources.analysis_budget();
     config.memory_staging = true;
     config.staging_bytes = request.resources.download_budget();
+    if request.resources.automatic_memory {
+        config.memory_scheduling = true;
+        config.memory_ceiling = Some(auto_memory::physical_memory());
+        config.total_memory_bytes =
+            Some(auto_memory::initial_budget(auto_memory::physical_memory()));
+    }
     let cache = request.data_dir.join("inference-cache");
     if private_dir(&cache).is_ok() {
         config.inference_cache_dir = Some(cache);
@@ -72,21 +77,24 @@ fn encoding_progress(
             .load(Ordering::Relaxed)
             .min(resolving);
         let fetch_work = resolving - waiting_memory;
-        let (fetching, metadata, retrying) = if report.source == ScanSource::Cloud {
+        let (fetching, metadata, retrying) = if report.source == ScanSource::Cloud || sources.inventory.has_cloud {
+            let cloud_work = if report.source == ScanSource::Cloud && !sources.inventory.has_cloud {
+                fetch_work
+            } else { sources.cloud_resolving.load(Ordering::Acquire).min(fetch_work) };
             let active = fetches
                 .active
                 .load(Ordering::Relaxed)
                 .min(fetches.limit as u64)
-                .min(fetch_work);
+                .min(cloud_work);
             let metadata = fetches
                 .metadata
                 .load(Ordering::Relaxed)
-                .min(fetch_work - active);
+                .min(cloud_work - active);
             let retrying = fetches
                 .retrying
                 .load(Ordering::Relaxed)
-                .min(fetch_work - active - metadata);
-            (active, metadata, retrying)
+                .min(cloud_work - active - metadata);
+            (active + fetch_work - cloud_work, metadata, retrying)
         } else {
             (fetch_work, 0, 0)
         };
@@ -114,14 +122,23 @@ fn encoding_progress(
         event["work"]["memory_in_use"] = (work.memory_in_use + fetches.memory.used()).into();
         event["work"]["memory_limit"] = (work.memory_limit + fetches.memory.limit()).into();
         event["work"]["original_storage"] = "memory".into();
-        event["work"]["fetching"] = fetching.into();
+        let range_fetching = fetches.range_active.load(Ordering::Relaxed);
+        let range_metadata = fetches.range_metadata.load(Ordering::Relaxed);
+        let range_retrying = fetches.range_retrying.load(Ordering::Relaxed);
+        event["work"]["range_fetching"] = range_fetching.into();
+        event["work"]["range_resolving"] = range_metadata.into();
+        event["work"]["range_retrying"] = range_retrying.into();
+        event["work"]["fetching"] = (fetching + range_fetching).into();
+        event["work"]["resolving"] = (metadata + range_metadata).into();
         event["work"]["waiting_download"] = waiting.into();
-        event["work"]["retrying_download"] = retrying.into();
+        event["work"]["retrying_download"] = (retrying + range_retrying).into();
         event["work"]["download_limit"] = fetches.connection_limit().into();
-        // Active excludes queued originals and all RAM/retry waits. In
-        // particular, download activity never occupies an analysis worker.
+        // Active excludes queued originals and all RAM/retry waits. Prefetch
+        // downloads are separate jobs; range reads overlap an existing decoder
+        // and therefore do not add another active analysis job.
         event["active"] =
-            (fetching + metadata + work.fetching + work.reading + work.hashing + work.encoding).into();
+            (fetching + metadata + work.fetching + work.reading + work.hashing + work.encoding)
+                .into();
     } else {
         event["active"] = update
             .counts
@@ -130,17 +147,23 @@ fn encoding_progress(
             .into();
     }
     let downloads = fetches.download_progress();
-    if report.source == ScanSource::Cloud {
-        let total = sources.inventory.file_bytes.load(Ordering::Acquire);
-        let ready = sources
-            .resolved_bytes
-            .load(Ordering::Acquire)
-            .saturating_add(downloads["received_bytes"].as_u64().unwrap_or(0))
-            .min(total);
+    if report.source == ScanSource::Cloud || sources.inventory.has_cloud {
+        let total = if sources.inventory.has_cloud {
+            sources.inventory.cloud_file_bytes.load(Ordering::Acquire)
+        } else { sources.inventory.file_bytes.load(Ordering::Acquire) };
+        let sampled_files = fetches.sampled_files.load(Ordering::Acquire);
+        let sampled_original_bytes = fetches.sampled_original_bytes.load(Ordering::Acquire);
+        let ready = if sources.inventory.has_cloud { sources.resolved_cloud_bytes.load(Ordering::Acquire) }
+            else { sources.resolved_bytes.load(Ordering::Acquire) }
+            .saturating_sub(sampled_original_bytes)
+            .saturating_add(downloads["cloud_full_received_bytes"].as_u64().unwrap_or(0)).min(total);
         event["cloud_data"] = json!({"ready_bytes":ready,"total_bytes":total,
-            "inventory_complete":sources.inventory.complete.load(Ordering::Acquire)});
+            "inventory_complete":sources.inventory.complete.load(Ordering::Acquire),
+            "on_demand":sampled_files>0,"sampled_files":sampled_files,
+            "sampled_original_bytes":sampled_original_bytes,
+            "sampled_received_bytes":fetches.sampled_received_bytes.load(Ordering::Relaxed)});
     }
-    if report.source == ScanSource::Cloud || downloads["total"].as_u64().unwrap_or(0) > 0 {
+    if report.source == ScanSource::Cloud || sources.inventory.has_cloud || downloads["total"].as_u64().unwrap_or(0) > 0 {
         event["downloads"] = downloads;
         event["downloads"]["forecast_bytes"] = fetches.memory.forecast().into();
         event["downloads"]["forecast_seconds"] = memory::FORECAST_SECONDS.into();
@@ -153,6 +176,8 @@ enum ResolvedInput {
     Path(Option<tempfile::TempDir>),
     Memory(Arc<filetwin_core::memory_input::MemoryInput>),
     Reused(FileRecord),
+    Cached(FileRecord),
+    Seekable(Arc<dyn filetwin_core::memory_input::SeekableInput>),
     Excluded(FileRecord),
 }
 
@@ -214,11 +239,7 @@ fn resolve_input(
     if file.external.is_none() {
         return Ok(ResolvedInput::Path(None));
     }
-    if file
-        .external
-        .as_ref()
-        .is_some_and(|item| item.id.starts_with("asset:"))
-    {
+    if file.is_photos_source() {
         return resolve_photos_memory(file, temporary, cancel, runtime, fetches, downloaded);
     }
     let lease = tempfile::Builder::new()
@@ -299,6 +320,7 @@ fn resolve_photos_memory(
         item.size
     };
     let ticket = fetches.track(&item.name, size);
+    ticket.native();
     let mut capacity = if size > 0 {
         size
     } else {
@@ -321,7 +343,7 @@ fn resolve_photos_memory(
                 // The provider has closed the failed pipe and acknowledged the
                 // overflow. The attempt's partial buffer and claim are already
                 // dropped, so a larger claim cannot deadlock against itself.
-                capacity = photos_retry_capacity(capacity, required, fetches.memory.limit())?;
+                capacity = photos_retry_capacity(capacity, required, fetches.memory.ceiling())?;
                 if file.is_photos_preview() {
                     capacity = capacity.min(8 << 20);
                 }
@@ -549,6 +571,12 @@ pub(super) fn run(
     let checkpoint = checkpoint::Checkpoint::open(request)?;
     let mut fetches =
         fetch::Fetches::with_memory(fetch::MAX_DOWNLOADS, request.resources.download_budget());
+    if request.resources.automatic_memory {
+        let physical = auto_memory::physical_memory();
+        fetches
+            .memory
+            .enable_automatic(physical.saturating_sub(memory::ANALYSIS_HEADROOM.min(physical / 4)));
+    }
     fetches.retry_forever = request.checkpoint_id.is_some();
     let control = control::Control::new(request, cancel.clone(), Some(fetches.memory.clone()));
     let token = control.token.clone();
@@ -564,7 +592,9 @@ pub(super) fn run(
     // An unsealed (including user-finished) inventory can be rediscovered in a
     // different order. Reuse vectors, but never reuse scores with old ordinals.
     if saved.is_none() {
-        if let Some(checkpoint) = &checkpoint { checkpoint.invalidate_inventory()?; }
+        if let Some(checkpoint) = &checkpoint {
+            checkpoint.invalidate_inventory()?;
+        }
     }
     let mut snapshot = None;
     let capture = |previous: &[InputFile]| {
@@ -616,8 +646,16 @@ pub(super) fn run(
         };
         if token.is_finishing() {
             report.status = "finished".into();
-            return publish_resuming(request, &pass.files, &pass.counts, cancel, report,
-                started, checkpoint.as_deref(), Some(&token));
+            return publish_resuming(
+                request,
+                &pass.files,
+                &pass.counts,
+                cancel,
+                report,
+                started,
+                checkpoint.as_deref(),
+                Some(&token),
+            );
         }
         if !pass.complete || cancel.load(Ordering::Acquire) || token.is_cancelled() {
             if token.is_cancelled() {
@@ -644,8 +682,16 @@ pub(super) fn run(
         // snapshot of the last completed metadata check, never a live watcher.
         let finish_report = |report: &mut ScanReport| {
             report.status = "finished".into();
-            publish_resuming(request, &pass.files, &pass.counts, cancel, report,
-                started, checkpoint.as_deref(), Some(&token))
+            publish_resuming(
+                request,
+                &pass.files,
+                &pass.counts,
+                cancel,
+                report,
+                started,
+                checkpoint.as_deref(),
+                Some(&token),
+            )
         };
         let mut current = match capture(&pass.files) {
             Err(_) if token.is_finishing() => return finish_report(report),
@@ -727,6 +773,15 @@ fn run_pass(
     let token = fetches.control.clone();
     let files = RefCell::new(Vec::<InputFile>::new());
     let mut engine_config = config(request, temporary);
+    let mut governor = request.resources.automatic_memory.then(|| {
+        engine_config.external_memory = Some(fetches.memory.usage.clone());
+        auto_memory::Governor::new(
+            !request.cloud_items.is_empty()
+                || request.external_source_stream.is_some()
+                || !request.external_sources.is_empty(),
+            engine_config.workers,
+        )
+    });
     acceleration::select(request, &mut engine_config, checkpoint.as_deref(), cancel)?;
     let backend = engine_config.backend;
     let encoder = Encoder::new(engine_config)?;
@@ -770,13 +825,14 @@ fn run_pass(
         let checkpoint = checkpoint.clone();
         let source_cache = source_cache.clone();
         let families = request.families.clone();
-        let remote = request.source == ScanSource::Cloud
+        let has_cloud = !request.cloud_items.is_empty();
+        let remote = has_cloud
             || request.external_source_stream.is_some()
             || !request.external_sources.is_empty();
         // Metadata/RAM waiters do not tie up the transport pool. A bounded
         // lookahead lets smaller originals fit while larger ones wait for RAM.
-        let producers = if request.source == ScanSource::Cloud {
-            fetches.limit * 2
+        let producers = if has_cloud {
+            (fetches.limit * 2).max(if request.external_source_stream.is_some() { NATIVE_PREPARERS } else { 1 })
         } else if remote {
             NATIVE_PREPARERS
         } else {
@@ -785,7 +841,7 @@ fn run_pass(
         // Every PikPak original owns a byte reservation. Let that reservation
         // bound the ready queue, independent of worker or connection counts.
         // Path-only sources retain a small metadata queue without pre-reading.
-        let ready_limit = if request.source == ScanSource::Cloud {
+        let ready_limit = if has_cloud {
             READY_QUEUE_CAPACITY
         } else {
             request.resources.effective_workers()
@@ -818,7 +874,20 @@ fn run_pass(
                     if !file.is_photos_preview() {
                         file.display.bytes = record.bytes.unwrap_or(file.display.bytes);
                     }
-                    return Ok(ResolvedInput::Reused(record));
+                    return Ok(ResolvedInput::Cached(record));
+                }
+                if families.iter().any(|family| matches!(family.as_str(), "audio" | "video")) {
+                    if let (Some(item), Some(client)) = (file.cloud.as_ref(), client.as_ref()) {
+                        if let Some((original, revision)) = runtime.block_on(fetch::prepare_seekable(
+                            client, item, stop, fetches.clone(), runtime.clone(), downloaded.clone(),
+                        ))? {
+                            let item = file.cloud.as_mut().unwrap();
+                            item.revision = revision;
+                            item.size = original.len();
+                            file.display.bytes = item.size;
+                            return Ok(ResolvedInput::Seekable(original));
+                        }
+                    }
                 }
                 let mut attempt = 0u32;
                 loop {
@@ -906,11 +975,18 @@ fn run_pass(
             let extension = if file.is_photos_preview() { "jpg".to_owned() } else { safe_extension(&file.display.name) };
             let key = format!("{i:08}.{extension}");
             let source = match prepared.result {
-                Ok(ResolvedInput::Reused(record) | ResolvedInput::Excluded(record)) => {
+                Ok(resolved @ (ResolvedInput::Reused(_) | ResolvedInput::Cached(_) | ResolvedInput::Excluded(_))) => {
+                    let already_cached = matches!(&resolved, ResolvedInput::Cached(_));
+                    let record = match resolved {
+                        ResolvedInput::Reused(record) | ResolvedInput::Cached(record) | ResolvedInput::Excluded(record) => record,
+                        _ => unreachable!(),
+                    };
                     // Keep this scan independently resumable even if another
                     // saved scan is cleared after providing a cached vector.
-                    source_cache.completed(file, &record).map_err(|_| filetwin_core::Error::new(
-                        filetwin_core::ErrorCode::IoError,"checkpoint","Could not cache reused analysis. Check available storage, then resume."))?;
+                    if !already_cached {
+                        source_cache.completed(file, &record).map_err(|_| filetwin_core::Error::new(
+                            filetwin_core::ErrorCode::IoError,"checkpoint","Could not cache reused analysis. Check available storage, then resume."))?;
+                    }
                     if let Some(checkpoint) = &checkpoint {
                         checkpoint.completed(file, &record).map_err(|_| filetwin_core::Error::new(
                             filetwin_core::ErrorCode::IoError,"checkpoint","Could not save reused analysis."))?;
@@ -930,6 +1006,7 @@ fn run_pass(
                     continue;
                 }
                 Ok(ResolvedInput::Memory(data)) => filetwin_core::api::EncodeSource::from_memory(key, data),
+                Ok(ResolvedInput::Seekable(data)) => filetwin_core::api::EncodeSource::from_seekable(key, data),
                 Ok(ResolvedInput::Path(lease)) => {
                     let mut source = filetwin_core::api::EncodeSource::new(key, file.path.clone());
                     if let Some(lease) = lease { source = source.retaining(lease); }
@@ -947,7 +1024,11 @@ fn run_pass(
         { let mut base = base.borrow_mut(); sync_discovery(&mut base, &sources.discovery); }
         report.borrow_mut().downloaded_bytes = downloaded.load(Ordering::Relaxed);
         if cancel.load(Ordering::Acquire) { token.cancel(); }
+        if let (Some(governor), Some(work)) = (&mut governor, &update.work) {
+            governor.update(work, &fetches.memory, &token);
+        }
         let mut event = encoding_progress(&base.borrow(), update, &report.borrow(), started.elapsed().as_secs_f64(), &fetches, &sources.state);
+        if let Some(governor) = &governor { governor.annotate(&mut event); }
         if let Some(checkpoint) = &checkpoint { event["session_statistics"] = checkpoint.statistics(); }
         if emit(&event).is_err() {
             token.cancel();
@@ -1069,7 +1150,7 @@ fn run_pass(
     })
 }
 
-fn fetching_error(error: &anyhow::Error, cancelled: bool) -> filetwin_core::Error {
+pub(super) fn fetching_error(error: &anyhow::Error, cancelled: bool) -> filetwin_core::Error {
     use filetwin_core::{Error, ErrorCode};
     if cancelled {
         return Error::new(ErrorCode::Cancelled, "fetching", "Scan cancelled");
@@ -1147,11 +1228,14 @@ pub(super) fn error_reason(error: Option<&filetwin_core::Error>) -> String {
         return "Password-protected file skipped. Its contents cannot be analysed without a password.".into();
     }
     use filetwin_core::ErrorCode::*;
+    if error.is_some_and(|error| error.code == ResourceBudgetTooSmall && error.details["retry_after_drain"].as_bool() == Some(true)) {
+        return "Other retained originals prevented this decoder retry. Retry this file after the rest of the scan finishes.".into();
+    }
     if let Some(error) = error.filter(|e| e.stage == "fetching") {
         let reason = match error.details["fetch_kind"].as_str() {
             Some("open_file_limit") => Some("The scan reached this process's open-file limit while fetching originals."),
             Some("disk_full") => Some("There is not enough free disk space for the temporary original."),
-            Some("memory_limit") => Some("This original needs more RAM. Increase Scan Resources and retry; no disk copy was created."),
+            Some("memory_limit") => Some("This original cannot fit in available system memory. No disk copy was created."),
             Some("permission") => Some("The app does not have permission to read or save this original."),
             Some("authentication") => Some("PikPak could not authenticate the original download. Check login status in Settings → Accounts."),
             Some("guest_unavailable") => Some("Guest Mode could not access or verify this file's original public share. Use an available share or choose User or Dynamic mode in the sidebar."),
@@ -1175,7 +1259,7 @@ pub(super) fn error_reason(error: Option<&filetwin_core::Error>) -> String {
                 _ => format!("The drive returned HTTP {status} while fetching this original."),
             };
         }
-        return "Could not fetch the original into memory. Check drive access, connection and the scan’s RAM allowance, then retry.".into();
+        return "Could not fetch the original into memory. Check drive access and connection, then retry.".into();
     }
     if error.is_some_and(|e| {
         e.code == InsufficientContent && e.stage == "media" && e.message.contains("duration")
@@ -1192,7 +1276,7 @@ pub(super) fn error_reason(error: Option<&filetwin_core::Error>) -> String {
         Some(UnselectedFamily)=>"Content type excluded from similarity analysis.",
         Some(DecodeFailed)=>"The file could not be decoded. It may be damaged or use an unsupported encoding; exact-copy matching is still available.",
         Some(WorkerFailed)=>"The analysis worker could not finish this file. Retry the scan; its exact-copy hash is retained when available.",
-        Some(ResourceBudgetTooSmall)=>"This file needs more RAM. Increase Scan Resources and retry; originals are never spilled to disk.",
+        Some(ResourceBudgetTooSmall)=>"This file and its decoder cannot fit in available system RAM. Originals are never spilled to disk.",
         _=>"The file could not be analysed. Check file access and the analysis components, then retry.",
     }.into()
 }
@@ -1207,6 +1291,37 @@ fn publish(
     started: Instant,
 ) -> Result<()> {
     publish_resuming(request, files, counts, cancel, report, started, None, None)
+}
+
+/// A full original can prove both its SHA256 and its provider GCID. Join those
+/// verified identities before grouping, so a native SHA copy also matches a
+/// cloud original, including another sparse original with that same GCID.
+/// A sparse original contributes only its GCID; it never invents a full hash.
+fn exact_evidence(files: &[InputFile]) -> Vec<Option<String>> {
+    fn representative(parents: &std::collections::BTreeMap<String, String>, id: &str) -> String {
+        let mut current = id;
+        while let Some(parent) = parents.get(current) {
+            if parent == current { break; }
+            current = parent;
+        }
+        current.to_owned()
+    }
+    let identities: Vec<_> = files.iter().map(InputFile::exact_identity).collect();
+    let mut parents = std::collections::BTreeMap::<String, String>::new();
+    for (file, identity) in files.iter().zip(&identities) {
+        let Some(identity) = identity else { continue; };
+        parents.entry(identity.clone()).or_insert_with(|| identity.clone());
+        let Some(sha) = file.record.as_ref().and_then(|record| record.file_id.as_ref())
+            .filter(|id| id.starts_with("sha256:")) else { continue; };
+        parents.entry(sha.clone()).or_insert_with(|| sha.clone());
+        let first = representative(&parents, identity);
+        let second = representative(&parents, sha);
+        if first != second {
+            let (root, child) = if first < second { (first, second) } else { (second, first) };
+            parents.insert(child, root);
+        }
+    }
+    identities.into_iter().map(|identity| identity.map(|id| representative(&parents, &id))).collect()
 }
 
 fn publish_resuming(
@@ -1231,9 +1346,9 @@ fn publish_resuming(
     } else {
         store::MatrixWriter::new(&request.data_dir)?
     };
-    let previously_compared = writer.saved_scores()?;
     let mut profiles = std::collections::BTreeMap::<&str, Vec<(usize, &FileRecord)>>::new();
-    let mut hashes = std::collections::BTreeMap::<&str, Vec<MatchedFile>>::new();
+    let mut hashes = std::collections::BTreeMap::<String, Vec<MatchedFile>>::new();
+    let exact_identities = exact_evidence(files);
     let mut inventory_bytes = 0;
     for (i, file) in files.iter().enumerate() {
         if let Some(token) = token {
@@ -1253,21 +1368,18 @@ fn publish_resuming(
                 record.file_id = None;
                 record
             });
-        writer.file(
+        let exact_identity=exact_identities[i].clone();
+        writer.file_with_digest(
             i,
             &file.display,
             preview_record.as_ref().or(file.record.as_ref()),
+            exact_identity.as_deref(),
         )?;
         let bytes = serde_json::to_vec(&file.display)?.len();
         if inventory_bytes + bytes < 40 * 1024 * 1024 {
             inventory_bytes += bytes;
             report.files.push(file.display.clone());
-            if let Some(id) = file
-                .record
-                .as_ref()
-                .and_then(|r| r.file_id.as_deref())
-                .filter(|_| request.exact_duplicates && !file.is_photos_preview())
-            {
+            if let Some(id) = exact_identity.filter(|_|request.exact_duplicates) {
                 hashes.entry(id).or_default().push(file.display.clone());
             }
         } else {
@@ -1281,15 +1393,21 @@ fn publish_resuming(
             }
         }
     }
-    let total: u64 = profiles
-        .values()
-        .map(|v| {
-            let n = v.len() as u64;
-            n.saturating_mul(n.saturating_sub(1)) / 2
-        })
-        .sum();
-    let mut compared = 0u64;
-    let mut last = Instant::now();
+    let profiles = comparison::profiles(&profiles)?;
+    let prepared = if checkpoint.is_some() {
+        writer.prepare_controlled(&profiles,cancel,token)
+    } else { writer.prepare(&profiles) };
+    if let Err(error) = prepared {
+        if checkpoint.is_some() && cancel.load(Ordering::Acquire) {
+            // An interrupted old-format upgrade rolls back as one transaction;
+            // its previously committed comparisons remain available to resume.
+            report.status = "paused".into();
+            return Ok(());
+        }
+        return Err(error);
+    }
+    let previously_compared = writer.saved_scores()?;
+    let total = comparison::total(&profiles)?;
     let comparison = |count: u64, stage: &str| {
         let mut event = progress(counts, report, stage, started.elapsed().as_secs_f64());
         if let Some(checkpoint) = checkpoint {
@@ -1301,53 +1419,24 @@ fn publish_resuming(
         event["counts"]["pairs_total"] = total.into();
         event["counts"]["pairs_compared"] = count.into();
         event["counts"]["scores_retained"] = count.into();
-        event["counts"]["comparison_limit"] = MAX_SAVED_SCORES.into();
+        event["counts"]["comparison_limit"] = Value::Null;
         event["counts"]["comparisons_remaining"] = total.saturating_sub(count).into();
         event
     };
     emit(&comparison(previously_compared, "comparison"))?;
-    'pairs: for members in profiles.values() {
-        for (n, (a, left)) in members.iter().enumerate() {
-            for (b, right) in &members[n + 1..] {
-                if let Some(token) = token {
-                    if token.is_paused() {
-                        writer.checkpoint()?;
-                        let _ = control::wait_blocking(token, cancel);
-                    }
-                }
-                if cancel.load(Ordering::Acquire)
-                    || report.status == "cancelled"
-                    || compared >= MAX_SAVED_SCORES
-                {
-                    break 'pairs;
-                }
-                if compared < previously_compared {
-                    compared += 1;
-                    continue;
-                }
-                let lv = left.vector.as_ref().unwrap();
-                let rv = right.vector.as_ref().unwrap();
-                if lv.len() != rv.len() {
-                    bail!("Inconsistent vector dimensions in the same FileTwin profile.");
-                }
-                let score = if lv == rv {
-                    1.0
-                } else {
-                    filetwin_core::profile::cosine(lv, rv)
-                };
-                if !score.is_finite() {
-                    bail!("FileTwin returned an invalid content vector.");
-                }
-                writer.score(*a, *b, score)?;
-                compared += 1;
-                if last.elapsed() > Duration::from_millis(250) {
-                    writer.checkpoint()?;
-                    emit(&comparison(compared, "comparison"))?;
-                    last = Instant::now();
-                }
-            }
-        }
-    }
+    let compared = if report.status == "cancelled" {
+        previously_compared
+    } else {
+        comparison::run(
+            &profiles,
+            &writer,
+            previously_compared,
+            request.resources.effective_workers(),
+            cancel,
+            token,
+            |count| emit(&comparison(count, "comparison")),
+        )?
+    };
     let terminal = comparison(compared, "finishing");
     writer.checkpoint()?;
     if cancel.load(Ordering::Acquire) && checkpoint.is_some() {
@@ -1357,9 +1446,7 @@ fn publish_resuming(
     }
     emit(&terminal)?;
     if compared < total && !cancel.load(Ordering::Acquire) && report.status != "cancelled" {
-        if report.status != "finished" { report.status = "partial".into(); }
-        report.truncated = true;
-        issue(report,"Comparisons", &format!("The {MAX_SAVED_SCORES}-comparison limit was reached: {compared} of {total} compatible comparisons were saved, with {} omitted. Choose a smaller scan scope for complete comparisons.", total.saturating_sub(compared)));
+        bail!("Similarity comparison stopped before all compatible pairs were saved.");
     }
     report.scores_retained = compared;
     report.run_id = Some(writer.id.clone());
@@ -1498,6 +1585,7 @@ mod tests {
             .enumerate()
             .map(|(i, name)| {
                 let mut file = InputFile::external(ExternalSource {
+                    provider: None,
                     id: format!("asset:{i}"),
                     name: (*name).into(),
                     path: format!("Photos/{name}"),
@@ -1789,4 +1877,70 @@ mod tests {
         assert_eq!(event["work"]["independent_downloads"], true);
         assert_eq!(event["counts"]["files_failed"], 0);
     }
+    #[test]
+    fn on_demand_media_progress_does_not_credit_an_entire_original_or_double_count_workers() {
+        let mut report=report();report.source=ScanSource::Cloud;
+        let fetches=fetch::Fetches::new(4);
+        fetches.sampled_files.store(1,Ordering::Relaxed);fetches.sampled_original_bytes.store(1<<30,Ordering::Relaxed);
+        fetches.sampled_received_bytes.store(256<<10,Ordering::Relaxed);fetches.range_active.store(1,Ordering::Relaxed);
+        let sources=prefetch::State::default();sources.inventory.file_bytes.store(1<<30,Ordering::Relaxed);
+        sources.resolved_bytes.store(1<<30,Ordering::Relaxed);
+        let update=Progress{stage:filetwin_core::api::Stage::Encoding,counts:Counts::default(),elapsed_seconds:1.0,
+            work:Some(filetwin_core::api::WorkCounts{encoding:1,..Default::default()})};
+        let event=encoding_progress(&Counts::default(),&update,&report,1.0,&fetches,&sources);
+        assert_eq!(event["cloud_data"]["on_demand"],true);assert_eq!(event["cloud_data"]["ready_bytes"],0);
+        assert_eq!(event["cloud_data"]["sampled_received_bytes"],256<<10);
+        assert_eq!(event["work"]["fetching"],1);assert_eq!(event["work"]["range_fetching"],1);
+        assert_eq!(event["active"],1,"The same range-reading decoder is one analysis worker");
+    }
+
+    #[test]
+    fn full_sha_evidence_bridges_native_and_sparse_cloud_without_inventing_hashes() {
+        let gcid=format!("gcid:{}:123","ab".repeat(20));
+        let sha=format!("sha256:{:064x}",1);
+        let other_sha=format!("sha256:{:064x}",2);
+        let record=|id:&str| FileRecord {path:FilePath::Utf8("generated".into()),file_id:Some(id.into()),bytes:Some(123),
+            state:FileState::Ready,family:None,profile_id:None,vector:None,vector_sha256:None,reused:false,error:None,extraction:None};
+        let cloud=|id:&str,hash:&str| {
+            let mut file=InputFile::cloud(CloudItem{id:id.into(),name:"generated.mp4".into(),path:"/generated".into(),
+                is_folder:false,size:123,ancestors:vec![],revision:Some("ab".repeat(20))});
+            file.record=Some(record(hash));file
+        };
+        let native=|id:&str,hash:&str| {
+            let mut file=InputFile::external(ExternalSource{provider:Some("local".into()),id:id.into(),name:"generated.mp4".into(),
+                path:"/Native/generated".into(),size:123,local_path:None,revision:None,content_kind:None});
+            file.record=Some(record(hash));file
+        };
+        let sparse=cloud("range",&gcid);
+        let local=native("cross-native:local:copy",&sha);
+        let unproven=exact_evidence(&[sparse.clone(),local.clone()]);
+        assert_eq!(unproven,vec![Some(gcid.clone()),Some(sha.clone())],"Sparse bytes cannot prove a full SHA256");
+        let full=cloud("full",&sha);
+        let bridge=[sparse.clone(),local.clone(),full.clone()];
+        for order in [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]] {
+            let evidence=exact_evidence(&order.map(|index|bridge[index].clone()));
+            assert!(evidence.iter().all(|id|id.as_ref()==Some(&gcid)),"Proof is independent of discovery order");
+        }
+        let mut preview=native("cross-native:photos:preview",&sha);
+        preview.external.as_mut().unwrap().content_kind=Some(ExternalContentKind::PhotosPreview);
+        let proven=exact_evidence(&[sparse,local,full,native("cross-native:local:different",&other_sha),preview]);
+        assert_eq!(proven,vec![Some(gcid.clone()),Some(gcid.clone()),Some(gcid),Some(other_sha),None]);
+    }
+
+    #[test]
+    fn mixed_progress_counts_only_cloud_originals_in_cloud_byte_totals() {
+        let fetches=fetch::Fetches::new(4);
+        let cloud=fetches.track("generated-cloud",100);cloud.sample(20,100,20);
+        let native=fetches.track("generated-photos",1_000);native.native();native.sample(900,1_000,900);
+        let mut inventory=discovery::State::default();inventory.has_cloud=true;
+        let sources=prefetch::State { inventory:Arc::new(inventory),..Default::default() };
+        sources.inventory.file_bytes.store(1_100,Ordering::Relaxed);
+        sources.inventory.cloud_file_bytes.store(100,Ordering::Relaxed);
+        let update=Progress{stage:filetwin_core::api::Stage::Encoding,counts:Counts::default(),elapsed_seconds:1.0,work:None};
+        let event=encoding_progress(&Counts::default(),&update,&report(),1.0,&fetches,&sources);
+        assert_eq!(event["cloud_data"]["total_bytes"],100);
+        assert_eq!(event["cloud_data"]["ready_bytes"],20);
+        assert_eq!(event["downloads"]["received_bytes"],920);
+    }
+
 }

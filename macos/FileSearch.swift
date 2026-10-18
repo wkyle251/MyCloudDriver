@@ -2,7 +2,7 @@ import Combine
 import Darwin
 import Foundation
 
-enum FileSearchScope {
+enum FileSearchScope: Sendable {
     case expanded
     case root
 
@@ -10,12 +10,12 @@ enum FileSearchScope {
     var shortcut: String { self == .expanded ? "⌘F" : "⌘⇧F" }
 }
 
-struct FileSearchAncestor: Codable, Hashable {
+struct FileSearchAncestor: Codable, Hashable, Sendable {
     let id: String
     let name: String
 }
 
-struct FileSearchItem: Codable, Hashable, Identifiable {
+struct FileSearchItem: Codable, Hashable, Identifiable, Sendable {
     let id: String
     let name: String
     let kind: String
@@ -48,14 +48,14 @@ struct FileSearchMatch: Identifiable, Equatable {
     var fullPath: String { parentPath + " › " + item.name }
 }
 
-struct FileSearchProgress: Codable, Equatable {
+struct FileSearchProgress: Codable, Equatable, Sendable {
     var indexedItems = 0
     var scannedFolders = 0
     var discoveredFolders = 0
     var failedFolders = 0
 }
 
-struct FileSearchEvent: Decodable {
+struct FileSearchEvent: Decodable, Sendable {
     let event: String
     let parentId: String?
     let ancestors: [FileSearchAncestor]?
@@ -132,7 +132,7 @@ final class FileSearchIndex {
         complete = false
     }
 
-    func ingest(_ event: FileSearchEvent) {
+    func ingest(_ event: FileSearchEvent, sourceName: String = "PikPak") {
         progress = event.progress
         switch event.event {
         case "page":
@@ -143,12 +143,12 @@ final class FileSearchIndex {
             for item in items where !item.id.isEmpty {
                 entries[item.id] = Entry(item: item, ancestors: ancestors,
                                         normalizedName: Self.normalized(item.name),
-                                        linkID: nil, sourceName: "PikPak")
+                                        linkID: nil, sourceName: sourceName)
                 seenThisScan.insert(item.id)
             }
         case "failure":
-            let path = (["PikPak"] + (event.ancestors ?? []).map(\.name)).joined(separator: " › ")
-            addFailure("Source: PikPak name search\nCode: \(event.code ?? "SEARCH_FAILED")\nMessage: \(event.message ?? "This folder could not be scanned.")\nFolder: \(path)")
+            let path = ([sourceName] + (event.ancestors ?? []).map(\.name)).joined(separator: " › ")
+            addFailure("Source: \(sourceName) name search\nCode: \(event.code ?? "SEARCH_FAILED")\nMessage: \(event.message ?? "This folder could not be scanned.")\nFolder: \(path)")
         case "finished":
             complete = progress.failedFolders == 0
             if complete {
@@ -267,9 +267,19 @@ struct FileSearchConfiguration {
     let environment: [String: String]
 }
 
+protocol FileSearchScanJob: AnyObject {
+    var runningProcessIdentifier: Int32? { get }
+    func cancel()
+}
+
+typealias FileSearchScanFactory = (
+    _ onEvent: @escaping (FileSearchEvent) -> Void,
+    _ onFinish: @escaping (Int32, String) -> Void
+) -> any FileSearchScanJob
+
 /// A separate read-only helper, never the downloader/uploader or foreground
 /// browser process. Closing the palette terminates only this process.
-final class FileSearchJob: @unchecked Sendable {
+final class FileSearchJob: FileSearchScanJob, @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
     private var cancelled = false
@@ -393,6 +403,7 @@ private final class FileSearchWorker: @unchecked Sendable {
     private var rootIndex = FileSearchIndex()
     private var expandedIndex = FileSearchIndex()
     private var scope = FileSearchScope.root
+    private var sourceName = "PikPak"
     private var index: FileSearchIndex { scope == .root ? rootIndex : expandedIndex }
     private var generation = UUID()
     private var query = ""
@@ -403,10 +414,11 @@ private final class FileSearchWorker: @unchecked Sendable {
     init(publish: @escaping (UUID, FileSearchSnapshot) -> Void) { self.publish = publish }
 
     func rebind(_ id: UUID, scope: FileSearchScope? = nil, reset: Bool = false,
-                begin: Bool = false, expandedItems: [FileSearchMatch]? = nil) {
+                begin: Bool = false, expandedItems: [FileSearchMatch]? = nil, sourceName: String? = nil) {
         queue.async { [self] in
             generation = id
             if let scope { self.scope = scope }
+            if let sourceName { self.sourceName = sourceName }
             if reset { rootIndex = FileSearchIndex(); expandedIndex = FileSearchIndex(); query = "" }
             if let expandedItems { expandedIndex.replaceExpandedItems(expandedItems) }
             if begin { index.beginScan() }
@@ -416,7 +428,7 @@ private final class FileSearchWorker: @unchecked Sendable {
     func receive(_ event: FileSearchEvent, runID: UUID) {
         queue.async { [self] in
             guard generation == runID else { return }
-            index.ingest(event)
+            index.ingest(event, sourceName: sourceName)
             scheduleSnapshot()
         }
     }
@@ -427,7 +439,7 @@ private final class FileSearchWorker: @unchecked Sendable {
             guard generation == runID else { return }
             if code != 0 || (!index.complete && index.failures.isEmpty) {
                 let reported = FileSearchIndex.withoutStatusNotes(error)
-                index.addFailure("Source: PikPak name search\nCode: SEARCH_ENGINE_\(code)\nMessage: \(reported.isEmpty ? "The scan stopped before completion. Scan again to retry." : reported)")
+                index.addFailure("Source: \(sourceName) name search\nCode: SEARCH_ENGINE_\(code)\nMessage: \(reported.isEmpty ? "The scan stopped before completion. Scan again to retry." : reported)")
             }
             completion(makeSnapshot())
         }
@@ -472,6 +484,9 @@ final class FileSearchModel: ObservableObject {
     @Published private(set) var isPresented = false
     @Published private(set) var scope = FileSearchScope.root
     @Published private(set) var contextName = "My PikPak"
+    @Published private(set) var sourceName = "PikPak"
+    @Published private(set) var sourceSymbol = "cloud"
+    @Published private(set) var isNative = false
     @Published private(set) var query = ""
     @Published private(set) var results: [FileSearchMatch] = []
     @Published private(set) var totalMatches = 0
@@ -484,7 +499,9 @@ final class FileSearchModel: ObservableObject {
     @Published var selectedID: String?
     @Published private(set) var focusRequest = UUID()
     private var configuration: FileSearchConfiguration?
-    private var job: FileSearchJob?
+    private var job: (any FileSearchScanJob)?
+    private var nativeContextID: String?
+    private var scanFactory: FileSearchScanFactory?
     private var generation = UUID()
     private var resultLimit = 100
     private var queryTask: Task<Void, Never>?
@@ -500,12 +517,35 @@ final class FileSearchModel: ObservableObject {
         }
     }
 
-    var canScan: Bool { scope == .root && configuration != nil && !isScanning && !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    var scopeTitle: String { scope == .expanded ? "Current expanded items" : "Search from \(sourceName) root" }
+    var placeholder: String {
+        scope == .expanded ? "Search current expanded files and folders…" : "Search every file and folder from \(sourceName) root…"
+    }
+    var canScan: Bool { scope == .root && (configuration != nil || scanFactory != nil) && !isScanning && !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     var resourceProcessIdentifier: Int32? { job?.runningProcessIdentifier }
 
     func present(scope: FileSearchScope = .root, configuration: FileSearchConfiguration? = nil,
                  expandedItems: [FileSearchMatch] = [], contextName: String = "My PikPak",
                  failure: String? = nil) {
+        if isNative { reset() }
+        nativeContextID = nil; scanFactory = nil
+        sourceName = "PikPak"; sourceSymbol = "cloud"; isNative = false
+        presentContext(scope: scope, configuration: configuration, expandedItems: expandedItems,
+                       contextName: contextName, failure: failure)
+    }
+
+    func presentNative(scope: FileSearchScope = .expanded, contextID: String, contextName: String,
+                       sourceName: String, symbol: String, expandedItems: [FileSearchMatch] = [],
+                       scanFactory: FileSearchScanFactory? = nil, failure: String? = nil) {
+        if !isNative || nativeContextID != contextID { reset() }
+        nativeContextID = contextID; self.scanFactory = scanFactory
+        self.sourceName = sourceName; sourceSymbol = symbol; isNative = true
+        presentContext(scope: scope, configuration: nil, expandedItems: expandedItems,
+                       contextName: contextName, failure: failure)
+    }
+
+    private func presentContext(scope: FileSearchScope, configuration: FileSearchConfiguration?,
+                                expandedItems: [FileSearchMatch], contextName: String, failure: String?) {
         if self.scope != scope || scope == .expanded {
             stopScan()
             results = []; totalMatches = 0; selectedID = nil; indexedItems = 0
@@ -522,7 +562,8 @@ final class FileSearchModel: ObservableObject {
         isPresented = true
         focusRequest = UUID()
         if !isComplete && !isScanning { hasStartedScan = false }
-        worker.rebind(generation, scope: scope, expandedItems: scope == .expanded ? expandedItems : nil)
+        worker.rebind(generation, scope: scope, expandedItems: scope == .expanded ? expandedItems : nil,
+                      sourceName: sourceName)
         if scope == .root && !query.isEmpty && !isComplete && !isScanning { scanAgain() }
         requestMatches()
     }
@@ -550,7 +591,7 @@ final class FileSearchModel: ObservableObject {
 
     func scanAgain() { scanAgain(automatic: false) }
     private func scanAgain(automatic: Bool) {
-        guard canScan, let configuration else { return }
+        guard canScan else { return }
         retryTask?.cancel(); retryTask = nil
         if !automatic { retryAttempt = 0 }
         job?.cancel()
@@ -563,23 +604,29 @@ final class FileSearchModel: ObservableObject {
         failures = []
         worker.rebind(runID, begin: true)
         requestMatches()
-        let job = FileSearchJob()
-        self.job = job
         let worker = worker
-        job.start(configuration: configuration, onEvent: { event in
+        let onEvent: (FileSearchEvent) -> Void = { event in
             worker.receive(event, runID: runID)
-        }, onFinish: { [weak self] code, error in
+        }
+        let onFinish: (Int32, String) -> Void = { [weak self] code, error in
             worker.finish(code, error: error, runID: runID) { snapshot in
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.generation == runID else { return }
                     self.isScanning = false
                     self.job = nil
                     self.apply(snapshot)
-                    if code != 0 || !snapshot.complete { self.scheduleRetry(runID) }
+                    if (code != 0 || !snapshot.complete) && !self.isNative { self.scheduleRetry(runID) }
                     else { self.retryAttempt = 0 }
                 }
             }
-        })
+        }
+        if let scanFactory {
+            job = scanFactory(onEvent, onFinish)
+        } else if let configuration {
+            let engine = FileSearchJob()
+            job = engine
+            engine.start(configuration: configuration, onEvent: onEvent, onFinish: onFinish)
+        }
     }
 
     func stopScan() {
@@ -615,6 +662,8 @@ final class FileSearchModel: ObservableObject {
     func reset() {
         close()
         configuration = nil
+        nativeContextID = nil; scanFactory = nil
+        sourceName = "PikPak"; sourceSymbol = "cloud"; isNative = false
         configurationFailure = nil
         query = ""; results = []; totalMatches = 0; indexedItems = 0
         progress = FileSearchProgress(); failures = []; isComplete = false

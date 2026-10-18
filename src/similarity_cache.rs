@@ -27,6 +27,7 @@ pub(super) struct VectorCache {
     records: BTreeMap<(String, String), FileRecord>,
     bytes: usize,
     directory: PathBuf,
+    dirty: bool,
 }
 
 impl VectorCache {
@@ -35,6 +36,7 @@ impl VectorCache {
             records: Default::default(),
             bytes: 0,
             directory: directory.into(),
+            dirty: false,
         };
         // A cache is disposable. An interrupted or corrupt cache must never
         // prevent a scan; a valid legacy file is a useful migration fallback.
@@ -48,6 +50,7 @@ impl VectorCache {
                 cache.add(&record);
             }
         }
+        cache.dirty = false;
         cache
     }
 
@@ -75,6 +78,7 @@ impl VectorCache {
         ));
         self.bytes += bytes;
         self.records.insert(key, record);
+        self.dirty = true;
     }
 
     /// A temporary FileTwin-compatible JSON snapshot, automatically removed
@@ -85,6 +89,9 @@ impl VectorCache {
     }
 
     pub(super) fn save(&self) -> Result<()> {
+        if !self.dirty && !self.directory.join(LEGACY_FILENAME).exists() {
+            return Ok(());
+        }
         private_dir(&self.directory)?;
         let lock = private_file(&self.directory.join("filetwin-vectors.lock"), true)?;
         lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -175,17 +182,10 @@ fn private_file(path: &Path, create: bool) -> Result<File> {
 }
 
 pub(super) fn validate_record(record: &FileRecord) -> Result<()> {
-    let valid_sha = |id: &str| {
-        id.strip_prefix("sha256:").is_some_and(|s| {
-            s.len() == 64
-                && s.bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        })
-    };
     if record.state != FileState::Ready
         || record.bytes.is_none()
         || record.error.is_some()
-        || !record.file_id.as_deref().is_some_and(valid_sha)
+        || !record.file_id.as_deref().is_some_and(|id| filetwin_core::valid_content_id(id, record.bytes))
     {
         bail!("Invalid cached file metadata.");
     }

@@ -11,6 +11,8 @@ import Foundation
     }
     @MainActor static func main() async throws {
         try fractionsAndSnapshots()
+        try listingProgress()
+        try onDemandProgress()
         downloadTimeEstimates()
         processingSpeeds()
         try sourceTransferProgress()
@@ -42,6 +44,12 @@ import Foundation
                 downloads=dict(total=1,omitted=0,speed=50,items=[dict(id=1,name='large.bin',
                     received=500,total=2000,speed=50,state='downloading',attempt=1,retry_seconds=0)])))
         if launch==3:
+            emit(dict(event='inventory_check'))
+            emit(dict(event='discovery_listing',folders_discovered=9,folders_completed=4,
+                folders_pending=5,pages_completed=11,found=25,complete=False))
+            deadline=time.monotonic()+10
+            while not (data/'allow-comparison').exists() and time.monotonic()<deadline:
+                time.sleep(.02)
             emit(dict(event='restored_inventory'))
             progress('comparison')
             # Exit immediately: the UI must drain queued final events too.
@@ -115,6 +123,10 @@ import Foundation
 
         let third = SimilarityScanModel(source:.cloud,activity:FinderTaskActivityStore())
         third.start(config,resuming:saved)
+        try await until { third.progress.stage == .checking && third.progress.listingFoldersCompleted == 4 }
+        precondition(third.progress.listingPagesCompleted == 11 && third.progress.listingFilesFound == 25,
+            "The model must retain numeric discovery progress during the final change check")
+        try Data().write(to:config.dataDirectory.appendingPathComponent("allow-comparison"))
         try await until { !third.isRunning && third.report != nil }
         precondition(third.report?.downloadedBytes == 1700 && third.progress.downloadedBytes == 1700,
             "Resuming a sealed comparison must not add its historical report bytes again")
@@ -123,6 +135,46 @@ import Foundation
         third.clearSession()
         print("PASS every progress card and queue snapshot saved on pause, including late analysis completion")
         print("PASS same-helper pause, two restarts and sealed comparisons preserve cumulative totals without double counting")
+    }
+    static func onDemandProgress() throws {
+        let event: [String:Any] = ["stage":"analysing", "completed":9, "total":10, "discovery_complete":true,
+            "cloud_data":["ready_bytes":1000, "total_bytes":1000, "inventory_complete":true,
+                "on_demand":true, "sampled_files":2, "sampled_received_bytes":1_048_576]]
+        let progress = SimilarityScanProgress(event:event)
+        precondition(progress.usesOnDemandCloudProgress && !progress.usesCloudByteProgress)
+        precondition(progress.fraction == 0.9, "Sampled originals use file-analysis progress, not whole-file byte readiness")
+        precondition(progress.cloudDownloadSecondsRemaining(at:Date()) == nil)
+        precondition(progress.cloudDownloadTimeLabel(at:Date(), running:true) == nil)
+        precondition(progress.cloudByteLabel?.contains("2 sampled originals") == true)
+        let restored = try JSONDecoder().decode(SimilarityScanProgress.self, from:JSONEncoder().encode(progress))
+        precondition(restored.cloudOnDemand == true && restored.sampledReceivedBytes == 1_048_576)
+        var summary = SimilarityScanProgress(); summary.restoreSummary(from:restored)
+        precondition(summary.cloudOnDemand == true && summary.sampledOriginals == 2)
+        let row = SimilarityDownload(event:["id":1, "name":"generated.mp4", "received":1_048_576,
+            "total":1_073_741_824, "speed":1024, "state":"downloading", "on_demand":true])!
+        precondition(row.fraction == nil && row.remainingLabel(speed:1024) == "—")
+        precondition(row.status(age:0, running:true) == "Fetching ranges")
+        precondition(row.byteLabel.contains("fetched as needed"))
+        let oldRow = SimilarityDownload(event:["id":2, "name":"generated.txt", "received":10, "total":100])!
+        precondition(oldRow.onDemand == nil && oldRow.fraction == 0.1)
+        print("PASS sampled cloud originals show range traffic without whole-file readiness or download ETA")
+    }
+    static func listingProgress() throws {
+        var progress = SimilarityScanProgress()
+        progress.stage = .checking
+        progress.applyListing(["folders_discovered":9, "folders_completed":4,
+            "folders_pending":5, "pages_completed":11, "found":25])
+        precondition(progress.completedLabel == "4 of 9 folders checked · 11 pages · 25 files found")
+        precondition(progress.fraction == nil, "A growing folder inventory must remain indeterminate")
+        let data = try JSONEncoder().encode(progress)
+        let restored = try JSONDecoder().decode(SimilarityScanProgress.self, from:data)
+        precondition(restored.listingFoldersCompleted == 4 && restored.listingPagesCompleted == 11)
+        precondition(restored.afterHelperRestart().listingFoldersCompleted == nil)
+        var old = try JSONSerialization.jsonObject(with:data) as! [String:Any]
+        for key in ["listingFoldersDiscovered", "listingFoldersCompleted", "listingFoldersPending", "listingPagesCompleted", "listingFilesFound"] { old.removeValue(forKey:key) }
+        let legacy = try JSONDecoder().decode(SimilarityScanProgress.self, from:JSONSerialization.data(withJSONObject:old))
+        precondition(legacy.listingFoldersCompleted == nil, "Older snapshots remain readable")
+        print("PASS final inventory checks show folder/page/file progress and keep old snapshots readable")
     }
     static func fractionsAndSnapshots() throws {
         let event: [String:Any] = ["stage":"analysing","completed":9,"total":10,"discovery_complete":true,

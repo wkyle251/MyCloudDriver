@@ -1,6 +1,93 @@
 use super::*;
 
 #[tokio::test]
+async fn restored_queue_without_gcid_recognizes_a_completed_receipt_before_any_url_lookup() {
+    use std::sync::atomic::Ordering;
+    for pat in [false, true] {
+        let fixture = guest_fixture::Fixture::new().await;
+        fixture.user_available.store(true, Ordering::SeqCst);
+        let mut gcid = pikpak::upload::GcidHasher::new(8); gcid.update(b"abcdefgh");
+        fixture.saved.lock().unwrap()["hash"] = serde_json::json!(gcid.finish());
+        let builder = Client::builder().api_base_url(&fixture.base).auth_base_url(&fixture.base);
+        let client = if pat { builder.personal_access_token("account-access") }
+            else { builder.refresh_token("account-refresh").device_id("generated-device") }
+            .build().unwrap().with_content_mode(pikpak::ContentMode::User);
+        let file: FileInfo = serde_json::from_value(fixture.saved.lock().unwrap().clone()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        download_file(&client, &file, directory.path(), false, false, Arc::new(AtomicU64::new(0))).await.unwrap();
+        let mut restored = file.clone(); restored.hash = None;
+        restored.modified_time = Some("stale-queue-time".into());
+        fixture.user_available.store(false, Ordering::SeqCst);
+        fixture.requests.lock().unwrap().clear();
+        let received = Arc::new(AtomicU64::new(0));
+        download_file(&client.clone().with_content_mode(pikpak::ContentMode::Dynamic), &restored, directory.path(),
+            false, false, received.clone()).await.unwrap();
+        assert_eq!(received.load(Ordering::Relaxed), 0);
+        assert!(fixture.requests.lock().unwrap().is_empty(), "A completed local receipt needs no Guest or User request");
+        assert_eq!(std::fs::read(directory.path().join(&file.name)).unwrap(), b"abcdefgh");
+        restored.hash = Some("EF".repeat(20));
+        assert!(download_file(&client, &restored, directory.path(), false, false, Arc::new(AtomicU64::new(0))).await.is_err(),
+            "A known different content revision must not adopt the old receipt");
+        assert!(fixture.requests.lock().unwrap().iter().any(|request| request.starts_with("GET /drive/v1/files/")));
+        restored.hash = None;
+        let path = directory.path().join(&file.name); let modified = path.metadata().unwrap().modified().unwrap();
+        std::fs::write(&path, b"xxxxxxxx").unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(modified).unwrap();
+        assert!(download_file(&client, &restored, directory.path(), false, false, Arc::new(AtomicU64::new(0))).await.is_err(),
+            "Download recovery still rejects a changed local file even though duplicate scans trust its GCID");
+        assert_eq!(std::fs::read(&path).unwrap(), b"xxxxxxxx");
+    }
+}
+
+#[tokio::test]
+async fn missing_guest_original_falls_back_to_fresh_user_url_for_oauth_and_pat() {
+    use std::sync::atomic::Ordering;
+    for pat in [false, true] {
+        let fixture = guest_fixture::Fixture::new().await;
+        fixture.user_available.store(true, Ordering::SeqCst);
+        fixture.original.lock().unwrap()["web_content_link"] = serde_json::Value::Null;
+        fixture.saved.lock().unwrap()["web_content_link"] = serde_json::Value::Null;
+        fixture.share_create_status.store(403, Ordering::SeqCst);
+        fixture.user_url_missing_responses.store(1, Ordering::SeqCst);
+        let builder = Client::builder().api_base_url(&fixture.base).auth_base_url(&fixture.base);
+        let client = if pat { builder.personal_access_token("account-access") }
+            else { builder.refresh_token("account-refresh").device_id("generated-device") }
+            .build().unwrap().with_content_mode(pikpak::ContentMode::Dynamic);
+        let file: FileInfo = serde_json::from_value(fixture.saved.lock().unwrap().clone()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        download_file(&client, &file, directory.path(), false, false, Arc::new(AtomicU64::new(0))).await.unwrap();
+        assert_eq!(std::fs::read(directory.path().join("saved-name.bin")).unwrap(), b"abcdefgh");
+        let requests = fixture.requests.lock().unwrap();
+        assert_eq!(requests.iter().filter(|request| request.starts_with("GET /drive/v1/files/saved-id")).count(), 2);
+        assert!(!requests.iter().any(|request| request.starts_with("GET /guest-body/")));
+        assert!(requests.iter().any(|request| request.starts_with("GET /user-body/")));
+        assert_eq!(client.content_mode(), pikpak::ContentMode::Dynamic);
+    }
+}
+
+#[tokio::test]
+async fn unavailable_guest_and_user_original_is_bounded_and_explains_fallback() {
+    use std::sync::atomic::Ordering;
+    let fixture = guest_fixture::Fixture::new().await;
+    fixture.user_available.store(true, Ordering::SeqCst);
+    fixture.original.lock().unwrap()["web_content_link"] = serde_json::Value::Null;
+    fixture.saved.lock().unwrap()["web_content_link"] = serde_json::Value::Null;
+    fixture.share_create_status.store(403, Ordering::SeqCst);
+    *fixture.user_link_override.lock().unwrap() = Some(String::new());
+    let client = Client::builder().personal_access_token("account-access")
+        .api_base_url(&fixture.base).auth_base_url(&fixture.base).build().unwrap()
+        .with_content_mode(pikpak::ContentMode::Dynamic);
+    let file: FileInfo = serde_json::from_value(fixture.saved.lock().unwrap().clone()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let error = download_file(&client, &file, directory.path(), false, false, Arc::new(AtomicU64::new(0))).await.unwrap_err();
+    assert!(error.to_string().contains("Guest access was unavailable; User Mode"));
+    assert_eq!(pikpak::download_policy::permanent_failure(&error), Some(pikpak::download_policy::ORIGINAL_URL_UNAVAILABLE));
+    assert!(!pikpak::download_policy::retryable(&error));
+    assert_eq!(fixture.requests.lock().unwrap().iter().filter(|request| request.starts_with("GET /drive/v1/files/saved-id")).count(), 2);
+    assert!(!directory.path().join("saved-name.bin").exists());
+}
+
+#[tokio::test]
 async fn expired_original_downloads_through_new_share_and_resumes_verified_prefix() {
     for status in ["EXPIRED", "DELETED", "AUDIT_FAILED"] {
         let fixture = guest_fixture::Fixture::new().await;

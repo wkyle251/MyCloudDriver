@@ -46,10 +46,37 @@ pub(super) struct InputFile {
 }
 
 impl InputFile {
+    pub fn is_photos_source(&self) -> bool {
+        self.external.as_ref().is_some_and(|item| {
+            item.provider.as_deref() == Some("photos") || item.id.starts_with("asset:")
+        })
+    }
     pub fn is_photos_preview(&self) -> bool {
         self.external
             .as_ref()
             .is_some_and(|item| item.content_kind == Some(ExternalContentKind::PhotosPreview))
+    }
+    /// Exact-copy evidence is independent of the vector cache's content-ID
+    /// representation. A provider GCID unifies full-hashed and range originals;
+    /// preview digests and stale-sized analysis never identify the original.
+    pub fn exact_identity(&self) -> Option<String> {
+        if self.is_photos_preview() { return None; }
+        let record=self.record.as_ref()?;
+        let id=record.file_id.as_deref()?;
+        if record.bytes!=Some(self.display.bytes)
+            || record.error.as_ref().is_some_and(|error|error.code==filetwin_core::ErrorCode::SourceChanged)
+            || !filetwin_core::valid_content_id(id,record.bytes) { return None; }
+        if let Some(cloud)=&self.cloud {
+            if record.bytes!=Some(cloud.size) {return None;}
+            if let Some(hash)=cloud.revision.as_deref().map(str::trim).filter(|hash|hash.len()==40 && hash.bytes().all(|b|b.is_ascii_hexdigit())) {
+                if cloud.size>0 {
+                    let exact=format!("gcid:{}:{}",hash.to_ascii_lowercase(),cloud.size);
+                    if id.starts_with("gcid:") && id!=exact {return None;}
+                    return Some(exact);
+                }
+            }
+        }
+        Some(id.to_owned())
     }
     pub fn local_device(&self) -> Option<u64> {
         if self.cloud.is_none() && self.external.is_none() {
@@ -692,5 +719,56 @@ impl InputFile {
             extraction: None,
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod exact_identity_tests {
+    use super::*;
+    use filetwin_core::api::{FilePath,FileRecord,FileState};
+    fn input(id:&str,content:&str)->InputFile {
+        let mut file=InputFile::cloud(CloudItem{id:id.into(),name:"generated.mp4".into(),path:"/generated.mp4".into(),is_folder:false,size:123,ancestors:vec![],revision:Some("AB".repeat(20))});
+        let profile=filetwin_core::profile::video_profile();let mut vector=vec![0.0f32;profile.dimensions];vector[0]=1.0;
+        let bytes=vector.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>();
+        file.record=Some(FileRecord{path:FilePath::Utf8(id.into()),file_id:Some(content.into()),bytes:Some(123),state:FileState::Ready,family:Some("video".into()),profile_id:Some(profile.profile_id),vector:Some(vector),vector_sha256:Some(hex::encode(ring::digest::digest(&ring::digest::SHA256,&bytes))),reused:false,error:None,extraction:None});
+        file.display.family="video".into();file.display.state="ready".into();file
+    }
+    #[test]
+    fn full_and_range_exact_identity_agree_in_both_cache_completion_orders() {
+        for reversed in [false,true] {
+            let root=tempfile::tempdir().unwrap();let cache=source_cache::SourceCache::open(root.path()).unwrap();
+            let full=input("generated-full",&format!("sha256:{:064x}",1));let range=input("generated-range",&format!("gcid:{}:123","ab".repeat(20)));
+            for file in if reversed {[&range,&full]}else{[&full,&range]} {cache.completed(file,file.record.as_ref().unwrap()).unwrap();}
+            let files=[full,range].map(|mut file| {file.record=cache.reused(&file,filetwin_core::profile::Backend::Cpu,&["video".into()]).unwrap();file});
+            let key=format!("gcid:{}:123","ab".repeat(20));
+            assert!(files.iter().all(|file|file.exact_identity().as_deref()==Some(key.as_str())));
+            assert!(files[0].record.as_ref().unwrap().file_id.as_ref().unwrap().starts_with("sha256:"));
+            assert!(files[1].record.as_ref().unwrap().file_id.as_ref().unwrap().starts_with("gcid:"));
+            let writer=store::MatrixWriter::new(root.path()).unwrap();
+            for (ordinal,file) in files.iter().enumerate() {writer.file_with_digest(ordinal,&file.display,file.record.as_ref(),file.exact_identity().as_deref()).unwrap();}
+            let run=writer.id.clone();writer.publish(&json!({})).unwrap();
+            let groups=grouping::group_scores(GroupQuery{data_dir:root.path().into(),run_id:run,result_revision:1,minimum_score:1.0,include_identical:true},&AtomicBool::new(false)).unwrap();
+            assert_eq!(groups.groups.len(),1);assert!(groups.groups[0].identical);assert_eq!(groups.groups[0].file_ids.len(),2);
+        }
+    }
+    #[test]
+    fn previews_changed_sources_and_mismatched_sizes_never_gain_exact_evidence() {
+        let valid=input("generated",&format!("sha256:{:064x}",1));
+        let mut preview=valid.clone();preview.external=Some(ExternalSource{provider:None,id:"preview".into(),name:"generated".into(),path:"/generated".into(),size:123,local_path:None,revision:Some("preview".into()),content_kind:Some(ExternalContentKind::PhotosPreview)});assert!(preview.exact_identity().is_none());
+        let mut changed=valid.clone();changed.record.as_mut().unwrap().error=Some(filetwin_core::Error::new(filetwin_core::ErrorCode::SourceChanged,"validation","generated change"));assert!(changed.exact_identity().is_none());
+        let mut missing=valid.clone();missing.record.as_mut().unwrap().file_id=None;assert!(missing.exact_identity().is_none());
+        let mut resized=valid.clone();resized.cloud.as_mut().unwrap().size+=1;resized.display.bytes+=1;assert!(resized.exact_identity().is_none());
+        let wrong=input("generated",&format!("gcid:{}:123","cd".repeat(20)));assert!(wrong.exact_identity().is_none());
+    }
+    #[test]
+    fn old_sha_prefix_migrates_to_canonical_exact_digest_without_relabeling_vectors() {
+        let root=tempfile::tempdir().unwrap();let checkpoint=root.path().join("12345678-1234-1234-1234-123456789abc");private_dir(&checkpoint).unwrap();
+        let files=[input("generated-a",&format!("sha256:{:064x}",1)),input("generated-b",&format!("sha256:{:064x}",1))];
+        let writer=store::MatrixWriter::resume(root.path(),&checkpoint).unwrap();for (ordinal,file)in files.iter().enumerate(){writer.file(ordinal,&file.display,file.record.as_ref()).unwrap();}writer.score(0,1,1.0).unwrap();writer.checkpoint().unwrap();drop(writer);
+        let writer=store::MatrixWriter::resume(root.path(),&checkpoint).unwrap();let mut records=std::collections::BTreeMap::<&str,Vec<(usize,&FileRecord)>>::new();
+        for (ordinal,file)in files.iter().enumerate(){writer.file_with_digest(ordinal,&file.display,file.record.as_ref(),file.exact_identity().as_deref()).unwrap();let record=file.record.as_ref().unwrap();records.entry(record.profile_id.as_deref().unwrap()).or_default().push((ordinal,record));}
+        writer.prepare(&comparison::profiles(&records).unwrap()).unwrap();assert_eq!(writer.saved_scores().unwrap(),1);let run=writer.id.clone();writer.publish(&json!({})).unwrap();
+        let saved=store::SavedMatrix::open(root.path(),&run,1).unwrap();assert!(saved.files.iter().all(|f|f.digest==files[0].exact_identity()));
+        assert!(files.iter().all(|file|file.record.as_ref().unwrap().file_id.as_deref()==Some(format!("sha256:{:064x}",1).as_str())));
     }
 }

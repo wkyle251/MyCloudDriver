@@ -31,19 +31,25 @@ struct Bytes {
 struct Staging {
     used: Mutex<u64>,
     limit: AtomicU64,
+    ceiling: Option<u64>,
+    required: AtomicU64,
+    paused: AtomicBool,
+    completion: Mutex<BTreeMap<(u64, u64), usize>>,
 }
 struct Reservation {
     budget: Arc<Staging>,
     bytes: u64,
     active: AtomicBool,
+    completion_extra: Option<u64>,
 }
 impl Drop for Reservation {
     fn drop(&mut self) { self.release(); }
 }
 impl Reservation {
-    fn new(budget: Arc<Staging>, bytes: u64) -> Self { Self { budget, bytes, active: AtomicBool::new(true) } }
+    fn new(budget: Arc<Staging>, bytes: u64) -> Self { Self { budget, bytes, active: AtomicBool::new(true), completion_extra: None } }
     fn split(&mut self, bytes: u64) -> Self {
         assert!(bytes <= self.bytes && self.active.load(Ordering::Acquire));
+        assert!(self.completion_extra.is_none());
         self.bytes -= bytes;
         Self::new(self.budget.clone(), bytes)
     }
@@ -52,16 +58,48 @@ impl OriginalReservation for Reservation {
     fn bytes(&self) -> u64 { self.bytes }
     fn release(&self) {
         let mut used = self.budget.used.lock().unwrap();
-        if self.active.swap(false, Ordering::AcqRel) { *used -= self.bytes; }
+        if self.active.swap(false, Ordering::AcqRel) {
+            *used -= self.bytes;
+            if let Some(extra) = self.completion_extra {
+                let mut completion = self.budget.completion.lock().unwrap();
+                Staging::untrack(&mut completion, extra, self.bytes);
+            }
+        }
     }
     fn try_reacquire(&self) -> bool {
         let mut used = self.budget.used.lock().unwrap();
         if self.active.load(Ordering::Acquire) { return true; }
         if self.bytes > self.budget.limit.load(Ordering::Acquire).saturating_sub(*used) { return false; }
+        if let Some(extra) = self.completion_extra {
+            let mut completion = self.budget.completion.lock().unwrap();
+            *completion.entry((extra, self.bytes)).or_default() += 1;
+            if Staging::minimum_for(used.saturating_add(self.bytes), &completion) > self.budget.limit.load(Ordering::Acquire) {
+                Staging::untrack(&mut completion, extra, self.bytes); return false;
+            }
+        }
         *used += self.bytes; self.active.store(true, Ordering::Release); true
     }
 }
 impl Staging {
+    fn untrack(completion: &mut BTreeMap<(u64, u64), usize>, extra: u64, bytes: u64) {
+        let key = (extra, bytes);
+        let count = completion.get_mut(&key).unwrap(); *count -= 1;
+        if *count == 0 { completion.remove(&key); }
+    }
+    fn minimum_for(used: u64, completion: &BTreeMap<(u64, u64), usize>) -> u64 {
+        let mut minimum = used; let mut released = 0u64;
+        for (&(extra, bytes), &count) in completion {
+            for _ in 0..count {
+                minimum = minimum.max(used.saturating_sub(released).saturating_add(extra));
+                released += bytes;
+            }
+        }
+        minimum
+    }
+    fn new(limit: u64, ceiling: Option<u64>) -> Self {
+        Self { used: Mutex::new(0), limit: AtomicU64::new(limit), ceiling,
+            required: AtomicU64::new(0), paused: AtomicBool::new(false), completion: Mutex::new(BTreeMap::new()) }
+    }
     fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<Reservation> {
         let mut used = self.used.lock().unwrap();
         if bytes > self.limit.load(Ordering::Acquire).saturating_sub(*used) { return None; }
@@ -72,21 +110,29 @@ impl Staging {
     fn reserve(
         self: &Arc<Self>,
         bytes: u64,
+        completion_extra: u64,
         cancel: &CancellationToken,
         phase: &Phase,
     ) -> Result<Reservation> {
         loop {
             read_checkpoint(cancel)?;
-            if bytes > self.limit.load(Ordering::Acquire) {
+            if bytes > self.ceiling.unwrap_or_else(|| self.limit.load(Ordering::Acquire)) {
                 return Err(Error::new(ErrorCode::ResourceBudgetTooSmall, "memory", "The adjusted RAM budget cannot fit this input."));
             }
             {
                 let mut used = self.used.lock().unwrap();
-                if bytes <= self.limit.load(Ordering::Acquire).saturating_sub(*used) {
+                let mut completion = self.completion.lock().unwrap();
+                *completion.entry((completion_extra, bytes)).or_default() += 1;
+                let required = Self::minimum_for(used.saturating_add(bytes), &completion);
+                if !self.paused.load(Ordering::Acquire) && required <= self.limit.load(Ordering::Acquire) {
                     *used += bytes;
                     phase.store(READING, Ordering::Release);
-                    return Ok(Reservation::new(self.clone(), bytes));
+                    let mut reservation = Reservation::new(self.clone(), bytes);
+                    reservation.completion_extra = Some(completion_extra);
+                    return Ok(reservation);
                 }
+                Self::untrack(&mut completion, completion_extra, bytes);
+                self.required.fetch_max(required, Ordering::Relaxed);
             }
             phase.store(WAITING, Ordering::Release);
             std::thread::sleep(Duration::from_millis(5));
@@ -135,12 +181,13 @@ impl Input {
         match (&self.file, &self.revision) {
             (Reader::File(file), Some(revision)) => local::still_current(file, &self.source.path, revision),
             (Reader::Memory(_), None) => true,
+            (Reader::Seekable(_), None) => self.source.seekable.as_ref().is_some_and(|s| s.current()),
             _ => false,
         }
     }
     fn changed(&mut self) {
         self.record.file_id = None;
-        self.record.error = Some(changed_error());
+        self.record.error = Some(self.source.seekable.as_ref().and_then(|s| s.failure()).unwrap_or_else(changed_error));
         self.record.state = FileState::Failed;
     }
 }
@@ -150,6 +197,22 @@ fn changed_error() -> Error {
         "validation",
         "Source changed during processing; vector discarded",
     )
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn a_small_original_does_not_hide_larger_reader_completion_requirements() {
+        let mut completion = BTreeMap::new();
+        completion.insert((0, 512 << 20), 1);
+        completion.insert((15 << 30, 15 << 30), 2);
+        let used = (30 << 30) + (512 << 20);
+        assert_eq!(Staging::minimum_for(used, &completion), 45 << 30);
+        assert!(Staging::minimum_for(used, &completion) > (32 << 30) - (512 << 20));
+        Staging::untrack(&mut completion, 15 << 30, 15 << 30);
+        assert_eq!(Staging::minimum_for(used - (15 << 30), &completion), 30 << 30);
+    }
 }
 fn blank(key: &Path) -> FileRecord {
     FileRecord {
@@ -208,11 +271,16 @@ fn prepare(
     read_checkpoint(cancel)?;
     phase.store(FETCHING, Ordering::Release);
     let source = source.resolve(cancel)?;
-    if source.memory.is_none() && !source.path.is_absolute() {
+    if source.memory.is_none() && source.seekable.is_none() && !source.path.is_absolute() {
         return Err(Error::invalid("A resolved source must be an absolute path"));
     }
     phase.store(READING, Ordering::Release);
-    let (mut file, revision, source_bytes) = if let Some(memory) = &source.memory {
+    let (mut file, revision, source_bytes) = if let Some(input) = &source.seekable {
+        if !crate::valid_content_id(input.content_id(), Some(input.len())) || !input.content_id().starts_with("gcid:") {
+            return Err(Error::invalid("Seekable media needs a verified provider GCID and original length"));
+        }
+        (Reader::seekable(input.clone()), None, input.len())
+    } else if let Some(memory) = &source.memory {
         (Reader::memory(memory.clone()), None, memory.as_ref().as_ref().len() as u64)
     } else {
         let file = local::open_secure(&source.path)?;
@@ -225,9 +293,12 @@ fn prepare(
     let mut prefix = [0u8; 4096];
     let n = file.read(&mut prefix)?;
     bytes.read.fetch_add(n as u64, Ordering::Relaxed);
-    if source.memory.is_none() { bytes.acquired.fetch_add(n as u64, Ordering::Relaxed); }
+    if source.memory.is_none() && source.seekable.is_none() { bytes.acquired.fetch_add(n as u64, Ordering::Relaxed); }
     file.seek(SeekFrom::Start(0))?;
     let (family, format) = detect_format(&prefix[..n], &source.path);
+    if source.seekable.is_some() && format != "media" {
+        return Err(Error::new(ErrorCode::UnsupportedFormat, "validation", "Seekable originals are restricted to media containers"));
+    }
     // A container's sniffed family is only a hint. Probe its streams before
     // deciding whether it is audio or video, and constrain the worker profiles.
     let excluded = family != "unknown" && source.families.as_ref().is_some_and(|families| {
@@ -239,11 +310,17 @@ fn prepare(
     });
     let native = !excluded && format != "utf8" && family != "unknown";
     let required = source_bytes.saturating_add(2 * protocol::MAX_RESPONSE as u64);
-    let needs_copy = source.memory.is_none() && (native
+    let needs_copy = source.memory.is_none() && source.seekable.is_none() && (native
         || (config.memory_scheduling && !excluded && format == "utf8"));
-    let overflow = needs_copy && required > staging.limit.load(Ordering::Acquire);
+    let completion_extra = if config.memory_ceiling.is_some() && needs_copy {
+        let reader_copy = if matches!(format, "utf8" | "media" | "heif_avif") || matches!(family, "audio" | "video") { 0 } else { source_bytes };
+        let decoder = if matches!(family, "image" | "video") || format == "media" { 512 << 20 } else { 128 << 20 };
+        reader_copy.saturating_add(decoder).saturating_sub(512 << 20)
+    } else { 0 };
+    let overflow = needs_copy && (required > staging.ceiling.unwrap_or_else(|| staging.limit.load(Ordering::Acquire))
+        || config.memory_ceiling.is_some_and(|ceiling| required.saturating_add(completion_extra).saturating_add(512 << 20) > ceiling));
     let mut reservation = if needs_copy && !overflow {
-        Some(staging.reserve(required, cancel, &phase)?)
+        Some(staging.reserve(required, completion_extra, cancel, &phase)?)
     } else {
         None
     };
@@ -261,12 +338,18 @@ fn prepare(
     };
     // In RAM scheduling mode acquisition only copies bytes. Hashing is a
     // separate analysis job, admitted after transferring the original's lease.
-    let mut hash = (!config.memory_scheduling).then(Sha256::new);
+    let mut hash = (!config.memory_scheduling && source.seekable.is_none()).then(Sha256::new);
     let mut buffer = [0u8; 65536];
     let mut size = 0u64;
-    let acquire = !config.memory_scheduling || memory_copy.is_some() || staged.is_some();
+    let acquire = source.seekable.is_none() && (!config.memory_scheduling || memory_copy.is_some() || staged.is_some());
     while acquire {
         read_checkpoint(cancel)?;
+        while staging.paused.load(Ordering::Acquire) {
+            phase.store(WAITING, Ordering::Release);
+            read_checkpoint(cancel)?;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        phase.store(READING, Ordering::Release);
         let n = file.read(&mut buffer)?;
         if n == 0 {
             break;
@@ -280,7 +363,7 @@ fn prepare(
             bytes.hashed.fetch_add(n as u64, Ordering::Relaxed);
         }
         bytes.read.fetch_add(n as u64, Ordering::Relaxed);
-        if source.memory.is_none() { bytes.acquired.fetch_add(n as u64, Ordering::Relaxed); }
+        if source.memory.is_none() && source.seekable.is_none() { bytes.acquired.fetch_add(n as u64, Ordering::Relaxed); }
         if let Some(staged) = &mut staged { staged.write_all(&buffer[..n])?; }
         if let Some(copy) = &mut memory_copy {
             if size > source_bytes { return Err(changed_error()); }
@@ -292,7 +375,7 @@ fn prepare(
     }
     if acquire && size != source_bytes { return Err(changed_error()); }
     let mut record = blank(&source.key);
-    record.file_id = hash.map(|hash| format!("sha256:{:x}", hash.finalize()));
+    record.file_id = source.seekable.as_ref().map(|s| s.content_id().to_owned()).or_else(|| hash.map(|hash| format!("sha256:{:x}", hash.finalize())));
     record.bytes = Some(if acquire { size } else { source_bytes });
     record.family = (family != "unknown").then(|| family.into());
     if excluded {
@@ -310,7 +393,7 @@ fn prepare(
             Error::new(
                 ErrorCode::ResourceBudgetTooSmall,
                 "staging",
-                if config.memory_staging { "Original needs more RAM than the scan allowance; increase Scan Resources. No disk copy was created." } else { "File exceeds the private staging allowance" },
+                if config.memory_staging { "Original cannot fit in available system memory. No disk copy was created." } else { "File exceeds the private staging allowance" },
             ),
         );
     } else if family == "unknown" {
@@ -348,7 +431,7 @@ fn prepare(
     // 64 MiB bands so tiny differences in original size do not reload the
     // model for every image. Reader copies are charged at their exact size.
     if config.memory_scheduling {
-        input.allowance = input.allowance.min(config.memory_bytes.saturating_sub(input.fixed_bytes()));
+        input.allowance = input.allowance.min(config.memory_ceiling.unwrap_or(config.memory_bytes).saturating_sub(input.fixed_bytes()));
     } else {
         input.allowance = (input.allowance.saturating_sub(input.reader_copy_bytes()) / (64 << 20) * (64 << 20))
             .max(512 << 20)
@@ -446,6 +529,7 @@ struct Pipeline<'a> {
     checkpoint_error: Option<Error>,
     started: Instant,
     last_progress: Instant,
+    retry_blocked_since: Option<Instant>,
 }
 impl Drop for Pipeline<'_> {
     fn drop(&mut self) {
@@ -473,8 +557,21 @@ impl Pipeline<'_> {
             ready: self.queued.len() as u64,
             original_memory_bytes: if self.config.memory_staging { *self.staging.used.lock().unwrap() } else { 0 },
             original_bytes_read: self.bytes.acquired.load(Ordering::Relaxed),
+            staging_memory_required: self.staging.required.swap(0, Ordering::Relaxed),
+            staging_memory_limit: self.config.staging_bytes,
             ..WorkCounts::default()
         };
+        work.analysis_memory_forecast = self.analysis.used();
+        for input in self.queued.iter().filter(|input| input.analysis_reservation.is_none()) {
+            work.analysis_memory_forecast = work.analysis_memory_forecast.saturating_add(input.reservation_bytes());
+            work.analysis_growth_bytes = work.analysis_growth_bytes.saturating_add(input.reservation_bytes()
+                .saturating_sub(input.original_bytes().saturating_sub(input.transferred_bytes())));
+        }
+        if let Some(input) = self.queued.iter().filter(|input| input.analysis_reservation.is_none())
+            .min_by_key(|input| input.reservation_bytes().saturating_sub(input.original_bytes().saturating_sub(input.transferred_bytes()))) {
+            work.analysis_memory_required = self.analysis.used().saturating_add(input.reservation_bytes());
+            work.analysis_transfer_bytes = input.original_bytes().saturating_sub(input.transferred_bytes());
+        }
         for phase in self.jobs.values() {
             match phase.load(Ordering::Acquire) {
                 FETCHING => work.fetching += 1,
@@ -579,7 +676,7 @@ impl Pipeline<'_> {
         )
     }
     fn adjust_allowance(&self, input: &mut Input) -> Result<()> {
-        let available = self.config.memory_bytes.saturating_sub(input.fixed_bytes());
+        let available = self.config.memory_ceiling.unwrap_or(self.config.memory_bytes).saturating_sub(input.fixed_bytes());
         let minimum = if input.record.error.is_some() || input.format == "utf8" { 1 << 20 }
             else if input.visual() || input.format == "media" { 512 << 20 }
             else { 128 << 20 };
@@ -592,11 +689,25 @@ impl Pipeline<'_> {
     fn update_resources(&mut self, limits: LiveResources) {
         self.config.workers = limits.workers.max(1);
         self.config.memory_bytes = limits.memory_bytes.max(1);
-        self.config.staging_bytes = limits.staging_bytes.max(1);
+        // An unused source bank must really be empty. Even one phantom byte
+        // would prevent a ready original from transferring at an exact fit.
+        self.config.staging_bytes = limits.staging_bytes;
+        self.config.total_memory_bytes = limits.total_memory_bytes;
+        if let (Some(total), Some(external), Some(target)) = (limits.total_memory_bytes, &self.config.external_memory, limits.external_memory_bytes) {
+            let analysis = self.analysis.used();
+            self.config.staging_bytes = self.config.staging_bytes.min(total.saturating_sub(analysis)
+                .saturating_sub(external.used.load(Ordering::Acquire).max(target)));
+            self.staging.limit.store(self.config.staging_bytes, Ordering::Release);
+            let available = total.saturating_sub(analysis)
+                .saturating_sub(self.staging.used().max(self.config.staging_bytes));
+            external.limit.store(target.min(available), Ordering::Release);
+        }
         self.analysis.limit.store(self.config.memory_bytes, Ordering::Release);
         self.staging.limit.store(self.config.staging_bytes, Ordering::Release);
+        self.staging.paused.store(limits.acquisition_paused, Ordering::Release);
         *self.reader_config.write().unwrap() = self.config.clone();
         self.pool.as_mut().unwrap().update_resources(&self.config);
+        if limits.acquisition_paused { self.pool.as_mut().unwrap().release_idle(); }
         let capacity = self.pool().capacity();
         self.native.resize_with(self.native.len().max(capacity), || None);
         (self.grow_readers)(capacity);
@@ -719,7 +830,7 @@ impl Pipeline<'_> {
                         continue;
                     }
                     match result {
-                        Ok(mut input) if self.config.memory_scheduling => {
+                        Ok(mut input) if self.config.memory_scheduling && input.record.file_id.is_none() => {
                             if let Err(error) = self.adjust_allowance(&mut input) {
                                 unavailable(&mut input.record, error);
                                 self.record(input.record.clone());
@@ -761,7 +872,7 @@ impl Pipeline<'_> {
             if let Err(error) = &outcome {
                 // Borrow unused shared memory for readers that need more than
                 // the initial allowance. No other job's reservation is exceeded.
-                let decoder_limit = self.config.memory_bytes.saturating_sub(input.fixed_bytes());
+                let decoder_limit = self.config.memory_ceiling.unwrap_or(self.config.memory_bytes).saturating_sub(input.fixed_bytes());
                 if !self.finishing && error.code == ErrorCode::ResourceBudgetTooSmall
                     && input.allowance < decoder_limit
                     && input.current()
@@ -781,6 +892,7 @@ impl Pipeline<'_> {
             }
             self.finish(input, outcome);
         }
+        if self.staging.paused.load(Ordering::Acquire) { self.pool.as_mut().unwrap().release_idle(); }
         Ok(())
     }
     fn accelerator_active(&self) -> usize {
@@ -802,16 +914,39 @@ impl Pipeline<'_> {
             slots.iter().rposition(Option::is_none)
         }
     }
+    fn shared_memory_fits(&self, input: &Input) -> bool {
+        let Some(total) = self.config.total_memory_bytes else { return true; };
+        if input.analysis_reservation.is_some() { return true; }
+        // Source banks may temporarily exceed a reduced allowance. Reserve
+        // room for both held originals and any new acquisition still allowed.
+        // Credit only this input's original during its zero-copy handoff.
+        let sources = self.staging.used().max(self.config.staging_bytes)
+            .saturating_add(self.config.external_memory.as_ref().map_or(0, |memory| memory.committed()));
+        let committed = self.analysis.used().saturating_add(sources);
+        let transfer = input.original_bytes().saturating_sub(input.transferred_bytes());
+        input.reservation_bytes().saturating_sub(transfer) <= total.saturating_sub(committed)
+    }
     fn dispatch(&mut self) -> Result<()> {
+        let draining = self.external_cancel.is_memory_draining();
         loop {
+            if draining && (self.pool().active() > 0 || self.jobs.values().any(|phase|
+                matches!(phase.load(Ordering::Acquire), HASHING | ENCODING))) { break; }
             let available = self.config.memory_bytes.saturating_sub(if self.config.memory_scheduling { self.analysis.used() } else { self.pool().memory_in_use() });
             // A large original waiting for RAM must not block smaller ready
             // files that fit. Choose the oldest ready input that can run now.
-            let Some(index) = self.queued.iter().position(|input| {
+            let eligible = |input: &Input| {
                 (!self.external_cancel.is_finishing() || input.analysis_started)
                     && (input.analysis_reservation.is_some() || input.reservation_bytes() <= available)
+                    && self.shared_memory_fits(input)
                     && (input.record.file_id.is_none() || input.format == "utf8" || self.free_slot(input).is_some())
-            }) else { break; };
+            };
+            let index = if draining {
+                self.queued.iter().enumerate().filter(|(_, input)| eligible(input))
+                    .min_by_key(|(index, input)| (input.analysis_reservation.is_none(),
+                        input.reservation_bytes().saturating_sub(input.original_bytes().saturating_sub(input.transferred_bytes())), *index))
+                    .map(|(index, _)| index)
+            } else { self.queued.iter().position(eligible) };
+            let Some(index) = index else { break; };
             let mut input = self.queued.remove(index).unwrap();
             if self.config.memory_scheduling && input.analysis_reservation.is_none() {
                 let Some(mut reservation) = self.analysis.try_reserve(input.reservation_bytes()) else {
@@ -830,11 +965,13 @@ impl Pipeline<'_> {
                 input.analysis_started = true;
                 input.phase.store(HASHING, Ordering::Release);
                 self.send(Work::Hash(input))?;
+                if draining { break; }
                 continue;
             }
             if input.format == "utf8" {
                 input.phase.store(ENCODING, Ordering::Release);
                 self.send(Work::Text(input))?;
+                if draining { break; }
                 continue;
             }
             let target_slot = self.free_slot(&input).expect("Admitted native slot");
@@ -852,7 +989,10 @@ impl Pipeline<'_> {
                 continue;
             }
             let (path, memory_input, lease): (_, _, Box<dyn std::any::Any + Send>) =
-                if let Some(memory) = input.memory_copy.clone().or_else(|| input.file.data()) {
+                if let Some(original) = input.source.seekable.clone() {
+                    let server = MemoryServer::new_seekable(original)?;
+                    (input.source.key.clone(), Some(server.location.clone()), Box::new(server))
+                } else if let Some(memory) = input.memory_copy.clone().or_else(|| input.file.data()) {
                     let server = MemoryServer::new(memory)?;
                     (input.source.key.clone(), Some(server.location.clone()), Box::new(server))
                 } else {
@@ -883,22 +1023,54 @@ impl Pipeline<'_> {
                     _staged: lease,
                 });
             self.native[slot] = Some(input);
-        }
-        // Every retained buffer remains charged even after a decoder asks to
-        // grow. If all jobs are waiting and neither pool can accept a retry,
-        // report the shortage rather than deadlocking both queues indefinitely.
-        if !self.queued.is_empty() && self.pool().active() == 0
-            && !self.jobs.values().any(|p| matches!(p.load(Ordering::Acquire), FETCHING | READING | HASHING | ENCODING)) {
-            let available = self.config.memory_bytes.saturating_sub(self.analysis.used());
-            if !self.queued.iter().any(|input| input.reservation_bytes() <= available) {
-                if let Some(index) = self.queued.iter().rposition(|input| input.transferred_bytes() > 0) {
-                    let input = self.queued.remove(index).unwrap();
-                    self.finish(input, Err(Error::new(ErrorCode::ResourceBudgetTooSmall, "memory",
-                        "Retained originals leave too little Analysis RAM for this decoder retry. Increase Analysis RAM or retry this file after other work finishes.")));
-                }
-            }
+            if draining { break; }
         }
         Ok(())
+    }
+    fn release_blocked_retry(&mut self) {
+        let automatic = self.config.memory_ceiling.is_some();
+        let at_capacity = self.config.memory_ceiling.is_none_or(|ceiling|
+            self.config.total_memory_bytes.is_some_and(|total| total >= ceiling)
+                && !self.staging.paused.load(Ordering::Acquire));
+        let active = self.pool().active() > 0 || self.jobs.values()
+            .any(|phase| matches!(phase.load(Ordering::Acquire), FETCHING | READING | HASHING | ENCODING));
+        let available = self.config.memory_bytes.saturating_sub(self.analysis.used());
+        if !at_capacity || active || self.queued.is_empty()
+            || self.queued.iter().any(|input| input.reservation_bytes() <= available && self.shared_memory_fits(input)) {
+            self.retry_blocked_since = None; return;
+        }
+        if let Some(ceiling) = self.config.memory_ceiling {
+            let analysis = self.analysis.used();
+            let staging = self.staging.used();
+            let external = self.config.external_memory.as_ref();
+            let actual = analysis.saturating_add(staging)
+                .saturating_add(external.map_or(0, |memory| memory.used.load(Ordering::Acquire)));
+            let can_rebalance = self.queued.iter().any(|input| {
+                let transfer = input.original_bytes().saturating_sub(input.transferred_bytes());
+                input.reservation_bytes() <= ceiling.saturating_sub(analysis)
+                    && input.reservation_bytes().saturating_sub(transfer) <= ceiling.saturating_sub(actual)
+            });
+            let can_complete_download = external.is_some_and(|memory|
+                memory.incomplete.load(Ordering::Acquire) > 0
+                    && analysis.saturating_add(staging).saturating_add(memory.completion_required.load(Ordering::Acquire)) <= ceiling);
+            if can_rebalance || can_complete_download {
+                self.retry_blocked_since = None; return;
+            }
+        }
+        // Give the governor and source lookahead a full turn before deciding
+        // the physical working set cannot make progress. Never fail a file
+        // merely because a temporary soft allowance is smaller than it needs.
+        let blocked = self.retry_blocked_since.get_or_insert_with(Instant::now);
+        if automatic && blocked.elapsed() < Duration::from_millis(250) { return; }
+        if let Some(index) = self.queued.iter().enumerate().filter(|(_, input)| input.transferred_bytes() > 0)
+            .max_by_key(|(_, input)| input.transferred_bytes()).map(|(index, _)| index) {
+            let input = self.queued.remove(index).unwrap();
+            let mut error = Error::new(ErrorCode::ResourceBudgetTooSmall, "memory",
+                "Retained originals leave too little memory for this decoder retry. Retry this file after the remaining analysis finishes.");
+            error.details = Box::new(serde_json::json!({"retry_after_drain":true}));
+            self.finish(input, Err(error));
+            self.retry_blocked_since = None;
+        }
     }
     fn process(&mut self, next: &mut dyn FnMut() -> Result<EncodeSourcePoll>) -> Result<()> {
         let mut keys = HashSet::new();
@@ -913,16 +1085,18 @@ impl Pipeline<'_> {
                 self.jobs.retain(|key, phase| matches!(phase.load(Ordering::Acquire), HASHING | ENCODING)
                     || self.queued.iter().any(|input| &input.source.key == key));
             }
+            self.pool.as_mut().unwrap().pause_tick(self.external_cancel.is_paused());
             self.drain()?;
+            if let Some(resources) = self.external_cancel.take_resources() { self.update_resources(resources); }
             if self.finishing {
                 self.dispatch()?;
+                self.release_blocked_retry();
                 // Only jobs already admitted to analysis are allowed to finish.
                 // Blocked network reads are abandoned, never joined here.
                 if self.jobs.is_empty() { break; }
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
-            if let Some(resources) = self.external_cancel.take_resources() { self.update_resources(resources); }
             self.read_cancel.set_paused(self.external_cancel.is_paused());
             if self.external_cancel.is_paused() {
                 std::thread::sleep(Duration::from_millis(20));
@@ -930,7 +1104,11 @@ impl Pipeline<'_> {
             }
             self.dispatch()?;
             self.read_cancel.set_paused(self.external_cancel.is_paused());
-            while !complete && self.jobs.len() < self.pool().capacity() && self.reads_in_flight < MAX_READERS {
+            // Automatic admission allows a bounded read lookahead even when
+            // every processing slot holds a waiting retry. A smaller ready
+            // original can then run and free RAM for those retries.
+            let lookahead = if self.config.memory_ceiling.is_some() { MAX_READERS } else { 0 };
+            while !complete && self.jobs.len() < self.pool().capacity().saturating_add(lookahead) && self.reads_in_flight < MAX_READERS {
                 self.check()?;
                 if self.external_cancel.is_paused() || self.external_cancel.is_finishing() { break; }
                 let source = match next()? {
@@ -959,6 +1137,7 @@ impl Pipeline<'_> {
                 self.reads_in_flight += 1;
                 self.send(Work::Read(source, phase))?;
             }
+            self.release_blocked_retry();
             self.emit(false);
             if complete && self.jobs.is_empty() {
                 break;
@@ -1012,11 +1191,8 @@ pub(super) fn encode(
     let result = (|| -> Result<VectorFile> {
         let capacity = native::worker_count(&config);
         let bytes = Arc::new(Bytes::default());
-        let staging = Arc::new(Staging {
-            used: Mutex::new(0),
-            limit: AtomicU64::new(config.staging_bytes),
-        });
-        let analysis = Arc::new(Staging { used: Mutex::new(0), limit: AtomicU64::new(config.memory_bytes) });
+        let staging = Arc::new(Staging::new(config.staging_bytes, config.memory_ceiling));
+        let analysis = Arc::new(Staging::new(config.memory_bytes, config.memory_ceiling));
         let reader_config = Arc::new(RwLock::new(config.clone()));
         let cancel = CancellationToken::default();
         let read_cancel = CancellationToken::default();
@@ -1094,6 +1270,7 @@ pub(super) fn encode(
             checkpoint_error: None,
             started,
             last_progress: Instant::now(),
+            retry_blocked_since: None,
         };
         let cancelled = match pipeline.process(next) {
             Ok(()) => false,

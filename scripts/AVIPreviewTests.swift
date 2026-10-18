@@ -88,8 +88,8 @@ private actor PreviewProgressLog {
         let output = copy!.url
         try await verifyVideo(output, audio: true)
         copy = nil
-        precondition(!manager.fileExists(atPath: output.path))
-        check(try previewDirectories() == baseline)
+        await wait { !manager.fileExists(atPath: output.path) }
+        await wait { (try? previewDirectories()) == baseline }
         check(try Data(contentsOf: original) == originalBytes)
         print("PASS Xvid AVI video/audio decodes inside AVFoundation; generated copy cleanup preserves the original")
 
@@ -112,7 +112,7 @@ private actor PreviewProgressLog {
         model.playback.seek(to: 1.2)
         await wait { abs(model.playback.position - 1.2) < 0.1 }
         model.clear()
-        check(try previewDirectories() == baseline)
+        await wait { (try? previewDirectories()) == baseline }
         print("PASS silent MJPEG, uppercase AVI selection, native preview play/pause/seek and cleanup")
 
         let corrupt = directory.appendingPathComponent("Corrupt.avi")
@@ -121,7 +121,7 @@ private actor PreviewProgressLog {
             _ = try await VideoPreviewPreparation.prepare(source: corrupt) { _ in }
             preconditionFailure("Corrupt AVI must fail")
         } catch { precondition(!(error is CancellationError)) }
-        check(try previewDirectories() == baseline)
+        await wait { (try? previewDirectories()) == baseline }
         print("PASS corrupt AVI reports an error and removes incomplete output")
 
         let large = directory.appendingPathComponent("Long.avi")
@@ -136,7 +136,7 @@ private actor PreviewProgressLog {
         conversion.cancel()
         do { _ = try await conversion.value; preconditionFailure("Cancelled conversion must not publish a copy") }
         catch { precondition(error is CancellationError) }
-        check(try previewDirectories() == baseline)
+        await wait { (try? previewDirectories()) == baseline }
         precondition(manager.fileExists(atPath: large.path))
         print("PASS cancellation stops an active encoder before deleting its output")
 
@@ -193,20 +193,40 @@ private actor PreviewProgressLog {
         precondition(!VideoPreviewPreparation.isFormatFailure(nil))
         print("PASS MP4 conversion preserves original bytes; parser failures recover while network/auth/protected errors do not")
 
+        // URLSession may buffer a small download before its first delegate
+        // update. Send a large prefix, then wait for the consumer to observe
+        // the stalled rate before releasing the rest of this valid MP4.
+        let paddingSize = 4 * 1024 * 1024
+        var freeBoxSize = UInt32(paddingSize).bigEndian
+        var progressBytes = mp4Bytes
+        withUnsafeBytes(of: &freeBoxSize) { progressBytes.append(contentsOf: $0) }
+        progressBytes.append(Data("free".utf8))
+        progressBytes.append(Data(count: paddingSize - 8))
+        let progressMP4 = directory.appendingPathComponent("Progress.MP4")
+        try progressBytes.write(to: progressMP4)
         let server = Process(), portPipe = Pipe()
         server.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         server.arguments = ["-u", "-c", #"""
-import http.server, pathlib, re, sys, time
+import http.server, pathlib, re, sys, threading, time
 avi = pathlib.Path(sys.argv[1]).read_bytes()
 mp4 = pathlib.Path(sys.argv[2]).read_bytes()
+progress_mp4 = pathlib.Path(sys.argv[3]).read_bytes()
+progress_gate = threading.Event()
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def do_GET(self):
+        if self.path == '/release-progress':
+            progress_gate.set()
+            self.send_response(200); self.send_header('Content-Length', '0'); self.end_headers()
+            return
         assert self.headers.get('Referer') == 'https://mypikpak.com/'
         assert self.headers.get('Origin') == 'https://mypikpak.com'
         if self.path == '/error':
             self.send_error(403); return
         body = mp4 if self.path.startswith('/mp4') else avi
+        if self.path.endswith('.progress'):
+            body = progress_mp4
+            progress_gate.clear()
         if self.path.startswith('/range-') or self.path == '/mp4.chunks':
             total = len(body)
             content_range = f'bytes 0-{total-1}/{total}'
@@ -240,15 +260,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if 'no-length' not in self.path: self.send_header('Content-Length', len(body))
         self.end_headers()
         try:
-            for start in range(0, len(body), 4096):
-                self.wfile.write(body[start:start+4096]); self.wfile.flush()
+            chunk = 1024 * 1024 if self.path.endswith('.progress') else 4096
+            for start in range(0, len(body), chunk):
+                self.wfile.write(body[start:start+chunk]); self.wfile.flush()
                 if self.path == '/slow': time.sleep(0.15)
-                if self.path.endswith('.progress'): time.sleep(2 if start == 0 else 0.15)
+                if self.path.endswith('.progress'):
+                    if start == 0: progress_gate.wait(timeout=20)
+                    else: time.sleep(0.15)
         except (BrokenPipeError, ConnectionResetError): pass
 server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
 print(server.server_port, flush=True)
 server.serve_forever()
-"""#, original.path, mp4.path]
+"""#, original.path, mp4.path, progressMP4.path]
         server.standardOutput = portPipe; server.standardError = FileHandle.nullDevice
         try server.run()
         defer { server.terminate(); server.waitUntilExit() }
@@ -296,15 +319,19 @@ server.serve_forever()
         download.cancel()
         do { _ = try await download.value; preconditionFailure("Download cancellation must discard the preview") }
         catch { precondition(error is CancellationError || (error as NSError).code == NSURLErrorCancelled) }
-        check(try previewDirectories() == baseline)
+        await wait { (try? previewDirectories()) == baseline }
         print("PASS cloud download headers, real AVI playback, size/status validation and download cancellation")
         try await DownloaderModel.testAVIPreviewRouting(defaults: defaults, original: original)
         try await DownloaderModel.testMP4PreviewRecovery(defaults: defaults,
             remote: URL(string: "http://127.0.0.1:\(port)/mp4")!, bytes: mp4Bytes)
         try await DownloaderModel.testPreviewPreparationProgress(defaults: defaults,
-            remote: URL(string: "http://127.0.0.1:\(port)/mp4")!, bytes: mp4Bytes)
+            remote: URL(string: "http://127.0.0.1:\(port)/mp4")!, bytes: progressBytes,
+            releaseDownload: {
+                let (_, response) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:\(port)/release-progress")!)
+                precondition((response as? HTTPURLResponse)?.statusCode == 200)
+            })
         check(try Data(contentsOf: mp4) == mp4Bytes)
-        check(try previewDirectories() == baseline)
+        await wait { (try? previewDirectories()) == baseline }
         try DownloaderModel.testMergeFolderSelection(defaults: defaults)
     }
 }

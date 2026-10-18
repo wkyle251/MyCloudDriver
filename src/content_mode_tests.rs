@@ -356,6 +356,38 @@ async fn malformed_original_links_are_typed_nonretryable_and_dynamic_can_fallbac
 }
 
 #[tokio::test]
+async fn missing_user_original_gets_one_fresh_lookup_for_account_and_share() {
+    let fixture = Fixture::new().await;
+    fixture.user_available.store(true, Ordering::SeqCst);
+    let user = client(&fixture, ContentMode::User);
+    let file = user.list_folder("saved-folder").await.unwrap().remove(0);
+    for kind in 0..4 {
+        fixture.requests.lock().unwrap().clear();
+        fixture.user_url_missing_responses.store(1, Ordering::SeqCst);
+        let download = match kind {
+            0 => user.get_download_url(&file.id).await.unwrap(),
+            1 => user.get_download_url_for_file(&file).await.unwrap(),
+            2 => user.similarity_download_info(&file.id, "saved-folder").await.unwrap().0,
+            _ => user.share_client("https://mypikpak.com/s/public-share", "", "").unwrap()
+                .get_download_url("source-id").await.unwrap(),
+        };
+        assert!(download.web_content_link.contains("/user-body/"));
+        let requests = fixture.requests.lock().unwrap();
+        assert_eq!(requests.iter().filter(|request| request.starts_with("GET /drive/v1/files/saved-id")
+            || request.starts_with("GET /drive/v1/share/file_info")).count(), 2);
+        assert!(requests.iter().filter(|request| request.starts_with("GET /drive/v1/"))
+            .all(|request| request.contains("authorization: Bearer account-access")));
+    }
+    *fixture.user_link_override.lock().unwrap() = Some(String::new());
+    fixture.requests.lock().unwrap().clear();
+    assert!(matches!(user.get_download_url(&file.id).await, Err(crate::Error::InvalidDownloadUrl)));
+    assert_eq!(fixture.requests.lock().unwrap().iter().filter(|request| request.starts_with("GET /drive/v1/files/saved-id")).count(), 2,
+        "Unusable User metadata must not create an unbounded refresh loop");
+    assert_eq!(user.similarity_file_revision(&file.id, "saved-folder").await.unwrap().0, 8,
+        "Metadata-only revision checks must not require a download URL");
+}
+
+#[tokio::test]
 async fn invalid_direct_links_use_only_valid_original_media_candidates() {
     let fixture = Fixture::new().await;
     fixture.user_available.store(true, Ordering::SeqCst);

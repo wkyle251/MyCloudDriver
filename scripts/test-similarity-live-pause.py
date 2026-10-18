@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Cooperative comparison pause keeps the same helper and committed scores."""
 import json
+from contextlib import closing, contextmanager
 import os
 from pathlib import Path
 import selectors
@@ -12,11 +13,56 @@ import time
 import uuid
 
 resources = Path(sys.argv[1]).resolve()
+
+@contextmanager
+def existing_database(path):
+    # Product recovery opens existing journals read/write so SQLite can repair
+    # hot journals or recreate WAL support files after helper termination.
+    # mode=rw and strict resolution still forbid creating a lookalike database.
+    path = path.resolve(strict=True)
+    assert path.is_file(), 'Expected an existing generated comparison database'
+    with closing(sqlite3.connect(path.as_uri() + '?mode=rw', uri=True, timeout=10)) as db:
+        yield db
+
+
+def comparison_database(checkpoint):
+    with existing_database(checkpoint / 'checkpoint.sqlite3') as journal:
+        generation = journal.execute("SELECT value FROM metadata WHERE key='comparison_directory'").fetchone()
+    if generation:
+        value = generation[0]
+        if isinstance(value, bytes):
+            value = value.decode('ascii')
+        assert str(uuid.UUID(value)) == value.lower(), 'Invalid generated comparison directory'
+        return checkpoint / value / 'matrix.sqlite3'
+    # Old checkpoints stored the row matrix directly beside the file journal.
+    return checkpoint / 'matrix.sqlite3'
+
+
+def saved_scores(db):
+    """Read schema and its durable count from one consistent SQLite snapshot."""
+    own_transaction = not db.in_transaction
+    if own_transaction:
+        db.execute('BEGIN')
+    try:
+        tables = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('comparison_progress','scores')")}
+        if 'comparison_progress' in tables:
+            row = db.execute('SELECT completed FROM comparison_progress WHERE singleton=1').fetchone()
+            assert row is not None and row[0] >= 0, 'Missing committed comparison progress'
+            return row[0]
+        assert 'scores' in tables, 'Selected database has no saved comparison format'
+        return db.execute('SELECT COUNT(*) FROM scores').fetchone()[0]
+    finally:
+        if own_transaction:
+            db.rollback()  # End this read snapshot before the next pause sample.
+
 with tempfile.TemporaryDirectory(prefix='similarity-live-pause-') as temporary:
     root = Path(temporary).resolve()
     inputs = root / 'inputs'
     inputs.mkdir()
-    for index in range(1200):
+    count = 5000
+    expected = count * (count - 1) // 2
+    for index in range(count):
         (inputs / f'{index}.txt').write_text('A garden with flowers and trees. ' * 25)
     identifier = str(uuid.uuid4())
     checkpoint = root / 'data/checkpoints' / identifier
@@ -51,18 +97,18 @@ with tempfile.TemporaryDirectory(prefix='similarity-live-pause-') as temporary:
                         requested = True
                     if event.get('event') == 'pause_state' and event.get('paused'):
                         time.sleep(.2)  # Finish the coordinator's current pair/transaction.
-                        with sqlite3.connect(checkpoint / 'matrix.sqlite3') as db:
-                            paused_scores = db.execute('SELECT COUNT(*) FROM scores').fetchone()[0]
+                        with existing_database(comparison_database(checkpoint)) as db:
+                            paused_scores = saved_scores(db)
                             time.sleep(.5)
-                            assert db.execute('SELECT COUNT(*) FROM scores').fetchone()[0] == paused_scores
+                            assert saved_scores(db) == paused_scores
                         assert process.poll() is None, 'Pause exited the RAM-owning helper'
                         (checkpoint / 'pause').unlink()
                         resumed = True
         assert requested and resumed and paused_scores > 0
         assert process.wait(timeout=10) == 0, process.stderr.read().decode()[:500]
         report = json.loads((root / 'report.json').read_text())
-        assert report['status'] == 'completed' and report['scores_retained'] == 719400
-        print(f'PASS same-helper comparison pause freezes {paused_scores:,} saved scores and resumes to 719,400')
+        assert report['status'] == 'completed' and report['scores_retained'] == expected
+        print(f'PASS same-helper comparison pause freezes {paused_scores:,} saved scores and resumes to {expected:,}')
     finally:
         selector.close()
         if process.poll() is None:

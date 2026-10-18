@@ -242,3 +242,32 @@ report a RAM shortage instead of deadlocking. FFmpeg reads no longer reserve a
 second full-file copy; image/document readers retain their real copy allowance.
 Protocol v4, encoding profiles and compatible cached vectors remain unchanged.
 This is a local integration change, not a modification of the upstream checkout.
+
+
+### MyCloudDriver: seekable original media (2026-10-14)
+
+Native protocol v5 adds `range_only` loopback inputs, defaulting to false when
+the field is absent. Helper and worker must be installed together. Verified
+PikPak audio/video can provide on-demand original ranges through a bounded,
+leased RAM cache without staging or SHA-256-hashing the complete original.
+Its explicit `gcid:<hash>:<size>` content ID records provider evidence and
+original length; complete-content `sha256:<hash>` IDs retain their meaning.
+Encoding profiles and vector components remain unchanged, and compatible old
+vectors and published score snapshots stay readable.
+
+The host retains a scan transport entitlement and one admitted reusable block
+for each seekable original. Additional blocks borrow spare RAM without waiting;
+pressure shrinks the cache. Requests retain origin throttling and cancellation,
+validate content ranges/length/validators, and check provider GCID on link or
+Guest-to-User refresh. Unsupported initial ranges fall back to full acquisition.
+The seekable source exposes typed transport failures and revision validity to
+the pipeline. Server-local cancellation does not poison a reusable original.
+Pauses abort in-flight HTTP attempts before waiting and preserve completed
+blocks; native deadlines exclude paused time, and range-only FFmpeg inputs do
+not retain the former 30-second socket read timeout. Decoder/server shutdown
+joins readers before releasing the original and its leases.
+
+Generated HTTP and actual FFmpeg fixtures cover bounded reads, malformed ranges,
+changed content, pressure, Guest/User handoff, pause beyond 30 seconds, cleanup
+and full-input/range vector agreement. This changes only the vendored integration;
+the independent upstream checkout is unchanged.
