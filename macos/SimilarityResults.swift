@@ -22,20 +22,36 @@ struct SimilarityTreeSnapshot {
     let roots: [SimilarityTreeNode]
     let nodes: [String: SimilarityTreeNode]
     let parents: [String: SimilarityTreeNode]
+    let fileIDs: [String]
     let grouped: Bool
 
     init(roots: [SimilarityTreeNode]) {
         self.roots = roots; grouped = roots.first?.group != nil
-        var nodes: [String: SimilarityTreeNode] = [:], parents: [String: SimilarityTreeNode] = [:]
+        var nodes: [String: SimilarityTreeNode] = [:], parents: [String: SimilarityTreeNode] = [:], fileIDs: [String] = []
         func visit(_ node: SimilarityTreeNode, parent: SimilarityTreeNode?) {
             nodes[node.id] = node
+            if node.file != nil { fileIDs.append(node.id) }
             if let parent { parents[node.id] = parent }
             for child in node.children { visit(child, parent: node) }
         }
         for root in roots { visit(root, parent: nil) }
-        self.nodes = nodes; self.parents = parents
+        self.nodes = nodes; self.parents = parents; self.fileIDs = fileIDs
     }
     static let empty = Self(roots: [])
+}
+
+enum SimilarityResultSelection {
+    /// Continue in display order; at the end, use the nearest preceding item.
+    static func next(after current: String, in order: [String], available: (String) -> Bool) -> String? {
+        var passed = false, previous: String?
+        for id in order {
+            if id == current { passed = true; continue }
+            guard available(id) else { continue }
+            if passed { return id }
+            previous = id
+        }
+        return previous
+    }
 }
 
 struct SimilarityResultGroup: Identifiable {
@@ -74,6 +90,7 @@ struct SimilarityResultIndex {
     let files: [SimilarityFile]
     let byID: [String: SimilarityFile]
     let byScoreID: [String: SimilarityFile]
+    let byOrdinal: [UInt64: SimilarityFile]
     let exactGroups: [String: [SimilarityFile]]
     let exactGroupForFile: [String: String]
     let exactResultGroups: [SimilarityResultGroup]
@@ -120,6 +137,7 @@ struct SimilarityResultIndex {
         }
         return .init(tree: SimilarityTreeSnapshot(roots: roots), files: files, byID: Dictionary(files.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a }),
             byScoreID: Dictionary(files.map { ($0.scoreID, $0) }, uniquingKeysWith: { a, _ in a }),
+            byOrdinal: Dictionary(files.compactMap { file in file.engineIndex.map { ($0, file) } }, uniquingKeysWith: { a, _ in a }),
             exactGroups: exactGroups, exactGroupForFile: membership, exactResultGroups: exact,
             availableFileIDs: Set(files.filter { $0.state == nil || $0.state == "ready" }.map(\.id)))
     }
@@ -144,7 +162,13 @@ struct SimilarityResultIndex {
 }
 
 struct SimilarityScoreRow: Decodable {
-    struct Entry: Decodable { let fileId: String; let score: Double }
+    struct Entry: Decodable {
+        let fileId: String?
+        let ordinal: UInt64?
+        let score: Double
+        init(fileId: String, score: Double) { self.fileId = fileId; ordinal = nil; self.score = score }
+        init(ordinal: UInt64, score: Double) { fileId = nil; self.ordinal = ordinal; self.score = score }
+    }
     let fileId: String
     let entries: [Entry]
     let unavailable: [String: UInt64]
@@ -220,6 +244,10 @@ private struct SimilarityGroupPresentation {
     private var matchTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
     private var groupingTask: Task<Void, Never>?
+    // Confirmed filesystem changes must finish saving even if this result
+    // window closes or another report replaces it. Never cancel this chain.
+    private var mutationTask: Task<Void, Never>?
+    private var keepsSelectionEmptyAfterTrash = false
     private var groupPresentationTask: Task<Void, Never>?
     private var groupPresentationID = UUID()
     private var groupingRequestInFlight = false
@@ -247,6 +275,7 @@ private struct SimilarityGroupPresentation {
     private var sizeBasedPlanOrder: [SizeBasedPlanKey] = []
     private var sizeBasedPlanTasks: [SizeBasedPlanKey: Task<Void, Never>] = [:]
     private var sizeBasedPlanRevision = UUID()
+    func waitForSavedMutations() async { await mutationTask?.value }
     #if FINDER_WORKSPACE_TESTS
     private(set) var sizeBasedPlanBuildCount = 0
     var sizeBasedPlanCacheCount: Int { sizeBasedPlans.count }
@@ -399,14 +428,70 @@ private struct SimilarityGroupPresentation {
         let ids = ids.filter { index?.byID[$0] != nil }
         guard !ids.isEmpty else { return }
         let changed = trashed ? ids.subtracting(trashedIDs) : ids.intersection(trashedIDs)
+        guard !changed.isEmpty else { return }
+        let excluded = trashedIDs.union(ids)
+        var disappearingGroups = Set<String>()
+        if trashed, browseGroups {
+            let affected = Set(changed.compactMap { groupPresentation.groupForFile[$0] })
+            let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            for id in affected {
+                guard let position = groupPresentation.positions[id] else { continue }
+                let remaining = groups[position].members.filter { !excluded.contains($0.id) }
+                if remaining.count < 2 || (!search.isEmpty && !remaining.contains(where: { $0.path.localizedStandardContains(search) })) {
+                    disappearingGroups.insert(id)
+                }
+            }
+        }
+        if trashed, let selectedID, changed.contains(selectedID) {
+            let next = SimilarityResultSelection.next(after: selectedID, in: tree.fileIDs) { id in
+                !excluded.contains(id) && (!browseGroups || groupPresentation.groupForFile[id].map { !disappearingGroups.contains($0) } == true)
+            }
+            keepsSelectionEmptyAfterTrash = next == nil
+            select(next)
+        } else if trashed, let selectedGroupID, disappearingGroups.contains(selectedGroupID) {
+            let next = SimilarityResultSelection.next(after: selectedGroupID, in: tree.roots.map(\.id)) { !disappearingGroups.contains($0) }
+            keepsSelectionEmptyAfterTrash = next == nil
+            selectNode(next)
+        }
         let available = changed.filter { index?.availableFileIDs.contains($0) == true }.count
         availableFileCount += trashed ? -available : available
         if trashed { trashedIDs.formUnion(ids) } else { trashedIDs.subtract(ids) }
-        if trashed, let selectedID, ids.contains(selectedID) { select(nil) }
         if !trashed { fileActionMessage = nil }
         // A Trash acknowledgement can arrive while the threshold's new groups
         // are loading. Keep that loading state until the new groups arrive.
         filterMatches(); applyGroups(unfilteredGroups, completesGrouping: false)
+        persistTrashState(changed, trashed: trashed)
+    }
+
+    func savedTrashUpdater(_ ids: Set<String>) -> ((Bool) async throws -> Void)? {
+        guard let configuration, let run = report?.runId, run.hasPrefix("mcd2-"),
+              let revision = report?.resultRevision else { return nil }
+        let fileIDs = ids.compactMap { index?.byID[$0]?.scoreID }
+        guard !fileIDs.isEmpty else { return nil }
+        return { trashed in
+            let input: [String: Any] = ["data_dir":configuration.dataDirectory.path, "run_id":run,
+                "result_revision":revision, "file_ids":fileIDs, "trashed":trashed]
+            _ = try await SimilarityHelper.request(configuration: configuration, command: "similarity-result-files",
+                input: JSONSerialization.data(withJSONObject: input))
+        }
+    }
+
+    private func persistTrashState(_ ids: Set<String>, trashed: Bool) {
+        guard let update = savedTrashUpdater(ids) else { return }
+        let previous = mutationTask, token = generation
+        mutationTask = Task { [weak self] in
+            await previous?.value
+            do {
+                try await update(trashed)
+                guard let self, self.generation == token else { return }
+                self.groupCache = [:]; self.groupCacheOrder = []
+                self.regroup(immediate: true)
+            } catch {
+                guard let self, self.generation == token else { return }
+                self.fileActionError = "The file change succeeded, but its saved comparison cleanup could not finish. Reopen these results to retry. "
+                    + FileSearchIndex.redacted(error.localizedDescription)
+            }
+        }
     }
     func setCloudFilesTrashed(_ ids: Set<String>, _ trashed: Bool) {
         guard !ids.isEmpty else { return }
@@ -425,6 +510,7 @@ private struct SimilarityGroupPresentation {
         groupingID = UUID(); groups = []; selectedGroupID = nil; isGrouping = false; groupingError = nil
         groupExpansion = nil
         trashedIDs = []; trashingIDs = []; unfilteredGroups = []; fileActionMessage = nil; fileActionError = nil
+        keepsSelectionEmptyAfterTrash = false
         groupCache = [:]; groupCacheOrder = []
         report = nil; configuration = nil; query = ""
         minimumScore = 0.9; identicalOnly = false; showAllScores = false; browseGroups = true
@@ -436,18 +522,29 @@ private struct SimilarityGroupPresentation {
         browseGroups = report.status != "cancelled" && (report.runId != nil || !report.groups.isEmpty)
         let token = generation
         indexTask = Task { [weak self] in
-            let index = await Task.detached(priority: .userInitiated) { SimilarityResultIndex.build(report) }.value
+          do {
+            let (index, excluded) = try await Task.detached(priority: .userInitiated) {
+                (SimilarityResultIndex.build(report), try SimilarityResultExclusions.load(report, configuration: configuration))
+            }.value
             guard let self, !Task.isCancelled, self.generation == token else { return }
             self.index = index; self.availableFileCount = index.availableFileIDs.count
-            if !self.browseGroups { self.tree = index.tree }
+            self.trashedIDs = Set(index.files.filter { $0.engineIndex.map(excluded.contains) == true }.map(\.id))
+            self.availableFileCount -= self.trashedIDs.intersection(index.availableFileIDs).count
+            if !self.browseGroups { self.filterTree() }
             self.isIndexing = false
-            self.regroup(immediate: true)
+            if self.trashedIDs.isEmpty { self.regroup(immediate: true) }
+            else { self.persistTrashState(self.trashedIDs, trashed: true) }
             // Let the user choose the reference file instead of fetching a
             // potentially large cloud original as a side effect of finishing.
+          } catch {
+            guard let self, !Task.isCancelled, self.generation == token else { return }
+            self.isIndexing = false; self.error = FileSearchIndex.redacted(error.localizedDescription)
+          }
         }
     }
     func select(_ id: String?) {
         if let id, trashedIDs.contains(id) { return }
+        if id != nil { keepsSelectionEmptyAfterTrash = false }
         selectedGroupID = nil
         guard selectedID != id else { return }
         queryTask?.cancel(); matchTask?.cancel(); matchFilterTask?.cancel(); requestID = UUID(); selectedID = id
@@ -472,7 +569,7 @@ private struct SimilarityGroupPresentation {
         queryTask = Task { [weak self] in
             do {
                 let input: [String: Any] = ["data_dir": configuration.dataDirectory.path, "run_id": run,
-                    "result_revision": revision, "file_id": file.scoreID, "row_offset": offset]
+                    "result_revision": revision, "file_id": file.scoreID, "row_offset": offset, "compact": true]
                 let data = try JSONSerialization.data(withJSONObject: input)
                 let output = try await SimilarityHelper.request(configuration: configuration, command: "similarity-scores", input: data)
                 let row = try await Task.detached(priority: .userInitiated) {
@@ -533,7 +630,9 @@ private struct SimilarityGroupPresentation {
         let exactIDs = Set(exact.map(\.id))
         var seen = Set<String>()
         var matches: [SimilarityRelatedFile] = row.entries.compactMap { entry in
-            guard entry.score.isFinite, (-1...1).contains(entry.score), let other = index.byScoreID[entry.fileId], other.id != file.id,
+            let other = entry.ordinal.flatMap { index.byOrdinal[$0] }
+                ?? entry.fileId.flatMap { index.byScoreID[$0] }
+            guard entry.score.isFinite, (-1...1).contains(entry.score), let other, other.id != file.id,
                   seen.insert(other.id).inserted else { return nil }
             return .init(file: other, score: entry.score, identical: exactIDs.contains(other.id))
         }
@@ -668,7 +767,8 @@ private struct SimilarityGroupPresentation {
         groupPresentation = presentation; groupedFileCount = presentation.fileCount
         groups = presentation.groups; isGrouping = groupingRequestInFlight; filterTree()
         if selectedID == nil, selectedGroupID.flatMap({ presentation.positions[$0] }) == nil {
-            selectedGroupID = browseGroups ? (previousMember.flatMap { presentation.groupForFile[$0] } ?? groups.first?.id) : nil
+            selectedGroupID = browseGroups && !keepsSelectionEmptyAfterTrash
+                ? (previousMember.flatMap { presentation.groupForFile[$0] } ?? groups.first?.id) : nil
         }
     }
     #if FINDER_WORKSPACE_TESTS
@@ -733,8 +833,9 @@ private final class SimilarityHelperProcess: @unchecked Sendable {
             let data = try handle.read(upToCount: 16_384) ?? Data()
             throw CloudDriveError.message(String(data: data, encoding: .utf8).flatMap { $0.isEmpty ? nil : $0 } ?? "Saved scores could not be loaded.")
         }
-        let size = try output.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-        guard size < 32 * 1024 * 1024 else { throw CloudDriveError.message("This score row is too large to display. Narrow the scan scope.") }
-        return try Data(contentsOf: output)
+        guard let bytes = SimilaritySessionStore.readBoundedFile(output, maximumBytes: SimilarityReportStorage.maximumBytes) else {
+            throw CloudDriveError.message("The saved comparison response could not be read. Retry loading it.")
+        }
+        return bytes
     }
 }

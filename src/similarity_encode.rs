@@ -608,7 +608,7 @@ pub(super) fn run(
         })
     };
     for round in 0..=8 {
-        let pass = if let Some(saved) = saved.take() {
+        let mut pass = if let Some(saved) = saved.take() {
             acceleration::announce(
                 checkpoint
                     .as_ref()
@@ -736,7 +736,8 @@ pub(super) fn run(
         changes.announce(current.files.len())?;
         if round == 8 {
             emit(
-                &json!({"event":"interrupted", "reason":"Files are still changing. Completed analysis is saved; resume when the folder settles."}),
+                &json!({"event":"interrupted", "automatic_resume":false,
+                    "reason":"Files are still changing. Completed analysis is saved; resume when the folder settles."}),
             )?;
             cancel.store(true, Ordering::Release);
             report.status = "paused".into();
@@ -749,6 +750,7 @@ pub(super) fn run(
             report.coverage = "Files changed repeatedly before the scan could finish. Completed analysis is saved.".into();
             return Ok(());
         }
+        inventory::retain_completed(&mut pass.files, &mut current.files);
         snapshot = Some(current);
     }
     unreachable!()
@@ -853,6 +855,14 @@ fn run_pass(
             ready_limit,
             move |file, stop| {
                 control::wait_blocking(&fetches.control, stop)?;
+                // Reconciliation already matched this result's captured
+                // revision. Recheck live metadata after any queue wait, then
+                // skip acquisition/analysis even for a completed exclusion or
+                // failure; another file changing is not a request to retry it.
+                if let Some(mut record) = file.record.take().filter(|_| file.checkpoint_revision().is_some()) {
+                    record.reused = true;
+                    return Ok(ResolvedInput::Reused(record));
+                }
                 if let Some(record) = checkpoint
                     .as_ref()
                     .map(|c| c.reused(file))
@@ -993,15 +1003,18 @@ fn run_pass(
                     }
                     file.display.family = record.family.clone().unwrap_or_else(|| "other".into());
                     let ready = record.state == FileState::Ready;
-                    file.display.state = if ready { "ready" } else { "excluded" }.into();
+                    let excluded = matches!(record.state, FileState::Unsupported | FileState::Skipped);
+                    file.display.state = if ready { "ready" } else if excluded { "excluded" } else { "failed" }.into();
                     if let Some(bytes) = record.bytes { if !file.is_photos_preview() { file.display.bytes = bytes; } }
                     if !ready {
                         scope::classified_issue(&mut report.borrow_mut(), &file.display.path,
-                            &error_reason(record.error.as_ref()), "unsupported");
+                            &error_reason(record.error.as_ref()), if excluded { "unsupported" } else { "failed" });
                     }
                     let mut counts = base.borrow_mut();
                     counts.files_processed += 1; counts.cache_hits += u64::from(record.reused);
-                    if ready { counts.files_ready += 1; } else { counts.files_skipped += 1; }
+                    if ready { counts.files_ready += 1; }
+                    else if excluded { counts.files_skipped += 1; }
+                    else { counts.files_failed += 1; }
                     file.record = Some(record);
                     continue;
                 }
@@ -1705,6 +1718,7 @@ mod tests {
         let reference = result.files.iter().find(|f| f.state == "ready").unwrap();
         let row = score_row(
             ScoreRowRequest {
+                compact: false,
                 data_dir: request.data_dir,
                 run_id: result.run_id.unwrap(),
                 result_revision: 1,

@@ -3,6 +3,7 @@
 use crate::*;
 use std::collections::VecDeque;
 use std::time::Instant;
+use std::sync::{Mutex, OnceLock, Weak};
 use tokio::sync::mpsc;
 
 #[cfg(test)]
@@ -64,6 +65,7 @@ struct Root {
     source: Source,
     steps: usize,
     bodies: usize,
+    verification_states: Vec<Weak<download_transport::RetryState>>,
     discovered: bool,
     discovery_failed: bool,
     error: Option<String>,
@@ -185,8 +187,50 @@ fn fail_discovery(root: &mut Root, error: &anyhow::Error) {
 
 /// Bounds folder discovery ahead of the body pool. Each selection can still
 /// discover its first page when a different selection is paused or backlogged.
-const DISCOVERY_AHEAD: usize = 2048;
 const DISCOVERY_CONNECTIONS: usize = 4;
+
+#[derive(Clone, Copy)]
+struct DiscoveryLimits { receiving: usize, total: usize, per_root: usize }
+impl Default for DiscoveryLimits {
+    fn default() -> Self { Self { receiving: 2048, total: 8192, per_root: 200 } }
+}
+impl DiscoveryLimits {
+    fn allows(self, outstanding: usize, waiting_for_payload: usize, root_waiting_for_payload: usize) -> bool {
+        outstanding < self.total
+            && (waiting_for_payload < self.receiving || root_waiting_for_payload < self.per_root)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DiscoverySnapshot {
+    pub(crate) outstanding: usize,
+    pub(crate) waiting_for_payload: usize,
+    pub(crate) final_verification: usize,
+}
+fn discovery_metrics() -> &'static Mutex<DiscoverySnapshot> {
+    static METRICS: OnceLock<Mutex<DiscoverySnapshot>> = OnceLock::new();
+    METRICS.get_or_init(Default::default)
+}
+pub(crate) fn discovery_snapshot() -> DiscoverySnapshot {
+    *discovery_metrics().lock().unwrap_or_else(|error| error.into_inner())
+}
+struct DiscoveryReporting;
+impl Drop for DiscoveryReporting {
+    fn drop(&mut self) {
+        *discovery_metrics().lock().unwrap_or_else(|error| error.into_inner()) = DiscoverySnapshot::default();
+    }
+}
+impl Root {
+    fn pending_final_checks(&mut self) -> usize {
+        let mut pending = 0;
+        self.verification_states.retain(|state| {
+            let Some(state) = state.upgrade() else { return false; };
+            pending += usize::from(state.final_verification_pending());
+            true
+        });
+        pending.min(self.bodies)
+    }
+}
 
 fn accept_file(
     root: &mut Root,
@@ -236,6 +280,8 @@ fn accept_file(
             "output_directory":output
         }]}));
         root.bodies += 1;
+        let retry_state = Arc::new(download_transport::RetryState::default());
+        root.verification_states.push(Arc::downgrade(&retry_state));
         bodies
             .send(Body {
                 root: root.request.id.clone(),
@@ -245,7 +291,7 @@ fn accept_file(
                     file,
                     output_directory: output,
                     remote_path: path,
-                    retry_state: Arc::default(),
+                    retry_state,
                 },
             })
             .map_err(|_| anyhow::anyhow!("Download scheduler stopped"))?;
@@ -280,6 +326,11 @@ async fn discover(step: &Step) -> Result<(Vec<FileInfo>, Option<String>)> {
 }
 
 pub async fn run(account: &Client, args: Args) -> Result<()> {
+    run_with_limits(account, args, DiscoveryLimits::default()).await
+}
+
+async fn run_with_limits(account: &Client, args: Args, limits: DiscoveryLimits) -> Result<()> {
+    let _reporting = DiscoveryReporting;
     let (body_sender, body_receiver) = mpsc::unbounded_channel::<Body>();
     let (done_sender, mut done_receiver) = mpsc::unbounded_channel();
     let received = Arc::new(AtomicU64::new(0));
@@ -293,6 +344,7 @@ pub async fn run(account: &Client, args: Args) -> Result<()> {
                 let cleanup_enabled = cleanup_enabled.clone();
                 async move {
                     let task = &body.task;
+                    task.retry_state.set_final_verification_pending(false);
                     let mut preparation = task.retry_state.preparation.attempt();
                     let result = async {
                         emit_download_progress(true, DownloadProgressEvent::FileDequeued {
@@ -371,6 +423,7 @@ pub async fn run(account: &Client, args: Args) -> Result<()> {
         &mut done_receiver,
         &mut pool,
         &delete_after_download,
+        limits,
     )
     .await;
     drop(body_sender);
@@ -389,6 +442,7 @@ async fn coordinate(
     completed: &mut mpsc::UnboundedReceiver<(String, Result<()>)>,
     pool: &mut tokio::task::JoinHandle<Result<()>>,
     delete_after_download: &AtomicBool,
+    limits: DiscoveryLimits,
 ) -> Result<()> {
     let mut roots = HashMap::<String, Root>::new();
     let mut root_scopes = HashMap::<String, RootScope>::new();
@@ -504,6 +558,7 @@ async fn coordinate(
                     source,
                     steps: 0,
                     bodies: 0,
+                    verification_states: Vec::new(),
                     discovered: false,
                     discovery_failed: false,
                     error: None,
@@ -584,6 +639,21 @@ async fn coordinate(
         }
 
         let outstanding: usize = roots.values().map(|root| root.bodies).sum();
+        // A received file awaiting final read-back cannot feed the network.
+        // Counting it as download lookahead stranded free RAM/HTTP capacity
+        // behind thousands of HDD checks. Keep a separate bounded total so
+        // small files cannot grow metadata indefinitely while the disk drains.
+        let mut root_waiting = HashMap::new();
+        let mut final_verification = 0usize;
+        for (id, root) in &mut roots {
+            let checking = root.pending_final_checks();
+            final_verification += checking;
+            root_waiting.insert(id.as_str(), root.bodies.saturating_sub(checking));
+        }
+        let waiting_for_payload = outstanding.saturating_sub(final_verification);
+        *discovery_metrics().lock().unwrap_or_else(|error| error.into_inner()) = DiscoverySnapshot {
+            outstanding, waiting_for_payload, final_verification,
+        };
         while discovering.len() < DISCOVERY_CONNECTIONS {
             let next = pending.iter().position(|step| {
                 match transfer_control::action(&step.control_id()) {
@@ -591,8 +661,8 @@ async fn coordinate(
                     Some(transfer_control::Action::Pause) => false,
                     None => {
                         step.ready <= Instant::now()
-                            && (outstanding < DISCOVERY_AHEAD
-                                || roots.get(&step.root).is_some_and(|root| root.bodies < 200))
+                            && limits.allows(outstanding, waiting_for_payload,
+                                root_waiting.get(step.root.as_str()).copied().unwrap_or(0))
                     }
                 }
             });

@@ -18,10 +18,30 @@ enum FinderAppVersion {
     }
 }
 
-enum FinderPreviewPlacement: String, CaseIterable, Identifiable {
-    case right, bottom
+enum FinderPreviewLayout: String, CaseIterable, Identifiable {
+    case sideBySide, topAndBottom
     var id: Self { self }
-    var title: String { self == .right ? "Right" : "Bottom" }
+    var title: String { self == .sideBySide ? "Side by side" : "Top and bottom" }
+    var placements: [FinderPreviewPlacement] { self == .sideBySide ? [.left, .right] : [.top, .bottom] }
+}
+
+enum FinderPreviewPlacement: String, CaseIterable, Identifiable {
+    case left, right, top, bottom
+    var id: Self { self }
+    var title: String {
+        switch self {
+        case .left: return "Left"
+        case .right: return "Right"
+        case .top: return "Top"
+        case .bottom: return "Bottom"
+        }
+    }
+    var layout: FinderPreviewLayout { self == .top || self == .bottom ? .topAndBottom : .sideBySide }
+    var previewFirst: Bool { self == .left || self == .top }
+
+    init(layout: FinderPreviewLayout, previewFirst: Bool) {
+        self = layout == .sideBySide ? (previewFirst ? .left : .right) : (previewFirst ? .top : .bottom)
+    }
 }
 
 enum PikPakContentMode: String, CaseIterable, Identifiable, Codable {
@@ -72,7 +92,13 @@ final class FinderSettings: ObservableObject {
     }
 
     @Published var downloadBufferCapMiB: Int {
-        didSet { defaults.set(downloadBufferCapMiB, forKey: "downloadBufferCapMiB") }
+        didSet {
+            let bounded = DownloadBufferPolicy.clampedCapMiB(downloadBufferCapMiB)
+            if bounded != downloadBufferCapMiB { downloadBufferCapMiB = bounded; return }
+            defaults.set(downloadBufferCapMiB, forKey: DownloadBufferPolicy.preferenceKey)
+            defaults.removeObject(forKey: DownloadBufferPolicy.legacyPreviewPreferenceKey)
+            PreviewMemoryBudget.shared.configure(capMiB: downloadBufferCapMiB)
+        }
     }
     var downloadBufferLimit: UInt64 {
         DownloadBufferPolicy.limitBytes(memory: ProcessInfo.processInfo.physicalMemory,
@@ -80,6 +106,11 @@ final class FinderSettings: ObservableObject {
     }
     func downloadBufferEnvironment(_ source: [String: String]) -> [String: String] {
         DownloadBufferPolicy.environment(source, capMiB: downloadBufferCapMiB)
+    }
+
+    var previewBufferCapMiB: Int {
+        get { downloadBufferCapMiB }
+        set { downloadBufferCapMiB = newValue }
     }
 
     @Published var autoHideSidebar: Bool {
@@ -91,6 +122,10 @@ final class FinderSettings: ObservableObject {
     @Published var previewPlacement: FinderPreviewPlacement {
         didSet { defaults.set(previewPlacement.rawValue, forKey: "finderPreviewPlacement") }
     }
+    var previewLayout: FinderPreviewLayout {
+        get { previewPlacement.layout }
+        set { previewPlacement = .init(layout: newValue, previewFirst: previewPlacement.previewFirst) }
+    }
     @Published private(set) var concurrentExtractions: Int
     @Published var selectedPane = 0
     @Published private(set) var layoutResetRevision = 0
@@ -101,14 +136,16 @@ final class FinderSettings: ObservableObject {
         contentMode = PikPakContentMode(rawValue: defaults.string(forKey: "pikpakContentMode") ?? "")
             ?? (defaults.bool(forKey: "pikpakGuestMode") ? .guest : .user)
         deleteAfterDownload = defaults.bool(forKey: "deleteAfterDownload")
-        let cap = defaults.integer(forKey: "downloadBufferCapMiB")
-        downloadBufferCapMiB = DownloadBufferPolicy.capsMiB.contains(cap) ? cap : 0
+        downloadBufferCapMiB = DownloadBufferPolicy.savedCapMiB(defaults: defaults)
         autoHideSidebar = defaults.bool(forKey: "finderAutoHideSidebar")
         showsPreviewPane = defaults.object(forKey: "finderShowsPreviewPane") as? Bool ?? true
         previewPlacement = FinderPreviewPlacement(rawValue: defaults.string(forKey: "finderPreviewPlacement") ?? "") ?? .right
         concurrentExtractions = min(8, max(1,
             (defaults.object(forKey: "finderConcurrentExtractions") as? NSNumber)?.intValue ?? 4))
         defaults.set(contentMode.rawValue, forKey: "pikpakContentMode")
+        defaults.set(downloadBufferCapMiB, forKey: DownloadBufferPolicy.preferenceKey)
+        defaults.removeObject(forKey: DownloadBufferPolicy.legacyPreviewPreferenceKey)
+        PreviewMemoryBudget.shared.configure(capMiB: downloadBufferCapMiB)
     }
 
     func setConcurrentExtractions(_ value: Int) {
@@ -121,7 +158,6 @@ final class FinderSettings: ObservableObject {
         // accounts, transfers, download destination and background work intact.
         let values: [String: Any] = [
             "browserSplitFraction": 0.64, "browserBottomSplitFraction": 0.45,
-            "previewCanvasHeight": 440.0,
             "browserViewMode": 0, "linksViewMode": 0,
             "browserListItemZoom": 1.0, "browserThumbnailItemZoom": 1.0, "browserItemZoom": 0.0,
             "browserNameColumnWidth": 250.0, "browserSizeColumnWidth": 76.0,
@@ -129,7 +165,8 @@ final class FinderSettings: ObservableObject {
             "browserShowsSizeColumn": true, "browserShowsKindColumn": true, "browserShowsModifiedColumn": true,
         ]
         values.forEach { defaults.set($0.value, forKey: $0.key) }
-        defaults.removeObject(forKey: "previewCanvasWidth") // Width now always follows the pane.
+        defaults.removeObject(forKey: "previewCanvasWidth")
+        defaults.removeObject(forKey: "previewCanvasHeight") // Media always fills the pane.
         autoHideSidebar = false; showsPreviewPane = true; previewPlacement = .right
         layoutResetRevision &+= 1
     }
@@ -376,6 +413,22 @@ struct FinderSettingsView: View {
     }
 }
 
+/// The layout and preview side describe all four arrangements without
+/// separate preferences that could disagree with the stored placement.
+struct FinderPreviewLayoutControls: View {
+    @ObservedObject var settings: FinderSettings
+    var body: some View {
+        Group {
+            Picker("Preview layout", selection: $settings.previewLayout) {
+                ForEach(FinderPreviewLayout.allCases) { Text($0.title).tag($0) }
+            }.pickerStyle(.segmented)
+            Picker("Preview placement", selection: $settings.previewPlacement) {
+                ForEach(settings.previewLayout.placements) { Text($0.title).tag($0) }
+            }.pickerStyle(.segmented)
+        }
+    }
+}
+
 private struct FinderGeneralSettingsView: View {
     @ObservedObject var settings: FinderSettings
     @ObservedObject var model: DownloaderModel
@@ -396,9 +449,7 @@ private struct FinderGeneralSettingsView: View {
             }
             Section("Browser and Links") {
                 Toggle("Show the preview pane", isOn: $settings.showsPreviewPane)
-                Picker("Preview placement", selection: $settings.previewPlacement) {
-                    ForEach(FinderPreviewPlacement.allCases) { Text($0.title).tag($0) }
-                }.pickerStyle(.segmented)
+                FinderPreviewLayoutControls(settings: settings)
                 Text("Applies to every drive and all workspace windows.").font(.caption).foregroundStyle(.secondary)
                 Text("You can also change this in View. Hide the preview to give the file list more space.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -411,25 +462,31 @@ private struct FinderGeneralSettingsView: View {
                         settings.resetLayout(); didResetLayout = true
                     }.pointingHandCursor()
                 }
-                Text("Restore the sidebar, split view, preview height, file columns, list view and item sizes across all drives.")
+                Text("Restore the sidebar, preview layout, file columns, list view and item sizes across all drives.")
                     .font(.caption).foregroundStyle(.secondary)
                 if didResetLayout {
                     Label("Layout reset", systemImage: "checkmark.circle.fill")
                         .font(.caption).foregroundStyle(.green)
                 }
             }
+            Section("RAM buffer") {
+                Picker("Download RAM buffer maximum", selection: $settings.downloadBufferCapMiB) {
+                    Text("Automatic").tag(0)
+                    ForEach(DownloadBufferPolicy.capsMiB().filter { $0 > 0 }, id: \.self) { cap in
+                        Text(DownloadBufferPolicy.text(UInt64(cap) * 1_048_576)).tag(cap)
+                    }
+                }
+                LabeledContent(settings.downloadBufferCapMiB == 0 ? "Automatic maximum" : "Maximum", value:
+                    ByteCountFormatter.string(fromByteCount: Int64(clamping: settings.downloadBufferLimit), countStyle: .memory))
+                Text("Applies to downloads and media previews on every drive and link. Automatic allows up to this Mac’s installed memory; the buffer grows as needed and waits under high macOS memory pressure. Changes apply immediately to previews and to the next download session.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("Preview RAM is shared across files and windows, including the next file. Buffering continues while paused. Previous files leave RAM two seconds after selection changes.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section("Transfers") {
                 Text("Uploads and downloads adjust automatically to your connection. You can pause or resume them in Transfers. iCloud Drive and Photos transfers are managed by macOS.")
                     .font(.caption).foregroundStyle(.secondary)
                 LabeledContent("This Mac", value: "\(ProcessInfo.processInfo.activeProcessorCount) cores · \(ProcessInfo.processInfo.physicalMemory / 1_073_741_824) GB memory")
-                Picker("Download RAM buffer maximum", selection: $settings.downloadBufferCapMiB) {
-                    Text("Automatic").tag(0)
-                    ForEach(DownloadBufferPolicy.capsMiB.filter { $0 > 0 }, id: \.self) { cap in
-                        Text(DownloadBufferPolicy.text(UInt64(cap) * 1_048_576)).tag(cap)
-                    }
-                }
-                Text("The buffer grows as needed and shrinks under macOS memory pressure. Selected sizes set a maximum. Changes apply to the next download session.")
-                    .font(.caption).foregroundStyle(.secondary)
                 LabeledContent("Download folder") {
                     Text(model.outputURL.path).lineLimit(2).truncationMode(.middle)
                         .textSelection(.enabled)

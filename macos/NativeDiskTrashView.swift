@@ -30,7 +30,8 @@ struct NativeDiskTrashView: View {
             if model.diskTrashItems.isEmpty {
                 VStack(spacing: 12) {
                     Image(systemName: "trash").font(.system(size: 38)).foregroundStyle(.secondary)
-                    Text(model.diskTrashLoading ? "Loading Trash…" : "Trash is empty").font(.title3.weight(.semibold))
+                    Text(model.diskTrashLoading ? "Loading Trash…" : model.diskTrashError == nil ? "Trash is empty" : "No verified Trash items to display")
+                        .font(.title3.weight(.semibold))
                 }.frame(maxWidth: .infinity, maxHeight: .infinity).finderCard(padding: 16)
             } else {
                 Table(model.diskTrashItems, selection: $model.diskTrashSelection) {

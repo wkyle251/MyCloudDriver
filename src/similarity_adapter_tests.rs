@@ -714,6 +714,7 @@ async fn scope_filters_do_not_encode_other_families_or_follow_symlinks() {
     let image = report.files.iter().find(|f| f.family == "image").unwrap();
     let row = score_row(
         ScoreRowRequest {
+            compact: false,
             data_dir: r.data_dir,
             run_id: report.run_id.unwrap(),
             result_revision: 1,
@@ -772,6 +773,7 @@ fn legacy_scan_rows_and_groups_are_read_without_migration_or_source_access() {
     let before = std::fs::read(&path).unwrap();
     let row = score_row(
         ScoreRowRequest {
+            compact: false,
             data_dir: dir.path().into(),
             run_id: "old-run".into(),
             result_revision: 2,

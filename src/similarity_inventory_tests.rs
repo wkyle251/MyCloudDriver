@@ -96,6 +96,63 @@ fn cloud_revision_changes_and_legacy_snapshots_are_revalidated() {
 }
 
 #[test]
+fn stale_native_listing_revision_does_not_restart_unchanged_analysis() {
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("generated.txt");
+    std::fs::write(&path, b"before").unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let revision = |device| format!("{}:{}:{}:{}:{}:{}:{}", device, metadata.ino(),
+        metadata.len(), metadata.mtime(), metadata.mtime_nsec(), metadata.ctime(), metadata.ctime_nsec());
+    let source = ExternalSource {
+        provider: Some("local".into()), content_kind: None,
+        id: "same-native-file".into(), name: "generated.txt".into(),
+        path: path.to_string_lossy().into(), size: 6, local_path: Some(path.clone()),
+        revision: Some(revision(metadata.dev().wrapping_add(4))),
+    };
+    let mut initial = scope::InputFile::external(source.clone());
+    initial.capture_inventory_version();
+    let mut fresh_source = source;
+    fresh_source.revision = Some(revision(metadata.dev()));
+    let mut current = scope::InputFile::external(fresh_source);
+    current.capture_inventory_version();
+    assert!(!changes(&[initial.clone()], &[current.clone()]).any(),
+        "Refreshing a stale mount number must not restart analysis of the same live file");
+    assert_eq!(initial.checkpoint_revision(), current.checkpoint_revision());
+    assert!(current.checkpoint_revision().is_some());
+    // A real same-size replacement must still invalidate the captured work,
+    // even when the provider reuses its original listing revision.
+    let replacement = root.path().join("replacement.txt");
+    std::fs::write(&replacement, b"edited").unwrap();
+    std::fs::rename(replacement, &path).unwrap();
+    assert!(initial.checkpoint_revision().is_none());
+    current.capture_inventory_version();
+    assert_eq!(changes(&[initial], &[current]).changed, 1);
+}
+
+#[test]
+fn remote_provider_revision_remains_part_of_file_change_detection() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("generated.txt");
+    std::fs::write(&path, b"remote").unwrap();
+    for provider in [None, Some("icloud"), Some("photos")] {
+        let source = ExternalSource {
+            provider: provider.map(str::to_owned), content_kind: None,
+            id: "provider-file".into(), name: "generated.txt".into(),
+            path: "/provider/generated.txt".into(), size: 6,
+            local_path: Some(path.clone()), revision: Some("revision-one".into()),
+        };
+        let mut previous = scope::InputFile::external(source.clone());
+        previous.capture_inventory_version();
+        let mut source = source;
+        source.revision = Some("revision-two".into());
+        let mut current = scope::InputFile::external(source);
+        current.capture_inventory_version();
+        assert_eq!(changes(&[previous], &[current]).changed, 1, "{provider:?}");
+    }
+}
+
+#[test]
 fn edits_after_native_acquisition_cannot_relabel_old_analysis() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("generated.txt");

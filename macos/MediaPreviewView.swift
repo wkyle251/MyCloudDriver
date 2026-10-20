@@ -2,14 +2,15 @@ import AppKit
 import AVKit
 import SwiftUI
 
-/// Clicking anywhere in the inspector establishes one keyboard context, even
-/// when a native slider or a SwiftUI button subsequently becomes first responder.
+/// Space controls visible media from anywhere in the file window. Clicking the
+/// inspector gives arrows a preview context, including on sliders and buttons.
 struct MediaPreviewKeyboardScope: NSViewRepresentable {
     var playback: MediaPlaybackController?
+    var isMediaPreview = false
     var onMove: (Int) -> Void
     func makeNSView(context: Context) -> MediaPreviewKeyView { MediaPreviewKeyView() }
     func updateNSView(_ view: MediaPreviewKeyView, context: Context) {
-        view.playback = playback; view.onMove = onMove
+        view.playback = playback; view.isMediaPreview = isMediaPreview; view.onMove = onMove
     }
     static func dismantleNSView(_ view: MediaPreviewKeyView, coordinator: ()) { view.stop() }
 }
@@ -17,6 +18,7 @@ struct MediaPreviewKeyboardScope: NSViewRepresentable {
 final class MediaPreviewKeyView: NSView {
     private static let scopes = NSHashTable<MediaPreviewKeyView>.weakObjects()
     weak var playback: MediaPlaybackController?
+    var isMediaPreview = false
     var onMove: ((Int) -> Void)?
     private(set) var hasPreviewFocus = false
     private var monitor: Any?
@@ -45,11 +47,12 @@ final class MediaPreviewKeyView: NSView {
         if let text = window.firstResponder as? NSTextView, text.isEditable { return false }
         if window.firstResponder is NSTextField { return false }
         guard let scope = scopes.allObjects.first(where: {
-            $0.window === window && $0.hasPreviewFocus && !$0.isHiddenOrHasHiddenAncestor
+            $0.window === window && !$0.isHiddenOrHasHiddenAncestor
+                && (event.keyCode == 49 ? $0.isMediaPreview : $0.hasPreviewFocus)
         }) else { return false }
         switch event.keyCode {
         case 49:
-            // Keep Space in the preview while its player is preparing, too.
+            // Reserve Space for visible media while its player is preparing, too.
             // A held key must not alternate between pause and resume.
             if !event.isARepeat { scope.playback?.togglePlayback() }
         case 123, 124:
@@ -205,6 +208,8 @@ enum MediaVideoTracks {
 struct MediaPreviewView: View {
     @ObservedObject var playback: MediaPlaybackController
     let isAudio: Bool
+    var transfer = MediaPreviewTransferState()
+    var placeholder: AnyView? = nil
     var onVideoFailure: ((Error, AVPlayer) -> Void)? = nil
     @State private var displayedPlayer: AVPlayer?
     @State private var failedPlayer: AVPlayer?
@@ -227,44 +232,47 @@ struct MediaPreviewView: View {
                         failedPlayer = source; onVideoFailure?(error, source)
                     }).id(ObjectIdentifier(player))
                 }
-                if preparingVideo || displayFailed { Color.black.allowsHitTesting(false) }
-                if playback.phase == .failed || displayFailed {
-                    Label("Preview unavailable", systemImage: "exclamationmark.triangle")
-                        .font(.callout).foregroundStyle(.white).padding()
-                } else if preparingVideo || playback.phase == .loading || playback.phase == .buffering {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text(preparingVideo || playback.phase == .loading ? "Loading preview…" : "Buffering…").font(.caption)
-                    }.padding(10).background(.regularMaterial, in: Capsule())
-                        .allowsHitTesting(false)
+                if preparingVideo || displayFailed || playback.phase == .failed {
+                    if let placeholder { placeholder.allowsHitTesting(false) }
                 }
             }.frame(maxWidth: .infinity, maxHeight: .infinity).clipped()
-            MediaTransportBar(playback: playback, settings: playback.settings, preparingVideo: preparingVideo)
+            MediaTransportBar(playback: playback, settings: playback.settings, transfer: transfer,
+                preparingVideo: preparingVideo)
         }.background(Color(nsColor: .controlBackgroundColor))
             .onChange(of: playback.player) { _ in displayedPlayer = nil; failedPlayer = nil }
     }
 }
 
-private struct MediaTransportBar: View {
+struct MediaTransportBar: View {
     @ObservedObject var playback: MediaPlaybackController
     @ObservedObject var settings: MediaPlaybackSettings
+    var transfer = MediaPreviewTransferState()
     var preparingVideo = false
     @State private var isScrubbing = false
     @State private var scrubPosition = 0.0
     private var position: Double { isScrubbing ? scrubPosition : playback.position }
     private var muted: Bool { settings.values.muted || settings.values.volume == 0 }
+    private var canPlay: Bool { !transfer.preparing && playback.canPlay }
+    private var canSeek: Bool { !transfer.preparing && playback.canSeek }
 
     var body: some View {
-        VStack(spacing: 7) {
-            HStack(spacing: 5) {
-                Text(MediaPlaybackController.time(position))
-                Spacer(minLength: 2)
-                Text(isScrubbing ? "Seeking" : preparingVideo ? "Loading" : playback.phase.rawValue).foregroundStyle(.secondary)
-                Spacer(minLength: 2)
-                Text(playback.duration > 0 ? MediaPlaybackController.time(playback.duration) : "—:—")
-            }.font(.system(size: 10, weight: .medium, design: .monospaced)).foregroundStyle(.secondary)
-            MediaSeekSlider(position: playback.position, duration: playback.duration, enabled: playback.canSeek,
-                source: playback.player, bufferedRanges: playback.bufferedRanges,
+        // Keep the same controls mounted as the pane crosses between two and
+        // three rows, preserving native slider focus and an active scrub.
+        MediaTransportLayout {
+            Text(transfer.waitingForMemory ? "Waiting for memory" : transfer.preparing || preparingVideo ? "Preparing…" : MediaPlaybackController.time(position))
+                .lineLimit(1)
+            Text(!transfer.preparing && playback.duration > 0 ? MediaPlaybackController.time(playback.duration) : "—:—")
+                .lineLimit(1)
+            HStack(spacing: 0) {
+                if !transfer.complete {
+                    Label(transfer.speedText, systemImage: "arrow.down")
+                        .lineLimit(1).fixedSize()
+                        .help("Average download speed over the last five seconds")
+                        .accessibilityLabel("Download speed: \(transfer.speedText), five-second average")
+                }
+            }
+            MediaSeekSlider(position: transfer.preparing ? 0 : playback.position, duration: transfer.preparing ? 0 : playback.duration, enabled: canSeek,
+                source: playback.player, bufferedRanges: transfer.ranges ?? playback.bufferedRanges, showsThumb: canSeek,
                 onScrub: { value in scrubPosition = value; isScrubbing = true },
                 onCommit: { value, source in
                     isScrubbing = false
@@ -272,32 +280,24 @@ private struct MediaTransportBar: View {
                     playback.seek(to: value)
                 })
                 .frame(height: 18)
-                .help(playback.bufferHelp.map { "Drag to seek. The solid section is played; lighter sections are held in memory. \($0)" }
-                    ?? "Drag to seek. The solid section is played; lighter sections are buffered.")
-
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 16) {
-                    transportButtons
-                    Spacer(minLength: 20)
-                    volumeControls.frame(width: 164)
-                    speedMenu
-                }.frame(minWidth: 400)
-                VStack(spacing: 7) {
-                    HStack { transportButtons; Spacer(minLength: 0); speedMenu }
-                    volumeControls
-                }
-            }
-        }.padding(10)
+                .help("Drag to seek. Solid color is played; lighter color shows buffered parts of the file. Gaps are not buffered.")
+            transportButtons
+            GeometryReader { viewport in
+                volumeControls(compact: viewport.size.width < 180).frame(height: 26)
+            }.frame(height: 26)
+            speedMenu.disabled(transfer.preparing)
+        }.font(.system(size: 10, weight: .medium, design: .monospaced)).foregroundStyle(.secondary)
+            .padding(.horizontal, 10).padding(.vertical, 8)
             .background(Color(nsColor: .controlBackgroundColor))
             .overlay(alignment: .top) { Divider() }
             .onChange(of: playback.player) { _ in isScrubbing = false; scrubPosition = 0 }
     }
     private var transportButtons: some View {
         HStack(spacing: 7) {
-            control("Back 5 seconds", symbol: "gobackward.5", enabled: playback.canSeek) { playback.skip(-5) }
+            control("Back 5 seconds", symbol: "gobackward.5", enabled: canSeek) { playback.skip(-5) }
             control(playback.wantsPlayback ? "Pause" : playback.phase == .finished ? "Replay" : "Play",
-                    symbol: playback.wantsPlayback ? "pause.fill" : "play.fill", enabled: playback.canPlay, prominent: true) { playback.togglePlayback() }
-            control("Forward 5 seconds", symbol: "goforward.5", enabled: playback.canSeek) { playback.skip(5) }
+                    symbol: playback.wantsPlayback ? "pause.fill" : "play.fill", enabled: canPlay, prominent: true) { playback.togglePlayback() }
+            control("Forward 5 seconds", symbol: "goforward.5", enabled: canSeek) { playback.skip(5) }
         }.fixedSize()
     }
     private var speedMenu: some View {
@@ -312,15 +312,17 @@ private struct MediaTransportBar: View {
             .menuStyle(.borderlessButton).fixedSize().buttonStyle(.automatic)
             .help("Playback speed · remembered for every video").accessibilityLabel("Playback speed")
     }
-    private var volumeControls: some View {
-        HStack(spacing: 8) {
+    private func volumeControls(compact: Bool) -> some View {
+        HStack(spacing: compact ? 4 : 6) {
             control(muted ? "Unmute" : "Mute", symbol: muted ? "speaker.slash.fill" : "speaker.wave.2.fill") { settings.toggleMute() }
             MediaSeekSlider(position: settings.values.volume, duration: 1, enabled: true, source: nil,
                 label: "Preview volume", onScrub: { settings.setVolume($0) }, onCommit: { value, _ in settings.setVolume(value) })
-                .frame(height: 18)
+                .frame(width: compact ? 56 : 110, height: 18)
                 .help("Preview volume · remembered for every video")
-            Text(muted ? "Muted" : "\(Int((settings.values.volume * 100).rounded()))%")
-                .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).frame(width: 34, alignment: .trailing)
+            if !compact {
+                Text(muted ? "Muted" : "\(Int((settings.values.volume * 100).rounded()))%")
+                    .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).frame(width: 34, alignment: .trailing)
+            }
         }
     }
     private func speedLabel(_ value: Double) -> String { "\(value.formatted(.number.precision(.fractionLength(0...2))))×" }
@@ -336,6 +338,57 @@ private struct MediaTransportBar: View {
     }
 }
 
+/// Wide previews put the clocks beside the timeline and download speed beside
+/// the controls. Narrow previews give the clocks/download speed their own row.
+/// Width, rather than the saved pane placement, also handles expanded previews.
+private struct MediaTransportLayout: Layout {
+    private let wideMinimumWidth: CGFloat = 520
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width.flatMap { $0.isFinite ? max(0, $0) : nil } ?? wideMinimumWidth
+        return .init(width: width, height: width >= wideMinimumWidth ? 50 : 68)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        // Stable slots: elapsed, duration, download, timeline, transport, volume, rate.
+        guard subviews.count == 7 else { return }
+        let width = bounds.width, wide = width >= wideMinimumWidth, compact = width < 360
+        let duration = subviews[1].sizeThatFits(.unspecified).width
+        // Reserve the duration's clock width so minute/hour changes never
+        // move the seek track underneath an active drag.
+        let elapsed = max(duration, subviews[0].sizeThatFits(.unspecified).width)
+        let download = subviews[2].sizeThatFits(.unspecified).width
+        let transport = subviews[4].sizeThatFits(.unspecified).width
+        let volume: CGFloat = compact ? 84 : 180
+        let rate = subviews[6].sizeThatFits(.unspecified).width
+        let gap: CGFloat = compact ? 6 : 10
+        let volumeX = transport + gap, rateX = max(0, width - rate)
+        let controlsY: CGFloat = wide ? 24 : 42
+        func place(_ index: Int, x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat) {
+            subviews[index].place(at: .init(x: bounds.minX + x + width / 2, y: bounds.minY + y + height / 2),
+                anchor: .center, proposal: .init(width: max(0, width), height: height))
+        }
+        place(4, x: 0, y: controlsY, width: transport, height: 26)
+        place(5, x: volumeX, y: controlsY, width: volume, height: 26)
+        place(6, x: rateX, y: controlsY, width: rate, height: 26)
+        if wide {
+            place(0, x: 0, y: 0, width: elapsed, height: 18)
+            place(3, x: elapsed + 6, y: 0, width: width - elapsed - duration - 12, height: 18)
+            place(1, x: width - duration, y: 0, width: duration, height: 18)
+            let availableStart = volumeX + volume + gap
+            let availableEnd = rateX - gap
+            place(2, x: (availableStart + availableEnd - download) / 2, y: controlsY, width: download, height: 26)
+        } else {
+            place(0, x: 0, y: 0, width: elapsed, height: 14)
+            place(1, x: width - duration, y: 0, width: duration, height: 14)
+            let availableStart = elapsed + 6, availableEnd = width - duration - 6
+            let downloadX = min(max((width - download) / 2, availableStart), availableEnd - download)
+            place(2, x: downloadX, y: 0, width: download, height: 14)
+            place(3, x: 0, y: 18, width: width, height: 18)
+        }
+    }
+}
+
 /// Nonblocking pointer tracking keeps playback ticks out of an active drag.
 /// Seek once on release; volume uses the same control and updates continuously.
 private struct MediaSeekSlider: NSViewRepresentable {
@@ -344,6 +397,7 @@ private struct MediaSeekSlider: NSViewRepresentable {
     let enabled: Bool
     let source: AVPlayer?
     var bufferedRanges: [ClosedRange<Double>] = []
+    var showsThumb = true
     var label = "Playback position"
     let onScrub: (Double) -> Void
     let onCommit: (Double, AVPlayer?) -> Void
@@ -354,6 +408,7 @@ private struct MediaSeekSlider: NSViewRepresentable {
         slider.setAccessibilityLabel(label)
         slider.isVolume = label == "Preview volume"
         slider.bufferedRanges = bufferedRanges
+        slider.showsThumb = showsThumb
         slider.onScrub = onScrub; slider.onCommit = onCommit; slider.source = source
         if !slider.tracking { slider.value = min(max(0, position), slider.maximum) }
         slider.needsDisplay = true
@@ -381,6 +436,7 @@ final class MediaSliderControl: NSControl {
     var maximum = 1.0
     var isVolume = false
     var bufferedRanges: [ClosedRange<Double>] = [] { didSet { if oldValue != bufferedRanges { needsDisplay = true } } }
+    var showsThumb = true { didSet { if oldValue != showsThumb { needsDisplay = true } } }
     var onScrub: ((Double) -> Void)?
     var onCommit: ((Double, AVPlayer?) -> Void)?
     override var acceptsFirstResponder: Bool { isEnabled }
@@ -402,7 +458,7 @@ final class MediaSliderControl: NSControl {
         // Share the exact same rail, insets and time mapping as the playhead.
         // Buffered islands stay separate, and played content is drawn on top.
         if !isVolume {
-            NSColor.controlAccentColor.withAlphaComponent(isEnabled ? 0.28 : 0.12).setFill()
+            NSColor.controlAccentColor.withAlphaComponent(0.30).setFill()
             for range in bufferedRanges where range.lowerBound.isFinite && range.upperBound.isFinite {
                 let start = min(1, max(0, range.lowerBound)), end = min(1, max(0, range.upperBound))
                 guard end > start else { continue }
@@ -413,13 +469,15 @@ final class MediaSliderControl: NSControl {
         NSColor.controlAccentColor.withAlphaComponent(isEnabled ? 1 : 0.3).setFill()
         NSBezierPath(rect: .init(x: track.minX, y: track.minY, width: max(0, x - track.minX), height: track.height)).fill()
         NSGraphicsContext.restoreGraphicsState()
-        let knob = NSBezierPath(ovalIn: .init(x: x - 6, y: center - 6, width: 12, height: 12))
-        NSColor.controlBackgroundColor.setFill(); knob.fill()
-        NSColor.separatorColor.withAlphaComponent(0.5).setStroke(); knob.lineWidth = 0.7; knob.stroke()
-        if window?.firstResponder === self {
-            NSColor.keyboardFocusIndicatorColor.setStroke()
-            let ring = NSBezierPath(ovalIn: .init(x: x - 8, y: center - 8, width: 16, height: 16))
-            ring.lineWidth = 1; ring.stroke()
+        if showsThumb {
+            let knob = NSBezierPath(ovalIn: .init(x: x - 6, y: center - 6, width: 12, height: 12))
+            NSColor.controlBackgroundColor.setFill(); knob.fill()
+            NSColor.separatorColor.withAlphaComponent(0.5).setStroke(); knob.lineWidth = 0.7; knob.stroke()
+            if window?.firstResponder === self {
+                NSColor.keyboardFocusIndicatorColor.setStroke()
+                let ring = NSBezierPath(ovalIn: .init(x: x - 8, y: center - 8, width: 16, height: 16))
+                ring.lineWidth = 1; ring.stroke()
+            }
         }
     }
     override func mouseDown(with event: NSEvent) {

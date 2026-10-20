@@ -2475,7 +2475,6 @@ final class DownloaderModel: ObservableObject {
     /// transfer and remains populated after the network goes idle. Derive the
     /// displayed rate from byte deltas instead, and expire the last sample soon
     /// after bytes stop arriving.
-    private static let previewTransferRateIdleTimeout: TimeInterval = 1.5
     private static let compatibilityPlayerBundleID = "com.colliderli.iina"
     private static let compatibilityPreviewFilenamePrefix = "PikPakDownloader-Preview-"
 
@@ -3432,8 +3431,37 @@ final class DownloaderModel: ObservableObject {
     private var quickLookDownloadSession: URLSession?
     private var quickLookDownloadGeneration = UUID()
     private var previewResourceLoader: PreviewResourceLoader?
+    private var previewFileResourceLoader: FilePreviewResourceLoader?
+    private let retiredPreviewFileLoaders = PreviewBufferRetention<String, FilePreviewResourceLoader> { $0.invalidate() }
     private var previewResourceCaches: [String: PreviewResourceCache] = [:]
     private var previewResourceCacheFileID: String?
+    private var previewResourceCacheIdentity: String?
+    private let retiredPreviewCaches = PreviewBufferRetention<String, [String: PreviewResourceCache]> {
+        for cache in $0.values { cache.removeFromDisk() }
+    }
+    private var nextPreviewIdentity: String?
+    private var nextPreviewInfo: PreviewInfo?
+    private var nextPreviewSource: PreviewSource?
+    private var nextPreviewCache: PreviewResourceCache?
+    private var nextPreviewCacheKey: String?
+    private var nextPreviewPrefetcher: PreviewResourcePrefetcher?
+    private var nextPreviewTask: Task<Void, Never>?
+    private struct QueuedPreviewBuffer {
+        let info: PreviewInfo
+        let source: PreviewSource
+        let cache: PreviewResourceCache
+        let key: String
+    }
+    private var queuedPreviewBuffers: [String: QueuedPreviewBuffer] = [:]
+    private var nextPreviewOrder: [String] = []
+    private var nextPreviewOwner: String?
+    private var nextPreviewContext: UUID?
+    private var failedNextPreviews = Set<String>()
+    private var nextPreviewRequest = UUID()
+    #if FINDER_WORKSPACE_TESTS
+    private var nextPreviewMetadataFixture: ((BrowserItem) async throws -> PreviewInfo)?
+    private var nextPreviewTransportFixture: ((URL) -> URL)?
+    #endif
     /// Folder expansion used to share the single foreground engine lane, so a
     /// second disclosure click could only queue behind the first. Each open now
     /// gets its own helper, bounded so a burst of clicks cannot flood PikPak.
@@ -3447,7 +3475,7 @@ final class DownloaderModel: ObservableObject {
     private var previewLastCacheSnapshot: PreviewResourceCacheSnapshot?
     private var previewCacheRateSample: (bytes: UInt64, date: Date)?
     private var previewNetworkRateSample: (bytes: UInt64, date: Date)?
-    private var previewLastTransferProgressDate: Date?
+    private var previewTransferReadActivity = FilePreviewReadActivity()
     private let quickLookPreviewCoordinator = QuickLookPreviewCoordinator()
     private let cloudDownloadPromiseCoordinator = CloudDownloadPromiseCoordinator()
     private var activeDownloadTransfers: [String: DownloadTransfer] = [:]
@@ -7441,6 +7469,19 @@ final class DownloaderModel: ObservableObject {
         // Keep the requested item associated with any engine/API failure so
         // the preview pane can show its diagnostic instead of going blank.
         previewFileID = item.id
+        let identity = quickLookIdentity(for: item)
+        if let buffered = queuedPreviewBuffers.removeValue(forKey: identity) {
+            let info = buffered.info
+            buffered.cache.setPriority(1)
+            previewResourceCaches[buffered.key] = buffered.cache
+            previewResourceCacheFileID = item.id
+            previewResourceCacheIdentity = identity
+            let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+            if let data = try? encoder.encode(info), let output = String(data: data, encoding: .utf8) {
+                finishPreview(output: output, fileID: item.id)
+                return
+            }
+        }
         if item.mediaKind == .video || item.mediaKind == .audio {
             previewStreamingState = .preparing
         }
@@ -15655,7 +15696,7 @@ final class DownloaderModel: ObservableObject {
         }
         selectedBrowserItemID = item.id
         if !keepsCurrentPreview {
-            clearPreview(preservingQuickLook: quickLookTargetIsCurrent)
+            clearPreview(preservingResourceCacheFor: item.id, preservingQuickLook: quickLookTargetIsCurrent)
         }
         if isQuickLookSessionActive {
             cancelAutomaticPreviewNavigation()
@@ -20273,6 +20314,9 @@ final class DownloaderModel: ObservableObject {
             values["file_worker_limit"] = Double(t.fileWorkerLimit ?? 0)
             values["admitted_read_tasks"] = Double(t.admittedReadTasks ?? 0)
             values["deferred_read_tasks"] = Double(t.deferredReadTasks ?? 0)
+            values["discovery_outstanding_files"] = Double(t.discoveryOutstandingFiles ?? 0)
+            values["discovery_waiting_files"] = Double(t.discoveryWaitingFiles ?? 0)
+            values["final_verification_tasks"] = Double(t.finalVerificationTasks ?? 0)
             values["download_has_ready"] = t.downloadHasReady == true ? 1 : 0
             values["waiting_writers"] = Double(t.waitingWriters ?? 0)
             values["eligible_waiting_writers"] = Double(t.eligibleWaitingWriters ?? 0)
@@ -20324,7 +20368,8 @@ final class DownloaderModel: ObservableObject {
             "read_preparation", "read_queue_wait", "read_gate_wait", "read_turn_wait", "read_io", "read_hash", "scheduler_pass", "replay_read",
             "resume_plan_new", "resume_plan_missing", "resume_plan_unverified", "resume_plan_length", "resume_plan_revision",
             "resume_plan_source", "resume_plan_validator", "resume_plan_range", "resume_plan_accepted", "resume_plan_full",
-            "resume_plan_promoted", "resume_plan_tail"]
+            "resume_plan_promoted", "resume_plan_tail",
+            "publication_payload_sync", "publication_pending_receipt", "publication_move", "publication_committed_receipt"]
         for (kind, metric) in event.diagnostics ?? [:] where kinds.contains(kind) {
             if let old = downloadDiagnosticMetrics[kind] {
                 downloadDiagnosticMetrics[kind] = .init(count: old.count &+ metric.count, bytes: old.bytes &+ metric.bytes,
@@ -20379,6 +20424,9 @@ final class DownloaderModel: ObservableObject {
             values["deferred_read_tasks"] = Double(traffic.deferredReadTasks ?? 0)
             values["deferred_read_bytes"] = Double(traffic.deferredReadBytes ?? 0)
             values["read_admission_deferrals"] = Double(traffic.readAdmissionDeferrals ?? 0)
+            values["discovery_outstanding_files"] = Double(traffic.discoveryOutstandingFiles ?? 0)
+            values["discovery_waiting_files"] = Double(traffic.discoveryWaitingFiles ?? 0)
+            values["final_verification_tasks"] = Double(traffic.finalVerificationTasks ?? 0)
             values["receiving_tasks"] = Double(traffic.receivingTasks ?? 0)
             values["ram_draining_tasks"] = Double(traffic.ramDrainingTasks ?? 0)
             values["disk_only_tasks"] = Double(traffic.diskOnlyTasks ?? 0)
@@ -21937,7 +21985,7 @@ final class DownloaderModel: ObservableObject {
         quickLookPreviewCoordinator.showFailure("Could not prepare this file for preview. Try again.")
     }
 
-    private func playbackSources(from preview: PreviewInfo) -> [PreviewSource] {
+    private func playbackSources(from preview: PreviewInfo, isVideo: Bool? = nil) -> [PreviewSource] {
         var candidates = preview.sources ?? []
         if let contentURL = preview.contentURL,
            !candidates.contains(where: { $0.contentURL == contentURL }) {
@@ -21957,7 +22005,7 @@ final class DownloaderModel: ObservableObject {
             guard let url = source.contentURL else { return false }
             return seen.insert(url.absoluteString).inserted
         }
-        guard selectedBrowserItem?.mediaKind == .video else { return unique }
+        guard isVideo ?? (selectedBrowserItem?.mediaKind == .video) else { return unique }
 
         // Prefer PikPak's macOS-friendly transcodes. Original AVI/MKV files
         // can contain legacy codecs even when the extension is recognized.
@@ -21969,17 +22017,18 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func playbackCompatibilityRank(_ source: PreviewSource) -> Int {
-        let isPlaylist = source.contentURL?.pathExtension.lowercased() == "m3u8"
+        // Progressive sources use the shared byte budget and can be prefetched.
+        let playlistPenalty = source.contentURL?.pathExtension.lowercased() == "m3u8" ? 10 : 0
         let codec = source.videoCodec?.lowercased() ?? ""
         let isNativeCodec = codec.contains("h264") || codec.contains("avc")
             || codec.contains("hevc") || codec.contains("h265")
         if !source.isOrigin, isNativeCodec {
-            return isPlaylist ? 1 : 0
+            return playlistPenalty
         }
         if !source.isOrigin {
-            return isPlaylist ? 3 : 2
+            return playlistPenalty + 2
         }
-        return isPlaylist ? 5 : 4
+        return playlistPenalty + 4
     }
 
     /// Original AVI containers need a compatible copy even when PikPak omits
@@ -22012,27 +22061,26 @@ final class DownloaderModel: ObservableObject {
         previewPlayer?.pause(); previewPlayer = nil
         let size = source.isOrigin ? (previewInfo?.size ?? 0) : 0
         let key = previewResourceCacheKey(for: source, index: index)
-        let cachedInput = reuseBufferedSource ? try? previewResourceCaches[key]?.takeCompleteFile(expectedSize: size) : nil
-        // A partial cache still requires a complete download. A complete one
-        // survives cache cleanup as an owned input until conversion finishes.
+        let cachedSource = reuseBufferedSource && previewResourceCaches[key]?.snapshot.fraction == 1
+            ? previewResourceCaches.removeValue(forKey: key) : nil
         clearPreviewResourceCaches()
         let generation = UUID()
         previewLoadGeneration = generation
         previewPlaybackWasRequested = autoplay
         previewPlaybackError = nil; previewErrorDiagnostic = nil
         previewRequiresCompatibilityPlayer = false; previewCompatibilityPlayerName = nil
-        previewSourceLabel = cachedInput == nil ? "Downloading \(format.displayName) for preview…" : "Preparing buffered video preview…"
+        previewSourceLabel = cachedSource == nil ? "Downloading \(format.displayName) for preview…" : "Preparing buffered video preview…"
         isPreviewLoading = true
         resetPreviewStreamingMetrics(state: .preparing)
         let proxy = proxyURL
         #if FINDER_WORKSPACE_TESTS
-        let preparationURL = cachedInput?.url ?? previewFixtureMediaURL ?? url
+        let fallbackURL = previewFixtureMediaURL ?? url
         #else
-        let preparationURL = cachedInput?.url ?? url
+        let fallbackURL = url
         #endif
         clearPreviewPreparationProgress()
         updatePreviewPreparationProgress(.init(message: previewSourceLabel ?? "Preparing preview…",
-            fileSize: size, activity: preparationURL.isFileURL ? .processing : .transferring))
+            fileSize: size, activity: cachedSource != nil || fallbackURL.isFileURL ? .processing : .transferring))
         previewPreparationRateTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard self?.previewLoadGeneration == generation else { return }
@@ -22042,8 +22090,13 @@ final class DownloaderModel: ObservableObject {
             }
         }
         compatiblePreviewTask = Task { [weak self] in
-            defer { withExtendedLifetime(cachedInput) {} }
+            defer { cachedSource?.removeFromDisk() }
             do {
+                let cachedInput = try await NativeFileWork.run {
+                    try cachedSource?.takeCompleteFile(expectedSize: size)
+                }
+                defer { withExtendedLifetime(cachedInput) {} }
+                let preparationURL = cachedInput?.url ?? fallbackURL
                 let copy = try await VideoPreviewPreparation.prepare(source: preparationURL, format: format, expectedSize: size, proxyURL: proxy) { [weak self] progress in
                     Task { @MainActor in
                         guard let self, self.previewLoadGeneration == generation, self.previewFileID == fileID,
@@ -22309,7 +22362,7 @@ final class DownloaderModel: ObservableObject {
         let resourceCache = supportsRetainedTransport
             ? previewResourceCache(for: source, index: index, fileID: fileID)
             : nil
-        let usesManagedTransport = resourceCache != nil
+        let usesManagedTransport = resourceCache != nil || contentURL.isFileURL
         let proxyLabel = PreviewTransport.usesProxy(proxyURL) ? " • app proxy" : ""
         let transportLabel = usesManagedTransport ? " • retained cache\(proxyLabel)" : proxyLabel
         previewSourceLabel = localURL != nil ? "Compatible preview • temporary copy"
@@ -22340,7 +22393,19 @@ final class DownloaderModel: ObservableObject {
             assetOptions[AVURLAssetOverrideMIMETypeKey] = mimeType
         }
         let asset: AVURLAsset
-        if let resourceCache {
+        if contentURL.isFileURL,
+           let loader = selectedBrowserItem.flatMap({ retiredPreviewFileLoaders.take(quickLookIdentity(for: $0)) })
+                ?? (try? FilePreviewResourceLoader(fileURL: contentURL, onSnapshot: { [weak self] snapshot in
+                    self?.updatePreviewCacheMetrics(snapshot, generation: generation, fileID: fileID)
+                })) {
+            previewUsesRetainedCache = true
+            previewFileResourceLoader = loader
+            loader.setCachePriority(1)
+            updatePreviewCacheMetrics(loader.snapshot, generation: generation, fileID: fileID, resetsRateSample: true)
+            asset = AVURLAsset(url: loader.assetURL, options: assetOptions)
+            asset.resourceLoader.setDelegate(loader, queue: loader.delegateQueue)
+            loader.setReadingAhead(true)
+        } else if let resourceCache {
             previewUsesRetainedCache = true
             updatePreviewCacheMetrics(
                 resourceCache.snapshot,
@@ -22371,7 +22436,7 @@ final class DownloaderModel: ObservableObject {
             asset = AVURLAsset(url: contentURL, options: assetOptions)
         }
         let playerItem = AVPlayerItem(asset: asset)
-        // Continue filling the disk cache while paused, but keep the player's
+        // Continue filling RAM while paused, but keep the player's
         // in-memory lookahead independent of the full file duration.
         playerItem.canUseNetworkResourcesForLiveStreamingWhilePaused = true
         playerItem.preferredForwardBufferDuration = Self.previewForwardBufferDuration
@@ -22556,8 +22621,14 @@ final class DownloaderModel: ObservableObject {
         fileID: String
     ) -> PreviewResourceCache? {
         if previewResourceCacheFileID != fileID {
-            clearPreviewResourceCaches()
+            retirePreviewResourceCaches()
             previewResourceCacheFileID = fileID
+            if let item = browserItem(withID: fileID) {
+                let identity = quickLookIdentity(for: item)
+                previewResourceCacheIdentity = identity
+                previewResourceCaches = retiredPreviewCaches.take(identity) ?? [:]
+                for cache in previewResourceCaches.values { cache.setPriority(1) }
+            }
         }
         let key = previewResourceCacheKey(for: source, index: index)
         if let cached = previewResourceCaches[key] {
@@ -22592,15 +22663,293 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func clearPreviewResourceCaches() {
+        cancelNextPreviewBuffer()
+        retiredPreviewCaches.removeAll()
+        retiredPreviewFileLoaders.removeAll()
         let caches = Array(previewResourceCaches.values)
         previewResourceCaches = [:]
         previewResourceCacheFileID = nil
+        previewResourceCacheIdentity = nil
         previewCacheRateSample = nil
-        previewLastTransferProgressDate = nil
+        previewTransferReadActivity = FilePreviewReadActivity()
         for cache in caches {
             cache.removeFromDisk()
         }
     }
+
+    private func retirePreviewResourceCaches(unless identity: String? = nil) {
+        if let identity, previewResourceCacheIdentity == identity { return }
+        let caches = previewResourceCaches
+        if !caches.isEmpty {
+            for cache in caches.values { cache.setPriority(-1, gracePeriod: 2) }
+            // Old test fixtures may supply only a file ID; real sources always have an identity.
+            let key = previewResourceCacheIdentity ?? previewResourceCacheFileID ?? UUID().uuidString
+            retiredPreviewCaches.insert(caches, for: key)
+        }
+        previewResourceCaches = [:]; previewResourceCacheFileID = nil; previewResourceCacheIdentity = nil
+    }
+
+    private func stopNextPreviewBuffer(retaining: Bool) {
+        nextPreviewRequest = UUID()
+        nextPreviewTask?.cancel(); nextPreviewTask = nil
+        nextPreviewPrefetcher?.invalidate(); nextPreviewPrefetcher = nil
+        if let nextPreviewCache {
+            if retaining, let nextPreviewIdentity, let info = nextPreviewInfo, let key = nextPreviewCacheKey,
+               let source = nextPreviewSource {
+                queuedPreviewBuffers[nextPreviewIdentity] = .init(info: info, source: source, cache: nextPreviewCache, key: key)
+            } else { nextPreviewCache.removeFromDisk() }
+        }
+        nextPreviewCache = nil; nextPreviewIdentity = nil; nextPreviewInfo = nil; nextPreviewSource = nil; nextPreviewCacheKey = nil
+    }
+    private func cancelNextPreviewBuffer(unless identity: String? = nil) {
+        if identity != nil, nextPreviewContext == fileOpenContext {
+            stopNextPreviewBuffer(retaining: true)
+            return
+        }
+        stopNextPreviewBuffer(retaining: false)
+        for buffer in queuedPreviewBuffers.values { buffer.cache.removeFromDisk() }
+        queuedPreviewBuffers.removeAll(); nextPreviewOrder = []; failedNextPreviews = []
+        nextPreviewOwner = nil; nextPreviewContext = nil
+    }
+
+    private var nextPreviewBufferItems: [BrowserItem] {
+        let rows = browserFilterSelectionItems
+        guard let selectedBrowserItemID,
+              let index = rows.firstIndex(where: { $0.id == selectedBrowserItemID }) else { return [] }
+        var seen = Set<String>()
+        return rows.dropFirst(index + 1).filter {
+            !$0.isFolder && ($0.mediaKind == .video || $0.mediaKind == .audio) && seen.insert($0.id).inserted
+        }
+    }
+    private var nextPreviewBufferItem: BrowserItem? { nextPreviewBufferItems.first }
+
+    private func startNextPreviewReader(_ buffer: QueuedPreviewBuffer) {
+        guard var url = buffer.source.contentURL else { return }
+        #if FINDER_WORKSPACE_TESTS
+        if let nextPreviewTransportFixture { url = nextPreviewTransportFixture(url) }
+        #endif
+        let currentCache = previewSources.indices.contains(previewSourceIndex)
+            ? previewResourceCaches[previewResourceCacheKey(for: previewSources[previewSourceIndex], index: previewSourceIndex)] : nil
+        let currentFileLoader = previewFileResourceLoader
+        nextPreviewInfo = buffer.info; nextPreviewSource = buffer.source; nextPreviewCache = buffer.cache; nextPreviewCacheKey = buffer.key
+        let prefetcher = PreviewResourcePrefetcher(originalURL: url, proxyURL: proxyURL,
+            cache: buffer.cache, onCacheProgress: { _ in },
+            mayPrefetch: { [weak currentCache, weak currentFileLoader] in
+                currentCache?.snapshot.fraction == 1 || currentFileLoader?.snapshot.fraction == 1
+            })
+        nextPreviewPrefetcher = prefetcher
+        prefetcher.start(after: 0)
+    }
+
+    private func refreshNextPreviewBuffer() {
+        guard !isClosingWindow, let owner = previewFileID.flatMap({ browserItem(withID: $0) }).map({ quickLookIdentity(for: $0) }) else { return }
+        let candidates = nextPreviewBufferItems
+        let order = candidates.map { quickLookIdentity(for: $0) }
+        if nextPreviewContext != fileOpenContext || (nextPreviewOwner == owner && nextPreviewOrder != order) {
+            cancelNextPreviewBuffer()
+        }
+        nextPreviewContext = fileOpenContext; nextPreviewOwner = owner; nextPreviewOrder = order
+        let desired = Set(order)
+        if let nextPreviewIdentity, !desired.contains(nextPreviewIdentity) { stopNextPreviewBuffer(retaining: false) }
+        for id in Array(queuedPreviewBuffers.keys) where !desired.contains(id) {
+            queuedPreviewBuffers.removeValue(forKey: id)?.cache.removeFromDisk()
+        }
+        failedNextPreviews.formIntersection(desired)
+        guard previewLastCacheSnapshot?.fraction == 1 else { return }
+        if nextPreviewPrefetcher?.hasTerminalFailure == true {
+            if let nextPreviewIdentity { failedNextPreviews.insert(nextPreviewIdentity) }
+            stopNextPreviewBuffer(retaining: false)
+        } else if nextPreviewCache?.snapshot.fraction == 1 {
+            stopNextPreviewBuffer(retaining: true)
+        }
+        guard nextPreviewIdentity == nil, PreviewMemoryBudget.shared.permitsReadAhead,
+              let candidate = candidates.first(where: {
+                  let id = quickLookIdentity(for: $0)
+                  return !failedNextPreviews.contains(id) && queuedPreviewBuffers[id]?.cache.snapshot.fraction != 1
+              }) else { return }
+        let identity = quickLookIdentity(for: candidate)
+        nextPreviewIdentity = identity
+        if let retained = queuedPreviewBuffers.removeValue(forKey: identity) {
+            startNextPreviewReader(retained)
+            return
+        }
+        let request = UUID(); nextPreviewRequest = request
+        nextPreviewTask = Task { [weak self] in
+            do {
+                guard let self else { return }
+                let info = try await self.nextPreviewMetadata(for: candidate)
+                try Task.checkCancellation()
+                guard self.nextPreviewRequest == request, self.nextPreviewIdentity == identity else { return }
+                let sources = self.playbackSources(from: info, isVideo: candidate.mediaKind == .video)
+                // Match the source that will actually play when this row is selected.
+                // HLS stays with AVPlayer; a progressive file is needed for a RAM queue.
+                guard let source = sources.first, let url = source.contentURL,
+                      url.pathExtension.lowercased() != "m3u8" else {
+                    self.failedNextPreviews.insert(identity); self.stopNextPreviewBuffer(retaining: false)
+                    return
+                }
+                let cache = try PreviewResourceCache()
+                cache.setPriority(0)
+                self.startNextPreviewReader(.init(info: info, source: source, cache: cache,
+                    key: self.previewResourceCacheKey(for: source, index: 0)))
+            } catch {
+                guard let self, !Task.isCancelled, self.nextPreviewRequest == request else { return }
+                self.failedNextPreviews.insert(identity); self.stopNextPreviewBuffer(retaining: false)
+            }
+        }
+    }
+
+    private func nextPreviewMetadata(for item: BrowserItem) async throws -> PreviewInfo {
+        #if FINDER_WORKSPACE_TESTS
+        if let nextPreviewMetadataFixture { return try await nextPreviewMetadataFixture(item) }
+        #endif
+        let configuration = try fileOpenConfiguration(for: item)
+        guard let command = configuration.arguments.first else { throw CancellationError() }
+        let helper = SimilarityConfiguration(executable: configuration.executable,
+            models: configuration.exchangeDirectory, worker: configuration.executable,
+            dataDirectory: configuration.exchangeDirectory, temporaryDirectory: configuration.exchangeDirectory,
+            environment: configuration.environment)
+        let data = try await SimilarityHelper.request(configuration: helper,
+            command: command, input: configuration.requestData ?? Data(),
+            arguments: configuration.requestData == nil ? Array(configuration.arguments.dropFirst()) : [])
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(PreviewInfo.self, from: data)
+    }
+
+    #if FINDER_WORKSPACE_TESTS
+    static func testPreviewRAMFolderQueue(defaults: UserDefaults, remote: URL, fileBytes: Int64) async throws {
+        let shared = PreviewMemoryBudget.shared
+        defer { shared.setLimit(64 << 20); shared.setPressure(1) }
+        for isLink in [false, true] {
+            let model = DownloaderModel(finderFixture: true, defaults: defaults)
+            defer { model.clearPreview(); model.clearPreviewResourceCaches() }
+            if isLink {
+                model.browserSource = .sharedLink; model.activeSharedLinkID = UUID()
+                model.browserStack = [.sharedRoot, .init(id: "fixture-root", name: "Generated shared files", path: "/Generated shared files")]
+            }
+            func item(_ name: String) -> BrowserItem {
+                .init(id: name, name: name, size: UInt64(fileBytes), kind: .file, parentId: nil, mimeType: "video/mp4",
+                    createdTime: nil, modifiedTime: nil, fileExtension: nil, iconLink: nil, thumbnailLink: nil,
+                    fileCategory: nil, hash: nil, md5Checksum: nil)
+            }
+            let files = ["A.mp4", "B.mp4", "C.mp4", "D.mp4", "E.mp4"].map(item)
+            model.browserItems = files
+            model.updateBrowserSelection(to: files[0], requestsPreview: false)
+            var requests: [String] = []
+            func source(_ item: BrowserItem) -> PreviewSource {
+                .init(url: "https://fixture.invalid/\(item.name)", label: "Fixture", isOrigin: true, videoCodec: "h264", audioCodec: "aac")
+            }
+            model.nextPreviewMetadataFixture = { item in
+                requests.append(item.id)
+                let media = source(item)
+                return .init(name: item.name, size: item.size, mimeType: item.mimeType,
+                    thumbnailLink: nil, iconLink: nil, contentLink: media.url, sources: [media])
+            }
+            // Only this fixture maps the validated HTTPS source to a loopback HTTP server.
+            model.nextPreviewTransportFixture = { _ in remote }
+            let firstSource = source(files[0])
+            model.previewSources = [firstSource]; model.previewSourceIndex = 0; model.previewFileID = files[0].id
+            let first = model.previewResourceCache(for: firstSource, index: 0, fileID: files[0].id)!
+            shared.setLimit(fileBytes * 3)
+            first.updateMetadata(typeIdentifier: "public.mpeg-4", contentLength: fileBytes, supportsByteRanges: true)
+            precondition(first.store(Data(repeating: 1, count: Int(fileBytes)), at: 0, allowsEviction: false) != nil)
+            model.previewLastCacheSnapshot = first.snapshot
+            func buffer(_ index: Int) -> PreviewResourceCache? {
+                let id = model.quickLookIdentity(for: files[index])
+                return model.queuedPreviewBuffers[id]?.cache ?? (model.nextPreviewIdentity == id ? model.nextPreviewCache : nil)
+            }
+            func wait(_ message: String, _ check: () -> Bool) async throws {
+                for _ in 0..<600 {
+                    model.refreshNextPreviewBuffer()
+                    if check() { return }
+                    try await Task.sleep(nanoseconds: 20_000_000)
+                }
+                preconditionFailure(message)
+            }
+            try await wait("PikPak current + two successors must fill the shared cap") { buffer(1)?.snapshot.fraction == 1 && buffer(2)?.snapshot.fraction == 1 }
+            for _ in 0..<20 { model.refreshNextPreviewBuffer(); try await Task.sleep(nanoseconds: 20_000_000) }
+            precondition(requests == [files[1].id, files[2].id] && shared.residentBytes <= fileBytes * 3)
+            shared.setPressure(2); shared.setLimit(fileBytes * 4)
+            for _ in 0..<20 { model.refreshNextPreviewBuffer(); try await Task.sleep(nanoseconds: 20_000_000) }
+            precondition(requests.count == 2, "Pressure stops cloud metadata/read-ahead with spare RAM")
+            shared.setPressure(1)
+            try await wait("PikPak resumes the third successor") { buffer(3)?.snapshot.fraction == 1 }
+            let third = buffer(2)!, fourth = buffer(3)!
+            // Exercise the actual request/promotion path without using any cloud credentials.
+            model.selectedBrowserItemID = files[2].id; model.selectedBrowserItemIDs = [files[2].id]
+            model.isFinderWorkspaceFixture = false; model.previewFixtureMediaURL = remote
+            model.requestPreview(for: files[2])
+            precondition(model.previewResourceCaches.values.contains { $0 === third }, "A later cached file must be promoted directly")
+            precondition(buffer(3) === fourth, "Later prefetched files survive promotion")
+            model.previewLastCacheSnapshot = third.snapshot
+            try await wait("PikPak keeps buffering the following file") { buffer(4)?.snapshot.fraction == 1 }
+            let future = [fourth, buffer(4)!]
+            let folder = BrowserItem(id: "folder", name: "Another folder", size: 0, kind: .folder, parentId: nil,
+                mimeType: nil, createdTime: nil, modifiedTime: nil, fileExtension: nil, iconLink: nil,
+                thumbnailLink: nil, fileCategory: nil, hash: nil, md5Checksum: nil)
+            model.browserItems.append(folder)
+            model.clearPreview(preservingResourceCacheFor: folder.id)
+            precondition(model.nextPreviewIdentity == nil && model.queuedPreviewBuffers.isEmpty && future.allSatisfy { $0.snapshot.cachedBytes == 0 },
+                "Folder focus cancels every remaining cloud prefetch")
+            model.clearPreviewResourceCaches()
+            for _ in 0..<100 where shared.residentBytes != 0 { try await Task.sleep(nanoseconds: 20_000_000) }
+            precondition(shared.residentBytes == 0)
+            print("PASS \(isLink ? "PikPak Link" : "PikPak Drive") folder queue: real HTTP, multiple files, cap, pressure, promotion and folder cancellation")
+        }
+    }
+    static func testPreviewRAMQueue(defaults: UserDefaults) async throws {
+        let model = DownloaderModel(finderFixture: true, defaults: defaults)
+        defer { model.clearPreview(); model.clearPreviewResourceCaches() }
+        func item(_ name: String) -> BrowserItem {
+            .init(id: name, name: name, size: 4, kind: .file, parentId: nil, mimeType: "video/mp4",
+                createdTime: nil, modifiedTime: nil, fileExtension: nil, iconLink: nil, thumbnailLink: nil,
+                fileCategory: nil, hash: nil, md5Checksum: nil)
+        }
+        let a = item("A.mp4"), b = item("B.mov"), c = item("C.mp4")
+        model.browserItems = [a, b, c]
+        model.updateBrowserSelection(to: a, requestsPreview: false)
+        model.browserFileFilter = .fileExtension("mp4")
+        precondition(model.nextPreviewBufferItem?.id == c.id)
+        model.browserFileFilter = .all
+        precondition(model.nextPreviewBufferItem?.id == b.id)
+        model.browserFileFilter = .fileExtension("mp4")
+        let source = PreviewSource(url: "https://127.0.0.1:9/fixture.mp4", label: "Fixture", isOrigin: true, videoCodec: nil, audioCodec: nil)
+        var requests: [String] = []
+        model.nextPreviewMetadataFixture = { item in
+            requests.append(item.id)
+            return .init(name: item.name, size: item.size, mimeType: item.mimeType,
+                thumbnailLink: nil, iconLink: nil, contentLink: source.url, sources: [source])
+        }
+        model.previewSources = [source]; model.previewSourceIndex = 0; model.previewFileID = a.id
+        let cache = model.previewResourceCache(for: source, index: 0, fileID: a.id)!
+        cache.updateMetadata(typeIdentifier: "public.mpeg-4", contentLength: 4, supportsByteRanges: true)
+        cache.store(Data([0, 1]), at: 0)
+        model.previewLastCacheSnapshot = cache.snapshot
+        model.refreshNextPreviewBuffer()
+        precondition(requests.isEmpty && model.nextPreviewIdentity == nil, "Current file must finish first")
+        cache.store(Data([2, 3]), at: 2); model.previewLastCacheSnapshot = cache.snapshot
+        model.refreshNextPreviewBuffer()
+        for _ in 0..<100 where model.nextPreviewCache == nil { try await Task.sleep(nanoseconds: 10_000_000) }
+        precondition(requests == [c.id] && model.nextPreviewCache != nil, "Filtered next file must be prefetched")
+        let rejected = model.nextPreviewCache!
+        model.browserFileFilter = .all
+        model.refreshNextPreviewBuffer()
+        for _ in 0..<100 where requests.count < 2 { try await Task.sleep(nanoseconds: 10_000_000) }
+        precondition(requests == [c.id, b.id] && !rejected.permitsBackgroundPrefetch,
+            "Changing a filter cancels the old next file and resolves the new visible successor")
+        model.cancelNextPreviewBuffer()
+        let original = cache.snapshot
+        model.clearPreview(preservingResourceCacheFor: b.id)
+        precondition(cache.snapshot == original, "A focus change retains RAM for the grace period")
+        model.selectedBrowserItemID = a.id
+        let restored = model.previewResourceCache(for: source, index: 0, fileID: a.id)!
+        precondition(restored === cache && restored.snapshot == original, "A quick return reuses the same RAM cache")
+        model.clearPreview(preservingResourceCacheFor: b.id)
+        try await Task.sleep(nanoseconds: 2_150_000_000)
+        precondition(cache.snapshot.cachedBytes == 0, "Previous cloud previews expire after two seconds")
+        print("PASS PikPak RAM: current-first admission, filtered successor, live filter retargeting, grace-period reuse and expiry")
+    }
+    #endif
 
     private func handlePreviewPlayerStatus(
         _ playerStatus: AVPlayerItem.Status,
@@ -22745,6 +23094,10 @@ final class DownloaderModel: ObservableObject {
                     generation: generation,
                     fileID: fileID
                 )
+                if let loader = self.previewFileResourceLoader {
+                    self.updatePreviewCacheMetrics(loader.snapshot, generation: generation, fileID: fileID)
+                }
+                self.refreshNextPreviewBuffer()
                 do {
                     try await Task.sleep(
                         nanoseconds: Self.previewMetricsIntervalNanoseconds
@@ -22867,7 +23220,7 @@ final class DownloaderModel: ObservableObject {
         }
 
         let now = Date()
-        expirePreviewTransferRateIfIdle(now: now)
+        refreshPreviewTransferRate(now: now)
         guard !previewUsesRetainedCache else { return }
         guard let events = playerItem.accessLog()?.events, !events.isEmpty else { return }
         let transferredBytes = events.reduce(UInt64(0)) { total, event in
@@ -22883,36 +23236,26 @@ final class DownloaderModel: ObservableObject {
     /// arriving now. Sampling the cumulative network-byte counter makes zero
     /// traffic settle back to zero even while playback continues from a buffer.
     private func updatePreviewNetworkRate(transferredBytes: UInt64, now: Date) {
-        guard let sample = previewNetworkRateSample else {
-            previewNetworkRateSample = (transferredBytes, now)
-            previewTransferBytesPerSecond = 0
-            return
-        }
-
-        let elapsed = now.timeIntervalSince(sample.date)
-        guard elapsed >= 0.15 else { return }
+        recordPreviewTransferBytes(transferredBytes, previous: previewNetworkRateSample?.bytes, now: now)
         previewNetworkRateSample = (transferredBytes, now)
-
-        if transferredBytes > sample.bytes {
-            previewTransferBytesPerSecond = Double(transferredBytes - sample.bytes) / elapsed
-            previewLastTransferProgressDate = now
-        } else if transferredBytes < sample.bytes {
-            // Access-log events may roll over when AVPlayer changes requests.
-            // Establish a fresh baseline rather than reporting an invalid rate.
-            previewTransferBytesPerSecond = 0
-            previewLastTransferProgressDate = nil
-        } else {
-            expirePreviewTransferRateIfIdle(now: now)
-        }
     }
 
-    private func expirePreviewTransferRateIfIdle(now: Date) {
-        guard previewTransferBytesPerSecond > 0 else { return }
-        guard let lastProgress = previewLastTransferProgressDate,
-              now.timeIntervalSince(lastProgress) < Self.previewTransferRateIdleTimeout else {
-            previewTransferBytesPerSecond = 0
-            return
+    private func recordPreviewTransferBytes(_ bytes: UInt64, previous: UInt64?, now: Date) {
+        let time = now.timeIntervalSinceReferenceDate
+        if let previous, bytes >= previous {
+            previewTransferReadActivity.record(bytes: Int(clamping: bytes - previous), at: time)
+        } else {
+            // A resumed cache or a rolled-over access log establishes a new baseline.
+            previewTransferReadActivity = FilePreviewReadActivity()
+            previewTransferReadActivity.begin(at: time)
         }
+        refreshPreviewTransferRate(now: now)
+    }
+
+    private func refreshPreviewTransferRate(now: Date) {
+        let rate = previewFileResourceLoader?.status.bytesPerSecond
+            ?? previewTransferReadActivity.bytesPerSecond(at: now.timeIntervalSinceReferenceDate)
+        if previewTransferBytesPerSecond != rate { previewTransferBytesPerSecond = rate }
     }
 
     private func loadedDuration(in values: [NSValue]) -> Double {
@@ -22990,29 +23333,9 @@ final class DownloaderModel: ObservableObject {
         let buffered = bufferedSecondsAhead(of: previewPlaybackSeconds, in: snapshot)
         if previewBufferedSeconds != buffered { previewBufferedSeconds = buffered }
 
-        let now = Date()
-        if resetsRateSample {
-            previewCacheRateSample = (cachedBytes, now)
-            previewTransferBytesPerSecond = 0
-            previewLastTransferProgressDate = nil
-            return
-        }
-        guard let sample = previewCacheRateSample else {
-            previewCacheRateSample = (cachedBytes, now)
-            return
-        }
-        let elapsed = now.timeIntervalSince(sample.date)
-        guard elapsed >= 0.15 else { return }
-        previewCacheRateSample = (cachedBytes, now)
-        if cachedBytes > sample.bytes {
-            previewTransferBytesPerSecond = Double(cachedBytes - sample.bytes) / elapsed
-            previewLastTransferProgressDate = now
-        } else if cachedBytes < sample.bytes {
-            previewTransferBytesPerSecond = 0
-            previewLastTransferProgressDate = nil
-        } else {
-            expirePreviewTransferRateIfIdle(now: now)
-        }
+        let now = Date(), received = UInt64(max(0, snapshot.receivedBytes ?? snapshot.cachedBytes))
+        recordPreviewTransferBytes(received, previous: resetsRateSample ? nil : previewCacheRateSample?.bytes, now: now)
+        previewCacheRateSample = (received, now)
     }
 
     /// A failure reported after the media has been playing is not a startup
@@ -23198,6 +23521,7 @@ final class DownloaderModel: ObservableObject {
     }
 
     private func removePreviewPlayerObservers() {
+        previewFileResourceLoader?.invalidate(); previewFileResourceLoader = nil
         previewResourceLoader?.invalidate()
         previewResourceLoader = nil
         playerItemStatusObservation?.invalidate()
@@ -23253,7 +23577,7 @@ final class DownloaderModel: ObservableObject {
         previewLastCacheSnapshot = nil
         previewCacheRateSample = nil
         previewNetworkRateSample = nil
-        previewLastTransferProgressDate = nil
+        previewTransferReadActivity = FilePreviewReadActivity()
     }
 
     private func finishFolderMeasurement(
@@ -24732,6 +25056,12 @@ final class DownloaderModel: ObservableObject {
         if !preservingQuickLook { cancelQuickLookPreparation() }
         previewLoadGeneration = UUID()
         previewPlaybackWasRequested = false
+        if let loader = previewFileResourceLoader, let selected = previewFileID.flatMap({ browserItem(withID: $0) }) {
+            loader.setReadingAhead(false)
+            loader.setCachePriority(-1, gracePeriod: 2)
+            retiredPreviewFileLoaders.insert(loader, for: quickLookIdentity(for: selected))
+            previewFileResourceLoader = nil
+        }
         removePreviewPlayerObservers()
         previewPlayer?.pause()
         previewPlayer = nil
@@ -24751,14 +25081,10 @@ final class DownloaderModel: ObservableObject {
         previewCompatibilityPlayerName = nil
         isPreviewLoading = false
         resetPreviewStreamingMetrics(state: .idle)
-        // A nil retention target means the preview UI/player is being cleared,
-        // not that the selected media changed. Keep its sparse byte cache so a
-        // later retry/reselection and backward seeks do not re-download data.
-        // Supplying a different file ID is the sole normal cache eviction path.
-        if let retainedFileID,
-           previewResourceCacheFileID != retainedFileID {
-            clearPreviewResourceCaches()
-        }
+        let identity = retainedFileID.flatMap { browserItem(withID: $0) }
+            .flatMap { !$0.isFolder && ($0.mediaKind == .video || $0.mediaKind == .audio) ? quickLookIdentity(for: $0) : nil }
+        retirePreviewResourceCaches(unless: identity)
+        cancelNextPreviewBuffer(unless: identity)
     }
 
     private func scheduleAutomaticPreview(for item: BrowserItem) {
@@ -25973,6 +26299,26 @@ extension DownloaderModel {
         precondition(publications == 0 && model.previewRetainedBytes == 100,
                      "Old previews must not update the current file")
         observation.cancel()
+        let rates = finderWorkspaceFixture(defaults: defaults)
+        defer { rates.clearPreview() }
+        let start = Date(timeIntervalSinceReferenceDate: 1_000)
+        rates.updatePreviewNetworkRate(transferredBytes: 0, now: start)
+        rates.updatePreviewNetworkRate(transferredBytes: 1_000, now: start.addingTimeInterval(1))
+        rates.updatePreviewNetworkRate(transferredBytes: 3_000, now: start.addingTimeInterval(2))
+        precondition(rates.previewTransferBytesPerSecond == 1_500)
+        rates.refreshPreviewTransferRate(now: start.addingTimeInterval(4))
+        precondition(rates.previewTransferBytesPerSecond == 750, "Paused polling smooths gaps between network bursts")
+        rates.refreshPreviewTransferRate(now: start.addingTimeInterval(5.5))
+        precondition(rates.previewTransferBytesPerSecond == 600)
+        rates.refreshPreviewTransferRate(now: start.addingTimeInterval(6.1))
+        precondition(rates.previewTransferBytesPerSecond == 400, "Old traffic leaves the five-second window")
+        rates.refreshPreviewTransferRate(now: start.addingTimeInterval(7.1))
+        precondition(rates.previewTransferBytesPerSecond == 0, "A stalled source reaches zero")
+        rates.updatePreviewNetworkRate(transferredBytes: 10, now: start.addingTimeInterval(8))
+        precondition(rates.previewTransferBytesPerSecond == 0, "An access-log reset cannot report stale speed")
+        rates.updatePreviewNetworkRate(transferredBytes: 1_010, now: start.addingTimeInterval(9))
+        precondition(rates.previewTransferBytesPerSecond == 1_000)
+        print("PASS network download speed: five-second average, paused polling, burst gaps, expiry and counter reset")
         print("PASS real preview: bounded buffer before/after duration, duplicate metrics and stale generation")
     }
 

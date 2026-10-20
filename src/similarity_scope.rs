@@ -98,11 +98,18 @@ impl InputFile {
             .and_then(|path| resolve_root(path).ok())
             .and_then(|path| std::fs::symlink_metadata(path).ok())
             .map(|m| Revision::of(&m));
+        // Native listings can outlive a remount. Their cached revision then
+        // contains the old st_dev even though discovery captured the current
+        // file's complete revision above. Hash only that authoritative local
+        // metadata; provider revisions remain necessary for remote originals.
+        let provider_revision = self.external.as_ref()
+            .filter(|item| item.provider.as_deref() != Some("local") || external_metadata.is_none())
+            .and_then(|item| item.revision.as_ref());
         let mut value = json!({"id":self.display.id,"name":self.display.name,"path":self.display.path,
             "size":self.external.as_ref().map_or(self.display.bytes, |item| item.size),
             "local":if self.external.is_none() { self.revision.as_ref() } else { None },"external_metadata":external_metadata,
             "cloud_revision":self.cloud.as_ref().and_then(|item| item.revision.as_ref()),
-            "provider_revision":self.external.as_ref().and_then(|item| item.revision.as_ref())});
+            "provider_revision":provider_revision});
         if self.is_photos_preview() {
             value["content_kind"] = "photos_preview_1024_v1".into();
         }

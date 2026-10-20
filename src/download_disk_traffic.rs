@@ -177,6 +177,14 @@ impl State {
             || now.saturating_duration_since(self.last_io) >= IDLE_HANDOFF);
         match self.phase {
             Phase::Read if pending_write > write_threshold(limit) => self.finish_read(now, ReadHandover::PendingWrites),
+            // Completed checks can hold every byte-admission slot while their
+            // durable checkpoint waits here. Selected deferred jobs are not
+            // runnable I/O; let the batch release those slots after a short
+            // idle gap instead of waiting for the normal read-turn deadline.
+            // An admitted reader stays runnable between its physical chunks.
+            Phase::Read if !self.checkpoints.is_empty() && !reading && self.writers == 0
+                && now.saturating_duration_since(self.last_io) >= IDLE_HANDOFF
+                => self.finish_read(now, ReadHandover::WriteLatency),
             Phase::Read if !self.write_queue.is_empty()
                 && now.saturating_duration_since(self.last_received.max(self.since.unwrap_or(self.requested))) >= RECEIVE_IDLE_HANDOFF
                 => self.finish_read(now, ReadHandover::ReceiveIdle),
@@ -591,6 +599,7 @@ pub(crate) struct Snapshot {
     oldest_pending_ms: u64, read_tasks_started: u64, read_tasks_finished: u64,
     admitted_read_tasks: usize, admitted_read_bytes: u64,
     deferred_read_tasks: usize, deferred_read_bytes: u64, read_admission_deferrals: u64,
+    discovery_outstanding_files: usize, discovery_waiting_files: usize, final_verification_tasks: usize,
     receiving_tasks: usize, ram_draining_tasks: usize, disk_only_tasks: usize,
     file_worker_limit: usize, file_network_workers: usize, queued_downloads: usize, download_has_ready: bool,
     active_write_tasks: usize, active_write_bytes: u64, file_task_capacity: usize, file_task_capacity_reached: bool,
@@ -686,6 +695,10 @@ pub(crate) fn snapshot() -> Snapshot {
         result.include(&mut state, now);
     }
     let scheduler = crate::transfer_control::download_scheduler_snapshot();
+    let discovery = crate::live_downloads::discovery_snapshot();
+    result.discovery_outstanding_files = discovery.outstanding;
+    result.discovery_waiting_files = discovery.waiting_for_payload;
+    result.final_verification_tasks = discovery.final_verification;
     result.file_worker_limit = scheduler.limit; result.file_network_workers = scheduler.network_workers;
     result.queued_downloads = scheduler.queued_files; result.download_has_ready = scheduler.has_ready;
     result.file_task_capacity = scheduler.task_capacity; result.file_task_capacity_reached = scheduler.task_capacity_reached;

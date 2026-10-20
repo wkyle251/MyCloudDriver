@@ -33,7 +33,9 @@ struct Staging {
     limit: AtomicU64,
     ceiling: Option<u64>,
     required: AtomicU64,
+    minimum_required: AtomicU64,
     paused: AtomicBool,
+    draining: AtomicBool,
     completion: Mutex<BTreeMap<(u64, u64), usize>>,
 }
 struct Reservation {
@@ -98,7 +100,8 @@ impl Staging {
     }
     fn new(limit: u64, ceiling: Option<u64>) -> Self {
         Self { used: Mutex::new(0), limit: AtomicU64::new(limit), ceiling,
-            required: AtomicU64::new(0), paused: AtomicBool::new(false), completion: Mutex::new(BTreeMap::new()) }
+            required: AtomicU64::new(0), minimum_required: AtomicU64::new(0),
+            paused: AtomicBool::new(false), draining: AtomicBool::new(false), completion: Mutex::new(BTreeMap::new()) }
     }
     fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<Reservation> {
         let mut used = self.used.lock().unwrap();
@@ -124,7 +127,9 @@ impl Staging {
                 let mut completion = self.completion.lock().unwrap();
                 *completion.entry((completion_extra, bytes)).or_default() += 1;
                 let required = Self::minimum_for(used.saturating_add(bytes), &completion);
-                if !self.paused.load(Ordering::Acquire) && required <= self.limit.load(Ordering::Acquire) {
+                if !self.paused.load(Ordering::Acquire)
+                    && (!self.draining.load(Ordering::Acquire) || *used == 0)
+                    && required <= self.limit.load(Ordering::Acquire) {
                     *used += bytes;
                     phase.store(READING, Ordering::Release);
                     let mut reservation = Reservation::new(self.clone(), bytes);
@@ -133,6 +138,8 @@ impl Staging {
                 }
                 Self::untrack(&mut completion, completion_extra, bytes);
                 self.required.fetch_max(required, Ordering::Relaxed);
+                let _ = self.minimum_required.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+                    |old| Some(if old == 0 { required } else { old.min(required) }));
             }
             phase.store(WAITING, Ordering::Release);
             std::thread::sleep(Duration::from_millis(5));
@@ -558,6 +565,7 @@ impl Pipeline<'_> {
             original_memory_bytes: if self.config.memory_staging { *self.staging.used.lock().unwrap() } else { 0 },
             original_bytes_read: self.bytes.acquired.load(Ordering::Relaxed),
             staging_memory_required: self.staging.required.swap(0, Ordering::Relaxed),
+            staging_memory_minimum: self.staging.minimum_required.swap(0, Ordering::Relaxed),
             staging_memory_limit: self.config.staging_bytes,
             ..WorkCounts::default()
         };
@@ -705,6 +713,7 @@ impl Pipeline<'_> {
         self.analysis.limit.store(self.config.memory_bytes, Ordering::Release);
         self.staging.limit.store(self.config.staging_bytes, Ordering::Release);
         self.staging.paused.store(limits.acquisition_paused, Ordering::Release);
+        self.staging.draining.store(self.external_cancel.is_memory_draining(), Ordering::Release);
         *self.reader_config.write().unwrap() = self.config.clone();
         self.pool.as_mut().unwrap().update_resources(&self.config);
         if limits.acquisition_paused { self.pool.as_mut().unwrap().release_idle(); }

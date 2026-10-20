@@ -650,7 +650,31 @@ impl Client {
 
     /// List the direct children of a folder. Pass `""` for the root.
     pub async fn list_folder(&self, parent_id: &str) -> Result<Vec<FileInfo>> {
-        let cache_generation = self.duplicate_cache_generation().await;
+        self.list_folder_until(parent_id, None).await
+    }
+
+    /// Path lookup needs only the first matching child in server order.
+    /// A stopped listing supplies cache hints, never a complete inventory.
+    async fn list_folder_until(
+        &self,
+        parent_id: &str,
+        stop_at: Option<(&str, bool)>,
+    ) -> Result<Vec<FileInfo>> {
+        let cache_generation = if stop_at.is_some() {
+            if let Some(cache) = self.duplicate_cache().await {
+                match cache.invalidate_folder(parent_id).and_then(|_| cache.generation()) {
+                    Ok(generation) => Some((cache, generation)),
+                    Err(error) => {
+                        tracing::warn!(%error, "could not prepare the partial folder cache");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            self.duplicate_cache_generation().await
+        };
         let action = "GET:/drive/v1/files";
         let url = format!("{}/drive/v1/files", self.api_base.trim_end_matches('/'));
 
@@ -678,25 +702,30 @@ impl Client {
                 self.guest.remember_listing(&resp);
             }
             let body: ListResponse = serde_json::from_str(&resp)?;
+            let found = stop_at.is_some_and(|(name, folders_only)| {
+                body.files.iter().any(|file| file.name == name && (!folders_only || file.kind.is_folder()))
+            });
             all.extend(body.files);
 
-            match validated_next_page_token(body.next_page_token, &mut seen_page_tokens)? {
-                Some(token) => page_token = Some(token),
-                None => break,
+            page_token = validated_next_page_token(body.next_page_token, &mut seen_page_tokens)?;
+            if found || page_token.is_none() {
+                break;
             }
         }
 
         if let Some((cache, generation)) = cache_generation {
-            let stored = cache
-                .replace_folder_if_generation(parent_id, &all, generation)
-                .and_then(|stored| {
-                    if stored {
-                        Self::complete_listed_uploads(&cache, &all)?;
-                    }
-                    Ok(stored)
-                });
+            let stored = if page_token.is_none() {
+                cache.replace_folder_if_generation(parent_id, &all, generation)
+            } else {
+                cache.upsert_files_if_generation(parent_id, &all, generation)
+            }.and_then(|stored| {
+                if stored {
+                    Self::complete_listed_uploads(&cache, &all)?;
+                }
+                Ok(stored)
+            });
             if let Err(error) = stored {
-                tracing::warn!(%error, "could not cache the complete folder listing");
+                tracing::warn!(%error, "could not cache the folder listing");
             }
         }
         Ok(all)
@@ -1763,7 +1792,7 @@ impl Client {
         let mut parent_id = String::new();
 
         for seg in &segments {
-            let children = self.list_folder(&parent_id).await?;
+            let children = self.list_folder_until(&parent_id, Some((seg, true))).await?;
             let found = children
                 .iter()
                 .find(|f| f.kind.is_folder() && f.name == *seg);
@@ -1796,7 +1825,7 @@ impl Client {
 
         for (i, seg) in segments.iter().enumerate() {
             let is_last = i == segments.len() - 1;
-            let children = self.list_folder(&parent_id).await?;
+            let children = self.list_folder_until(&parent_id, Some((seg, !is_last))).await?;
             // Middle segments must be folders; only the final segment may be
             // a file. Restricting the search avoids matching a same-named
             // file that happens to precede the intended folder.
@@ -2175,6 +2204,10 @@ fn known_created_file(
         md5_checksum: None,
     }
 }
+
+#[cfg(test)]
+#[path = "client_path_tests.rs"]
+mod path_tests;
 
 #[cfg(test)]
 mod duplicate_cache_client_tests {

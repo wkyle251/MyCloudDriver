@@ -21,6 +21,7 @@ fn writes(root: &Path, count: usize) -> Vec<CheckpointWrite> {
                 data_path,
                 journal_path,
                 journal: b"new-durable-boundary".to_vec(),
+                precondition: None,
             }
         })
         .collect()
@@ -162,4 +163,82 @@ fn a_symlink_journal_cannot_modify_an_unrelated_file() {
         std::fs::read(&writes[0].journal_path).unwrap(),
         b"old-durable-boundary"
     );
+}
+
+#[test]
+fn a_failed_receipt_precondition_preserves_every_journal_before_sync_starts() {
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    let root = tempfile::tempdir().unwrap();
+    let mut writes = writes(root.path(), 3);
+    let path = writes[2].journal_path.clone();
+    let checked = Arc::new(AtomicUsize::new(0));
+    let observed = checked.clone();
+    writes[2].precondition = Some(Arc::new(move || {
+        observed.fetch_add(1, Ordering::Relaxed);
+        if std::fs::read(&path)? != b"old-durable-boundary" {
+            return Err(std::io::Error::other("Generated receipt belongs to another source"));
+        }
+        Ok(())
+    }));
+    std::fs::write(&writes[2].journal_path, b"foreign-source-receipt").unwrap();
+    let mut syncs = 0;
+    let result = checkpoint_batch_using(&writes, |_, _| {
+        syncs += 1;
+        Ok(())
+    });
+    let error = result.unwrap_err();
+    let rejected = error.get_ref().unwrap()
+        .downcast_ref::<CheckpointPreconditionFailure>().unwrap();
+    assert_eq!(rejected.index, 2, "Only the conflicting receipt's request may be rejected");
+    assert_eq!(checked.load(Ordering::Relaxed), 1);
+    assert_eq!(syncs, 0, "A rejected receipt must fail before starting the batch's barriers");
+    for (index, write) in writes.iter().enumerate() {
+        assert_eq!(
+            std::fs::read(&write.journal_path).unwrap(),
+            if index == 2 { b"foreign-source-receipt".as_slice() } else { b"old-durable-boundary".as_slice() },
+        );
+    }
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 6,
+        "A late precondition failure must clean journals staged for earlier batch members");
+}
+
+#[test]
+fn a_receipt_changed_during_the_data_barrier_blocks_all_journal_renames() {
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    let root = tempfile::tempdir().unwrap();
+    let mut writes = writes(root.path(), 3);
+    let path = writes[2].journal_path.clone();
+    let checked = Arc::new(AtomicUsize::new(0));
+    let observed = checked.clone();
+    writes[2].precondition = Some(Arc::new(move || {
+        observed.fetch_add(1, Ordering::Relaxed);
+        if std::fs::read(&path)? != b"old-durable-boundary" {
+            return Err(std::io::Error::other("Generated receipt belongs to another source"));
+        }
+        Ok(())
+    }));
+    let mut barriers = 0;
+    let result = checkpoint_batch_using(&writes, |phase, _| {
+        if phase == CheckpointSync::Barrier {
+            barriers += 1;
+            std::fs::write(&writes[2].journal_path, b"foreign-source-receipt")?;
+        }
+        Ok(())
+    });
+    let error = result.unwrap_err();
+    let rejected = error.get_ref().unwrap()
+        .downcast_ref::<CheckpointPreconditionFailure>().unwrap();
+    assert_eq!(rejected.index, 2, "An ownership change during sync must identify its own request");
+    assert_eq!(checked.load(Ordering::Relaxed), 2,
+        "Receipt ownership must be checked again after the potentially slow data barrier");
+    assert_eq!(barriers, 1, "A rejected prepublication guard cannot acknowledge a committed batch");
+    for (index, write) in writes.iter().enumerate() {
+        assert_eq!(
+            std::fs::read(&write.journal_path).unwrap(),
+            if index == 2 { b"foreign-source-receipt".as_slice() } else { b"old-durable-boundary".as_slice() },
+            "All guards must pass before even the first journal is renamed",
+        );
+    }
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 6,
+        "Rejected journal publication must leave no staging artifacts");
 }

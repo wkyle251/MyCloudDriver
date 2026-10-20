@@ -136,7 +136,7 @@ private final class NativeSearchCompletion: @unchecked Sendable {
             let previousFocus = selectionCursor
             reconcileSelection()
             if previousFocus != selectionCursor || (!previousSelection.isEmpty && selection.isEmpty) {
-                closePreview(); mediaPreview.clear()
+                closePreview(); mediaPreview.clear(preservingRAM: true)
             }
         }
     }
@@ -151,7 +151,7 @@ private final class NativeSearchCompletion: @unchecked Sendable {
             let previousFocus = selectionCursor
             reconcileSelection()
             if previousFocus != selectionCursor || (!previousSelection.isEmpty && selection.isEmpty) {
-                closePreview(); mediaPreview.clear()
+                closePreview(); mediaPreview.clear(preservingRAM: true)
             }
         }
     }
@@ -336,6 +336,17 @@ private final class NativeSearchCompletion: @unchecked Sendable {
         mediaPreview = NativeMediaPreviewModel(settings: playbackSettings ?? MediaPlaybackSettings())
         self.temporaryRoot = temporaryRoot ?? FileManager.default.temporaryDirectory
             .appendingPathComponent("MyCloudDriver-\(kind.rawValue)-\(UUID().uuidString)", isDirectory: true)
+        mediaPreview.nextItems = { [weak self] in
+            guard let self, let provider = self.provider, let focused = self.focusedRowID,
+                  let index = self.visibleRows.firstIndex(where: { $0.id == focused }) else { return [] }
+            return self.visibleRows.dropFirst(index + 1).filter {
+                !$0.item.isFolder && ($0.item.mediaType == "video" || $0.item.mediaType == "audio")
+            }.map { ($0.item, provider) }
+        }
+        mediaPreview.bufferingContext = { [weak self] in
+            guard let self, let provider = self.provider else { return nil }
+            return "\(provider.kind.rawValue)|\(provider.root.id)|\(self.location.id)"
+        }
         tree.onChange = { [weak self] in
             self?.invalidateRowCaches()
             self?.objectWillChange.send(); self?.reconcileSelection()
@@ -1135,12 +1146,14 @@ private final class NativeSearchCompletion: @unchecked Sendable {
                 catch { preparationError = error.localizedDescription }
             }
             do {
-                let items = try await store.list()
+                let listing = try await store.listing()
+                let items = listing.items
                 guard let self, !Task.isCancelled, self.diskTrashLoadID == id, self.diskTrash === store else { return }
                 self.diskTrashItems = items
                 self.diskTrashSelection.formIntersection(Set(items.map(\.id)))
                 self.diskTrashReady = preparationError == nil
-                self.diskTrashError = preparationError
+                self.diskTrashError = preparationError ?? (listing.unavailableCount > 0
+                    ? "\(listing.unavailableCount) Trash record(s) could not be verified. Their contents are preserved; other items are available below." : nil)
                 if migrated { self.reload() }
                 let available = Set(items.map(\.id))
                 self.undoStack.removeAll { !$0.diskTrashEntryIDs.isEmpty && !$0.diskTrashEntryIDs.isSubset(of: available) }
@@ -1294,12 +1307,20 @@ private final class NativeSearchCompletion: @unchecked Sendable {
         return resultIDs
     }
     private static func similarityUndo(_ undo: CloudDriveUndo, fileIDs: Set<String>, results: SimilarityResultsModel,
-                                       session: UUID, restoring: Bool) -> CloudDriveUndo {
-        .init(title: undo.title, diskTrashEntryIDs: undo.diskTrashEntryIDs) {
+                                       session: UUID, restoring: Bool,
+                                       savedUpdate: ((Bool) async throws -> Void)? = nil) -> CloudDriveUndo {
+        let update = savedUpdate ?? results.savedTrashUpdater(fileIDs)
+        return .init(title: undo.title, diskTrashEntryIDs: undo.diskTrashEntryIDs) {
+            await results.waitForSavedMutations()
             let reverse = try await undo.apply()
+            var updateError: String?
+            do { try await update?(!restoring) }
+            catch { updateError = "The file change succeeded, but its original saved comparison could not be updated. " + error.localizedDescription }
+            let failure = updateError
             return await MainActor.run {
                 if results.sessionToken == session { results.setTrashedIDs(fileIDs, !restoring) }
-                return Self.similarityUndo(reverse, fileIDs: fileIDs, results: results, session: session, restoring: !restoring)
+                if let failure { results.fileActionError = failure }
+                return Self.similarityUndo(reverse, fileIDs: fileIDs, results: results, session: session, restoring: !restoring, savedUpdate: update)
             }
         }
     }
@@ -1402,8 +1423,11 @@ private final class NativeSearchCompletion: @unchecked Sendable {
     }
     func selectionChanged() {
         if let item = inspectorItem, let provider {
-            if !mediaPreview.matches(item, provider: provider) { mediaPreview.clear() }
-        } else { mediaPreview.clear() }
+            if !mediaPreview.matches(item, provider: provider) {
+                mediaPreview.clear(preservingRAM: true,
+                    keeping: NativeMediaSourceIdentity(item: item, kind: provider.kind, rootID: provider.root.id))
+            }
+        } else { mediaPreview.clear(preservingRAM: true) }
         if quickLook.isActive { previewSelection() }
     }
     private func previewSelection() {

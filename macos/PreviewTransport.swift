@@ -139,6 +139,8 @@ enum PreviewTransport {
 struct PreviewResourceCacheSnapshot: Equatable {
     let cachedBytes: Int64
     let contentLength: Int64?
+    /// Received bytes include overlapping requests and survive cache eviction.
+    let receivedBytes: Int64?
     /// The retained byte ranges, ordered and disjoint. `cachedBytes` alone is a
     /// total and cannot say *where* the data is: AVFoundation routinely fetches
     /// a movie header near the end of a file before any media at the start, so
@@ -146,10 +148,11 @@ struct PreviewResourceCacheSnapshot: Equatable {
     /// the head.
     let ranges: [Range<Int64>]
 
-    init(cachedBytes: Int64, contentLength: Int64?, ranges: [Range<Int64>] = []) {
+    init(cachedBytes: Int64, contentLength: Int64?, ranges: [Range<Int64>] = [], receivedBytes: Int64? = nil) {
         self.cachedBytes = cachedBytes
         self.contentLength = contentLength
         self.ranges = ranges
+        self.receivedBytes = receivedBytes
     }
 
     var fraction: Double? {
@@ -184,244 +187,191 @@ fileprivate struct PreviewResourceMetadata {
     let supportsByteRanges: Bool
 }
 
-/// Sparse, owner-only disk storage for the byte ranges already supplied to
-/// AVFoundation. Keeping it outside AVPlayer's disposable in-memory buffer
-/// means a backwards seek can be served without another CDN request.
-final class PreviewResourceCache {
+/// Sparse byte ranges in RAM. All sources and windows share the same budget.
+/// A disk copy is created only when a complete file is handed to a converter.
+final class PreviewResourceCache: @unchecked Sendable {
     private let lock = NSLock()
-    private let fileURL: URL
-    private var fileHandle: FileHandle?
+    private var chunks: [Int64: Data] = [:]
+    private var chunkStarts: [Int64] = []
     private var cachedRanges: [Range<Int64>] = []
-    private var metadata = PreviewResourceMetadata(
-        typeIdentifier: nil,
-        contentLength: nil,
-        supportsByteRanges: false
-    )
+    private var metadata = PreviewResourceMetadata(typeIdentifier: nil, contentLength: nil, supportsByteRanges: false)
     private var isClosed = false
+    private var resident: Int64 = 0
+    private var received: Int64 = 0
     private let maximumBytes: Int64
-    private let minimumFreeDiskBytes: Int64
-    private var reachedBudget = false
-    private var lastCapacityCheck = Date.distantPast
-    private var availableDiskBytes: Int64 = .max
+    let memoryBudget: PreviewMemoryBudget
+    private var cleanupID: UUID?
 
-    init(maximumBytes: Int64 = 2 << 30, minimumFreeDiskBytes: Int64 = 256 << 20, directory: URL? = nil) throws {
+    // Keep the storage parameters source-compatible with existing callers.
+    init(maximumBytes: Int64 = .max, minimumFreeDiskBytes: Int64 = 0, directory: URL? = nil,
+         memoryBudget: PreviewMemoryBudget = .shared) throws {
         self.maximumBytes = max(1, maximumBytes)
-        self.minimumFreeDiskBytes = max(0, minimumFreeDiskBytes)
-        let manager = FileManager.default
-        let directory = directory ?? manager.temporaryDirectory
-            .appendingPathComponent("MyPikPak-MediaPreviewCache", isDirectory: true)
-        try manager.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: NSNumber(value: 0o700)]
-        )
-        try manager.setAttributes(
-            [.posixPermissions: NSNumber(value: 0o700)],
-            ofItemAtPath: directory.path
-        )
-        fileURL = directory
-            .appendingPathComponent(UUID().uuidString, isDirectory: false)
-        guard manager.createFile(
-            atPath: fileURL.path,
-            contents: nil,
-            attributes: [.posixPermissions: NSNumber(value: 0o600)]
-        ) else {
-            throw CocoaError(.fileWriteUnknown)
-        }
-        fileHandle = try FileHandle(forUpdating: fileURL)
+        self.memoryBudget = memoryBudget
+        cleanupID = memoryBudget.registerCleanup(residentBytes: { [weak self] in self?.snapshot.cachedBytes ?? 0 },
+            reclaim: { [weak self] in self?.reclaim() }) { [weak self] in self?.purge() }
     }
-
     deinit {
-        removeFromDisk()
+        if let cleanupID { memoryBudget.unregisterCleanup(cleanupID) }
+        memoryBudget.release(resident)
     }
-
     var snapshot: PreviewResourceCacheSnapshot {
-        lock.lock()
-        defer { lock.unlock() }
-        return snapshotLocked()
+        lock.lock(); defer { lock.unlock() }; return snapshotLocked()
     }
-
     fileprivate var contentMetadata: PreviewResourceMetadata {
-        lock.lock()
-        defer { lock.unlock() }
-        return metadata
+        lock.lock(); defer { lock.unlock() }; return metadata
     }
-
-    @discardableResult
-    func updateMetadata(
-        typeIdentifier: String?,
-        contentLength: Int64?,
-        supportsByteRanges: Bool
-    ) -> PreviewResourceCacheSnapshot {
-        lock.lock()
-        defer { lock.unlock() }
+    @discardableResult func updateMetadata(typeIdentifier: String?, contentLength: Int64?,
+                                          supportsByteRanges: Bool) -> PreviewResourceCacheSnapshot {
+        lock.lock(); defer { lock.unlock() }
         guard !isClosed else { return snapshotLocked() }
-        metadata = PreviewResourceMetadata(
-            typeIdentifier: typeIdentifier ?? metadata.typeIdentifier,
-            contentLength: contentLength ?? metadata.contentLength,
-            supportsByteRanges: supportsByteRanges || metadata.supportsByteRanges
-        )
+        metadata = .init(typeIdentifier: typeIdentifier ?? metadata.typeIdentifier,
+                         contentLength: contentLength ?? metadata.contentLength,
+                         supportsByteRanges: supportsByteRanges || metadata.supportsByteRanges)
         return snapshotLocked()
     }
-
-    @discardableResult
-    func store(_ data: Data, at offset: Int64, allowsEviction: Bool = true) -> PreviewResourceCacheSnapshot? {
+    @discardableResult func store(_ data: Data, at offset: Int64, allowsEviction: Bool = true) -> PreviewResourceCacheSnapshot? {
         guard !data.isEmpty, offset >= 0 else { return snapshot }
-        let (endOffset, overflow) = offset.addingReportingOverflow(Int64(data.count))
+        let (end, overflow) = offset.addingReportingOverflow(Int64(data.count))
         guard !overflow else { return nil }
-
-        lock.lock()
-        defer { lock.unlock() }
-        guard !isClosed, let fileHandle else { return nil }
-        do {
-            guard Int64(data.count) <= maximumBytes else { return nil }
-            if Date().timeIntervalSince(lastCapacityCheck) >= 1 {
-                availableDiskBytes = (try? fileURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-                    .volumeAvailableCapacityForImportantUsage) ?? .max
-                lastCapacityCheck = Date()
-            }
-            guard availableDiskBytes >= minimumFreeDiskBytes,
-                  Int64(data.count) <= availableDiskBytes - minimumFreeDiskBytes else { reachedBudget = true; return nil }
-            let incoming = offset..<endOffset
-            let overlap = cachedRanges.reduce(Int64(0)) { total, range in
-                total + max(0, min(range.upperBound, incoming.upperBound) - max(range.lowerBound, incoming.lowerBound))
-            }
-            let retained = snapshotLocked().cachedBytes
-            if retained + Int64(data.count) - overlap > maximumBytes {
-                reachedBudget = true
-                guard allowsEviction else { return nil }
-                // Keep playback usable by replacing old cache ranges. A later
-                // backwards seek can fetch them again; prefetch stops here.
-                try fileHandle.truncate(atOffset: 0)
-                cachedRanges.removeAll()
-            }
-            try fileHandle.seek(toOffset: UInt64(offset))
-            try fileHandle.write(contentsOf: data)
-            availableDiskBytes = max(0, availableDiskBytes - Int64(data.count))
-            insertCachedRange(offset ..< endOffset)
-            return snapshotLocked()
-        } catch {
-            return nil
+        lock.lock(); defer { lock.unlock() }
+        guard !isClosed, Int64(data.count) <= maximumBytes else { return nil }
+        var missing: [Range<Int64>] = [], cursor = offset
+        for range in cachedRanges where range.upperBound > cursor && range.lowerBound < end {
+            if range.lowerBound > cursor { missing.append(cursor..<min(end, range.lowerBound)) }
+            cursor = max(cursor, range.upperBound)
         }
+        if cursor < end { missing.append(cursor..<end) }
+        var added = missing.reduce(Int64(0)) { $0 + Int64($1.count) }
+        if added == 0 { received += Int64(data.count); return snapshotLocked() }
+        if resident + added > maximumBytes || !memoryBudget.reserve(added, background: !allowsEviction) {
+            guard allowsEviction else { return nil }
+            purgeLocked()
+            missing = [offset..<end]; added = Int64(data.count)
+            guard memoryBudget.reserve(added, background: false) else {
+                if let cleanupID { memoryBudget.requestRoom(excluding: cleanupID) }
+                return nil
+            }
+        }
+        var incoming: [Int64: Data] = [:]
+        for range in missing {
+            // Keep chunks small so reads/seeks never copy the rest of a large file.
+            var start = range.lowerBound
+            while start < range.upperBound {
+                let stop = min(range.upperBound, start + (1 << 20))
+                let lower = data.startIndex + Int(start - offset), upper = data.startIndex + Int(stop - offset)
+                guard let mapped = PreviewMemoryBudget.copy(data.subdata(in: lower..<upper)) else {
+                    memoryBudget.release(added); return nil
+                }
+                incoming[start] = mapped; start = stop
+            }
+        }
+        chunks.merge(incoming) { _, new in new }; resident += added
+        for start in incoming.keys.sorted() {
+            if chunkStarts.last.map({ $0 < start }) ?? true { chunkStarts.append(start); continue }
+            var low = 0, high = chunkStarts.count
+            while low < high {
+                let middle = (low + high) / 2
+                if chunkStarts[middle] < start { low = middle + 1 } else { high = middle }
+            }
+            chunkStarts.insert(start, at: low)
+        }
+        insertCachedRange(offset..<end)
+        received += Int64(data.count)
+        return snapshotLocked()
     }
-
     var permitsBackgroundPrefetch: Bool {
         lock.lock(); defer { lock.unlock() }
-        return !isClosed && !reachedBudget && snapshotLocked().cachedBytes < maximumBytes
+        return !isClosed && resident < maximumBytes && memoryBudget.permitsReadAhead
     }
-
     func read(at offset: Int64, maximumLength: Int) -> Data? {
         guard offset >= 0, maximumLength > 0 else { return nil }
-        lock.lock()
-        defer { lock.unlock() }
-        guard !isClosed, let fileHandle,
-              let range = cachedRanges.first(where: {
-                  $0.lowerBound <= offset && offset < $0.upperBound
-              }) else { return nil }
-        let available = min(Int64(maximumLength), range.upperBound - offset)
-        guard available > 0 else { return nil }
-        do {
-            try fileHandle.seek(toOffset: UInt64(offset))
-            return try fileHandle.read(upToCount: Int(available))
-        } catch {
-            return nil
-        }
-    }
-
-    /// Returns the first byte that has not been retained yet. The ranges may be
-    /// sparse because AVPlayer commonly asks for a movie header near the end of
-    /// a file before requesting the media at the beginning.
-    func firstMissingOffset() -> Int64? {
-        lock.lock()
-        defer { lock.unlock() }
+        lock.lock(); defer { lock.unlock() }
         guard !isClosed else { return nil }
-
+        var result = Data(), cursor = offset
+        // Binary search over sorted chunk offsets avoids scanning GB of ranges for every player read.
+        let starts = chunkStarts
+        var low = 0, high = starts.count
+        while low < high {
+            let middle = (low + high) / 2
+            if starts[middle] <= offset { low = middle + 1 } else { high = middle }
+        }
+        var index = max(0, low - 1)
+        while index < starts.count, result.count < maximumLength {
+            let start = starts[index]
+            guard let data = chunks[start], start <= cursor, cursor < start + Int64(data.count) else { break }
+            let from = Int(cursor - start), count = min(data.count - from, maximumLength - result.count)
+            result.append(data.subdata(in: from..<(from + count))); cursor += Int64(count); index += 1
+        }
+        return result.isEmpty ? nil : result
+    }
+    func firstMissingOffset() -> Int64? {
+        lock.lock(); defer { lock.unlock() }
+        guard !isClosed else { return nil }
         var cursor: Int64 = 0
         for range in cachedRanges {
-            if range.upperBound <= cursor { continue }
             if range.lowerBound > cursor { return cursor }
-            cursor = range.upperBound
+            cursor = max(cursor, range.upperBound)
         }
-        if let contentLength = metadata.contentLength,
-           cursor >= contentLength {
-            return nil
-        }
-        return cursor
+        return metadata.contentLength.map { cursor >= $0 } == true ? nil : cursor
     }
-
-    /// Transfer a complete cached object to preparation without downloading it
-    /// again. A same-volume rename keeps large videos off the main-thread I/O
-    /// path. Sparse or unknown-length caches never become local input files.
+    /// Only decoder recovery needs a complete input file. Call from a worker,
+    /// keeping the RAM owner alive until the write has finished.
     func takeCompleteFile(expectedSize: UInt64 = 0) throws -> VideoPreviewCopy? {
-        lock.lock()
-        defer { lock.unlock() }
+        lock.lock(); defer { lock.unlock() }
         guard !isClosed, let length = metadata.contentLength, length > 0,
-              cachedRanges == [0..<length], expectedSize == 0 || UInt64(length) == expectedSize,
-              let fileHandle, try fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize == Int(exactly: length) else { return nil }
-        let directory = fileURL.deletingLastPathComponent()
-            .appendingPathComponent("Prepared-\(UUID().uuidString)", isDirectory: true)
+              cachedRanges == [0..<length], expectedSize == 0 || UInt64(length) == expectedSize else { return nil }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("Prepared-\(UUID().uuidString)", isDirectory: true)
         try CloudDriveFiles.privateDirectory(directory)
         let input = directory.appendingPathComponent("source")
-        do { try FileManager.default.moveItem(at: fileURL, to: input) }
-        catch { try? FileManager.default.removeItem(at: directory); throw error }
-        isClosed = true; self.fileHandle = nil; cachedRanges = []
-        try? fileHandle.close()
-        return VideoPreviewCopy(url: input, directory: directory)
+        do {
+            guard FileManager.default.createFile(atPath: input.path, contents: nil, attributes: [.posixPermissions: 0o600]) else { throw CocoaError(.fileWriteUnknown) }
+            let handle = try FileHandle(forWritingTo: input)
+            defer { try? handle.close() }
+            for start in chunkStarts {
+                try handle.seek(toOffset: UInt64(start)); try handle.write(contentsOf: chunks[start]!)
+            }
+            purgeLocked(); isClosed = true
+            return VideoPreviewCopy(url: input, directory: directory)
+        } catch { try? FileManager.default.removeItem(at: directory); throw error }
     }
-
     func removeFromDisk() {
         lock.lock()
-        guard !isClosed else {
-            lock.unlock()
-            return
-        }
         isClosed = true
-        let handle = fileHandle
-        fileHandle = nil
-        cachedRanges = []
+        let discarded = chunks, bytes = resident, budget = memoryBudget
+        chunks = [:]; chunkStarts = []; cachedRanges = []; resident = 0
         lock.unlock()
-
-        try? handle?.close()
-        try? FileManager.default.removeItem(at: fileURL)
+        NativeFileWork.performMemoryCleanup {
+            withExtendedLifetime(discarded) {}
+            budget.release(bytes)
+        }
     }
-
+    func setPriority(_ priority: Int, gracePeriod: TimeInterval = 0) {
+        lock.lock(); defer { lock.unlock() }
+        if let cleanupID { memoryBudget.setPriority(priority, for: cleanupID, gracePeriod: gracePeriod) }
+    }
+    private func reclaim() {
+        lock.lock(); defer { lock.unlock() }
+        guard let cleanupID, memoryBudget.canReclaim(cleanupID) else { return }
+        purgeLocked()
+    }
+    private func purge() { lock.lock(); defer { lock.unlock() }; purgeLocked() }
+    private func purgeLocked() {
+        chunks = [:]; chunkStarts = []; cachedRanges = []; memoryBudget.release(resident); resident = 0
+    }
     private func insertCachedRange(_ incoming: Range<Int64>) {
-        var lower = incoming.lowerBound
-        var upper = incoming.upperBound
-        var result: [Range<Int64>] = []
-        var inserted = false
-
+        var lower = incoming.lowerBound, upper = incoming.upperBound
+        var result: [Range<Int64>] = [], inserted = false
         for range in cachedRanges {
-            if range.upperBound < lower {
+            if range.upperBound < lower { result.append(range) }
+            else if upper < range.lowerBound {
+                if !inserted { result.append(lower..<upper); inserted = true }
                 result.append(range)
-            } else if upper < range.lowerBound {
-                if !inserted {
-                    result.append(lower ..< upper)
-                    inserted = true
-                }
-                result.append(range)
-            } else {
-                lower = min(lower, range.lowerBound)
-                upper = max(upper, range.upperBound)
-            }
+            } else { lower = min(lower, range.lowerBound); upper = max(upper, range.upperBound) }
         }
-        if !inserted {
-            result.append(lower ..< upper)
-        }
-        cachedRanges = result
+        if !inserted { result.append(lower..<upper) }; cachedRanges = result
     }
-
     private func snapshotLocked() -> PreviewResourceCacheSnapshot {
-        let bytes = cachedRanges.reduce(Int64(0)) { total, range in
-            let length = range.upperBound - range.lowerBound
-            let (sum, overflow) = total.addingReportingOverflow(length)
-            return overflow ? Int64.max : sum
-        }
-        return PreviewResourceCacheSnapshot(
-            cachedBytes: bytes,
-            contentLength: metadata.contentLength,
-            ranges: cachedRanges
-        )
+        .init(cachedBytes: resident, contentLength: metadata.contentLength, ranges: cachedRanges, receivedBytes: received)
     }
 }
 
@@ -488,7 +438,7 @@ final class PreviewCacheProgressPublisher {
 /// enough data for its own immediate needs or the user pauses playback. The
 /// interactive resource-loader requests keep normal priority; this sequential
 /// fill is deliberately low priority and resumes at the first uncached byte.
-private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate {
+final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate {
     private let originalURL: URL
     private let headers: [String: String]
     private let cache: PreviewResourceCache
@@ -506,17 +456,23 @@ private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate 
     private var taskCancellationShouldRetry = false
     private var isInvalidated = false
     private var startIsScheduled = false
+    private var retryTimer: DispatchSourceTimer?
+    private var terminalFailure = false
+    private let mayPrefetch: @Sendable () -> Bool
+    var hasTerminalFailure: Bool { delegateQueue.sync { terminalFailure } }
 
     init(
         originalURL: URL,
         proxyURL: String,
         cache: PreviewResourceCache,
         onCacheProgress: @escaping (PreviewResourceCacheSnapshot) -> Void,
-        headers: [String: String]
+        headers: [String: String] = PreviewTransport.mediaHeaders,
+        mayPrefetch: @escaping @Sendable () -> Bool = { true }
     ) {
         self.originalURL = originalURL
         self.headers = headers
         self.cache = cache
+        self.mayPrefetch = mayPrefetch
         self.onCacheProgress = onCacheProgress
         delegateQueue = DispatchQueue(
             label: "com.wky.PikPakDownloader.preview-prefetch.\(UUID().uuidString)",
@@ -534,9 +490,20 @@ private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate 
             delegate: self,
             delegateQueue: sessionDelegateQueue
         )
+        let timer = DispatchSource.makeTimerSource(queue: delegateQueue)
+        retryTimer = timer
+        timer.schedule(deadline: .now() + .milliseconds(750), repeating: .milliseconds(250))
+        timer.setEventHandler { [weak self] in
+            guard let self, !self.isInvalidated else { return }
+            if self.cache.memoryBudget.isUnderPressure || !self.mayPrefetch() {
+                self.task?.cancel()
+            } else if !self.startIsScheduled { self.startTaskIfNeeded() }
+        }
+        timer.activate()
     }
 
     deinit {
+        retryTimer?.cancel()
         session?.invalidateAndCancel()
     }
 
@@ -559,6 +526,7 @@ private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate 
         delegateQueue.async { [weak self] in
             guard let self, !self.isInvalidated else { return }
             self.isInvalidated = true
+            self.retryTimer?.cancel()
             self.startIsScheduled = false
             self.task?.cancel()
             self.task = nil
@@ -567,7 +535,7 @@ private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate 
     }
 
     private func startTaskIfNeeded() {
-        guard !isInvalidated, task == nil, cache.permitsBackgroundPrefetch,
+        guard !isInvalidated, !terminalFailure, mayPrefetch(), task == nil, cache.permitsBackgroundPrefetch,
               let offset = cache.firstMissingOffset() else {
             publishCacheProgress(cache.snapshot)
             return
@@ -621,6 +589,7 @@ private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate 
                 || http.statusCode == 429
                 || (500...599).contains(http.statusCode)
             taskCancellationShouldRetry = taskCanRetry
+            terminalFailure = !taskCanRetry
             completionHandler(.cancel)
             return
         }
@@ -698,6 +667,9 @@ private final class PreviewResourcePrefetcher: NSObject, URLSessionDataDelegate 
             retryCount = 0
         }
         let wasCancelled = (error as NSError?)?.code == NSURLErrorCancelled
+        if error == nil, snapshot.cachedBytes > cachedBytesAtTaskStart {
+            start(after: 0); return
+        }
         guard taskCanRetry,
               (!wasCancelled || taskCancellationShouldRetry) else { return }
         let delay = AutomaticRecovery.delay(attempt: retryCount, schedule: [1, 3, 8, 30, 60])

@@ -588,12 +588,17 @@ fn load(path: &Path) -> Result<Option<Receipt>> {
 
 fn save(path: &Path, receipt: &Receipt) -> Result<()> {
     download_fs::create_dir_all(path.parent().unwrap())?;
+    validate_receipt_source(path, &receipt.source)?;
+    download_fs::atomic_write(path, &serde_json::to_vec(receipt)?)?;
+    Ok(())
+}
+
+fn validate_receipt_source(path: &Path, source: &Source) -> Result<()> {
     if let Some(previous) = load(path)? {
-        if previous.version != 1 || previous.source != receipt.source {
+        if previous.version != 1 || previous.source != *source {
             bail!("Download receipt belongs to another source; it was preserved");
         }
     }
-    download_fs::atomic_write(path, &serde_json::to_vec(receipt)?)?;
     Ok(())
 }
 
@@ -1930,19 +1935,12 @@ async fn finish_with_verification(
     let partial = partial.to_owned();
     let output = output.to_owned();
     let transfer_id = transfer_id.to_owned();
-    tokio::task::spawn_blocking(move || {
+    let pending = tokio::task::spawn_blocking(move || {
+        use crate::download_telemetry::{Kind, Operation};
         download_fs::validate(&partial)?;
         let mut file = download_fs::open(&partial, rustix::fs::OFlags::RDONLY)?;
         download_fs::validate_open_file(&partial, &file.metadata()?)?;
-        file.sync_data()
-            .context("Cannot sync completed download before publication")?;
-        download_fs::validate_open_file(&partial, &file.metadata()?)?;
         let metadata = file.metadata()?;
-        let local = Identity::read(&metadata)?;
-        if source.size > 0 && source.size != local.size {
-            bail!("Completed download has an unexpected size");
-        }
-        check_control(&transfer_id)?;
         let reused = verified
             .as_ref()
             .map(|proof| {
@@ -1950,6 +1948,28 @@ async fn finish_with_verification(
             })
             .transpose()?
             .flatten();
+        let already_durable = reused.is_some()
+            && verified.as_ref().is_some_and(|proof| proof.durably_synced());
+        if !already_durable {
+            let mut timing = Operation::new(Kind::PublicationPayloadSync, &transfer_id);
+            #[cfg(test)]
+            crate::download_transport::completion_tests::record_publication_sync(&transfer_id);
+            file.sync_data()
+                .context("Cannot sync completed download before publication")?;
+            timing.complete();
+        }
+        download_fs::validate_open_file(&partial, &file.metadata()?)?;
+        let metadata = file.metadata()?;
+        let local = Identity::read(&metadata)?;
+        if source.size > 0 && source.size != local.size {
+            bail!("Completed download has an unexpected size");
+        }
+        check_control(&transfer_id)?;
+        // Even a sync can race an external writer. The reused digest must
+        // still describe the exact retained descriptor after that wait.
+        if reused.is_some() {
+            verified.as_ref().unwrap().validate_unchanged(&metadata)?;
+        }
         let verification_reused = reused.is_some();
         let sha256 = match reused {
             Some(digest) => digest,
@@ -1961,6 +1981,11 @@ async fn finish_with_verification(
             bail!(
                 "Completed download bytes changed before publication; staging file was preserved"
             );
+        }
+        // The legacy checksum path has no retained VerifiedCompletion. Bind
+        // its proof to ctime too before awaiting a batched receipt save.
+        if local != Identity::read(&file.metadata()?)? {
+            bail!("Download staging file changed while verifying completion");
         }
         let receipt_path = path(&output, &source)?;
         if load(&receipt_path)?.is_some_and(|receipt| receipt.copy.is_some()) {
@@ -2003,29 +2028,128 @@ async fn finish_with_verification(
                 &mut receipt,
                 &transfer_id,
                 &options,
-            );
+            ).map(|_| None);
         }
-        save(&receipt_path, &receipt)?;
-        check_control(&transfer_id)?;
-        #[cfg(test)]
-        if matches!(options.fault, CopyFault::ChangeBeforePublication) {
-            let modified = file.metadata()?.modified()?;
-            std::fs::write(&partial, b"BAD-DATA")?;
-            file.set_times(std::fs::FileTimes::new().set_modified(modified))?;
+        Ok::<_, anyhow::Error>(Some(FinalPublication {
+            partial, output, transfer_id, options, verified, verification_reused,
+            file, identity: receipt.local.clone(), receipt_path, receipt,
+        }))
+    })
+    .await
+    .context("Download finalization worker stopped")??;
+    let Some(pending) = pending else { return Ok(()); };
+    let pending = save_final_receipt(pending).await?;
+    let published = tokio::task::spawn_blocking(move || publish_final_receipt(pending))
+        .await.context("Download publication worker stopped")??;
+    if let Some(published) = published {
+        // Publication has happened. Pause/Cancel must not interrupt recording
+        // that outcome; the normal checkpoint coordinator finishes its save.
+        save_final_receipt(published).await?;
+    }
+    Ok(())
+}
+
+/// Own the verified inode across the two asynchronous receipt commits.
+/// `identity` includes ctime; only our controlled move replaces that binding.
+struct FinalPublication {
+    partial: PathBuf,
+    output: PathBuf,
+    transfer_id: String,
+    options: FinishOptions,
+    verified: Option<crate::download_transport::VerifiedCompletion>,
+    verification_reused: bool,
+    file: std::fs::File,
+    identity: Identity,
+    receipt_path: PathBuf,
+    receipt: Receipt,
+}
+
+impl FinalPublication {
+    fn payload_path(&self) -> &Path {
+        if self.receipt.committed { &self.output } else { &self.partial }
+    }
+    fn validate_payload(&self) -> Result<std::fs::Metadata> {
+        let metadata = self.file.metadata()?;
+        download_fs::validate_open_file(self.payload_path(), &metadata)?;
+        if self.identity != Identity::read(&metadata)? {
+            bail!("Download staging file changed while saving its receipt");
         }
-        download_fs::validate_open_file(&partial, &file.metadata()?)?;
-        if verification_reused {
-            // Receipt writes can take time on an HDD. Reject even an edit
-            // whose mtime was restored after we reused the earlier digest.
-            verified
-                .as_ref()
-                .unwrap()
-                .validate_unchanged(&file.metadata()?)?;
-        }
-        if !receipt.local.same_file(&Identity::read(&file.metadata()?)?) {
-            bail!("Download staging file changed before publication");
-        }
-        let publication = if options.force_copy() {
+        Ok(metadata)
+    }
+}
+
+async fn save_final_receipt(pending: FinalPublication) -> Result<FinalPublication> {
+    use crate::download_telemetry::{Kind, Operation};
+    let mut timing = Operation::new(
+        if pending.receipt.committed { Kind::PublicationCommittedReceipt } else { Kind::PublicationPendingReceipt },
+        &pending.transfer_id,
+    );
+    let (pending, file, metadata, bytes) = tokio::task::spawn_blocking(move || {
+        let metadata = pending.validate_payload()?;
+        download_fs::create_dir_all(pending.receipt_path.parent().unwrap())?;
+        validate_receipt_source(&pending.receipt_path, &pending.receipt.source)?;
+        let file = tokio::fs::File::from_std(pending.file.try_clone()?);
+        let bytes = serde_json::to_vec(&pending.receipt)?;
+        Ok::<_, anyhow::Error>((pending, file, metadata, bytes))
+    }).await.context("Download receipt preparation stopped")??;
+    let gate = crate::download_verification::WriteGate::new(&file, &pending.transfer_id);
+    let guarded_path = pending.receipt_path.clone();
+    let guarded_source = pending.receipt.source.clone();
+    let precondition: download_fs::CheckpointPrecondition = std::sync::Arc::new(move || {
+        validate_receipt_source(&guarded_path, &guarded_source).map_err(std::io::Error::other)
+    });
+    #[cfg(test)]
+    batch_tests::before_receipt(&pending.transfer_id, pending.receipt.committed).await;
+    if gate.key().is_some() {
+        crate::download_checkpoint::commit_guarded(
+            &gate, &file, metadata, pending.payload_path(), &pending.receipt_path, bytes, precondition,
+        ).await?;
+    } else {
+        // Keep the existing SSD/network path: already durable data needs no
+        // extra per-file payload sync merely to save its receipt.
+        let path = pending.receipt_path.clone();
+        tokio::task::spawn_blocking(move || {
+            precondition()?;
+            download_fs::atomic_write(&path, &bytes)
+        })
+            .await.context("Download receipt save stopped")??;
+    }
+    let pending = tokio::task::spawn_blocking(move || {
+        pending.validate_payload()?;
+        Ok::<_, anyhow::Error>(pending)
+    }).await.context("Download receipt validation stopped")??;
+    timing.complete();
+    Ok(pending)
+}
+
+fn publish_final_receipt(pending: FinalPublication) -> Result<Option<FinalPublication>> {
+    use crate::download_telemetry::{Kind, Operation};
+    let FinalPublication {
+        partial, output, transfer_id, options, verified, verification_reused,
+        mut file, identity, receipt_path, mut receipt,
+    } = pending;
+    check_control(&transfer_id)?;
+    #[cfg(test)]
+    if matches!(options.fault, CopyFault::ChangeBeforePublication) {
+        let modified = file.metadata()?.modified()?;
+        std::fs::write(&partial, b"BAD-DATA")?;
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))?;
+    }
+    download_fs::validate_open_file(&partial, &file.metadata()?)?;
+    if verification_reused {
+        // Receipt writes can take time on an HDD. Reject even an edit
+        // whose mtime was restored after we reused the earlier digest.
+        verified
+            .as_ref()
+            .unwrap()
+            .validate_unchanged(&file.metadata()?)?;
+    }
+    if identity != Identity::read(&file.metadata()?)? {
+        bail!("Download staging file changed before publication");
+    }
+    let publication = {
+        let mut timing = Operation::new(Kind::PublicationMove, &transfer_id);
+        let result = if options.force_copy() {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "Generated copy fallback",
@@ -2033,33 +2157,37 @@ async fn finish_with_verification(
         } else {
             download_fs::publish_no_replace(&partial, &output)
         };
-        if let Err(error) = publication {
-            if download_fs::unsupported_operation(&error) {
-                return copy_publish(
-                    &partial,
-                    &output,
-                    &mut file,
-                    &receipt_path,
-                    &mut receipt,
-                    &transfer_id,
-                    &options,
-                );
-            }
-            return Err(error).context("Destination was preserved; cannot finalize download");
+        // An unsupported move is an unsuccessful move attempt even if
+        // the existing copy fallback subsequently publishes the file.
+        if result.is_ok() { timing.complete(); }
+        result
+    };
+    if let Err(error) = publication {
+        if download_fs::unsupported_operation(&error) {
+            return copy_publish(
+                &partial,
+                &output,
+                &mut file,
+                &receipt_path,
+                &mut receipt,
+                &transfer_id,
+                &options,
+            ).map(|_| None);
         }
-        let published = Identity::read(&download_fs::metadata(&output)?)?;
-        if !receipt.local.same_file(&published)
-            || !published.same_file(&Identity::read(&file.metadata()?)?)
-        {
-            bail!("Download staging file changed during publication; destination was preserved");
-        }
-        receipt.local = published;
-        receipt.committed = true;
-        save(&receipt_path, &receipt)?;
-        Ok(())
-    })
-    .await
-    .context("Download finalization worker stopped")?
+        return Err(error).context("Destination was preserved; cannot finalize download");
+    }
+    let published = Identity::read(&download_fs::metadata(&output)?)?;
+    if !receipt.local.same_file(&published)
+        || !published.same_file(&Identity::read(&file.metadata()?)?)
+    {
+        bail!("Download staging file changed during publication; destination was preserved");
+    }
+    receipt.local = published;
+    receipt.committed = true;
+    Ok(Some(FinalPublication {
+        partial, output, transfer_id, options, verified, verification_reused,
+        file, identity: receipt.local.clone(), receipt_path, receipt,
+    }))
 }
 
 fn copy_checkpoint(
@@ -2262,6 +2390,14 @@ fn copy_publish(
 #[cfg(test)]
 #[path = "download_receipt_copy_tests.rs"]
 mod copy_tests;
+
+#[cfg(test)]
+#[path = "download_receipt_batch_tests.rs"]
+mod batch_tests;
+
+#[cfg(test)]
+#[path = "download_receipt_identity_tests.rs"]
+mod identity_tests;
 
 #[cfg(test)]
 #[path = "download_receipt_recovery_tests.rs"]

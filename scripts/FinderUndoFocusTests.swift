@@ -1,4 +1,4 @@
-// Standalone generated notification regression; compile with FinderFileUndo.swift.
+// Compile with FinderFileUndo.swift and FinderCommandPublication.swift.
 import AppKit
 import Combine
 import Foundation

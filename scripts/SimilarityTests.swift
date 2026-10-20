@@ -2,7 +2,10 @@ import Darwin
 import AppKit
 import Foundation
 
-@main struct SimilarityTests {
+#if !SIMILARITY_QUERY_TEST_LIBRARY
+@main
+#endif
+struct SimilarityTests {
     @MainActor static func main() async throws {
         let suite = "com.wky.PikPakSimilarityTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!

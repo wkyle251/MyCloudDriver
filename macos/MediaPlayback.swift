@@ -139,6 +139,8 @@ final class MediaPlaybackRefreshQueue: @unchecked Sendable {
         if !bufferedRanges.isEmpty { bufferedRanges = [] }; if memoryBuffer != nil { memoryBuffer = nil }
         if wantsPlayback { wantsPlayback = false }; if phase != .loading { phase = .loading }
         guard let next, let item = next.currentItem else { return }
+        item.preferredForwardBufferDuration = 30
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
         // Inline previews must render here even when another player has left
         // an external video route active on the system.
         next.allowsExternalPlayback = false
@@ -217,7 +219,10 @@ final class MediaPlaybackRefreshQueue: @unchecked Sendable {
             player.pause(); wantsPlayback = false; phase = .paused
         } else {
             if phase == .finished { seek(to: 0) }
-            wantsPlayback = true; player.play(); phase = .buffering
+            wantsPlayback = true
+            // A deliberate Play should use available frames immediately. The
+            // independent RAM reader continues filling while playing or paused.
+            player.playImmediately(atRate: Float(settings.values.speed)); phase = .buffering
         }
     }
     func skip(_ seconds: Double) { seek(to: position + seconds) }

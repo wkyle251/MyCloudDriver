@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 /// Read throughput counts bytes received from the volume, including rereads after RAM eviction. The cache's
 /// resident size can stay constant while reading, so its growth is not a measure of speed.
 struct FilePreviewReadActivity {
+    static let averagingInterval: TimeInterval = 5
     private struct Sample { let time: TimeInterval; var bytes: Int64 }
     private var samples: [Sample] = []
     private var beganAt: TimeInterval = 0
@@ -19,15 +20,15 @@ struct FilePreviewReadActivity {
     mutating func record(bytes: Int, at time: TimeInterval) {
         guard isReading, bytes > 0 else { return }
         bytesRead += Int64(bytes)
-        samples.removeAll { $0.time <= time - 1 }
+        samples.removeAll { $0.time <= time - Self.averagingInterval }
         if let last = samples.last, time - last.time < 0.1 {
             samples[samples.count - 1].bytes += Int64(bytes)
         } else { samples.append(Sample(time: time, bytes: Int64(bytes))) }
     }
     func bytesPerSecond(at time: TimeInterval) -> Double {
         guard isReading else { return 0 }
-        let recent = samples.filter { $0.time > time - 1 }
-        return Double(recent.reduce(Int64(0)) { $0 + $1.bytes }) / min(1, max(0.001, time - beganAt))
+        let recent = samples.filter { $0.time > time - Self.averagingInterval }
+        return Double(recent.reduce(Int64(0)) { $0 + $1.bytes }) / min(Self.averagingInterval, max(0.001, time - beganAt))
     }
     mutating func end() { isReading = false; samples = [] }
 }
@@ -39,10 +40,12 @@ struct FilePreviewBufferStatus: Equatable {
     let bytesPerSecond: Double
     let isReading: Bool
     let failed: Bool
+    var memoryPressure = false
 
     var title: String {
         if failed { return "Read failed" }
         if cache.fraction == 1 { return "Fully buffered" }
+        if memoryPressure { return "Waiting for memory" }
         return isReading ? "Buffering" : "Buffer ready"
     }
 }
@@ -55,7 +58,7 @@ struct FilePreviewReadTimeout: LocalizedError, Sendable {
     }
 }
 
-/// Plays a file on an external disk or a network share from RAM. AVPlayer is given a custom-scheme
+/// Plays local, external, network and materialized cloud media from shared RAM. AVPlayer is given a custom-scheme
 /// asset; this delegate answers its byte-range requests from a `MemoryRangeBuffer`
 /// that a background reader fills from the volume: first what the player is waiting
 /// for, then what lies ahead of it. The file is opened read-only and never copied
@@ -100,6 +103,8 @@ final class FilePreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
     private var readerID: UUID?
     private var readOperation: Operation?
     private var readsAhead = false
+    private var retryTimer: DispatchSourceTimer?
+    private var retryNotBefore: TimeInterval = 0
     private let readAheadBlocks: Int
     private var invalidated = false
     private var readFailure: Error?
@@ -113,8 +118,8 @@ final class FilePreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
     /// `readAheadBytes` bounds how far beyond the playhead the reader goes once `setReadingAhead(true)` is called.
     /// Until then only the head and tail (`prime`) and what the player is waiting for are read, so selecting a video
     /// does not spin up a disk for hundreds of megabytes it may never play.
-    init(fileURL: URL, contentType: UTType? = nil, budgetBytes: Int64 = MemoryRangeBuffer.automaticBudget(), blockSize: Int = 1 << 20,
-         readAheadBytes: Int64 = 128 << 20,
+    init(fileURL: URL, contentType: UTType? = nil, budgetBytes: Int64 = .max, blockSize: Int = 1 << 20,
+         readAheadBytes: Int64 = .max, memoryBudget: PreviewMemoryBudget = .shared,
          io: IO = .init(),
          onSnapshot: @escaping @MainActor (PreviewResourceCacheSnapshot) -> Void = { _ in }) throws {
         let descriptor = open(fileURL.path, O_RDONLY | O_CLOEXEC)
@@ -127,7 +132,8 @@ final class FilePreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         self.descriptor = descriptor
         self.fileURL = fileURL
         self.io = io
-        buffer = MemoryRangeBuffer(contentLength: Int64(info.st_size), budgetBytes: budgetBytes, blockSize: blockSize)
+        buffer = MemoryRangeBuffer(contentLength: Int64(info.st_size), budgetBytes: budgetBytes, blockSize: blockSize,
+            memoryBudget: memoryBudget)
         readAheadBlocks = max(1, Int(max(0, readAheadBytes) / Int64(max(1, blockSize))))
         publisher = PreviewCacheProgressPublisher(onProgress: onSnapshot)
         self.contentType = (contentType ?? UTType(filenameExtension: fileURL.pathExtension))?.identifier ?? UTType.data.identifier
@@ -136,6 +142,11 @@ final class FilePreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         components.path = "/" + (contentType.map { "media." + ($0.preferredFilenameExtension ?? fileURL.pathExtension) } ?? fileURL.lastPathComponent)
         assetURL = components.url ?? URL(string: "\(Self.scheme)://file/media")!
         super.init()
+        let timer = DispatchSource.makeTimerSource(queue: delegateQueue)
+        retryTimer = timer
+        timer.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250))
+        timer.setEventHandler { [weak self] in self?.scheduleReads() }
+        timer.activate()
     }
     // Not `invalidate()`: its cancellation closure forms a weak reference, which is not allowed while deallocating.
     deinit { release() }
@@ -152,19 +163,20 @@ final class FilePreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
     var status: FilePreviewBufferStatus {
         lock.lock(); defer { lock.unlock() }
         return FilePreviewBufferStatus(cache: invalidated ? stoppedSnapshot : buffer.snapshot,
-            budgetBytes: Int64(buffer.maximumBlocks) * Int64(buffer.blockSize), bytesRead: readActivity.bytesRead,
+            budgetBytes: min(Int64(buffer.maximumBlocks) * Int64(buffer.blockSize), buffer.memoryBudget.limitBytes), bytesRead: readActivity.bytesRead,
             bytesPerSecond: readActivity.bytesPerSecond(at: ProcessInfo.processInfo.systemUptime),
-            isReading: readActivity.isReading, failed: readFailure != nil)
+            isReading: readActivity.isReading, failed: readFailure != nil, memoryPressure: buffer.memoryBudget.isUnderPressure)
     }
     /// Why reads stopped, once the disk or file failed.
     var failure: Error? { lock.lock(); defer { lock.unlock() }; return readFailure }
 
     /// Reads the start of the file, and its end where many movies keep their header, before playback begins.
     func prime(headBlocks: Int = 16, tailBlocks: Int = 2, noProgressTimeout: TimeInterval = 30,
+               invalidateOnCancel: Bool = true,
                progress: @escaping @Sendable (Double) -> Void) async throws {
         try await withTaskCancellationHandler {
             try await primeBlocks(headBlocks: headBlocks, tailBlocks: tailBlocks, noProgressTimeout: noProgressTimeout, progress: progress)
-        } onCancel: { self.invalidate() }
+        } onCancel: { if invalidateOnCancel { self.invalidate() } }
     }
 
     private func primeBlocks(headBlocks: Int, tailBlocks: Int, noProgressTimeout: TimeInterval,
@@ -211,8 +223,8 @@ final class FilePreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
 
     private func setPriority(_ blocks: [Int]) { lock.lock(); priority = blocks; lock.unlock() }
 
-    /// Starts or stops reading ahead of the playhead. Playback turns it on; pausing or leaving it off leaves the
-    /// disk alone once what the player asked for has been read.
+    /// Selection enables read-ahead independently of AVPlayer's paused state.
+    /// A retired selection disables it during its two-second grace period.
     func setReadingAhead(_ enabled: Bool) {
         lock.lock()
         let changed = readsAhead != enabled
@@ -221,7 +233,11 @@ final class FilePreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         lock.unlock()
         if enabled, changed, active { scheduleReads() }
     }
+    func setCachePriority(_ priority: Int, gracePeriod: TimeInterval = 0) {
+        buffer.setPriority(priority, gracePeriod: gracePeriod)
+    }
     private func release() {
+        retryTimer?.cancel()
         publisher.invalidate()
         lock.lock()
         let first = !invalidated
@@ -336,6 +352,7 @@ final class FilePreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
     private func scheduleReads() {
         lock.lock()
         guard !readerRunning, !invalidated, readFailure == nil else { lock.unlock(); return }
+        guard ProcessInfo.processInfo.systemUptime >= retryNotBefore else { lock.unlock(); return }
         guard nextReadLocked() != nil else { readActivity.end(); lock.unlock(); return }
         let request = UUID()
         let operation = BlockOperation { [weak self] in self?.readTurn(request) }
@@ -354,36 +371,39 @@ final class FilePreviewResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
             lock.unlock(); closeDescriptorIfIdle(); return
         }
         readerActive = true
+        let essential = demand.contains(index) || priority.contains(index)
         lock.unlock()
         let result = read(block: index)
         lock.lock()
         let publish = !invalidated
+        var stored = true
         if publish {
             switch result {
-            case .success(let data): buffer.store(data, block: index)
+            case .success(let data): stored = buffer.store(data, block: index, allowsEviction: essential)
             case .failure(let error): readFailure = error; readActivity.end()
             }
         }
         readerActive = false; readerRunning = false; readerID = nil; readOperation = nil
+        if !stored { retryNotBefore = ProcessInfo.processInfo.systemUptime + 0.25; readActivity.end() }
         lock.unlock()
         if publish {
             publisher.publish(buffer.snapshot)
             delegateQueue.async { [weak self] in self?.pump() }
         }
         closeDescriptorIfIdle()
-        scheduleReads()
+        if stored { scheduleReads() }
     }
 
     /// Called with `lock` held, both before queueing and when the turn starts:
     /// demand may change while a different volume occupies a shared worker.
     private func nextReadLocked() -> Int? {
         if let index = demand.first(where: { !buffer.contains($0) }) ?? priority.first(where: { !buffer.contains($0) }) { return index }
-        // Read ahead of the playhead, but only while playing, and only a bounded window: what fits in RAM with room
-        // to spare, and never more than `readAheadBlocks`.
-        guard readsAhead else { return nil }
+        guard readsAhead, buffer.memoryBudget.permitsReadAhead,
+              buffer.residentBytes < min(Int64(buffer.maximumBlocks) * Int64(buffer.blockSize), buffer.memoryBudget.limitBytes) else { return nil }
         let fits = buffer.blockCount <= buffer.maximumBlocks
-        let ahead = min(readAheadBlocks, fits ? buffer.blockCount : max(1, buffer.maximumBlocks * 3 / 4))
-        if let index = buffer.firstMissing(from: buffer.playheadBlock, count: ahead, wrapping: false) { return index }
+        let ahead = min(readAheadBlocks, buffer.blockCount, buffer.maximumBlocks)
+        if let index = buffer.firstMissing(from: buffer.playheadBlock, count: ahead, wrapping: fits),
+           Int64(buffer.blockRange(index).count) <= buffer.memoryBudget.availableBytes { return index }
         return nil
     }
 

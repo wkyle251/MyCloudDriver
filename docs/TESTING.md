@@ -201,6 +201,79 @@ completion/retry/cancellation recovery. No real account files are deleted.
 
 ## Download checkpoint disk pressure
 
+`client::path_tests` uses generated loopback responses to verify that account
+path lookup stops after the first matching page, follows later pages when
+needed, and preserves folder-only intermediate segments and server-order
+matching. Missing items and repeated pagination tokens retain their errors.
+Partial early results must not become complete cached inventories, and a
+mutation between pages must prevent stale results from overwriting the cache.
+
+`final_checkpoints_share_durable_barriers_and_release_scoped_read_admission`
+holds eight generated finalizers behind one synthetic HDD writer. Their final
+checkpoints share one batch and two full-cache barriers, and publication issues
+no additional payload sync. Sixteen further finalizers must progress with only
+eight read reservations and no network reception. Scheduler tests require the
+checkpoint handoff within one second when selected reads cannot run, while
+preserving physical readers, waiting readers, hash gaps and ordinary preparation.
+
+`only_an_unchanged_durable_completion_skips_the_publication_payload_sync` checks
+that an in-process successful commit can replace publication's payload sync;
+serial and restored proofs cannot. Failed checkpoint commits produce no durable
+proof. Source changes, copied/replaced/edited staging files, restored modification
+times and lost proofs retain the existing checksum and publication safeguards.
+Normal shutdown must report Pause before applying complete-file coverage checks
+to a retained partial checkpoint; interruption never withdraws its durable proof.
+Numeric diagnostics also time publication's payload sync, pending receipt,
+no-replace move and committed receipt independently, so further batching decisions
+can be based on disk time rather than flush counts alone.
+
+`publication_receipts_batch_without_rereads_and_finish_after_post_move_controls`
+holds eight generated finalizers through both receipt stages. Sixteen receipt
+saves share two batches and four full-cache barriers, compared with 32 individual
+receipt barriers. The fixture requires every byte to have been verified exactly
+once, withholds publication until the pending receipt is durable, and withholds
+completion until the committed receipt is durable. A lone finalizer must proceed
+within one second. Pause/Cancel after publication still finishes the committed
+receipt; Cancel before publication preserves staging.
+
+Isolated receipt identity tests edit staging with its modification time restored,
+edit or replace published output, and insert a foreign-source receipt while a
+save waits behind a held HDD writer. Each rejects false completion and preserves
+the changed data. Filesystem fault tests recheck every receipt precondition after
+the first barrier and stop the commit before any journal rename if ownership
+changed. A mixed eight-file coordinator fixture rejects only the offending
+receipt and internally requeues the seven healthy writes, retaining descriptors
+and permits without a caller retry. Receipt timings include queue admission after batching;
+checkpoint-wait and checkpoint-sync metrics separate those costs.
+
+`complete_original_recovery_reads_once_and_still_repairs_changed_pieces` restores
+a complete generated original with unchanged, absent, and changed checkpoint
+identities. Every intact case reads exactly the file's size, compares all piece
+digests, and publishes without another HTTP request. The damaged case downloads
+only its changed piece and performs a second full pass after repair. Aggregate
+and piece hashes come from the same physical pass; the resulting proof remains
+bound to the staging file's identity before publication. Other source revisions,
+partial coverage, and interrupted final checks retain their existing validation.
+
+Live folder discovery counts files that still need network payload separately
+from files awaiting final integrity checks. Up to 2,048 unreceived files can be
+looked ahead; discovery stops at 8,192 total outstanding files (plus pages already
+in flight). Another selection retains its first-page allowance below that total
+bound. Final checks are still mandatory, share the existing disk scheduler, and
+cannot certify or publish buffered data early. RAM and pressure limits remain
+the receiving boundary.
+
+`live_downloads::tests::live_discovery_fetches_fresh_files_while_prior_downloads_await_final_checks`
+holds the real physical-verifier gate while a loopback provider paginates a
+generated folder. With the old combined backlog, the next page receives zero
+bytes. With separate accounting, fresh payload arrives before either prior
+file's final check can run. This covers both restored complete range journals
+and newly downloaded sequential files. After releasing the gate, each file still reads all
+its bytes exactly once and publishes the expected original. The fixture also
+checks total-backlog limits, another selection's allowance, and telemetry reset.
+Numeric diagnostics expose `discovery_outstanding_files`,
+`discovery_waiting_files` and `final_verification_tasks`; they contain no names.
+
 ```sh
 cargo test --locked --offline --bin pikpak download_transport::completion_tests -- --nocapture
 cargo test --locked --offline --bin pikpak download_transport -- --test-threads=2
@@ -524,6 +597,10 @@ recovery after a failed build, compiler flags, damaged output and removed source
 Installation checks copy the signed build to a temporary location without launching
 it. They verify unchanged-install skipping, rejection of mismatched staging,
 verified rollback archives and restoration after a registration failure.
+`python3 scripts/test-app-install-fixtures.py` also simulates a quit-request
+timeout. The installer keeps waiting for the app and tracked helpers, including
+an orphaned helper; it replaces the bundle only after all have exited. A helper
+that remains alive past the wait leaves the installed app untouched.
 
 For timing, compare `time ./scripts/build-app.sh --clean` with a second ordinary
 build. `--clean` clears only the app's Swift compilation cache; Rust dependencies,
@@ -673,8 +750,9 @@ The media interaction suite generates H.264, VP9 and audio-only MP4s. VP9
 reproduces an AVKit item that reports ready without rendering a video frame.
 It checks first-frame detection, cloud-source fallback, local compatible-copy
 recovery, paused playback, stale callbacks, bounded retries and cleanup. Focus
-checks cover the header, video and controls, Space pause/resume with held-key
-repeats suppressed, Space during player preparation, five-second Left/Right
+checks cover the header, video and controls, Space pause/resume from the file list
+without preview focus, held-key repeats, Space during player preparation, Quick Look
+fallback for other file types and hidden/removed panes, five-second Left/Right
 seeks, Up/Down file navigation while a volume slider has focus, text input and
 clicks outside the pane. The UI fixture uses the production pane, player and sliders
 with three synthetic clips for pointer and keyboard verification.
@@ -1217,7 +1295,9 @@ area. Compile **one entry point at a time**; each declares `@main`.
 | `NativeFolderSizeTests.swift` | Calculate on a folder shows the row spinner (also on unsized folders below it, never on files or unrelated folders), then sizes that folder and every subfolder, whether already expanded or expanded later; several selected folders are sized together; a refresh discards the sizes. Runs on generated folders and on newly created APFS, case-sensitive APFS, HFS+ and ExFAT disk images for the external-disk case, with folder names containing spaces and accents so a listing and the size walk must agree on each file system's name form; never touches a real disk. Needs full Xcode (`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`) when `xcode-select` points at the Command Line Tools. |
 | `NativeDriveTreeTests.swift` | Inline disclosure, nested keyboard/range selection, remembered file focus on folder collapse/reopen, real temporary-file/folder Trash Undo/Redo, lazy loading and cache reuse, pagination/retry, sorting during I/O, bounded concurrency, refresh after rename/move/Undo, overlapping selections, Photos row identity and cancellation. Expand All fixtures cover deep/wide metadata trees, all descendant pages, cycles, cached branches, coalesced updates, Stop/collapse/reset/disconnect, stale replies, non-advancing pages and a generated local symlink; no file materialization. Replies that arrive together are published in one rebuild while a lone reply is shown at once. Expand All over several folders covers deduplicated and nested roots, ignored files, untouched unselected folders, the shared four-request bound, collapsing one expanding folder without stopping the others, and Stop cancelling all of them. |
 | `FinderWorkspaceTests.swift` | Settings, CPU/resource attribution, GPU counter validity and live device readings, navigation, and account management. CoreML job counts are attributed once per task. |
-| `WorkspaceSessionTests.swift` | Eight independent browsing workspaces; simultaneous different folders, selection/history/sidebar isolation, shared settings, independent drive titles, focused commands, resource aggregation, fresh storage on slot reuse, owner-specific scan recovery and idempotent teardown. Runs without presenting browser windows. |
+| `WorkspaceSessionTests.swift` | Eight independent browsing workspaces; simultaneous different folders, selection/history/sidebar isolation, shared settings, independent drive titles, focused commands, resource aggregation, fresh storage on slot reuse, owner-specific scan recovery and idempotent teardown. Native window notifications route commands without a second SwiftUI focus binding. A hundred status updates refresh callbacks without rebuilding menus; drive/login and command-availability changes still update validation. Parent/child menu tracking coalesces publications and immediately invalidates closed-window actions. Runs without presenting browser windows. |
+| `FinderCommandPublicationTests.swift` | Runs AppKit's event-tracking loop and verifies 100 command updates stay deferred even without menu notifications, while the main dispatch queue actually executes. Returning to the default run loop publishes once. Also covers nested parent/child notifications, cancellation and weak-owner teardown. Compile with `macos/FinderCommandPublication.swift`. |
+| `FinderUndoFocusTests.swift` | Generated native editor/window notifications coalesce outside SwiftUI updates; current focus validation remains immediate and released observers cannot publish. Compile with `macos/FinderFileUndo.swift` and `macos/FinderCommandPublication.swift`. |
 | `WorkspaceTransferStorageTests.swift` | Generated per-window queues recovered in a separate process; UUID validation, legacy migration, paused-state preservation, inherited destination volume/bookmark checkpoints for nested downloads and cleanup-only imports, upload journals, exclusion of current-run workspaces and no repeated completed work. |
 | `WorkspaceAccountSelectionTests.swift` | New-window account inheritance, explicit signed-out and sign-in-required selections, shared credential preservation and invalid namespace/account rejection. |
 | `WindowTorrentRelayTests.swift` | Synthetic account routing across windows, login-method updates, weak ownership, fallback after closing a window, retention of the last relay account owner and account-specific listing refreshes. |
@@ -1230,12 +1310,13 @@ area. Compile **one entry point at a time**; each declares `@main`.
 | `DownloadRetryTests.swift` | Live queue admission across destinations and shared links, incremental totals, source IDs, durable acknowledgements, helper-exit races, pause/resume, retries and per-file network rates. |
 | `DownloadRecoveryTests.swift` | Original destination volume checks, disconnect/access waits, reconnect, repeated disk-error backoff, durable root/child Pause including disconnected queued roots, immediate cancellation of visible and saved queues, overlapping-selection cleanup protection, cancellation totals, explicit re-add, late-event rejection and recovery across relaunch. Resume interrupts a slow cancelled-file cleanup between files, shows preparation while waiting for the current disk operation, starts without draining historical cleanup, and retains deferred cleanup across relaunch. Uses generated files and injected availability; never ejects an existing disk. |
 | `DownloadDestinationReplacementTests.swift` | A download disk backed up and reformatted, on newly created ExFAT then APFS disk images mounted at the same path: the saved identity is reported as a replaced disk (not unplugged), re-validating without it adopts the new disk, an unplugged disk is still reported as unplugged, and only this app's own restored `.part`, `.part.resume.json` or `.part.ranges.json` for the queued items count as proof (a finished file or another name does not; the scan is bounded). `DownloadRecoveryTests.swift` adds the model flow: a replaced or empty disk never receives the download on its own and offers Use This Disk, Use This Disk or restored progress files continue it, the new identity is saved, and a third disk is refused again. Needs full Xcode when `xcode-select` points at the Command Line Tools. |
-| `PreviewLayoutTests.swift` | Full pane width, height-only resizing, reachable bottom handle, one details-popover layout for every drive and placement (media keeps all but the grip), small windows and invalid saved heights. Also compiles directly with `macos/FinderPreviewPane.swift`. |
+| `PreviewLayoutTests.swift` | All four preview positions and both orientations, persisted settings and legacy Right/Bottom preferences, correct divider drag direction and size limits, tiny/invalid geometry, real hosted pane frames, unchanged native pane instances and browser scroll position while swapping sides/orientation. Also hosts the real preview pane at multiple sizes and placements: media fills all available width/height below the header, ignores legacy manual heights and retains its native surface; no media resize handle remains. Compile using `scripts/build-native-test.sh`. |
 | `MediaPlaybackTests.swift` | Real AVFoundation playback, seeks/replay, stale callbacks after file switches, persistent volume/mute/speed, buffer gaps/overlaps and duration bounds, invalid preferences and observer teardown. Compile with `macos/MediaPlayback.swift`. |
 | `NativeMediaPreviewTests.swift` | Native original preparation progress, cancellation/late completion, reuse across layout changes, retryable errors and safe staging cleanup. iCloud and Photos buffering panels persist from preparation to local availability, use actual provider byte counts for speed, keep a percentage-only speed unknown, decay to zero during a source stall, retain failure status and reject late progress after switching or closing. Covers video and audio. |
 | `MediaContainerTests.swift` | A video's real container decides how it opens. First-byte recognition of MPEG transport streams (188 and 192-byte packets, three aligned sync bytes), QuickTime/MP4 atoms, AVI, Matroska, FLV, ASF, Ogg, MPEG program streams and RealMedia, and which extensions each container may carry. Plain-language failure reasons from FFmpeg output (missing movie index only for a file that starts like QuickTime, invalid data, unsupported codec, a full disk, never a path). Generated media through the real preview flow: a transport stream named `.MOV` plays natively from an internal disk (private `.ts` link, original untouched and still there after clear) and from an external disk (RAM buffer told the stream's type), Matroska named `.mp4` is converted by its real format, a genuine QuickTime movie is unchanged, a cut-off movie says its index is missing, and garbage says its data is not valid. A damaged 4K transport stream (junk spliced into the packet grid, so Apple's reader finds no video) is repackaged without re-encoding in seconds with video and audio intact, and a repackaged copy that fails again is converted once. A player that never finishes opening is abandoned after a timeout. Only containers Apple's player does not read are repackaged first (an MP4/MOV fails on its codec, so it is converted straight away). IINA is offered only when installed (a stale registration for a deleted app is ignored; standard locations are searched), and the original is handed over untouched, nothing being opened when the file has gone. The model exposes the original file and whether a copy is being prepared, so the button can show while it waits. The argument builder is checked directly: video copied and HEVC tagged for repackaging, hardware-first and downscaled to 1920 for conversion, the demuxer always explicit. Needs FFmpeg. |
-| `NativeMediaPreviewWiringTests.swift` | Hosts the real inline preview in a hidden window with generated files, with direct playback, injected external-disk/network-share buffering and synthetic iCloud/Photos providers. Only the internal local disk omits the buffering panel. After every selection change, arrow-key burst and mid-load identity change the pane must be bound to the selected file, never left on "Preparing preview…" with the previous file prepared. Needs full Xcode (`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`) when `xcode-select` points at the Command Line Tools. |
-| `ExternalMediaBufferTests.swift` | The RAM buffer for files on external disks and network shares. Pure store: automatic budget (1/16 of RAM, 64 MiB to 1 GiB), contiguous reads, rejected bad blocks, eviction behind the playhead first, never beyond budget or the playhead's block, concurrent use. File-backed AVAssetResourceLoader on generated MP4s with exact-frame decoding: a file that fits is held completely and released on invalidate; a file several times the budget plays from head, middle and tail within budget; head and tail priming with progress; a file that becomes unreadable fails the request instead of hanging. Preview model: external volumes and network shares play through the loader, internal ones directly, selecting another file releases the previous buffer, clear() frees it. Compatible external-video copies retain their preparation/completion panel after bypassing the RAM loader. Read throughput counts actual reads, including evicted bytes, ages out on a stalled read and resets on idle/resume. Buffer status reports retained bytes, source, RAM limit, completion and read failure; pending status updates cannot restore a cleared preview. The seek bar maps RAM byte ranges proportionally and reverts without a buffer. Volume rule: local non-internal disks and nonlocal network shares are buffered; the startup disk and volumes of unknown kind are not. Needs FFmpeg and, when `xcode-select` points at the Command Line Tools, `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`. Selecting a video reads only its head and tail; a bounded window ahead of the playhead is read once playback starts (and not again when it is paused and resumed), and a released preview reads nothing. Downloads carry the validated destination kind per root in the continuous queue; legacy single-destination helpers use `MYCLOUDDRIVER_DOWNLOAD_DESTINATION`, and an internal legacy destination removes an inherited value. |
+| `NativeMediaPreviewWiringTests.swift` | Hosts the real inline preview in a hidden window with generated files, with direct playback, injected external-disk/network-share buffering and synthetic iCloud/Photos providers. Every source uses the shared RAM loader and its buffering panel. After every selection change, arrow-key burst and mid-load identity change the pane must be bound to the selected file, never left on "Preparing preview…" with the previous file prepared. Needs full Xcode (`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`) when `xcode-select` points at the Command Line Tools. |
+| `PreviewRAMBufferTests.swift` | Generated local/cloud items and loopback HTTP: one persisted download/preview setting, migration from the former preview setting, explicit Automatic precedence, installed-RAM automatic ceilings and manual options on 16 GB/64 GB Macs, shared accounting across disk/HTTP caches, sparse overlap with cumulative received-byte telemetry, lowering a live cap, pressure stop/recovery, paused filling, no normal disk cache, filtered next-file prefetch, live filter retargeting, prefetch promotion, grace-period reuse and two-second eviction. Build with `scripts/build-native-test.sh` using full Xcode. |
+| `ExternalMediaBufferTests.swift` | The RAM buffer for files on external disks and network shares. Pure store: automatic budget (installed physical RAM, allocated on demand), contiguous reads, rejected bad blocks, eviction behind the playhead first, never beyond budget or the playhead's block, concurrent use. File-backed AVAssetResourceLoader on generated MP4s with exact-frame decoding: a file that fits is held completely and released on invalidate; a file several times the budget plays from head, middle and tail within budget; head and tail priming with progress; a file that becomes unreadable fails the request instead of hanging. Preview model: internal/external volumes, network shares and compatible copies play through the RAM loader; selecting another file retains the previous buffer for two seconds, and clear() frees it immediately. Download throughput counts actual reads, including evicted bytes, averages a rolling five-second window, tolerates shorter burst gaps, ages out on a stalled read and resets on idle/resume. Buffer status reports retained bytes, source, RAM limit, completion and read failure; pending status updates cannot restore a cleared preview. The seek bar maps RAM byte ranges proportionally and reverts without a buffer. Volume classification distinguishes external disks, network shares and internal disks for source labels; all use preview RAM buffering. Needs FFmpeg and, when `xcode-select` points at the Command Line Tools, `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`. Head/tail priming and bounded read-ahead are checked independently; selected previews enable whole-file read-ahead even while paused, and a released preview reads nothing. Downloads carry the validated destination kind per root in the continuous queue; legacy single-destination helpers use `MYCLOUDDRIVER_DOWNLOAD_DESTINATION`, and an internal legacy destination removes an inherited value. |
 | `ExternalDiskTests.swift` | Creates its own 64 MB disk image: direct preview/export/upload sources, saved volume identity, ejection notifications, offline bookmark restoration without auto-mounting, read-only remount, incomplete-copy cleanup and replacement-disk rejection. Never uploads to a cloud account or ejects an existing user disk. Add `-D BROWSER_DROP_TESTS` to include uploader admission/resume checks. |
 | `NativeDiskDeletionTests.swift` | Creates its own 64 MB mounted volume and generated files: Trash/Undo/Redo contents, expanded parent/child selection, connected-root protection, rollback after a failed batch, disconnected volume rejection and read-only remount. Optional `--network-root /Volumes/Share` checks on-disk Trash/Undo/Redo on an already-mounted writable network share using its own uniquely named disposable folder as the Trash root. Never lists existing disk contents or ejects an existing disk. Compile with `scripts/build-native-test.sh`. |
 | `DiskTrashTests.swift` | Generated same-volume Trash entries: persistence, Put Back, Undo/Redo, conflict protection, Empty Trash snapshots, unrelated contents and native model state/history. Compile with `scripts/build-native-test.sh`. |
@@ -1270,7 +1351,7 @@ area. Compile **one entry point at a time**; each declares `@main`.
 | `PikPakTransferQuotaTests.swift` | Transfer-quota lifecycle across late replies, overlapping windows and cancellation; pass a built `PikPakAccountVerifierFixture` as its first argument to also cover the real helper's arguments, JSON delivery, failed refresh and process cleanup. |
 | `PreviewTransportTests.swift` | PikPak CDN HTTP links upgraded to HTTPS with signed path/query bytes preserved, unrelated HTTP and malformed links rejected; inherited proxies disabled and an explicit override retained. |
 | `PreviewProgressTests.swift` | Two million concurrent/burst cache events while the UI is occupied, latest-snapshot delivery, duplicate completed-cache reads, bounded update frequency, pending-event cancellation and release. No media or network access. |
-| `PreviewResourceLoaderTests.swift` | Generated MP4s served over loopback: MIME variants, completed/damaged caches, actual frame decoding, a 30-second player buffer before/after duration discovery, and duplicate/stale UI metrics. Requires macOS 14 or newer and ffmpeg. |
+| `PreviewResourceLoaderTests.swift` | Generated MP4s served over loopback: MIME variants, completed/damaged caches, actual frame decoding, a 30-second player buffer before/after duration discovery, duplicate/stale UI metrics, and five-second download rates across bursts, paused polling, idle expiry and access-log resets. Requires macOS 14 or newer and ffmpeg. |
 | `PreviewResponseTests.swift` | Real preview JSON in User/Guest/Dynamic modes, HTTP/HTTPS source deduplication, legacy content-only replies, image/Quick Look/Open URL selection, and missing-link errors. Uses synthetic responses without network access. |
 | `SharedLinkInputTests.swift` | One- to four-row input layouts, fields and buttons that never overlap or leave 0–1600 pt viewports including fractional widths, and bounded handling of transient zero/invalid layout proposals. |
 | `SimilarityInventoryTests.swift` | Provider refresh restricted to an empty regular inventory in the owning request directory, indeterminate checking progress, skipped selected-file deletion, and a real helper catching additions/deletions/edits during and after analysis so a resumed sealed comparison never reuses scores for removed files. Pass the built app's `Contents/Resources` path as its first argument. |
@@ -1600,37 +1681,83 @@ location should stay at the drive root until double-click or Return opens a
 folder. Check Left/Right, Up/Down and Space Quick Look on the indented files,
 then expand two Photos albums to verify their separate rows and shared layout.
 The Fixture menu's Show PikPak Media Preview uses a synthetic local video at
-`Resize sample.mp4` in the private folder opened by Fixture → Show Fixture Folder. Drag its bottom grip to
-adjust height, then drag the browser divider and shrink the window after Use
-Oversized Preview. The canvas must always fill the pane's width, with no side or
-corner grip. The header, bottom handle and scrollable details must remain visible.
+`Resize sample.mp4` in the private folder opened by Fixture → Show Fixture Folder.
+Drag the browser/preview divider and resize the window. The media must always fill
+all available width and height below its header, with no independent resize grip
+or unused space below it. Fixture → Set Legacy Preview Size must have no effect.
+The header and file-details popover must remain reachable.
 Settings → General → Reset Layout must restore the open workspace immediately,
-including when the preview is expanded. Verify playback continues while resizing.
+including when the preview is expanded. In Settings → General, switch Preview layout
+between Side by side and Top and bottom, then test both Preview placement options.
+Left/Top must put the preview first; Right/Bottom must put the file browser first.
+Enable Fixture → Simulate Background Updates, then open View → Preview Placement.
+Move between that submenu and its parent repeatedly; Left/Right/Top/Bottom must
+remain open and clickable while updates continue. Check each choice and its
+checkmark, then reopen or cancel the menu; command validation must resume normally.
+The fixture keeps timer ticks outside App state, matching production model updates.
+Fixture → Center Fixture Window brings its generated browser onto the active screen.
+Native menu notifications are logged to
+`/private/tmp/myclouddriver-preview-menu-tracking.log`. Accessibility menu opening
+can omit tracking notifications; use the event-tracking regression as well:
+
+```sh
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swiftc -swift-version 5 -parse-as-library macos/FinderCommandPublication.swift scripts/FinderCommandPublicationTests.swift -o /private/tmp/mycloud-command-publication-tests
+/private/tmp/mycloud-command-publication-tests
+```
+
+Drag each divider in both directions: the
+pane before it must grow when dragging right/down. Browser scroll position,
+selection, playback time and paused/playing intent must survive layout changes.
+Test all drive previews and relaunch persistence, narrow/short windows, hidden and
+expanded preview, and Reset Layout returning to Right. Verify playback continues
+while resizing.
 The media preview uses an app-owned control bar and no AVKit overlay controls.
 Change volume, mute and speed; open another video and verify those choices remain.
-Test seek dragging, ±10 seconds, replay, and changing speed while paused (must not
-start playback). Check the 180-point minimum canvas, expanded preview and both
-appearances. Native iCloud/Photos videos use this same bar; expanding their
+Test seek dragging, ±5 seconds, replay, and changing speed while paused (must not
+start playback). Check small panes, expanded preview and both appearances. Native iCloud/Photos videos use this same bar; expanding their
 preview must preserve playback, and switching to an image must stop the video.
-PikPak and Link show transfer speed, retained-byte progress and ranges inside
-Buffering details below the player. The collapsed panel shows only its disclosure;
-expanding it reveals one status/speed row, one byte/percentage summary and one retained-range
-bar, followed by source information and a help icon. Check compact widths and both appearances:
-the byte summary wraps rather than truncating, full buffering hides the idle transfer rate,
-conversion clears download metrics, and a failed stream has no animated buffer. The retained-byte buffer
-is separate from the timeline's currently playable ranges. Confirm that iCloud,
-Photos, external disks and network shares also use this disclosure; only the
-internal Local Disk omits it. Provider speed stays unknown until bytes are reported.
-All UI checks use synthetic media.
+Every drive uses the same responsive footer. At 540 points or wider it has two
+rows: elapsed/preparing status and duration beside the combined playback/buffer
+timeline, then transport, volume, five-second average download speed and playback
+speed together. Below 540 points it has three rows: status/time/download speed,
+the full-width timeline, then transport/volume/playback speed. Resize across the
+threshold in all four preview placements and expanded preview; playback position,
+paused/playing intent and native slider focus must survive. Narrow previews keep
+volume in the controls row with a shorter slider and the percentage available
+through accessibility; wider previews show the percentage inline. Check mute, volume dragging
+and playback speed at the minimum preview width. There must be no Buffering details disclosure,
+RAM/byte/percentage panel or loading card over the thumbnail. Check narrow panes,
+light/dark appearance, loading and ready states on PikPak Drive, Link, local,
+external, network, iCloud and Photos. Soft blue RAM ranges must preserve gaps; played
+content draws blue on the same rail. Preparation has no seek knob until seekable;
+complete buffering hides the idle speed. Unknown provider speed stays **—**.
+Conversion must clear the completed transfer's rate. A server stall decays to 0 B/s
+within five seconds and selection changes must not retain stale metrics.
 
-Loading cards must show percentage, received bytes and live speed before a player exists.
-Force a compatible MP4 preview and throttle its full-file HTTP download; verify that the
-loading card and buffering panel use those download metrics. A server stall must decay to
-0 B/s, an absent Content-Length must use a known source size when available, and an entirely
-unknown total must stay indeterminate while still showing bytes and speed. Conversion must
-clear the download's percentage/rate, and completion, failure, cancellation or selection
-changes must not retain stale metrics. `AVIPreviewTests.swift` exercises these with a local
-HTTP server and generated media, alongside real parsing/recovery/playback checks.
+`PreviewRAMBufferTests.swift` checks real player-independent file/HTTP buffering,
+shared cap and pressure recovery. Folder queues are exercised across internal,
+external, network, iCloud, Photos, PikPak and Link: at least two successors finish,
+no additional file starts when RAM is full, increasing the allowance resumes,
+pressure blocks work even with room, promotion of a later file reuses its cache
+and keeps later successors, and changing folders cancels every speculative buffer.
+Filtered-order changes and the two-second previous-file grace period are checked
+separately. `MediaPreviewInteractionTests.swift` uses a valid generated MP4 with a
+24 MB free atom before its trailing index and throttled reads: its real frame must
+play before a third of the file is buffered, then RAM must keep filling after Pause.
+The open watchdog must allow a slow source making progress and recover a reader
+that remains unknown without progress. `AVIPreviewTests.swift` covers compatible
+copy downloads and recovery with a local server and generated media.
+
+For visual/keyboard QA, build `scripts/PreviewFooterUITestApp.swift` using
+`scripts/build-native-test.sh`, package it as an app and launch it. It opens only
+generated media in a private temporary folder. The held download at right must
+leave its thumbnail clear with status/speed in the footer. Toggle Wide/Narrow
+loading preview to check both footer layouts while preparation continues; the
+workspace footer must also adapt as its available width changes. Release download
+to check the ready footer; Toggle appearance checks dark mode. In the real workspace,
+select `Trash keyboard fixture.txt`, click Trash, then press Return: the dialog must
+close and the file must appear in this fixture disk's Trash. Escape must cancel.
+The fixture removes its private files on normal quit.
 
 Right-click a file and enter Open With. Leave the pointer on its trigger and
 move between the parent and application list; the submenu must remain stable,
@@ -2783,3 +2910,14 @@ on an SSD check regressions; they do not establish real HDD or PikPak gains:
 python3 scripts/with-client-credentials.py cargo test --release --locked --bin pikpak speed_benchmark -- --ignored --nocapture --test-threads=1
 python3 scripts/test-remote-download-monitor.py
 ```
+
+
+## Shared media preview RAM regression
+
+```sh
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./scripts/build-native-test.sh scripts/PreviewRAMBufferTests.swift /private/tmp/mycloud-preview-ram-tests
+/private/tmp/mycloud-preview-ram-tests
+```
+
+The tests use generated media placeholders, synthetic providers and a loopback
+HTTP server. They do not read cloud credentials or existing media libraries.

@@ -10,6 +10,11 @@ struct DiskTrashItem: Identifiable, Hashable, Sendable {
     let bytes: UInt64?
 }
 
+struct DiskTrashListing: Sendable {
+    let items: [DiskTrashItem]
+    let unavailableCount: Int
+}
+
 /// A recoverable, same-volume Trash. Every entry is journalled before its
 /// original is moved. Only marked app storage and validated entry IDs are ever
 /// emptied; an existing user's Trash folder is never adopted wholesale.
@@ -98,17 +103,23 @@ final class DiskTrash: @unchecked Sendable {
     }
 
     func list() async throws -> [DiskTrashItem] {
+        try await listing().items
+    }
+
+    func listing() async throws -> DiskTrashListing {
         try await CloudDriveFiles.detached {
             // A read-only disk can still show its old Trash before a writable
             // connection migrates it. Reading never creates or renames storage.
             let store = !self.usesLegacyStorage && self.info(self.storage) == nil && Self.isManagedStorage(self.legacyStorage)
                 ? DiskTrash(volumeRoot: self.volumeRoot, volumeID: self.volumeID, legacy: true) : self
             return try store.locked(create: false, writing: false) {
-                try store.records().map { record in
+                var unavailable = 0
+                let items = try store.records(onInvalid: { unavailable += 1 }).map { record in
                     DiskTrashItem(id: record.id, name: record.name,
                         originalPath: "/" + record.components.joined(separator: "/"), deletedAt: record.deletedAt,
                         isFolder: record.isFolder, bytes: record.bytes)
                 }.sorted { $0.deletedAt == $1.deletedAt ? $0.id.uuidString < $1.id.uuidString : $0.deletedAt > $1.deletedAt }
+                return DiskTrashListing(items: items, unavailableCount: unavailable)
             }
         }
     }
@@ -369,17 +380,24 @@ final class DiskTrash: @unchecked Sendable {
         }
     }
 
-    private func records() throws -> [Record] {
+    private func records(onInvalid: (() -> Void)? = nil) throws -> [Record] {
         var records: [Record] = []
         for name in try fm.contentsOfDirectory(atPath: storage.path) {
             try CloudDriveFiles.checkCancellation()
             guard let id = UUID(uuidString: name), id.uuidString == name else { continue }
-            let record = try load(id)
-            // A journal written before an interrupted move, or left after a
-            // successful restore, must not look like another deleted file.
-            guard info(payload(record)) != nil else { continue }
-            try verifyEntry(record)
-            records.append(record)
+            do {
+                let record = try load(id)
+                // A journal written before an interrupted move, or left after
+                // a successful restore, is not another deleted file.
+                guard info(payload(record)) != nil else { continue }
+                try verifyEntry(record)
+                records.append(record)
+            } catch {
+                guard let onInvalid else { throw error }
+                try CloudDriveFiles.checkCancellation()
+                try validateVolume(writing: false)
+                onInvalid()
+            }
         }
         return records
     }

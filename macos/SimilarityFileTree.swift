@@ -59,6 +59,17 @@ struct SimilarityFileTree: NSViewRepresentable {
                 expansionTask?.cancel()
                 let known = nodes, expanded = expandedIDs
                 let groupTree = snapshot.grouped, changedKind = groupTree != grouped
+                let clip = outline.enclosingScrollView?.contentView
+                let origin = clip?.bounds.origin ?? .zero
+                let visible = outline.rows(in: outline.visibleRect)
+                var anchors: [(String, CGFloat)] = []
+                if !changedKind, visible.location != NSNotFound {
+                    for row in visible.location..<min(outline.numberOfRows, NSMaxRange(visible)) {
+                        if let node = outline.item(atRow: row) as? SimilarityTreeNode {
+                            anchors.append((node.id, outline.rect(ofRow: row).minY - origin.y))
+                        }
+                    }
+                }
                 self.roots = roots; nodes = snapshot.nodes; parents = snapshot.parents
                 snapshotID = snapshot.id; grouped = groupTree; expandedIDs = []
                 outline.reloadData()
@@ -83,6 +94,20 @@ struct SimilarityFileTree: NSViewRepresentable {
                     // Empty is a valid user choice: a redraw must not reopen
                     // every group after Collapse All.
                     for id in expanded { if let node = nodes[id] { outline.expandItem(node) } }
+                }
+                if let clip, !anchors.isEmpty {
+                    outline.layoutSubtreeIfNeeded()
+                    var restored = origin
+                    for (id, offset) in anchors {
+                        guard let node = nodes[id] else { continue }
+                        let row = outline.row(forItem: node)
+                        guard row >= 0 else { continue }
+                        restored.y = outline.rect(ofRow: row).minY - offset
+                        break
+                    }
+                    var bounds = clip.bounds; bounds.origin = restored
+                    clip.scroll(to: clip.constrainBoundsRect(bounds).origin)
+                    outline.enclosingScrollView?.reflectScrolledClipView(clip)
                 }
             }
             if let groupExpansion, appliedGroupExpansionID != groupExpansion.id {

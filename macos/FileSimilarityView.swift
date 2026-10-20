@@ -586,6 +586,9 @@ private struct SimilarityScanView: View {
                 } else if model.isPaused {
                     Label("Downloads are retained in RAM. Work already analysing may finish; no new files start until Resume.", systemImage: "pause.circle")
                         .font(.callout).foregroundStyle(.secondary)
+                } else if let reason = model.inventoryWaitReason {
+                    Label(reason, systemImage: "externaldrive.badge.exclamationmark")
+                        .font(.callout).foregroundStyle(.secondary)
                 } else if model.waitingForNetwork || model.progress.retryingDownloadFiles > 0 {
                     Label("Waiting for the drive. Downloads retry automatically; ready files continue analysing.",systemImage:"wifi.exclamationmark")
                         .font(.callout).foregroundStyle(.secondary)

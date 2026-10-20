@@ -3,6 +3,152 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[test]
+fn discovery_keeps_its_network_and_total_backlogs_bounded_independently() {
+    let limits = DiscoveryLimits::default();
+    assert!(limits.allows(2048, 0, 0), "A final-check backlog must not stop fresh folder pages");
+    assert!(!limits.allows(2048, 2048, 200), "Unreceived/paused files still consume network lookahead");
+    assert!(limits.allows(2048, 2048, 0), "Another selection can discover its first page");
+    assert!(!limits.allows(8192, 0, 0), "Final checks cannot grow an unbounded metadata backlog");
+}
+
+#[test]
+fn live_discovery_fetches_fresh_files_while_prior_downloads_await_final_checks() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .env("MYCLOUDDRIVER_DOWNLOAD_RAM_LIMIT_BYTES", (64 << 20).to_string())
+        .args(["--exact", "live_downloads::tests::verification_backlog_child", "--ignored", "--nocapture"])
+        .output().unwrap();
+    assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "isolated real queue, loopback folder pages and held physical verifier"]
+async fn verification_backlog_child() {
+    use std::os::unix::fs::MetadataExt;
+    use crate::download_verification::TestDrive;
+    let directory = tempfile::tempdir().unwrap();
+    std::env::set_var("MYCLOUDDRIVER_TRANSFER_LOCKS", directory.path().join("locks"));
+    std::env::set_var("MYCLOUDDRIVER_DOWNLOAD_CONNECTIONS", directory.path().join("connections"));
+    let control = directory.path().join("controls.json");
+    std::env::set_var("MYCLOUDDRIVER_TRANSFER_CONTROL", &control);
+    std::fs::write(&control, r#"{"actions":{}}"#).unwrap();
+    for (legacy, restored) in [(true, true), (false, true), (true, false), (false, false)] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let fetched = Arc::new(AtomicUsize::new(0));
+        let second_page = Arc::new(AtomicBool::new(false));
+        let server = {
+            let base = base.clone(); let fetched = fetched.clone(); let second_page = second_page.clone();
+            tokio::spawn(async move {
+                let mut clients = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (mut socket, _) = accepted.unwrap();
+                            let base = base.clone(); let fetched = fetched.clone(); let second_page = second_page.clone();
+                            clients.spawn(async move {
+                                let mut request = Vec::new();
+                                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                                    let mut buffer = [0; 4096]; let count = socket.read(&mut buffer).await.unwrap();
+                                    if count == 0 { return; } request.extend_from_slice(&buffer[..count]);
+                                }
+                                let header_end = request.windows(4).position(|bytes| bytes == b"\r\n\r\n").unwrap() + 4;
+                                let headers = String::from_utf8_lossy(&request[..header_end]);
+                                let length = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())).unwrap_or(0);
+                                while request.len() < header_end + length {
+                                    let mut buffer = [0; 4096]; let count = socket.read(&mut buffer).await.unwrap();
+                                    if count == 0 { return; } request.extend_from_slice(&buffer[..count]);
+                                }
+                                let request = String::from_utf8(request).unwrap();
+                                let target = request.split_whitespace().nth(1).unwrap();
+                                let url = reqwest::Url::parse(&format!("{base}{target}")).unwrap();
+                                let data = if url.path().contains("auth/token") {
+                                    serde_json::json!({"access_token":"fixture","refresh_token":"fixture","expires_in":7200,"sub":"fixture"}).to_string().into_bytes()
+                                } else if url.path().contains("captcha") {
+                                    br#"{"captcha_token":"fixture"}"#.to_vec()
+                                } else if url.path() == "/drive/v1/files" {
+                                    let next = url.query_pairs().any(|(key, _)| key == "page_token");
+                                    if next { second_page.store(true, Ordering::SeqCst); }
+                                    let ids = if next { vec!["fresh"] } else { vec!["first", "second"] };
+                                    let files: Vec<_> = ids.into_iter().map(|id| serde_json::json!({
+                                        "id":id,"name":format!("{id}.bin"),"size":"8","kind":"drive#file","parent_id":"folder","hash":"fixture"
+                                    })).collect();
+                                    serde_json::json!({"files":files,"next_page_token":if next { "" } else { "next" }}).to_string().into_bytes()
+                                } else if url.path().starts_with("/drive/v1/files/") {
+                                    let id = url.path().rsplit('/').next().unwrap();
+                                    serde_json::json!({"name":format!("{id}.bin"),"size":"8","hash":"fixture","web_content_link":format!("{base}/body/{id}")}).to_string().into_bytes()
+                                } else if url.path().starts_with("/body/") {
+                                    if url.path() == "/body/fresh" { fetched.fetch_add(8, Ordering::SeqCst); }
+                                    b"abcdefgh".to_vec()
+                                } else { panic!("Unexpected generated queue route: {}", url.path()); };
+                                let header = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nETag: \"fixture\"\r\nConnection: close\r\n\r\n", data.len());
+                                let _ = socket.write_all(header.as_bytes()).await; let _ = socket.write_all(&data).await;
+                            });
+                        }
+                        result = clients.join_next(), if !clients.is_empty() => { result.unwrap().unwrap(); }
+                    }
+                }
+            })
+        };
+        let destination = directory.path().join(format!("generated-{legacy}-{restored}"));
+        std::fs::create_dir_all(destination.join("folder")).unwrap();
+        let destination = destination.canonicalize().unwrap();
+        let output = destination.join("folder");
+        let root_id = format!("generated-{legacy}-{restored}");
+        let drive = TestDrive::new(&format!("generated-held-{legacy}-{restored}"));
+        let held = drive.hold().await;
+        let mut overrides = Vec::new(); let mut reads = Vec::new();
+        for id in ["first", "second", "fresh"] {
+            let key = format!("{id}|{}", output.display());
+            let control_id = format!("{root_id}:{}", hex::encode(ring::digest::digest(&ring::digest::SHA256, key.as_bytes())));
+            overrides.push(drive.sibling(&control_id));
+            reads.push(download_transport::completion_tests::ReadCounter::new(&control_id));
+            if id == "fresh" || !restored { continue; }
+            let part = output.join(format!("{id}.bin.part"));
+            let data = crate::download_names::sidecar(&part, ".ranges.data");
+            std::fs::write(&data, b"abcdefgh").unwrap();
+            let metadata = std::fs::metadata(&data).unwrap();
+            let identity = serde_json::json!({"device":metadata.dev(),"inode":metadata.ino(),"size":metadata.len(),
+                "modified_ns":metadata.mtime()*1_000_000_000+metadata.mtime_nsec(),"changed_ns":metadata.ctime()*1_000_000_000+metadata.ctime_nsec()});
+            let ranges = pikpak::download_ranges::State::new(8, "\"fixture\"".into(), 8);
+            let digest = hex::encode(ring::digest::digest(&ring::digest::SHA256, b"abcdefgh"));
+            let journal = serde_json::json!({"version":1,"file_id":id,"ranges":ranges,"source_revision":"gcid:FIXTURE",
+                "require_content_hash":true,"piece_sha256":[digest],"data_identity":identity});
+            std::fs::write(crate::download_names::sidecar(&part, ".ranges.json"), serde_json::to_vec(&journal).unwrap()).unwrap();
+        }
+        let inbox = destination.join("inbox.json");
+        std::fs::write(&inbox, serde_json::json!({"version":1,"content_mode":"user","requests":[{
+            "id":root_id,"path":"/folder","destination":destination,"file":{"id":"folder","name":"folder","size":"0","kind":"drive#folder"}
+        }]}).to_string()).unwrap();
+        let client = Client::builder().refresh_token("fixture").device_id("fixture")
+            .api_base_url(&base).auth_base_url(&base).build().unwrap();
+        let limits = DiscoveryLimits { receiving: 2, total: if legacy { 2 } else { 8 }, per_root: 2 };
+        let task = tokio::spawn(async move { run_with_limits(&client, Args { request_file: inbox }, limits).await });
+        until(|| discovery_snapshot().final_verification >= 2).await;
+        if legacy {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!second_page.load(Ordering::SeqCst) && fetched.load(Ordering::SeqCst) == 0,
+                "The old combined backlog must reproduce the idle network while the disk is held");
+        } else {
+            until(|| fetched.load(Ordering::SeqCst) == 8).await;
+            assert!(second_page.load(Ordering::SeqCst), "Fresh discovery must proceed before either final check finishes");
+        }
+        assert!(reads.iter().all(|read| read.bytes() == 0), "The generated physical reader is still held");
+        for id in ["first", "second", "fresh"] { assert!(!output.join(format!("{id}.bin")).exists()); }
+        println!("Blocked verifier: restored={restored}, legacy_limit={legacy}, new_payload_received={} bytes", fetched.load(Ordering::SeqCst));
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(15), task).await.unwrap().unwrap().unwrap();
+        for (index, id) in ["first", "second", "fresh"].into_iter().enumerate() {
+            assert_eq!(std::fs::read(output.join(format!("{id}.bin"))).unwrap(), b"abcdefgh");
+            assert_eq!(reads[index].bytes(), 8, "Each finished file still passes its full disk integrity check");
+        }
+        assert_eq!(discovery_snapshot().outstanding, 0, "Completed queue telemetry must reset");
+        server.abort(); drop(overrides);
+    }
+}
+
 #[tokio::test]
 async fn restored_completed_file_without_gcid_or_parent_skips_stale_path_and_original_url_lookups() {
     let fixture = crate::guest_fixture::Fixture::new().await;

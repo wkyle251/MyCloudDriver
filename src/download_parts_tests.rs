@@ -575,6 +575,49 @@ async fn newly_created_ranges_reverify_guest_checkpoint_before_sequential_user_s
 }
 
 #[tokio::test]
+async fn complete_original_recovery_reads_once_and_still_repairs_changed_pieces() {
+    use std::os::unix::fs::FileExt;
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let total = (16 << 20) + 23;
+    for mode in ["unchanged", "missing", "changed", "damaged"] {
+        let remote = fixture::Fixture::new(total).await;
+        let directory = tempfile::tempdir().unwrap();
+        let part = directory.path().join("generated.part");
+        std::fs::write(data_path(&part), fixture::bytes(0, total as usize, 1)).unwrap();
+        let state = State::new(total, "\"fixture-1\"".into(), total);
+        let digests = state.covered_ranges().map(|(_, offset, bytes)| {
+            integrity::fixture_digest(&data_path(&part), offset, bytes)
+        }).collect();
+        let saved_identity = if mode == "missing" { None } else { identity_of(&part) };
+        save_with_hashes(&part, "range-fixture", &state, Some("gcid:ORIGINAL"), true,
+            None, digests, saved_identity).unwrap();
+        if matches!(mode, "changed" | "damaged") {
+            let file = std::fs::OpenOptions::new().write(true).open(data_path(&part)).unwrap();
+            let byte = if mode == "damaged" { 0xff } else { fixture::bytes(total - 1, 1, 1)[0] };
+            file.write_all_at(&[byte], total - 1).unwrap();
+            file.sync_data().unwrap();
+            assert_ne!(identity_of(&part), saved_identity);
+        }
+        let id = format!("generated-complete-one-pass-{mode}");
+        let reads = super::super::completion_tests::ReadCounter::new(&id);
+        let mut progress = DownloadProgressContext::new(false, &id, "generated.bin");
+        progress.source_file_id = "range-fixture";
+        progress.source_revision = Some("gcid:ORIGINAL".into());
+        progress.require_content_hash = true;
+        let verified = super::super::attempt_for_publication(&http, &remote.url, total,
+            &part, false, progress.clone(), None).await.map_err(DlError::into_inner).unwrap();
+        assert!(verified.is_some(), "Full disk verification must still produce a publication proof");
+        assert_eq!(reads.bytes(), if mode == "damaged" { 2 * total } else { total },
+            "{mode}: intact completed data needs one pass; repaired data needs a fresh final pass");
+        assert_eq!(progress.transferred_bytes(), if mode == "damaged" { 23 } else { 0 },
+            "Only the damaged final piece may be downloaded again");
+        assert_eq!(std::fs::read(&part).unwrap(), fixture::bytes(0, total as usize, 1));
+        assert!(!exists(&part));
+        println!("Complete recovery {mode}: {} verified bytes, {} network bytes", reads.bytes(), progress.transferred_bytes());
+    }
+}
+
+#[tokio::test]
 async fn complete_range_journal_avoids_probe_only_for_a_matching_original_hash() {
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
     for (saved_revision, current_revision, prefix, saved_file_id, complete) in [

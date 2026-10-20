@@ -1,6 +1,45 @@
 import AppKit
 import SwiftUI
 import Photos
+import Combine
+
+/// This deliberately keeps timer ticks out of App's state/command graph.
+@MainActor private final class DemoMenuUpdates: ObservableObject {
+    @Published var isEnabled = false
+    private var ticks = 0
+    func update(_ hub: CloudDriveHub) {
+        guard isEnabled else { return }
+        ticks += 1
+        hub.pikpak.status = "Synthetic background update \(ticks)"
+    }
+}
+
+/// Records native mutations in this generated fixture only, without updating
+/// SwiftUI state while the menu under test is being tracked.
+@MainActor private final class DemoMenuTrackingLog {
+    private var observers: [NSObjectProtocol] = []
+    private var depth = 0
+    private let url = URL(fileURLWithPath: "/private/tmp/myclouddriver-preview-menu-tracking.log")
+    init() {
+        try? Data().write(to: url)
+        for name in [NSMenu.didBeginTrackingNotification, NSMenu.didEndTrackingNotification,
+                     NSMenu.didAddItemNotification, NSMenu.didRemoveItemNotification, NSMenu.didChangeItemNotification] {
+            observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
+                MainActor.assumeIsolated { self?.record(notification) }
+            })
+        }
+    }
+    private func record(_ notification: Notification) {
+        if notification.name == NSMenu.didBeginTrackingNotification { depth += 1 }
+        if depth > 0, let menu = notification.object as? NSMenu,
+           let handle = try? FileHandle(forWritingTo: url) {
+            let line = "\(notification.name.rawValue) \(menu.title) \(ObjectIdentifier(menu))\n"
+            _ = try? handle.seekToEnd(); try? handle.write(contentsOf: Data(line.utf8)); try? handle.close()
+        }
+        if notification.name == NSMenu.didEndTrackingNotification { depth = max(0, depth - 1) }
+    }
+    deinit { observers.forEach(NotificationCenter.default.removeObserver) }
+}
 
 @MainActor private final class DemoPhotosAccessState {
     var status = PHAuthorizationStatus.authorized
@@ -46,8 +85,8 @@ private final class DemoPhotosDrive: NativeCloudDrive, @unchecked Sendable {
     @StateObject private var sessions: WorkspaceSessionManager
     private var hub: CloudDriveHub { sessions.activeHub }
     @State private var dark = false
-    @State private var stressMenuUpdates = false
-    @State private var menuUpdateTicks = 0
+    @StateObject private var menuUpdates = DemoMenuUpdates()
+    private let menuTrackingLog = DemoMenuTrackingLog()
     private let menuUpdateTimer = Timer.publish(every: 0.15, on: .main, in: .common).autoconnect()
     private let photosAccessState = DemoPhotosAccessState()
     private let storageState = DemoICloudStorageState()
@@ -118,20 +157,22 @@ private final class DemoPhotosDrive: NativeCloudDrive, @unchecked Sendable {
                     sessions.closeAll(); try? FileManager.default.removeItem(at: fixtureDirectory)
                 }
                 .onReceive(menuUpdateTimer) { _ in
-                    if stressMenuUpdates {
-                        menuUpdateTicks += 1
-                        hub.pikpak.status = "Synthetic background update \(menuUpdateTicks)"
-                    }
+                    menuUpdates.update(hub)
                 }
         }.defaultSize(width: 1240, height: 820)
         .commands {
             FinderCommands(settings: sessions.settings, sessions: sessions)
+            FinderSearchCommands(sessions: sessions)
             CommandMenu("Fixture") {
+                Button("Center Fixture Window") {
+                    guard let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "MyCloudDriver.workspace.primary" }) else { return }
+                    window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+                }
                 Button("Show Fixture Folder") { NSWorkspace.shared.open(fixtureDirectory) }
                 Button("All Drives") { hub.selected = nil }
                 Button("Find Similar Files") { hub.local.findSimilar([]) }
                 Button("Toggle Appearance") { dark.toggle() }.keyboardShortcut("d", modifiers: [.command, .shift])
-                Toggle("Simulate Background Updates", isOn: $stressMenuUpdates)
+                Toggle("Simulate Background Updates", isOn: $menuUpdates.isEnabled)
                 Button("Minimum Window Size") { NSApp.keyWindow?.setContentSize(.init(width: 560, height: 360)) }
                 Button("Compact Width") { NSApp.keyWindow?.setContentSize(.init(width: 750, height: 820)) }
                 Button("Compact Height") { NSApp.keyWindow?.setContentSize(.init(width: 1240, height: 460)) }
@@ -151,7 +192,7 @@ private final class DemoPhotosDrive: NativeCloudDrive, @unchecked Sendable {
                     hub.pikpak.configureMediaPreviewFixture(videoURL: video)
                     hub.pikpakNavigation.showImmediately(0); hub.open(.pikpak)
                 }
-                Button("Use Oversized Preview") {
+                Button("Set Legacy Preview Size") {
                     preferences.set(1_500.0, forKey: "previewCanvasWidth")
                     preferences.set(2_000.0, forKey: "previewCanvasHeight")
                 }

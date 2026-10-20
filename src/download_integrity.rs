@@ -266,7 +266,7 @@ impl Prefix {
         bytes: u64,
         control_id: &str,
     ) -> Result<Self, DlError> {
-        Self::read_inner(path, offset, bytes, &[], false, &[], control_id).await.map(|result| result.0)
+        Self::read_inner(path, offset, bytes, &[], false, &[], crate::download_telemetry::Kind::ResumeRead, control_id).await.map(|result| result.0)
     }
     pub async fn read_for_replay(
         path: &Path,
@@ -274,16 +274,27 @@ impl Prefix {
         bytes: u64,
         control_id: &str,
     ) -> Result<Self, DlError> {
-        Self::read_inner(path, offset, bytes, &[], true, &[], control_id).await.map(|result| result.0)
+        Self::read_inner(path, offset, bytes, &[], true, &[], crate::download_telemetry::Kind::ResumeRead, control_id).await.map(|result| result.0)
     }
     /// Recover a sequential checkpoint and its future range-piece contexts in
     /// the same physical pass. The caller still compares the whole-prefix digest.
     pub async fn read_partitioned(path: &Path, bytes: u64, partitions: &[u64], control_id: &str)
         -> Result<(Self, Vec<Self>), DlError> {
+        Self::read_pieces(path, bytes, partitions, crate::download_telemetry::Kind::ResumeRead, control_id).await
+    }
+    /// A complete original can recover and verify its piece contexts in the
+    /// same full-file pass. The caller must compare every piece digest before
+    /// consuming the aggregate proof; mismatches can then be repaired normally.
+    pub async fn read_complete_pieces(path: &Path, bytes: u64, partitions: &[u64], control_id: &str)
+        -> Result<(Self, Vec<Self>), DlError> {
+        Self::read_pieces(path, bytes, partitions, crate::download_telemetry::Kind::FinalRead, control_id).await
+    }
+    async fn read_pieces(path: &Path, bytes: u64, partitions: &[u64], kind: crate::download_telemetry::Kind, control_id: &str)
+        -> Result<(Self, Vec<Self>), DlError> {
         if partitions.iter().try_fold(0u64, |sum, size| sum.checked_add(*size)) != Some(bytes) {
             return Err(DlError::Fatal(anyhow::anyhow!("Invalid checkpoint partition coverage")));
         }
-        Self::read_inner(path, 0, bytes, &[], false, partitions, control_id).await
+        Self::read_inner(path, 0, bytes, &[], false, partitions, kind, control_id).await
     }
     pub async fn read_verified(
         path: &Path,
@@ -307,7 +318,9 @@ impl Prefix {
                 "Incomplete checkpoint checksum coverage"
             )));
         }
-        Self::read_inner(path, 0, bytes, expected, false, &[], control_id).await.map(|result| result.0)
+        let kind = if expected.is_empty() { crate::download_telemetry::Kind::ResumeRead }
+            else { crate::download_telemetry::Kind::FinalRead };
+        Self::read_inner(path, 0, bytes, expected, false, &[], kind, control_id).await.map(|result| result.0)
     }
     /// Restore independent sparse-piece contexts in one ordered physical pass.
     /// The third tuple field retains the state before that region's final byte
@@ -380,11 +393,10 @@ impl Prefix {
         expected: &[(u64, u64, String)],
         retain_replay_tail: bool,
         partitions: &[u64],
+        kind: crate::download_telemetry::Kind,
         control_id: &str,
     ) -> Result<(Self, Vec<Self>), DlError> {
-        let mut diagnostic = crate::download_telemetry::Operation::new(
-            if expected.is_empty() { crate::download_telemetry::Kind::ResumeRead }
-            else { crate::download_telemetry::Kind::FinalRead }, control_id);
+        let mut diagnostic = crate::download_telemetry::Operation::new(kind, control_id);
         let mut file = crate::download_fs::open_async(path, rustix::fs::OFlags::RDONLY)
             .await
             .map_err(|error| fatal(error, "Cannot verify saved download progress"))?;

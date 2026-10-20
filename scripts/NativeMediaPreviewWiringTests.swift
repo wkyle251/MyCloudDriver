@@ -109,8 +109,8 @@ private struct Harness: View {
             browser.select(browser.visibleRows[2], extending: false, toggling: false)
             let firstSettled = await settled(browser, provider)
             precondition(firstSettled, "First selection never became displayable (\(label))")
-            precondition((browser.mediaPreview.sourceBufferStatus != nil) == (kind != .local || bufferedKind != nil),
-                "Only the internal local disk omits the buffering panel")
+            precondition(browser.mediaPreview.bufferStatus != nil || browser.mediaPreview.failure != nil,
+                "All sources share the preview RAM buffer and its status panel")
 
             // One selection change at a time: the file requested must be the one now selected.
             for (step, offset) in [1, 1, -1, -1].enumerated() {
@@ -119,8 +119,8 @@ private struct Harness: View {
                 let selected = browser.inspectorItem!.id
                 let stepSettled = await settled(browser, provider)
                 precondition(stepSettled, "Selection step \(step) left the preview bound to another file (\(label))")
-                precondition(provider.requests.all.last == selected,
-                    "Selection step \(step) loaded \(provider.requests.all) instead of \(selected) (\(label))")
+                precondition(browser.mediaPreview.failure != nil || browser.mediaPreview.originalURL == browser.inspectorItem?.url,
+                    "Selection step \(step) must play \(selected), including when its bytes were prefetched (\(label))")
             }
 
             // Arrow-key bursts: whatever the last selection is must finish bound to it.

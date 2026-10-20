@@ -510,6 +510,66 @@ fn preparation_gaps_keep_selected_reads_when_no_local_writer_can_use_the_disk() 
     assert_eq!((state.last_read_pending_write_bytes, state.last_read_buffer_limit_bytes), (7 << 30, 8 << 30));
 }
 
+#[tokio::test]
+async fn completed_checkpoints_unblock_selected_deferred_reads_without_a_long_idle_turn() {
+    let gate = Arc::new(Traffic::new());
+    let completed = gate.register(1024);
+    let deferred: Vec<_> = (0..16).map(|_| gate.register(8 << 20)).collect();
+    drop(completed.chunk(1024, "generated-completed-check").await.unwrap());
+    drop(completed);
+    {
+        let state = gate.state.lock().unwrap();
+        assert_eq!(state.phase, Phase::Read);
+        assert!(deferred.iter().all(|read| state.jobs[&read.id].selected));
+        assert_eq!((state.readers, state.waiting_readers, state.runnable_jobs), (0, 0, 0));
+    }
+    let checkpoint = tokio::time::timeout(
+        Duration::from_secs(1),
+        gate.clone().checkpoint("generated-completed-check"),
+    ).await.expect("Completed checks must release admission without waiting five seconds behind unready read tickets");
+    {
+        let state = gate.state.lock().unwrap();
+        assert_eq!(state.phase, Phase::Write);
+        assert_eq!(state.writers, 1);
+        assert_eq!(state.remaining, 16 * (8 << 20));
+        assert_eq!(state.last_read_handover_reason, 7);
+    }
+    let mut ready = Box::pin(deferred[0].chunk(8 << 20, "generated-next-check"));
+    assert!(futures_util::poll!(&mut ready).is_pending(),
+        "A newly admitted check cannot overlap the durable checkpoint");
+    drop(checkpoint);
+    drop(tokio::time::timeout(Duration::from_secs(1), ready).await.unwrap().unwrap());
+    assert_eq!(gate.state.lock().unwrap().jobs[&deferred[0].id].remaining, 0,
+        "The parked read must retain its work and resume after the checkpoint");
+}
+
+#[test]
+fn checkpoint_idle_handoff_preserves_readers_hash_gaps_and_ordinary_preparation() {
+    let now = Instant::now();
+    for blocker in ["physical-read", "waiting-read", "hash-gap", "active-write", "short-gap", "payload-only"] {
+        let mut state = busy(now, 4 << 30);
+        state.select(Phase::Read, now);
+        state.runnable_jobs = 0;
+        state.jobs.get_mut(&0).unwrap().ready = false;
+        if blocker != "payload-only" { state.checkpoints.insert(0, now); }
+        let elapsed = if blocker == "short-gap" { IDLE_HANDOFF - Duration::from_millis(1) } else { IDLE_HANDOFF * 2 };
+        match blocker {
+            "physical-read" => state.readers = 1,
+            "waiting-read" => state.waiting_readers = 1,
+            "hash-gap" => {
+                state.runnable_jobs = 1;
+                state.jobs.get_mut(&0).unwrap().ready = true;
+            }
+            "active-write" => state.writers = 1,
+            _ => {}
+        }
+        state.last_received = now + elapsed;
+        state.tick(now + elapsed, 0, 8 << 30);
+        assert_eq!(state.phase, Phase::Read,
+            "A checkpoint idle handoff must preserve {blocker}");
+    }
+}
+
 #[test]
 fn an_emptied_cohort_selects_new_pending_reads_without_a_write_turn_below_threshold() {
     let now = Instant::now(); let mut state = busy(now, 1);

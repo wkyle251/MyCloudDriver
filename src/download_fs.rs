@@ -471,12 +471,30 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A checkpoint carries only data already handed to the OS. The coordinator
 /// retains the descriptor until the entire data-before-journal commit finishes.
+pub(crate) type CheckpointPrecondition =
+    std::sync::Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>;
+/// A request-specific ownership check failed before any journal was renamed.
+/// The coordinator can reject that request while retaining the other writes.
+#[derive(Debug)]
+pub(crate) struct CheckpointPreconditionFailure {
+    pub index: usize,
+    cause: std::io::Error,
+}
+impl std::fmt::Display for CheckpointPreconditionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.cause, formatter)
+    }
+}
+impl std::error::Error for CheckpointPreconditionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.cause) }
+}
 pub(crate) struct CheckpointWrite {
     pub data: File,
     pub data_path: PathBuf,
     pub metadata: std::fs::Metadata,
     pub journal_path: PathBuf,
     pub journal: Vec<u8>,
+    pub precondition: Option<CheckpointPrecondition>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -542,8 +560,11 @@ fn checkpoint_batch_using(writes: &[CheckpointWrite], mut sync: impl FnMut(Check
     let Some(first) = writes.first() else { return Ok(()); };
     let device = identity(&first.metadata).0;
     let mut staged = Vec::with_capacity(writes.len());
-    for write in writes {
+    for (index, write) in writes.iter().enumerate() {
         if identity(&write.metadata).0 != device { return Err(std::io::Error::other("Checkpoint batch crosses devices")); }
+        if let Some(check) = &write.precondition {
+            check().map_err(|cause| std::io::Error::other(CheckpointPreconditionFailure { index, cause }))?;
+        }
         validate_checkpoint(write)?;
         let item = stage_checkpoint(write)?;
         if identity(&item.parent.metadata()?).0 != device { return Err(std::io::Error::other("Checkpoint journal is on another device")); }
@@ -554,7 +575,13 @@ fn checkpoint_batch_using(writes: &[CheckpointWrite], mut sync: impl FnMut(Check
     sync(CheckpointSync::Barrier, &first.data)?;
     // A changed destination or data file cannot acquire a newer journal,
     // even if it changed while a disk-cache flush was in progress.
-    for write in writes { validate_checkpoint(write)?; validate(&write.journal_path)?; }
+    for (index, write) in writes.iter().enumerate() {
+        validate_checkpoint(write)?;
+        validate(&write.journal_path)?;
+        if let Some(check) = &write.precondition {
+            check().map_err(|cause| std::io::Error::other(CheckpointPreconditionFailure { index, cause }))?;
+        }
+    }
     for item in &staged { fs::renameat(&item.parent, &item.temporary, &item.parent, &item.name)?; }
     let mut parents = HashSet::new();
     for item in &staged {

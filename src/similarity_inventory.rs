@@ -42,6 +42,24 @@ pub(super) fn changes(previous: &[scope::InputFile], current: &[scope::InputFile
     result
 }
 
+/// A change elsewhere in the scope must not retry an unchanged file. Move
+/// completed records into the next pass, including its exclusion/failure
+/// diagnostics, without duplicating their vectors in RAM. Interrupted or
+/// changed-input attempts remain eligible for a retry.
+pub(super) fn retain_completed(previous: &mut [scope::InputFile], current: &mut [scope::InputFile]) {
+    let mut previous: HashMap<_, _> = previous.iter_mut().map(|file| {
+        (file.display.id.as_str(), (file.inventory_version.as_ref(), &mut file.record))
+    }).collect();
+    for file in current {
+        let Some((version, record)) = previous.remove(file.display.id.as_str()) else { continue };
+        if version.is_some() && version == file.inventory_version.as_ref() {
+            file.record = record.take().filter(|record| !record.error.as_ref().is_some_and(|error| {
+                matches!(error.code, filetwin_core::ErrorCode::Cancelled | filetwin_core::ErrorCode::SourceChanged)
+            }));
+        }
+    }
+}
+
 /// A vanished mount can expose an empty directory on its parent filesystem.
 /// This also protects local paths selected outside the native drive browser.
 pub(super) fn validate_removals(

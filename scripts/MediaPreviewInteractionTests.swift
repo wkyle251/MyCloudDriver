@@ -47,7 +47,7 @@ import SwiftUI
         let root = NSView(frame: .init(x: 0, y: 0, width: 600, height: 420))
         window.contentView = root
         let scope = MediaPreviewKeyView(frame: .init(x: 200, y: 0, width: 400, height: 420))
-        root.addSubview(scope); scope.playback = playback
+        root.addSubview(scope); scope.playback = playback; scope.isMediaPreview = true
         var moved: [Int] = []
         scope.onMove = { moved.append($0) }
         let volume = MediaSliderControl(frame: .init(x: 240, y: 30, width: 160, height: 18))
@@ -95,13 +95,70 @@ import SwiftUI
         precondition(!MediaPreviewKeyView.handle(key(123, window: window)), "Text editing keeps its arrows")
         precondition(!MediaPreviewKeyView.handle(key(49, window: window)), "Text editing keeps its spaces")
         scope.focus(for: click(.init(x: 100, y: 200), window: window))
+        window.makeFirstResponder(nil)
         precondition(!scope.hasPreviewFocus && !MediaPreviewKeyView.handle(key(125, window: window)))
-        precondition(!MediaPreviewKeyView.handle(key(49, window: window)), "Space outside the preview stays available for Quick Look")
+        precondition(MediaPreviewKeyView.handle(key(49, window: window)) && playback.wantsPlayback,
+            "Space in the file list plays the visible media preview without requiring a click in the pane")
+        precondition(MediaPreviewKeyView.handle(key(49, window: window, repeated: true)) && playback.wantsPlayback,
+            "Holding Space in the file list must not toggle playback repeatedly")
+        precondition(MediaPreviewKeyView.handle(key(49, window: window)) && !playback.wantsPlayback)
+        scope.playback = nil
+        precondition(MediaPreviewKeyView.handle(key(49, window: window)),
+            "A media preview that is still preparing keeps Space from opening Quick Look")
+        scope.playback = playback
+        scope.isMediaPreview = false
+        scope.focus(for: click(.init(x: 300, y: 200), window: window))
+        precondition(!MediaPreviewKeyView.handle(key(49, window: window)), "Other file types keep Space for Quick Look")
+        scope.isMediaPreview = true; scope.isHidden = true
+        precondition(!MediaPreviewKeyView.handle(key(49, window: window)), "A hidden media preview cannot claim Space")
+        scope.isHidden = false
         scope.focus(for: click(.init(x: 300, y: 200), window: window))
         scope.removeFromSuperview()
         precondition(!MediaPreviewKeyView.handle(key(125, window: window)), "Unmounted panes release focus")
         precondition(!MediaPreviewKeyView.handle(key(49, window: window)), "Unmounted panes release Space")
-        print("PASS preview focus: header/video/controls, Space pause/resume and repeats, preparing player, 5-second seeks, volume arrows, file steps, text editing and outside clicks")
+        print("PASS preview keys: Space plays visible media from the file list, ignores repeats, reserves loading media, preserves typing/Quick Look and ignores hidden/removed panes; focused arrows retain seeking and file navigation")
+    }
+    static func earlyNetworkPlayback(defaults: UserDefaults, movie: URL) async throws {
+        let original = try Data(contentsOf: movie)
+        var offset = 0, indexOffset: Int?
+        while offset + 8 <= original.count {
+            let length = original[offset..<offset + 4].reduce(0) { ($0 << 8) | Int($1) }
+            guard length >= 8, offset + length <= original.count else { break }
+            if String(decoding: original[offset + 4..<offset + 8], as: UTF8.self) == "moov" { indexOffset = offset; break }
+            offset += length
+        }
+        guard let indexOffset else { preconditionFailure("Generated MP4 needs a trailing index") }
+        // A valid free atom moves the movie index to the far end without
+        // moving any video chunks or changing their offsets.
+        let paddingLength = 24 << 20
+        var padding = Data((0..<4).reversed().map { UInt8((paddingLength >> ($0 * 8)) & 255) })
+        padding.append(Data("free".utf8)); padding.append(Data(count: paddingLength - 8))
+        var bytes = Data(original.prefix(indexOffset)); bytes.append(padding); bytes.append(original.suffix(from: indexOffset))
+        let slow = movie.deletingLastPathComponent().appendingPathComponent("SlowShare-TailIndex.mp4")
+        try bytes.write(to: slow)
+        let model = NativeMediaPreviewModel(settings: .init(defaults: defaults))
+        defer { model.clear() }
+        model.selectionDelayNanoseconds = 0
+        model.bufferedVolume = { _ in .networkShare }
+        model.memoryIO.read = { descriptor, target, length, position in
+            usleep(150_000)
+            return pread(descriptor, target, length, position)
+        }
+        let provider = ICloudDriveProvider(rootURL: slow.deletingLastPathComponent(), kind: .local)
+        let item = try ICloudDriveProvider.item(slow)
+        model.prepare(item, provider: provider)
+        try await wait(seconds: 5) { model.ready && model.playback.canPlay }
+        precondition(model.bufferStatus!.cache.cachedBytes < Int64(bytes.count / 3),
+            "A slow network file with its index at the end must open before a large linear prebuffer fills")
+        model.playback.togglePlayback()
+        try await wait(seconds: 5) { model.playback.position > 0.1 }
+        model.playback.togglePlayback()
+        let before = model.memoryLoader!.snapshot.cachedBytes
+        try await wait { model.memoryLoader!.snapshot.cachedBytes > before }
+        precondition(!model.playback.wantsPlayback && model.playback.player!.rate == 0)
+        let frame = try await AVAssetImageGenerator(asset: model.playback.player!.currentItem!.asset).image(at: CMTime(seconds: 1, preferredTimescale: 600))
+        precondition(frame.image.width == 160)
+        print("PASS slow network startup: trailing movie index fetched early, playback before one-third is buffered, real decoded frame and continued buffering after Pause")
     }
     static func nativeRecovery(defaults: UserDefaults, unsupported: URL) async throws {
         let before = try Data(contentsOf: unsupported)
@@ -129,7 +186,7 @@ import SwiftUI
         precondition(before == after)
         print("PASS native video recovery: decoded compatible frame, paused intent, stale callback, bounded failure, cleanup and original preservation")
     }
-    static func cachedSourceOwnership() throws {
+    static func cachedSourceOwnership() async throws {
         let bytes = Data((0..<32).map(UInt8.init))
         for mode in ["unknown", "partial", "sparse", "complete"] {
             let cache = try PreviewResourceCache()
@@ -152,6 +209,7 @@ import SwiftUI
             let repeated = try cache.takeCompleteFile()
             precondition(repeated == nil && cache.store(bytes, at: 0) == nil, "Ownership is transferred only once")
             input = nil
+            try await wait { !FileManager.default.fileExists(atPath: url.path) }
             precondition(!FileManager.default.fileExists(atPath: url.path), "Generated input is removed when preparation releases it")
         }
         print("PASS complete-cache ownership: no sparse inputs, size validation, no second download and cleanup")
@@ -215,8 +273,9 @@ import SwiftUI
         try await wait { surface.isReadyForDisplay }
         surface.clear()
         print("PASS actual AVKit frames: paused poster, ready-without-picture MP4, first-frame timeout and audio-only source rejection")
+        try await earlyNetworkPlayback(defaults: defaults, movie: good)
         try await nativeRecovery(defaults: defaults, unsupported: bad)
-        try cachedSourceOwnership()
+        try await cachedSourceOwnership()
         try DownloaderModel.testExternalPreviewHandoff(defaults: defaults)
         try await DownloaderModel.testVideoFrameRecovery(defaults: defaults, unsupported: bad, supported: good)
 
@@ -241,7 +300,8 @@ private struct PreviewInteractionFixture: View {
                 Spacer()
             }.padding(16).frame(width: 230)
             Divider()
-            FinderPreviewPane(mediaPlayback: model.playback, onPreviewMove: { index = min(urls.count - 1, max(0, index + $0)) }) {
+            FinderPreviewPane(mediaPlayback: model.playback, isMediaPreview: true,
+                onPreviewMove: { index = min(urls.count - 1, max(0, index + $0)) }) {
                 HStack { Image(systemName: "film"); Text("Clip \(index + 1): \(item.name)").font(.headline); Spacer() }
                     .padding(10).background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
             } media: {

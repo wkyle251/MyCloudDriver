@@ -15,12 +15,35 @@ import SwiftUI
     private var entries: [ObjectIdentifier: Entry] = [:]
     private weak var focusedWindow: NSWindow?
     private let closedWindows = NSHashTable<NSWindow>.weakObjects()
-    private var publicationScheduled = false
+    private let notificationCenter: NotificationCenter
+    private var windowObservers: [NSObjectProtocol] = []
+    private lazy var publication = FinderCommandPublication(notificationCenter: notificationCenter) { [weak self] in
+        self?.objectWillChange.send()
+    }
+
+    init(notificationCenter: NotificationCenter = .default) {
+        self.notificationCenter = notificationCenter
+        // All workspaces already register their actions here. A second
+        // FocusedValue subscription bypassed menu tracking on every body update.
+        windowObservers.append(notificationCenter.addObserver(forName: NSWindow.didBecomeKeyNotification,
+            object: nil, queue: .main) { [weak self] notification in
+                MainActor.assumeIsolated {
+                    if let window = notification.object as? NSWindow { self?.focus(window) }
+                }
+            })
+        _ = publication
+    }
+
+    deinit { for observer in windowObservers { notificationCenter.removeObserver(observer) } }
     func update(_ actions: FinderWindowActions, window: NSWindow, token: UUID) {
         guard !closedWindows.contains(window) else { return }
+        let previous = self.actions?.presentation
         entries[ObjectIdentifier(window)] = Entry(token: token, actions: actions)
         if window.isKeyWindow || focusedWindow === window {
-            focusedWindow = window; schedulePublication()
+            focusedWindow = window
+            // Keep action closures fresh without rebuilding menus for download
+            // speed, playback time or other unrelated workspace updates.
+            if previous != actions.presentation { schedulePublication() }
         }
     }
     func focus(_ window: NSWindow) {
@@ -40,15 +63,7 @@ import SwiftUI
         if focusedWindow === window { focusedWindow = nil }
     }
     private func schedulePublication() {
-        guard !publicationScheduled else { return }
-        publicationScheduled = true
-        // ViewBridge can detach during SwiftUI's update pass. Invalidate its
-        // commands immediately, but notify SwiftUI on the next main turn.
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.publicationScheduled = false
-            self.objectWillChange.send()
-        }
+        publication.request()
     }
 }
 
@@ -253,7 +268,7 @@ struct FinderWindowActionRegistration: NSViewRepresentable {
     }
     private func focus(_ window: NSWindow) {
         focusedWindow = window
-        if let entry = entries.values.first(where: { $0.window === window || similarityWindows(in: $0.hub).contains(where: { $0 === window }) }) { activeHub = entry.hub }
+        if let entry = entries.values.first(where: { $0.window === window || similarityWindows(in: $0.hub).contains(where: { $0 === window }) }), activeHub !== entry.hub { activeHub = entry.hub }
         FinderCommandRouter.shared.focus(window)
     }
     func newWindow() {

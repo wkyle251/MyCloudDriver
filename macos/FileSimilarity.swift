@@ -555,12 +555,14 @@ final class SimilarityScanModel: ObservableObject {
     @Published private(set) var isPausing = false { didSet { updateSleepPrevention() } }
     @Published private(set) var interrupted = false
     @Published private(set) var waitingForNetwork = false
+    @Published private(set) var inventoryWaitReason: String?
     @Published private(set) var recoverableSessions: [SimilaritySavedSession] = []
     private(set) var savedSession: SimilaritySavedSession?
     var nativeScope: SimilarityNativeScope?
     var acrossDriveScopes: [SimilarityAcrossDriveScope]?
     private var preserveOnClose = false
     private var pauseReason: String?
+    private var manualResumeRequired = false
     private var cancelRequested = false
     @Published private(set) var processingLabel = ""
     @Published private(set) var processingBackend: TaskResourceProcessing.Backend?
@@ -676,7 +678,7 @@ final class SimilarityScanModel: ObservableObject {
     /// pauses, cancellation and shutdown leave `interrupted` false and never
     /// reach here, so intent is preserved without a separate flag.
     func scheduleAutoResume() {
-        guard performAutoResume != nil, savedSession != nil, isPaused, interrupted,
+        guard !manualResumeRequired, performAutoResume != nil, savedSession != nil, isPaused, interrupted,
               !cancelRequested, !preserveOnClose else { return }
         let delay = AutomaticRecovery.delay(attempt: autoResumeAttempt, schedule: autoResumeDelays)
         autoResumeAttempt = AutomaticRecovery.nextAttempt(autoResumeAttempt)
@@ -765,6 +767,7 @@ final class SimilarityScanModel: ObservableObject {
         sleepWorkDepth += 1
         defer { sleepWorkDepth -= 1 }
         let resumesCurrentSession = session != nil && session?.id == savedSession?.id
+        manualResumeRequired = false
         if var session, session.id == savedSession?.id, let child = process, child.isRunning {
             guard let previous = resultConfiguration, SimilaritySessionStore.sameAccount(previous, configuration) else {
                 error = "Switch back to the account that started this scan, then resume."; return
@@ -820,7 +823,7 @@ final class SimilarityScanModel: ObservableObject {
         if let session { runResources?.acceleration = session.resources.acceleration ?? .cpu }
         generation = UUID()
         cancelRequested=false; isFinishing=false; processingLabel=""; processingBackend=nil
-        isPaused=false; isPausing=false; interrupted=false; waitingForNetwork=false; pauseReason=nil; preserveOnClose=false
+        isPaused=false; isPausing=false; interrupted=false; waitingForNetwork=false; inventoryWaitReason=nil; pauseReason=nil; preserveOnClose=false
         // The countdown is over; the attempt count stays until this run proves
         // itself by finishing work, so a crash loop still reaches its limit.
         autoResumeDeadline = nil
@@ -1018,6 +1021,9 @@ final class SimilarityScanModel: ObservableObject {
                         try await Task.sleep(nanoseconds: 50_000_000)
                     }
                     guard self.generation == runID, self.process?.isRunning == true, !self.isCancelling else { throw CancellationError() }
+                    if self.inventoryWaitReason != nil {
+                        self.inventoryWaitReason = nil; self.waitingForNetwork = false
+                    }
                     guard !emittedIDs.contains(file.id) else { return }
                     self.externalSourceIDs.insert(file.id)
                     try await writer.append(file)
@@ -1025,6 +1031,7 @@ final class SimilarityScanModel: ObservableObject {
                 }
                 try Task.checkCancellation()
                 try await writer.finish()
+                self.inventoryWaitReason = nil
                 self.waitingForNetwork = false
                 break
               } catch {
@@ -1033,6 +1040,11 @@ final class SimilarityScanModel: ObservableObject {
                 }
                 if TransferFailure.isRetryable(error) {
                     self.waitingForNetwork = true
+                    if case .waiting(let reason) = error as? CloudDriveError {
+                        self.inventoryWaitReason = reason
+                    } else {
+                        self.inventoryWaitReason = "File discovery is waiting for the drive. Completed analysis is saved."
+                    }
                     let seconds = min(30, 1 << min(retryAttempt, 5))
                     retryAttempt = AutomaticRecovery.nextAttempt(retryAttempt)
                     do { try await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000) }
@@ -1089,7 +1101,7 @@ final class SimilarityScanModel: ObservableObject {
         }
         if event["event"] as? String == "pause_state" {
             guard event["paused"] as? Bool == true, isPausing || isPaused else { return }
-            isPaused = true; isPausing = false; isRunning = false; interrupted = pauseReason != nil
+            isPaused = true; isPausing = false; isRunning = false; interrupted = !manualResumeRequired && pauseReason != nil
             message = cancelRequested ? "Scan cancelled · downloads retained" : pauseReason ?? "Scan paused · downloads retained"
             detail = "Partial downloads and queued originals stay in RAM. Resume continues this scan."
             if cancelRequested { savedSession?.state = "cancelled" }
@@ -1122,6 +1134,7 @@ final class SimilarityScanModel: ObservableObject {
             return
         }
         if event["event"] as? String == "interrupted" {
+            if event["automatic_resume"] as? Bool == false { manualResumeRequired = true }
             pause(reason:event["reason"] as? String ?? "The drive needs attention. Reconnect it, then resume."); return
         }
         if event["event"] as? String == "network_wait" {
@@ -1295,13 +1308,13 @@ final class SimilarityScanModel: ObservableObject {
             progress.downloadedBytes = max(progress.downloadedBytes, helperRestoresReport
                 ? max(base, result.downloadedBytes) : SimilarityScanProgress.cumulative(base, result.downloadedBytes))
         }
-        inventoryTask?.cancel(); inventoryTask = nil
+        inventoryTask?.cancel(); inventoryTask = nil; inventoryWaitReason = nil
         sourceTasks.values.forEach { $0.cancel() }; sourceTasks = [:]; sourceRequestRoot = nil; providerProgress = SimilarityProviderProgress()
         externalSources = []; externalSourceIDs = []
         let cancelled = cancelRequested || isCancelling || result?.status == "cancelled"
         if savedSession != nil && !resetWhenFinished && !cancelRequested && !finishedEarly && (isCancelling || isPausing || exitCode != 0 || result == nil || result?.status == "paused" || result?.status == "cancelled") {
             scopes.forEach { $0.stopAccessingSecurityScopedResource() }; scopes=[]
-            process=nil; isRunning=false; isPaused=true; interrupted = !isPausing || pauseReason != nil
+            process=nil; isRunning=false; isPaused=true; interrupted = !manualResumeRequired && (!isPausing || pauseReason != nil)
             isPausing=false; isCancelling=false; waitingForNetwork=false; fraction=nil; cleanupExternalScope()
             message=pauseReason ?? (interrupted ? "Scan interrupted — ready to resume" : "Scan paused")
             let reported = FileSearchIndex.withoutStatusNotes(diagnostic)
@@ -1421,7 +1434,7 @@ final class SimilarityScanModel: ObservableObject {
         do { try SimilaritySessionStore.finish(saved, configuration: configuration) }
         catch { self.error = "Could not save the finish request. Check available storage and try again."; return }
         savedSession = saved; isFinishing = true; isPaused = false; isPausing = false; isRunning = true
-        interrupted = false; waitingForNetwork = false; pauseReason = nil; error = nil
+        interrupted = false; waitingForNetwork = false; inventoryWaitReason = nil; pauseReason = nil; error = nil
         scanClock.resume(at: Date())
         message = "Finishing current analysis and preparing report…"
         detail = "No more files will start analysis. You can resume from the report."
@@ -1437,7 +1450,7 @@ final class SimilarityScanModel: ObservableObject {
         defer { sleepWorkDepth -= 1 }
         cancelRequested = !resetWhenFinished
         isCancelling=true; isPausing=false; isPaused=false; isRunning=true
-        interrupted=false; waitingForNetwork=false; pauseReason=nil; error=nil
+        interrupted=false; waitingForNetwork=false; inventoryWaitReason=nil; pauseReason=nil; error=nil
         recordProcessingSpeed()
         // A pause marker would make the helper return a paused report. Cancel
         // ends the helper and publishes its partial inventory and comparisons.
@@ -1479,7 +1492,7 @@ final class SimilarityScanModel: ObservableObject {
     private func resetIdleState() {
         cancelAutoResume(resettingAttempts: true)
         processingLabel=""; processingBackend=nil; cancelRequested=false; isFinishing=false
-        nativeScope = nil; acrossDriveScopes = nil; waitingForNetwork = false; isPausing = false; pauseReason = nil
+        nativeScope = nil; acrossDriveScopes = nil; waitingForNetwork = false; inventoryWaitReason = nil; isPausing = false; pauseReason = nil; manualResumeRequired = false
         results.reset(); resultConfiguration = nil
         report = nil; error = nil; message = "Ready to scan"; detail = ""
         fraction = nil; progress = SimilarityScanProgress(); startedAt = nil; runResources = nil
@@ -1710,9 +1723,9 @@ final class SimilarityProcessReader {
             var report: SimilarityReport?
             var message = String(data: diagnostic, encoding: .utf8) ?? ""
             do {
-                let size = try reportURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-                guard size < 64 * 1024 * 1024 else { throw CocoaError(.fileReadTooLarge) }
-                report = try decoder.decode(SimilarityReport.self, from: Data(contentsOf: reportURL))
+                guard let bytes = SimilaritySessionStore.readBoundedFile(reportURL,
+                    maximumBytes: SimilarityReportStorage.maximumBytes) else { throw CocoaError(.fileReadUnknown) }
+                report = try decoder.decode(SimilarityReport.self, from: bytes)
             } catch { if message.isEmpty { message = "The scan did not produce a readable report. \(error.localizedDescription)" } }
             completion(report, message)
         }

@@ -341,6 +341,78 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn query_fixture(count: usize) -> (tempfile::TempDir, String) {
+        let root = tempfile::tempdir().unwrap();
+        let vectors = vec![vec![1.0f32]; count];
+        let profiles = fixture_profiles(&vectors);
+        let writer = store::MatrixWriter::new(root.path()).unwrap();
+        populate(&writer, count); writer.prepare(&profiles).unwrap();
+        for a in 0..count - 1 { writer.chunk(0, a, a + 1, &vec![0.9456068339072593; count - a - 1]).unwrap(); }
+        let run = writer.id.clone(); writer.publish(&json!({"status":"completed"})).unwrap();
+        (root, run)
+    }
+    #[test]
+    fn saved_bounds_preserve_thresholds_and_rebuild_corrupt_or_stale_metadata() {
+        let (root, run) = query_fixture(8);
+        let source = root.path().join("runs").join(format!("{run}.sqlite3"));
+        let index_path = group_index::path(&source);
+        let read = |cutoff| {
+            let matrix = store::SavedMatrix::open(root.path(), &run, 1).unwrap();
+            let mut values = Vec::new();
+            matrix.visit_scores(cutoff, &AtomicBool::new(false), |a,b,s| { values.push((a.to_owned(),b.to_owned(),s)); Ok(()) }).unwrap();
+            values
+        };
+        assert_eq!(read(0.9).len(), 28);
+        let original = std::fs::read(&index_path).unwrap();
+        assert_eq!(read(0.94).len(), 28);
+        assert!(read(0.97).is_empty());
+        assert_eq!(std::fs::read(&index_path).unwrap(), original);
+        std::fs::write(&index_path, b"damaged derived index").unwrap();
+        assert_eq!(read(0.94).len(), 28);
+        assert_eq!(std::fs::read(&index_path).unwrap(), original);
+        let db = rusqlite::Connection::open(&source).unwrap();
+        let mut bytes: Vec<u8> = db.query_row("SELECT data FROM score_chunks WHERE a=0", [], |r| r.get(0)).unwrap();
+        bytes[..8].copy_from_slice(&f64::NAN.to_le_bytes());
+        db.execute("UPDATE score_chunks SET data=?1 WHERE a=0", [bytes]).unwrap(); drop(db);
+        let matrix = store::SavedMatrix::open(root.path(), &run, 1).unwrap();
+        assert!(matrix.visit_scores(1.0, &AtomicBool::new(false), |_,_,_| Ok(())).is_err(),
+            "A changed source must invalidate its bounds, including invalid scores below the cutoff");
+    }
+    #[test]
+    fn confirmed_trash_and_undo_persist_rows_and_groups_without_changing_scores() {
+        let (root, run) = query_fixture(4);
+        let groups = || grouping::group_scores(grouping::GroupQuery { data_dir:root.path().into(),run_id:run.clone(),
+            result_revision:1,minimum_score:0.94,include_identical:true }, &AtomicBool::new(false)).unwrap();
+        let original_groups = groups();
+        assert_eq!(original_groups.groups[0].file_ids.len(),4);
+        assert_eq!(original_groups.groups[0].minimum_score,Some(0.9456068339072593));
+        let original_bytes = serde_json::to_vec(&original_groups).unwrap();
+        let cache_file = std::fs::read_dir(root.path().join("runs")).unwrap().filter_map(|e|e.ok())
+            .find(|e|e.file_name().to_string_lossy().contains(".groups-")).unwrap().path();
+        use std::os::unix::fs::MetadataExt;
+        let cache_inode = std::fs::metadata(&cache_file).unwrap().ino();
+        assert_eq!(serde_json::to_vec(&groups()).unwrap(),original_bytes,
+            "Cached group responses must preserve every score bit as well as membership");
+        assert_eq!(std::fs::metadata(&cache_file).unwrap().ino(),cache_inode);
+        std::fs::write(&cache_file,b"damaged cached group response").unwrap();
+        assert_eq!(groups().groups[0].file_ids.len(),4);
+        let source = root.path().join("runs").join(format!("{run}.sqlite3"));
+        let metadata_before = group_index::identity(&source, &run, 1, 6).unwrap();
+        for trashed in [true,false] {
+            exclusions::update_result_files(exclusions::ResultFilesUpdate { data_dir:root.path().into(),run_id:run.clone(),
+                result_revision:1,file_ids:vec![file(1).id],trashed }, &AtomicBool::new(false)).unwrap();
+            let matrix=store::SavedMatrix::open(root.path(),&run,1).unwrap();
+            let row=matrix.row(&ScoreRowRequest { compact:true,data_dir:root.path().into(),run_id:run.clone(),
+                result_revision:1,file_id:file(0).id,row_offset:0 }, &AtomicBool::new(false)).unwrap();
+            assert_eq!(row["entries"].as_array().unwrap().len(),if trashed {2} else {3});
+            assert_eq!(row["entries"].as_array().unwrap().iter().any(|r| r["ordinal"]==1),!trashed);
+            assert_eq!(groups().groups[0].file_ids.len(),if trashed {3} else {4});
+            assert_eq!(group_index::identity(&source,&run,1,6).unwrap(),metadata_before);
+        }
+        assert!(exclusions::update_result_files(exclusions::ResultFilesUpdate { data_dir:root.path().into(),run_id:run.clone(),
+            result_revision:1,file_ids:vec!["another-scan-file".into()],trashed:true }, &AtomicBool::new(false)).is_err());
+        assert!(exclusions::load(&source,&run,1).unwrap().ordinals.is_empty());
+    }
     fn fixture_profiles<'a>(vectors: &'a [Vec<f32>]) -> Vec<Profile<'a>> {
         let mut profiles = vec![Profile {
             name: "fixture",
@@ -415,6 +487,7 @@ mod tests {
             let row = matrix
                 .row(
                     &ScoreRowRequest {
+                        compact: false,
                         data_dir: root.path().into(),
                         run_id: id.clone(),
                         result_revision: 1,

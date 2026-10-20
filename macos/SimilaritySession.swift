@@ -1,6 +1,13 @@
 import Foundation
 import Darwin
 
+enum SimilarityReportStorage {
+    // Native inventories with long provider IDs can exceed the old 64 MiB
+    // handoff cap well before 100,000 files. Use the same bounded limit for
+    // the helper handoff and saved-report recovery.
+    static let maximumBytes = 512 * 1_024 * 1_024
+}
+
 enum SimilarityNetworkFailure {
     static func isTemporary(_ error: Error, depth: Int = 0) -> Bool {
         guard !TransferFailure.hasUncertainMutation(error) else { return false }
@@ -192,10 +199,17 @@ enum SimilaritySessionStore {
         guard let run, run.hasPrefix("mcd2-"), run.count == 37,
               run.dropFirst(5).allSatisfy({ $0.isHexDigit }) else { return }
         try? FileManager.default.removeItem(at: configuration.dataDirectory.appendingPathComponent("runs").appendingPathComponent(run + ".sqlite3"))
+        try? FileManager.default.removeItem(at: configuration.dataDirectory.appendingPathComponent("runs").appendingPathComponent(run + ".group-index"))
+        try? FileManager.default.removeItem(at: configuration.dataDirectory.appendingPathComponent("runs").appendingPathComponent(run + ".excluded.json"))
+        let runs = configuration.dataDirectory.appendingPathComponent("runs")
+        for entry in (try? FileManager.default.contentsOfDirectory(at: runs, includingPropertiesForKeys: nil)) ?? []
+            where entry.lastPathComponent.hasPrefix(run + ".groups-") && entry.pathExtension == "zst" {
+            try? FileManager.default.removeItem(at: entry)
+        }
     }
     static func loadReport(_ configuration: SimilarityConfiguration, id: String) -> SimilarityReport? {
         let path=directory(configuration,id:id).appendingPathComponent("report.json")
-        guard let data = readBoundedFile(path, maximumBytes: 256 * 1_024 * 1_024) else { return nil }
+        guard let data = readBoundedFile(path, maximumBytes: SimilarityReportStorage.maximumBytes) else { return nil }
         return try? JSONDecoder().decode(SimilarityReport.self,from:data)
     }
     static func available(_ configuration: SimilarityConfiguration, source: SimilaritySource) -> [SimilaritySavedSession] {
@@ -212,7 +226,7 @@ enum SimilaritySessionStore {
         }.sorted { $0.updatedAt > $1.updatedAt }
     }
 
-    static func readBoundedFile(_ url: URL, maximumBytes: Int) -> Data? {
+    nonisolated static func readBoundedFile(_ url: URL, maximumBytes: Int) -> Data? {
         guard maximumBytes >= 0 else { return nil }
         let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard descriptor >= 0 else { return nil }

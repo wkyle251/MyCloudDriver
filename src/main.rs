@@ -76,6 +76,8 @@ enum Command {
     SimilarityScores(SimilarityScanArgs),
     /// Regroup a saved score matrix without reading original files.
     SimilarityGroups(SimilarityScanArgs),
+    /// Save confirmed Trash/Undo state and remove deleted source-vector associations.
+    SimilarityResultFiles(SimilarityScanArgs),
     /// Verify compared PikPak file metadata without changing files.
     SimilarityPreflight(SimilarityScanArgs),
     /// List files and directories.
@@ -1468,6 +1470,11 @@ fn rejected_session_reason(error: &anyhow::Error) -> Option<&'static str> {
 async fn run(cli: Cli) -> Result<()> {
     // The local scanner is usable when signed out and needs no OAuth client.
     let command = match cli.command {
+        Command::SimilarityResultFiles(args) => {
+            let request = read_json_request_bounded(&args.request_file, 64 * 1024 * 1024)?;
+            let cancelled = std::sync::atomic::AtomicBool::new(false);
+            return pikpak::similarity::emit(&pikpak::similarity::update_result_files(request, &cancelled)?);
+        }
         Command::SimilarityGroups(args) => {
             let request = read_json_request(&args.request_file)?;
             let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1507,7 +1514,7 @@ async fn run(cli: Cli) -> Result<()> {
     // neither session touches Safari's Web token chain.
     let (client, original_token) = build_client()?;
     let result = match command {
-        Command::SimilarityScan(_) | Command::SimilarityScores(_) | Command::SimilarityGroups(_) => unreachable!("handled before account setup"),
+        Command::SimilarityScan(_) | Command::SimilarityScores(_) | Command::SimilarityGroups(_) | Command::SimilarityResultFiles(_) => unreachable!("handled before account setup"),
         Command::Ls(args) => cmd_ls(&client, args).await,
         Command::Browse(args) => cmd_browse(&client, args).await,
         Command::SearchIndex(args) => {
@@ -5540,6 +5547,7 @@ async fn download_file_inner(
         }
     };
 
+    retry_state.set_final_verification_pending(true);
     let completed_size = if size > 0 {
         size
     } else {
@@ -6070,6 +6078,7 @@ async fn download_share_file_inner(
         }
     };
 
+    retry_state.set_final_verification_pending(true);
     let completed_size = if size > 0 {
         size
     } else {

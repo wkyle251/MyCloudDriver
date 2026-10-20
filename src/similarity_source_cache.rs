@@ -61,6 +61,7 @@ impl SourceCache {
                 seen_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(identity,revision,reader)) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY, stamp TEXT) WITHOUT ROWID;")?;
+        retired_schema(&db)?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS content_aliases(gcid TEXT,size INTEGER,profile TEXT,digest TEXT NOT NULL,
             seen_at INTEGER NOT NULL,PRIMARY KEY(gcid,size,profile)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS content_aliases_digest ON content_aliases(digest,profile);
@@ -391,6 +392,7 @@ impl SourceCache {
         let now = self.now();
         let identity = identity(file);
         let db = self.db.lock().unwrap();
+        if retired(&db, &identity, revision)? { return Ok(()); }
         let previous: Option<(Vec<u8>, i64)> = db.query_row(
             "SELECT payload,seen_at FROM outcomes WHERE identity=?1 AND revision=?2 AND reader=?3 AND length(payload)<=4194304",
             params![identity, revision, reader], |row| Ok((row.get(0)?, row.get(1)?)),
@@ -419,6 +421,7 @@ impl SourceCache {
         let mut db = self.db.lock().unwrap();
         let now = self.now();
         let identity = identity(file);
+        if retired(&db, &identity, revision)? { return Ok(()); }
         let previous: Option<(Vec<u8>, i64)> = db.query_row(
             "SELECT payload,seen_at FROM vectors WHERE digest=?1 AND profile=?2 AND length(payload)<=4194304",
             params![record.file_id, record.profile_id], |row| Ok((row.get(0)?, row.get(1)?)),
@@ -611,6 +614,59 @@ fn reader_key(file: &scope::InputFile) -> String {
         "binary-v1:{reader}:{}",
         encoding::safe_extension(&file.display.name).to_ascii_lowercase()
     )
+}
+
+fn retired_schema(db: &Connection) -> Result<()> {
+    db.execute_batch("CREATE TABLE IF NOT EXISTS retired_sources(identity TEXT,revision TEXT,
+        PRIMARY KEY(identity,revision)) WITHOUT ROWID;
+        CREATE TRIGGER IF NOT EXISTS no_retired_sources BEFORE INSERT ON sources
+        WHEN EXISTS(SELECT 1 FROM retired_sources r WHERE r.identity=NEW.identity AND r.revision=NEW.revision)
+        BEGIN SELECT RAISE(IGNORE); END;
+        CREATE TRIGGER IF NOT EXISTS no_retired_outcomes BEFORE INSERT ON outcomes
+        WHEN EXISTS(SELECT 1 FROM retired_sources r WHERE r.identity=NEW.identity AND r.revision=NEW.revision)
+        BEGIN SELECT RAISE(IGNORE); END;")?;
+    Ok(())
+}
+
+fn retired(db: &Connection, identity: &str, revision: &str) -> Result<bool> {
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM retired_sources WHERE identity=?1 AND revision=?2)",
+        params![identity, revision], |r| r.get(0))?)
+}
+
+/// Forget the removed file's associations, keeping a shared content vector
+/// while another retained copy still references it. Old checkpoint imports
+/// cannot resurrect a retired source revision.
+pub(super) fn forget_files(directory: &Path, ids: &[String]) -> Result<usize> {
+    let path = directory.join(FILENAME);
+    if !path.exists() { return Ok(0); }
+    let file = OpenOptions::new().read(true).write(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32).open(&path)?;
+    if !file.metadata()?.is_file() { bail!("Invalid source cache."); }
+    let mut db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    db.busy_timeout(Duration::from_secs(10))?;
+    retired_schema(&db)?;
+    let tx = db.transaction()?;
+    tx.execute_batch("CREATE TEMP TABLE forgotten_vectors(digest TEXT,profile TEXT,PRIMARY KEY(digest,profile)) WITHOUT ROWID;")?;
+    let mut forgotten = 0;
+    for id in ids {
+        for namespace in ["local", "provider", "pikpak"] {
+            let identity = format!("{namespace}:{id}");
+            tx.execute("INSERT OR IGNORE INTO retired_sources SELECT identity,revision FROM sources WHERE identity=?1", [&identity])?;
+            tx.execute("INSERT OR IGNORE INTO retired_sources SELECT identity,revision FROM outcomes WHERE identity=?1", [&identity])?;
+            tx.execute("INSERT OR IGNORE INTO forgotten_vectors SELECT digest,profile FROM sources WHERE identity=?1", [&identity])?;
+            forgotten += tx.execute("DELETE FROM sources WHERE identity=?1", [&identity])?;
+            tx.execute("DELETE FROM outcomes WHERE identity=?1", [&identity])?;
+        }
+    }
+    let aliases: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='content_aliases')", [], |r| r.get(0))?;
+    if aliases {
+        tx.execute("DELETE FROM content_aliases WHERE (digest,profile) IN (SELECT digest,profile FROM forgotten_vectors)
+            AND NOT EXISTS(SELECT 1 FROM sources s WHERE s.digest=content_aliases.digest AND s.profile=content_aliases.profile)", [])?;
+    }
+    tx.execute("DELETE FROM vectors WHERE (digest,profile) IN (SELECT digest,profile FROM forgotten_vectors)
+        AND NOT EXISTS(SELECT 1 FROM sources s WHERE s.digest=vectors.digest AND s.profile=vectors.profile)", [])?;
+    tx.commit()?;
+    Ok(forgotten)
 }
 
 fn identity(file: &scope::InputFile) -> String {
@@ -1582,6 +1638,25 @@ mod tests {
         assert_eq!((rows(&cache, "sources"), rows(&cache, "vectors")), (1, 1));
         let nothing = cache.prune_at(later);
         assert_eq!((nothing.sources, nothing.outcomes, nothing.vectors), (0, 0, 0), "pruning is idempotent");
+    }
+
+    #[test]
+    fn trash_forgets_source_vectors_without_harming_retained_duplicates_or_reimporting_old_work() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = SourceCache::open(root.path()).unwrap();
+        let (mut a, b) = (another_file("trashed-copy"), another_file("retained-copy"));
+        let record = record_with_hash(1);
+        cache.completed(&a, &record).unwrap(); cache.completed(&b, &record).unwrap();
+        assert_eq!(rows(&cache,"vectors"), 1);
+        assert_eq!(forget_files(root.path(), &[a.display.id.clone()]).unwrap(), 1);
+        assert!(reuse(&cache,&a).is_none()); assert!(reuse(&cache,&b).is_some());
+        assert_eq!(rows(&cache,"vectors"), 1, "Retained duplicate still owns its vector");
+        cache.completed(&a,&record).unwrap();
+        assert!(reuse(&cache,&a).is_none(), "An old checkpoint cannot resurrect a trashed source revision");
+        assert_eq!(forget_files(root.path(), &[b.display.id.clone()]).unwrap(), 1);
+        assert_eq!(rows(&cache,"vectors"), 0);
+        a.cloud.as_mut().unwrap().revision = Some("new-revision-after-restore".into());
+        cache.completed(&a,&record).unwrap(); assert!(reuse(&cache,&a).is_some());
     }
 
     #[test]

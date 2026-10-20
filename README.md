@@ -77,7 +77,7 @@ cannot replace downstream allowance. See [quota details](docs/PIKPAK_TRANSFER_QU
 | Function | PikPak | iCloud Drive | Apple Photos | Local Disk |
 | --- | --- | --- | --- | --- |
 | Browse, search, list/grid, multi-select | Files and folders | Files and folders | Photos, videos and albums | Files and folders |
-| Open With and Space Quick Look | Downloads a copy | Fetches cloud-only files as needed | Fetches original media as needed | Opens the local file |
+| Open With and Quick Look | Downloads a copy | Fetches cloud-only files as needed | Fetches original media as needed | Opens the local file |
 | Import / export | Upload / download queues | Copy into / out of the connected folder | Import media / export originals | Copy into / out of the selected folder |
 | Organise | Create, rename, move, copy, Trash | Create, rename, move, copy, Finder Trash | Create/rename albums, add/move album membership, delete | Create, rename, move, copy, Finder Trash |
 | Duplicate and similarity scans | Current folder or selection | Current folder or selection | Media, albums or library | Choose a folder, current folder or selection |
@@ -127,7 +127,7 @@ support session Undo. Existing PikPak Undo coverage is described below.
   any of them and choose **Expand All Levels in N Folders** to open all of them
   and every nested subfolder under one cancellable progress bar. Renaming and
   search fields keep the system's own ⌘A.
-- **Quick Look:** press Space to open a preview immediately. A loading indicator
+- **Quick Look:** press Space to open a preview when no video or audio preview is visible. A loading indicator
   appears while the file is fetched; Up/Down changes the previewed item.
 - **Native-drive thumbnails:** List, Thumbnails and the preview pane share a
   memory cache on Local Disk, external disks, iCloud Drive and Photos. Browsing
@@ -138,9 +138,10 @@ support session Undo. Existing PikPak Undo coverage is described below.
 - **Keyboard controls in the preview pane:** click anywhere in the pane, including the
   header, video, playback buttons, timeline or volume slider. Left/Right seek
   backward/forward **5 seconds**; Up/Down step to the previous/next item, one at
-  a time in both List and Thumbnails. **Space** pauses or resumes playback;
-  holding it counts as one press. Clicking the file list returns keyboard
-  control to the list, where Space opens Quick Look.
+  a time in both List and Thumbnails. Whenever a video or audio preview is visible,
+  **Space** pauses or resumes playback from the file list or preview pane;
+  holding it counts as one press. Text fields keep their spaces. With the preview
+  hidden or another file type selected, Space opens Quick Look.
 - **File type filter:** choose **Filter** in the Browser toolbar, then Images,
   Videos, Audio, Documents, Archives, Other Files, or a specific **File Extension**
   from the loaded files. Only matching files appear; folders stay visible so you
@@ -169,53 +170,65 @@ support session Undo. Existing PikPak Undo coverage is described below.
   One pass sizes that folder and every subfolder below it, including folders you expand later,
   on iCloud Drive, Local Disk and external disks. Several selected folders are measured together.
   Sizes belong to the listing they were measured from, so a refresh or a file change clears them.
-- **Preview placement and sizing:** choose **Settings → General → Preview placement**
-  for **Right** (default) or **Bottom**, shared across drives. The media preview
-  always fills its pane's width. Drag the
-  bottom grip to adjust its height; double-click it to fit the available height.
-  Bottom placement puts metadata and file actions behind the header's **ⓘ**
-  button, leaving more space for the image or player.
-  **Settings → General → Reset Layout** restores pane sizes, preview height,
+- **Preview placement and sizing:** in **Settings → General**, choose **Preview layout**
+  for **Side by side** or **Top and bottom**, then choose the preview's **Left/Right**
+  or **Top/Bottom** position. The file browser occupies the other pane. **Right** is
+  the default; **View → Preview Placement** also offers all four positions.
+  These preferences are shared across drives and workspace windows and survive
+  relaunch. Changing layout preserves whether the preview or file browser comes
+  first, with separate saved split sizes for each orientation. Drag the divider to
+  resize either arrangement. The media preview automatically fills the available
+  width and height below its header, with no separate media resize handle.
+  Metadata and file actions stay behind the header's **ⓘ** button in all layouts.
+  **Settings → General → Reset Layout** restores pane sizes and placement,
   sidebar visibility, file columns and list/zoom preferences across all drives.
 - **Media player:** video and audio previews use MyCloudDriver's playback bar:
-  play/pause, seek, skip 10 seconds, mute, volume and 0.5–2× speed. Volume, mute
+  play/pause, seek, skip 5 seconds, mute, volume and 0.5–2× speed. Volume, mute
   and speed are remembered across files, drives and app restarts. Reset Layout
-  keeps these playback preferences. Every drive except the Mac's internal Local Disk has a
-  buffering panel for media previews. iCloud Drive and Apple Photos show preparation
-  progress, transferred bytes and speed when the provider reports them, then the completed
-  preview's size and **Fully buffered** status once it is available on this Mac. Unknown
-  progress stays indeterminate and unknown speed shows **—**. PikPak and Link show their
-  one compact summary in **Buffering details** below the player: status, transfer speed,
-  buffered bytes, percentage and a single retained-range bar. Source information sits below
-  the bar; the information icon explains gaps and buffer lifetime. They stream as data arrives. Loading overlays also show
-  percentage, received bytes and transfer speed before playback starts, including full MP4/AVI
-  downloads for compatible previews. Unknown-length downloads still show bytes and speed;
-  conversion clears the completed download's percentage and transfer rate. The panel also remains available when an external
-  disk or network-share video needs a compatible preview copy.
-  **A video or audio file on an external disk or network share is read into memory** and played from there:
-  the start and end of the file load first ("Buffering from external disk…" or "Buffering from network share…" with progress),
-  then a bounded window is read ahead once playback starts. Reading ahead pauses with playback.
-  A file that fits in that window is held completely; a larger one keeps a window around
-  the playhead, so seeking elsewhere moves the window. The preview's buffering status shows
-  read speed, bytes in RAM, the percentage of the file held in memory and cyan segments for
-  the retained ranges. **Buffering details** adds the RAM limit and total bytes read, including
-  rereads after seeking. Speed returns to zero when reads stop or stall. The seek
-  bar's lighter shading also shows what is in memory, and its tooltip gives the amount. The
-  buffer is automatic (one sixteenth of the Mac's RAM, between 64 MB and 1 GB), is never
-  written to storage, and is released when the selection changes or the preview closes. If
-  the disk is unplugged, playback continues from memory until it runs out, then offers to
-  retry. Internal disks, iCloud and Photos are read as before.
-  The seek bar shows played content in solid color and AVPlayer's buffered
-  ranges in a lighter shade on the same track. Gaps after seeking stay visible;
-  buffering is media time available to the player, not a disk-cache percentage.
-  Expand **Buffering details** for the buffer and network information in PikPak and Link.
+  keeps these playback preferences. PikPak Drive, the Link tab, local and external disks,
+  network shares, iCloud Drive and Apple Photos share the same compact player footer.
+  Wide previews use two rows: time labels beside the playback track, then
+  playback, volume, download speed and playback speed together. Narrow previews
+  use three rows, with time labels and download speed above the track.
+  The footer adapts to the available width in every placement and expanded preview.
+  **Download speed** shows a rolling five-second average.
+  Preparation status also stays in this footer, leaving the
+  thumbnail unobstructed. The playback track combines solid blue played content, soft blue
+  retained RAM ranges and grey unbuffered parts; gaps remain visible. There is no
+  separate buffering panel, byte counter or percentage. Unknown speed shows **—**;
+  a completed file hides its idle speed. Conversion clears the download's rate.
+  **Preview RAM is shared across every drive, link and window.** Set its maximum in
+  **Settings → General → RAM buffer → Download RAM buffer maximum**. This setting
+  also controls download sessions. Automatic uses installed RAM as its ceiling,
+  growing only as data arrives and memory pressure permits. Custom limits cannot
+  exceed physical memory, so a 16 GB Mac permits 16 GB. Changes apply immediately
+  to previews and to the next download session. PikPak and shared-link byte ranges
+  stay in RAM; local, external and network files use the same budget, as do
+  materialized iCloud/Photos originals and compatible video copies.
+  Buffering continues while paused, filling the current file or the available RAM.
+  Native previews read the header and trailing index first and let player requests
+  take priority, so a slow network share need not fill a large startup window.
+  macOS memory pressure pauses background reads and downloads automatically; they
+  resume when pressure returns to normal. Critical pressure releases cached pages.
+  Selecting another file stops the previous file's read-ahead and retains its bytes
+  for two seconds. A quick return reuses them; otherwise they are released. Closing
+  the preview releases its RAM immediately. Once the current file is fully buffered,
+  spare RAM preloads successive media files in the visible, filtered order until
+  the shared allowance is full. Selecting any buffered file promotes its cache and
+  preserves later successors. Changing a filter or sort rebuilds the queue; focusing
+  another folder or leaving the location cancels its speculative buffers. The shared
+  limit includes these speculative and temporarily retained files. Progressive file
+  sources support this queue; HLS playlists remain managed by AVPlayer.
+  A file larger than the budget replaces old bytes as playback needs new ones.
+  If a disk is unplugged, buffered bytes remain playable until exhausted, then the
+  preview offers to retry.
   **Preparing a copy is fast where it can be.** A file macOS cannot play is first
   *repackaged*: its video is copied untouched into an MP4 and only the audio is
   re-encoded, which is limited by how fast the file can be read (seconds, even for 4K),
   and covers most AVI files (Xvid or H.264 video) and damaged or mislabelled streams.
   Only when that copy cannot play is the video re-encoded, with hardware encoding and at
   most 1920 pixels on its long side, falling back to software encoding. A transport
-  stream that Apple's player never finishes opening is abandoned after eight seconds.
+  stream that Apple's player never finishes opening is abandoned after eight seconds without read progress.
   A file already in an MP4 or QuickTime container (for example VP9 video) skips the
   copy, because a copy keeps the same unplayable stream, and is converted straight away.
   **Play in IINA.** When a file cannot be played in the pane, or while a copy is still
@@ -747,7 +760,8 @@ your saved sidebar preference. The home screen and short sidebars scroll as need
 | Browser / Links | Control-Command-1 / 3 |
 | Show Transfers | Command-Shift-T |
 | List / Thumbnails | Command-1 / 2 |
-| Quick Look | Space; Up/Down changes the selected item |
+| Play / pause visible media preview | Space, including from the file list |
+| Quick Look | Space when no media preview is visible; Up/Down changes the selected item |
 | Find names in current expanded items | Command-F |
 | Find names recursively from the connected drive root | Command-Shift-F |
 | Close Quick Look | Space or Escape |
@@ -1058,9 +1072,31 @@ before pushing. Only placeholder configuration templates belong in Git.
 
 For a live Terminal dashboard on this Mac while another Mac downloads, run
 `python3 scripts/remote-download-monitor.py` or open **Monitor Remote Downloads.command**.
+
 It shows download, RAM buffer, read/write pools, disk rates, and setup waits, and saves
 private rotating numeric logs locally. See [Remote download monitor](docs/REMOTE_DOWNLOAD_MONITOR.md)
 for SSH setup, history replay, low-speed summaries, and retention settings.
+
+Folder discovery keeps its network lookahead separate from final disk checks,
+so a large verification backlog can coexist with useful reception into RAM.
+Discovery retains bounded network and total file backlogs; every completed file
+still passes its integrity check before publication. Account path lookup stops
+listing each ancestor as soon as its first matching child is found, avoiding
+unnecessary pages during startup. Partial listings remain cache hints rather
+than complete folder inventories. Restoring a complete range
+checkpoint for the same original verifies the whole file and its individual
+pieces in one pass, including older checkpoints without a saved file identity.
+Damaged pieces are downloaded again and receive a fresh final check after repair.
+Completed range downloads share the disk's durable checkpoint batches. Publication
+skips a second payload sync only when that successful checkpoint still matches
+the exact verified file; restored serial checkpoints and changed files retain
+their own sync. If completed checks occupy every verification slot, an idle
+disk hands off to their checkpoint batch so waiting checks can continue.
+On a coordinated HDD, completion receipts use the same bounded batching queue.
+Recovery information becomes durable before publication, and the completion
+receipt becomes durable afterwards. Each wait rechecks the exact payload
+identity and the receipt's source ownership before the file can be reported
+complete.
 
 The app's download dashboard separates **Checks waiting** from **Reading now**.
 Selecting a read turn does not make every queued check an active disk reader;

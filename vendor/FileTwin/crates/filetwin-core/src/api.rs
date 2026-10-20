@@ -386,6 +386,10 @@ pub struct WorkCounts {
     /// Current source/analysis admission demand, including held reservations.
     #[serde(default)]
     pub staging_memory_required: u64,
+    /// Smallest waiting read's completion allowance; warning recovery admits
+    /// one original instead of reopening the full acquisition pipeline.
+    #[serde(default)]
+    pub staging_memory_minimum: u64,
     #[serde(default)]
     pub analysis_memory_required: u64,
     /// Original bytes in the next analysis job; handoff does not copy them.

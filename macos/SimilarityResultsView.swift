@@ -6,6 +6,7 @@ struct SimilarityResultsView: View {
     let report: SimilarityReport
     let coordinator: FileSimilarityCoordinator
     @State private var selectedMatchID: String?
+    @State private var previousMatchOrder: [String] = []
     @State private var showsCoverage = false
     @State private var visibleMatchCount = 200
     @State private var groupPage = 0
@@ -173,6 +174,13 @@ struct SimilarityResultsView: View {
             if coordinator.preview.isActive {
                 if let file = results.selectedFile { preview(file) } else { coordinator.preview.close() }
             }
+        }
+        .onChange(of: results.related.map(\.id)) { order in
+            if let selectedMatchID, results.trashedIDs.contains(selectedMatchID), !order.contains(selectedMatchID) {
+                let surviving = Set(order)
+                self.selectedMatchID = SimilarityResultSelection.next(after: selectedMatchID, in: previousMatchOrder) { surviving.contains($0) }
+            }
+            previousMatchOrder = order
         }
         .onChange(of: results.minimumScore) { _ in visibleMatchCount = 200 }
         .onChange(of: results.identicalOnly) { _ in visibleMatchCount = 200 }

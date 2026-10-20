@@ -22,6 +22,7 @@ struct Demand {
     download_incomplete: u64,
     staging_used: u64,
     staging_required: u64,
+    staging_minimum: u64,
     analysis_used: u64,
     analysis_required: u64,
     analysis_forecast: u64,
@@ -104,6 +105,10 @@ impl Governor {
         }
         self.pressure = pressure;
         self.total = self.total.max(used).min(self.physical).max(1);
+        if pressure >= 4 {
+            return Plan { total: self.total, download: demand.download_used,
+                staging: 0, analysis: demand.analysis_used, pressure };
+        }
         if pressure == 2 {
             return self.warning_drain(demand);
         }
@@ -117,9 +122,7 @@ impl Governor {
                 .saturating_sub(demand.analysis_used)
                 .saturating_sub(demand.analysis_transfer)
                 > self.total.saturating_sub(used);
-        let analysis = if pressure >= 4 {
-            demand.analysis_used
-        } else if acquisition_must_drain {
+        let analysis = if acquisition_must_drain {
             // A decoder retry cannot borrow bytes still held by a partial
             // original. Let that original finish and reach the ready queue;
             // analysing it can release the RAM needed by the larger retry.
@@ -217,6 +220,17 @@ impl Governor {
             plan.download = demand.download_minimum.min(self.physical
                 .saturating_sub(demand.staging_used).saturating_sub(demand.analysis_used)
                 .saturating_sub(memory::ANALYSIS_HEADROOM));
+        } else if demand.used() == 0 && demand.staging_minimum > 0 {
+            // A persistent warning can otherwise close both banks forever:
+            // no held input remains to drain, but every new read needs RAM.
+            // Fund only the smallest native read and its completion headroom.
+            // The staging pool serializes reads while memory_draining is set;
+            // the next ready-input update closes this bank before handoff.
+            let need = demand.staging_minimum.saturating_add(memory::ANALYSIS_HEADROOM);
+            if need <= self.physical {
+                self.total = self.total.max(need).min(self.physical);
+                plan.staging = demand.staging_minimum;
+            }
         }
         plan.total = self.total.max(1);
         // Held staging leases remain charged in demand.used(). A zero bank
@@ -228,6 +242,15 @@ impl Governor {
         work: &WorkCounts,
         memory: &memory::Budget,
         token: &filetwin_core::api::CancellationToken,
+    ) {
+        self.update_with_pressure(work, memory, token, system_memory().pressure);
+    }
+    fn update_with_pressure(
+        &mut self,
+        work: &WorkCounts,
+        memory: &memory::Budget,
+        token: &filetwin_core::api::CancellationToken,
+        pressure: u32,
     ) {
         let now = Instant::now();
         if self
@@ -245,6 +268,7 @@ impl Governor {
             download_incomplete: memory.usage.incomplete.load(Ordering::Acquire),
             staging_used: work.original_memory_bytes,
             staging_required: work.staging_memory_required,
+            staging_minimum: work.staging_memory_minimum,
             analysis_used: work
                 .memory_in_use
                 .saturating_sub(work.original_memory_bytes),
@@ -256,7 +280,7 @@ impl Governor {
         };
         let plan = self.plan(
             demand,
-            system_memory().pressure,
+            pressure,
             now.duration_since(self.started),
         );
         memory.usage.completion_required.store(
@@ -296,6 +320,79 @@ impl Governor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn persistent_warning_reopens_only_the_smallest_native_read_when_everything_has_drained() {
+        let mut governor = Governor::with_memory(16 << 30, true, 8);
+        governor.total = 2_727_390_887;
+        let waiting = Demand { staging_required: 2_509_723_543,
+            staging_minimum: 204_416_795, ..Default::default() };
+        let first = governor.plan(waiting, 2, Duration::ZERO);
+        assert_eq!(first.staging, waiting.staging_minimum);
+        assert_eq!((first.download, first.analysis), (0, 0));
+        assert!(first.total >= first.staging + memory::ANALYSIS_HEADROOM);
+        let reading = Demand { staging_used: first.staging, ..waiting };
+        assert_eq!(governor.plan(reading, 2, Duration::from_secs(1)).staging, 0,
+            "A warning must not admit another original while the first drains");
+        let ready = Demand { staging_used: first.staging, analysis_transfer: first.staging,
+            analysis_required: first.staging + memory::ANALYSIS_HEADROOM, ..waiting };
+        let handoff = governor.plan(ready, 2, Duration::from_secs(2));
+        assert_eq!(handoff.staging, 0);
+        assert_eq!(handoff.analysis, ready.analysis_required);
+        let active = Demand { analysis_used: handoff.analysis, analysis_active: 1, ..waiting };
+        assert_eq!(governor.plan(active, 2, Duration::from_secs(3)).staging, 0);
+        assert_eq!(governor.plan(waiting, 2, Duration::from_secs(4)).staging, first.staging,
+            "A persistent warning must still allow the next file after completion");
+        let critical = governor.plan(waiting, 4, Duration::from_secs(5));
+        assert_eq!((critical.download, critical.staging, critical.analysis), (0, 0, 0));
+    }
+
+    #[test]
+    fn persistent_warning_native_pipeline_completes_without_waiting_for_pressure_to_clear() {
+        use filetwin_core::{Encoder, api::{CancellationToken, EncodeRequest, EncodeSource, EncoderConfig}};
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        let directory = canonical.join("input");
+        let models = canonical.join("models");
+        let temporary = canonical.join("temporary");
+        for path in [&directory, &models, &temporary] { std::fs::create_dir(path).unwrap(); }
+        let mut sources = Vec::new();
+        for index in 0..4 {
+            let path = directory.join(format!("{index}.txt"));
+            std::fs::write(&path, "A garden with green trees, flowers and a wooden bench. ".repeat(40)).unwrap();
+            sources.push(EncodeSource::new(format!("{index}.txt"), path));
+        }
+        let memory = memory::Budget::new(256 << 20);
+        memory.enable_automatic(1 << 30);
+        let mut config = EncoderConfig::new(models, temporary);
+        config.memory_scheduling = true;
+        config.memory_staging = true;
+        config.memory_bytes = 1;
+        config.staging_bytes = 1;
+        config.memory_ceiling = Some(1 << 30);
+        config.total_memory_bytes = Some(512 << 20);
+        config.external_memory = Some(memory.usage.clone());
+        config.workers = 4;
+        let token = CancellationToken::default();
+        let mut governor = Governor::with_memory(1 << 30, true, 4);
+        let started = Instant::now();
+        let mut sources = sources.into_iter();
+        let mut saw_read = false;
+        let result = Encoder::new(config).unwrap().encode_sources(
+            &EncodeRequest::new(directory), &token, || Ok(sources.next()), |progress| {
+                if started.elapsed() > Duration::from_secs(15) { token.cancel(); }
+                if let Some(work) = &progress.work {
+                    assert!(work.reading <= 1, "Warning recovery admitted parallel source copies");
+                    assert!(work.hashing + work.encoding <= 1);
+                    saw_read |= work.original_memory_bytes > 0;
+                    governor.update_with_pressure(work, &memory, &token, 2);
+                }
+            }).unwrap();
+        assert!(!result.summary.cancelled, "Persistent warning stranded an idle pipeline");
+        assert!(result.complete && saw_read, "{:?}: {:?}", result.summary, result.files);
+        assert_eq!(result.summary.counts.files_ready, 4);
+        assert_eq!(result.files.len(), 4);
+    }
+
     #[test]
     fn persistent_warning_native_exact_fit_keeps_unused_source_banks_at_zero() {
         let mut governor = Governor::with_memory(16 << 30, true, 8);

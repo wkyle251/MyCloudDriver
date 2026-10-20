@@ -38,6 +38,7 @@ class InstallTests(unittest.TestCase):
         make_app(self.source, "new synthetic bytes")
         self.commands = []
         self.fail_registration = False
+        self.quit_timeout = False
         self.root_patch = patch.object(installer, "ROOT", self.root)
         self.native_patch = patch.object(installer.subprocess, "run", side_effect=self.native)
         self.process_patch = patch.object(installer, "processes", return_value={})
@@ -60,6 +61,8 @@ class InstallTests(unittest.TestCase):
             else: shutil.copytree(source, target, symlinks=True)
         elif command[0] == installer.LSREGISTER:
             if self.fail_registration: raise subprocess.CalledProcessError(1, command)
+        elif command[0] == "osascript":
+            if self.quit_timeout: raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         elif command[0] not in ("codesign", "open"):
             raise AssertionError(f"No real native command allowed: {command}")
 
@@ -107,6 +110,54 @@ class InstallTests(unittest.TestCase):
         self.assertEqual((outside / "Contents/MacOS/PikPakDownloader").read_text(), "outside synthetic bytes")
         self.assertTrue(self.destination.is_symlink())
         self.assertEqual(self.commands, [])
+
+    def test_quit_request_timeout_waits_for_the_app_and_orphaned_helper_before_installing(self):
+        make_app(self.destination, "old synthetic bytes")
+        expected = installer.inventory(self.destination)
+        self.quit_timeout = True
+        app = {101: (1, str(self.destination / "Contents/MacOS/PikPakDownloader"))}
+        helper = {102: (101, "generated-helper")}
+        tables = iter([{**app, **helper}, {**app, **helper},
+                       {102: (1, "generated-helper")}, {}])
+        polls = []
+        clock = [0.0]
+        def process_table():
+            self.assertEqual(installer.inventory(self.destination), expected,
+                             "The installed bundle must stay untouched until every tracked process exits")
+            self.assertFalse(any(command[0] == installer.LSREGISTER for command in self.commands))
+            table = next(tables)
+            polls.append(table)
+            return table
+        def advance(seconds):
+            clock[0] += seconds
+        with patch.object(installer, "processes", side_effect=process_table), \
+             patch.object(installer.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(installer.time, "sleep", side_effect=advance):
+            installer.install(self.source, self.destination, launch=False)
+        self.assertEqual(len(polls), 4)
+        self.assertEqual(polls[-1], {})
+        self.assertEqual(installer.inventory(self.destination), installer.inventory(self.source))
+        self.assertEqual(sum(command[0] == "osascript" for command in self.commands), 1)
+        self.assertTrue(any(command[0] == installer.LSREGISTER for command in self.commands))
+
+    def test_quit_request_timeout_with_a_live_helper_leaves_the_installed_bundle_untouched(self):
+        make_app(self.destination, "old synthetic bytes")
+        expected = installer.inventory(self.destination)
+        self.quit_timeout = True
+        table = {101: (1, str(self.destination / "Contents/MacOS/PikPakDownloader")),
+                 102: (101, "generated-helper")}
+        clock = [0.0]
+        def advance(seconds):
+            clock[0] += seconds
+        with patch.object(installer, "processes", return_value=table), \
+             patch.object(installer.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(installer.time, "sleep", side_effect=advance):
+            with self.assertRaisesRegex(RuntimeError, "still running; the installed bundle was not replaced"):
+                installer.install(self.source, self.destination, launch=False)
+        self.assertGreaterEqual(clock[0], 45)
+        self.assertEqual(installer.inventory(self.destination), expected)
+        self.assertFalse(any(command[0] in (installer.LSREGISTER, "open") for command in self.commands))
+        self.assertFalse(list(self.destination.parent.glob(".mycloud-install-*")))
 
     def test_standalone_install_waits_for_build_and_inherited_child_does_not_deadlock(self):
         # The subprocess replaces install() with a marker writer before main().

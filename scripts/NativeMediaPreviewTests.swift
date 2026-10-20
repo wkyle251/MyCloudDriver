@@ -42,7 +42,7 @@ private final class MediaProvider: NativeCloudDrive, @unchecked Sendable {
         }
         if item.id == "slow" || item.id == "percentage" || item.id == "telemetry" {
             // Simulate a provider that finishes a write after cancellation.
-            try? await Task.sleep(nanoseconds: item.id == "telemetry" ? 1_600_000_000 : 300_000_000)
+            try? await Task.sleep(nanoseconds: item.id == "telemetry" ? 5_800_000_000 : 300_000_000)
             progress(.init(message: "Original ready", fraction: 1, bytes: 100, fileSize: 100))
         }
         if item.id == "error" { throw CloudDriveError.message("Test source unavailable") }
@@ -60,7 +60,7 @@ private final class MediaProvider: NativeCloudDrive, @unchecked Sendable {
 }
 @main @MainActor struct NativeMediaPreviewTests {
     static func wait(_ check: () async -> Bool) async {
-        for _ in 0..<100 {
+        for _ in 0..<400 {
             if await check() { return }
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
@@ -277,10 +277,14 @@ private final class MediaProvider: NativeCloudDrive, @unchecked Sendable {
             await wait { await provider.requests.completed == 5 }
             let playerURL = (browser.mediaPreview.playback.player!.currentItem!.asset as! AVURLAsset).url
             precondition(browser.focusedRowID == originalRow && browser.inspectorPreviewIdentity == originalIdentity
-                && browser.mediaPreview.matches(originalItem, provider: provider) && playerURL == originalItem.url
+                && browser.mediaPreview.matches(originalItem, provider: provider)
+                && browser.mediaPreview.originalURL == originalItem.url
+                && playerURL == browser.mediaPreview.memoryLoader?.assetURL
                 && thumbnail.snapshot?.identity == originalIdentity && thumbnail.snapshot?.image(for: originalIdentity) === images[3],
                 "Up/Up/Down/Down and reverse must restore the same file, player and generated bitmap after late out-of-order completions")
-            let content = try Data(contentsOf: playerURL)
+            precondition(browser.mediaPreview.bufferStatus?.cache.fraction == 1,
+                "The selected original must be available through its RAM asset")
+            let content = try Data(contentsOf: browser.mediaPreview.originalURL!)
             precondition(content == Data("generated distinct media 3".utf8))
             thumbnail.clear()
         }

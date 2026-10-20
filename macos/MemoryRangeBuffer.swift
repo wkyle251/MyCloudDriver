@@ -7,23 +7,32 @@ final class MemoryRangeBuffer: @unchecked Sendable {
     let contentLength: Int64
     let blockSize: Int
     let maximumBlocks: Int
+    let memoryBudget: PreviewMemoryBudget
+    private var cleanupID: UUID?
     private let lock = NSLock()
     private var blocks: [Int: Data] = [:]
     private var anchor = 0
     private var resident: Int64 = 0
 
-    /// One sixteenth of the Mac's RAM, between 64 MiB and 1 GiB.
+    /// A ceiling of installed RAM, allocated only as bytes arrive and pressure permits.
     static func automaticBudget(physicalMemory: UInt64 = ProcessInfo.processInfo.physicalMemory) -> Int64 {
-        let mebibyte: Int64 = 1 << 20
-        return min(1 << 30, max(64 * mebibyte, Int64(clamping: physicalMemory / 16)))
+        max(1, Int64(clamping: physicalMemory))
     }
 
     /// Always room for the playhead's block and the block being read next.
-    init(contentLength: Int64, budgetBytes: Int64, blockSize: Int = 1 << 20) {
+    init(contentLength: Int64, budgetBytes: Int64, blockSize: Int = 1 << 20,
+         memoryBudget: PreviewMemoryBudget = .shared) {
         precondition(contentLength >= 0 && blockSize > 0)
         self.contentLength = contentLength
         self.blockSize = blockSize
+        self.memoryBudget = memoryBudget
         maximumBlocks = max(2, Int(max(0, budgetBytes) / Int64(blockSize)))
+        cleanupID = memoryBudget.registerCleanup(residentBytes: { [weak self] in self?.residentBytes ?? 0 },
+            reclaim: { [weak self] in self?.reclaim() }) { [weak self] in self?.removeAll() }
+    }
+    deinit {
+        if let cleanupID { memoryBudget.unregisterCleanup(cleanupID) }
+        memoryBudget.release(resident)
     }
 
     var blockCount: Int { Int((contentLength + Int64(blockSize) - 1) / Int64(blockSize)) }
@@ -44,20 +53,26 @@ final class MemoryRangeBuffer: @unchecked Sendable {
 
     /// Stores one whole block, evicting if the budget is exceeded. False if the block is out of range or the wrong length.
     @discardableResult
-    func store(_ data: Data, block index: Int) -> Bool {
+    func store(_ data: Data, block index: Int, allowsEviction: Bool = true) -> Bool {
         guard index >= 0, index < blockCount, Int64(data.count) == Int64(blockRange(index).count) else { return false }
         lock.lock(); defer { lock.unlock() }
-        if blocks[index] == nil { resident += Int64(data.count) }
-        else { resident += Int64(data.count) - Int64(blocks[index]!.count) }
-        blocks[index] = data
-        while blocks.count > maximumBlocks {
+        if blocks[index] != nil { blocks[index] = data; return true }
+        let bytes = Int64(data.count)
+        if !allowsEviction, blocks.count >= maximumBlocks { return false }
+        while blocks.count >= maximumBlocks || !memoryBudget.reserve(bytes, background: !allowsEviction) {
+            guard allowsEviction else { return false }
             // Behind the playhead counts three times as far as ahead, so the past is dropped before the future.
             let victim = blocks.keys.filter { $0 != anchor && $0 != index }.max {
                 (weight($0), $1) < (weight($1), $0)
             }
-            guard let victim else { break }
-            resident -= Int64(blocks.removeValue(forKey: victim)!.count)
+            guard let victim else {
+                if let cleanupID { memoryBudget.requestRoom(excluding: cleanupID) }
+                return false
+            }
+            let removed = Int64(blocks.removeValue(forKey: victim)!.count)
+            resident -= removed; memoryBudget.release(removed)
         }
+        resident += bytes; blocks[index] = data
         return true
     }
     private func weight(_ index: Int) -> Int { index < anchor ? (anchor - index) * 3 : index - anchor }
@@ -104,6 +119,15 @@ final class MemoryRangeBuffer: @unchecked Sendable {
     }
 
     func removeAll() {
-        lock.lock(); blocks = [:]; resident = 0; lock.unlock()
+        lock.lock(); blocks = [:]; memoryBudget.release(resident); resident = 0; lock.unlock()
+    }
+    func setPriority(_ priority: Int, gracePeriod: TimeInterval = 0) {
+        lock.lock(); defer { lock.unlock() }
+        if let cleanupID { memoryBudget.setPriority(priority, for: cleanupID, gracePeriod: gracePeriod) }
+    }
+    private func reclaim() {
+        lock.lock(); defer { lock.unlock() }
+        guard let cleanupID, memoryBudget.canReclaim(cleanupID) else { return }
+        blocks = [:]; memoryBudget.release(resident); resident = 0
     }
 }

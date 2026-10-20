@@ -101,6 +101,7 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/MediaFileDownload.swift" \
     "${PROJECT_ROOT}/macos/MediaPreviewBufferStatus.swift" \
     "${PROJECT_ROOT}/macos/MemoryRangeBuffer.swift" \
+    "${PROJECT_ROOT}/macos/PreviewMemoryBudget.swift" \
     "${PROJECT_ROOT}/macos/FilePreviewResourceLoader.swift" \
     "${PROJECT_ROOT}/macos/ExternalVolume.swift" \
     "${PROJECT_ROOT}/macos/MountedVolumeIdentity.swift" \
@@ -154,6 +155,7 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/PikPakBookmarks.swift" \
     "${PROJECT_ROOT}/macos/NativeDriveBookmarks.swift" \
     "${PROJECT_ROOT}/macos/WorkspaceSessions.swift" \
+    "${PROJECT_ROOT}/macos/FinderCommandPublication.swift" \
     "${PROJECT_ROOT}/macos/SimilarityResources.swift" \
     "${PROJECT_ROOT}/macos/SimilaritySession.swift" \
     "${PROJECT_ROOT}/macos/SimilarityInventoryWriter.swift" \
@@ -165,6 +167,7 @@ python3 "${SCRIPT_DIRECTORY}/build-swift-app.py" --cache-dir "${SWIFT_CACHE}" --
     "${PROJECT_ROOT}/macos/SimilarityAcrossDrives.swift" \
     "${PROJECT_ROOT}/macos/FileSimilarityView.swift" \
     "${PROJECT_ROOT}/macos/SimilarityResults.swift" \
+    "${PROJECT_ROOT}/macos/SimilarityResultExclusions.swift" \
     "${PROJECT_ROOT}/macos/SimilarityKeepSmallest.swift" \
     "${PROJECT_ROOT}/macos/SimilarityFileTree.swift" \
     "${PROJECT_ROOT}/macos/SimilarityResultsView.swift" \

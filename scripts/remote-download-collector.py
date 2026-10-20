@@ -27,6 +27,7 @@ read_tasks_started read_tasks_finished read_turns write_turns receiving_tasks ra
 ram_wait_count ram_wait_total_ms file_network_workers file_worker_limit admitted_read_tasks deferred_read_tasks
 download_has_ready waiting_writers eligible_waiting_writers checkpoint_batch_pending'''.split())
 PROGRESS_KEYS |= set('prefetch_bytes prefetch_tasks prefetch_discarded_bytes prefetch_active_slots prefetch_contexts prefetch_receiver_limit prefetch_context_limit prefetch_finished prefetch_failed prefetch_empty_ends'.split())
+PROGRESS_KEYS |= set('discovery_outstanding_files discovery_waiting_files final_verification_tasks'.split())
 RECEIVE_WAITS = 'ram_body_limit ram_shared_limit ram_pressure connection_budget connection_cooldown connection_endpoint_capacity connection_shared_slots'.split()
 RECEIVE_COUNTERS = set('''payload_timeout payload_connection payload_range_validation payload_io payload_interrupted
 payload_unavailable payload_streaming_fallback payload_early_empty_retry payload_deferred_rearm payload_http_success
@@ -47,7 +48,8 @@ read_turn_write_handoffs read_write_threshold_bytes last_read_pending_write_byte
 write_dispatch_polls turn_target_ms backlog_drives ram_wait_max_ms checkpoint_batches checkpoint_batched_files
 checkpoint_barriers checkpoint_batch_total_ms'''.split())
 KINDS = '''resume_read final_read checkpoint retry_cache_hit retry_cache_miss checkpoint_wait checkpoint_sync
-payload_write read_preparation read_queue_wait read_gate_wait read_turn_wait read_io read_hash scheduler_pass'''.split()
+payload_write read_preparation read_queue_wait read_gate_wait read_turn_wait read_io read_hash scheduler_pass
+publication_payload_sync publication_pending_receipt publication_move publication_committed_receipt'''.split()
 WINDOW_KEYS |= {kind+'_'+suffix for kind in KINDS for suffix in ('count','bytes','total_ms','max_ms','failed','active')}
 STAGES = set('''download_url account_metadata account_token account_captcha account_headers account_body
 account_backoff guest_metadata guest_captcha guest_headers guest_body guest_refresh_lock guest_refresh_headers

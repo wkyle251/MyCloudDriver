@@ -4,13 +4,86 @@ import Foundation
 
 @main struct WorkspaceSessionTests {
     @MainActor static func main() async throws {
+        setbuf(stdout, nil)
         _ = NSApplication.shared
         NSApp.setActivationPolicy(.prohibited)
         try await testCommandRegistrations()
+        try await testCommandMenuTracking()
+        try await testCommandPresentationUpdates()
         try await testSearchAfterBrowserClose()
         try testCredentialOwnerRetention()
         try await testSessionLifecycle()
         print("PASS workspace sessions: independent folders, selections, history, sidebars, drive titles and command routing; shared preferences; owner-specific auxiliary recovery and teardown")
+    }
+
+    @MainActor static func testCommandPresentationUpdates() async throws {
+        let center = NotificationCenter(), router = FinderCommandRouter(notificationCenter: center)
+        let first = makeWindow(), second = makeWindow(), token = UUID()
+        defer { first.close(); second.close() }
+        center.post(name: NSWindow.didBecomeKeyNotification, object: first)
+        router.update(actions(1), window: first, token: token)
+        try await Task.sleep(nanoseconds: 40_000_000)
+        var publications = 0, invoked = 0
+        let observation = router.objectWillChange.sink { publications += 1 }
+        defer { observation.cancel() }
+        for value in 1...100 {
+            var next = actions(1)
+            next.refresh = { invoked = value }
+            router.update(next, window: first, token: token)
+        }
+        try await Task.sleep(nanoseconds: 40_000_000)
+        router.actions?.refresh()
+        precondition(publications == 0 && invoked == 100,
+            "Status/progress updates must retain current closures without invalidating command presentation")
+        var changed = actions(1); changed.zoom = 1.8; changed.canTrash = true; changed.undoTitle = "Undo generated change"
+        router.update(changed, window: first, token: token)
+        try await Task.sleep(nanoseconds: 40_000_000)
+        precondition(publications == 1, "Visible command validation must still refresh")
+        router.update(actions(2), window: second, token: token)
+        center.post(name: NSWindow.didBecomeKeyNotification, object: second)
+        precondition(router.actions?.section == 2, "Native focus must route commands without a FocusedValue subscription")
+        print("PASS command presentation: 100 background updates produce no invalidations; fresh callbacks, validation changes and native window routing remain current")
+    }
+
+    @MainActor static func testCommandMenuTracking() async throws {
+        let center = NotificationCenter(), router = FinderCommandRouter(notificationCenter: center)
+        let window = makeWindow(), token = UUID()
+        defer { window.close() }
+        let parent = NSMenu(title: "View"), child = NSMenu(title: "Preview Placement")
+        var publications = 0, invoked = 0
+        let observation = router.objectWillChange.sink { publications += 1 }
+        defer { observation.cancel() }
+        router.focus(window)
+        router.update(actions(1), window: window, token: token)
+        // Tracking may begin after an update was queued but before it publishes.
+        center.post(name: NSMenu.didBeginTrackingNotification, object: parent)
+        center.post(name: NSMenu.didBeginTrackingNotification, object: child)
+        for value in 2...30 {
+            var next = actions(value)
+            next.refresh = { invoked = value }
+            router.update(next, window: window, token: token)
+        }
+        try await Task.sleep(nanoseconds: 40_000_000)
+        precondition(publications == 0, "Background updates must not rebuild a tracked submenu")
+        router.actions?.refresh()
+        precondition(invoked == 30 && router.actions?.section == 30,
+            "Menu action dispatch must use the latest registration while presentation is deferred")
+        center.post(name: NSMenu.didEndTrackingNotification, object: child)
+        try await Task.sleep(nanoseconds: 40_000_000)
+        precondition(publications == 0, "Closing a submenu must not rebuild its still-open parent")
+        center.post(name: NSMenu.didEndTrackingNotification, object: parent)
+        precondition(publications == 0, "Menu-close notifications must publish outside AppKit tracking")
+        try await Task.sleep(nanoseconds: 40_000_000)
+        precondition(publications == 1, "Closing the full menu must publish the latest state once")
+        center.post(name: NSMenu.didBeginTrackingNotification, object: parent)
+        router.close(window)
+        precondition(router.actions == nil, "Closing a window must invalidate actions even while a menu is open")
+        try await Task.sleep(nanoseconds: 40_000_000)
+        precondition(publications == 1)
+        center.post(name: NSMenu.didEndTrackingNotification, object: parent)
+        try await Task.sleep(nanoseconds: 40_000_000)
+        precondition(publications == 2, "Cancelled tracking must also release pending command validation")
+        print("PASS menu tracking: background command updates coalesce until all menus close; live actions and immediate closed-window invalidation remain current")
     }
 
     @MainActor static func testCommandRegistrations() async throws {
@@ -237,13 +310,36 @@ import Foundation
         manager.lastWindowClosedForTesting = { lastCloseCount += 1 }
         let browser = makeWindow(); manager.register(browser, hub: owner); focus(browser)
         precondition(manager.searchDrive == nil)
+        let searchCommands = FinderSearchCommandState(sessions: manager)
+        var searchPublications = 0
+        let searchObservation = searchCommands.objectWillChange.sink { searchPublications += 1 }
+        defer { searchObservation.cancel() }
+        for value in 1...100 { owner.pikpak.status = "Generated status \(value)" }
+        try await Task.sleep(nanoseconds: 40_000_000)
+        precondition(searchPublications == 0, "Transfer status must not invalidate search or View menus")
         manager.presentSearch(scope: .expanded)
         precondition(!owner.pikpak.fileSearch.isPresented)
         owner.open(.local)
+        try await Task.sleep(nanoseconds: 40_000_000)
+        precondition(searchCommands.snapshot.drive == .local && searchPublications == 1)
+        owner.pikpak.isLoginPresented = true
+        try await Task.sleep(nanoseconds: 40_000_000)
+        precondition(searchCommands.snapshot.isLoginPresented && searchPublications == 2)
+        owner.pikpak.isLoginPresented = false
+        try await Task.sleep(nanoseconds: 40_000_000)
+        precondition(!searchCommands.snapshot.isLoginPresented && searchPublications == 3,
+            "Search validation must follow drive and login changes after unrelated updates are removed")
         owner.pikpak.fileSimilarity.presentDrive("pikpak")
         let scan = owner.pikpak.fileSimilarity.presentedWindow!
         scan.orderOut(nil); focus(scan)
         precondition(manager.searchDrive == .pikpak)
+        try await Task.sleep(nanoseconds: 40_000_000)
+        precondition(searchCommands.snapshot.drive == .pikpak)
+        focus(browser)
+        try await Task.sleep(nanoseconds: 40_000_000)
+        precondition(searchCommands.snapshot.drive == .local,
+            "Search validation must follow browser/scan focus changes within the same hub")
+        focus(scan)
         browser.close()
         precondition(manager.workspaceCount == 0 && manager.tearDownCountForTesting == 0,
                      "An auxiliary scan keeps only its owning workspace alive")
@@ -261,19 +357,17 @@ import Foundation
                      "Scan Search must restore the scan owner's browser, preserving the other window")
         owner.pikpak.fileSearch.close()
         owner.open(.local); focus(restored)
-        var nativeTarget: CloudDriveHub?
-        let observer = NotificationCenter.default.addObserver(forName: .init("MyCloudDriverFind"), object: nil, queue: .main) { note in
-            MainActor.assumeIsolated { nativeTarget = note.object as? CloudDriveHub }
-        }
-        defer { NotificationCenter.default.removeObserver(observer) }
         manager.presentSearch(scope: .root)
-        precondition(!owner.pikpak.fileSearch.isPresented && nativeTarget == nil)
+        precondition(owner.local.fileSearch.isPresented && owner.local.fileSearch.scope == .root
+                     && !owner.pikpak.fileSearch.isPresented && !secondHub.local.fileSearch.isPresented,
+                     "Native root Find must open the current owner's search palette")
+        owner.local.fileSearch.close()
         manager.presentSearch(scope: .expanded)
-        try await Task.sleep(nanoseconds: 40_000_000)
-        precondition(nativeTarget === owner && !owner.pikpak.fileSearch.isPresented)
-        nativeTarget = nil; focus(second); manager.presentSearch(scope: .expanded)
-        try await Task.sleep(nanoseconds: 40_000_000)
-        precondition(nativeTarget === secondHub, "Native Find also follows the focused workspace")
+        precondition(owner.local.fileSearch.isPresented && owner.local.fileSearch.scope == .expanded
+                     && !owner.pikpak.fileSearch.isPresented && !secondHub.local.fileSearch.isPresented)
+        focus(second); manager.presentSearch(scope: .expanded)
+        precondition(secondHub.local.fileSearch.isPresented && secondHub.local.fileSearch.scope == .expanded
+                     && owner.local.fileSearch.isPresented, "Native Find also follows the focused workspace")
         owner.pikpak.fileSimilarity.close()
         closeNotification(restored)
         precondition(manager.workspaceCount == 1 && manager.tearDownCountForTesting == 1)

@@ -82,10 +82,11 @@ private final class FileProvider: NativeCloudDrive, @unchecked Sendable {
 
     static func bufferTests() {
         let gib: UInt64 = 1 << 30
-        precondition(MemoryRangeBuffer.automaticBudget(physicalMemory: 32 * gib) == Int64(gib), "Capped at 1 GiB")
-        precondition(MemoryRangeBuffer.automaticBudget(physicalMemory: 8 * gib) == Int64(gib / 2), "One sixteenth of RAM")
-        precondition(MemoryRangeBuffer.automaticBudget(physicalMemory: gib) == 64 << 20, "Never below 64 MiB")
-        print("PASS automatic budget is one sixteenth of RAM, between 64 MiB and 1 GiB")
+        for installed in [gib, 8 * gib, 16 * gib, 32 * gib, 64 * gib] {
+            precondition(MemoryRangeBuffer.automaticBudget(physicalMemory: installed) == Int64(installed),
+                "Automatic uses installed RAM as its ceiling")
+        }
+        print("PASS automatic budget follows installed RAM, including 16 GiB and 64 GiB Macs")
 
         // Three blocks, the last one partial.
         let buffer = MemoryRangeBuffer(contentLength: 10_340, budgetBytes: 3 * 4_096, blockSize: 4_096)
@@ -145,9 +146,11 @@ private final class FileProvider: NativeCloudDrive, @unchecked Sendable {
         activity.record(bytes: 1_000, at: 10.5)
         precondition(activity.isReading && abs(activity.bytesPerSecond(at: 10.5) - 2_000) < 0.001)
         activity.record(bytes: 2_000, at: 11.2)
-        precondition(activity.bytesRead == 3_000 && abs(activity.bytesPerSecond(at: 11.2) - 3_000) < 0.001)
-        precondition(abs(activity.bytesPerSecond(at: 11.6) - 2_000) < 0.001, "Old bytes age out of the one-second rate")
-        precondition(activity.bytesPerSecond(at: 12.3) == 0 && activity.isReading, "A stalled read stays active but its speed falls to zero")
+        precondition(activity.bytesRead == 3_000 && abs(activity.bytesPerSecond(at: 11.2) - 2_500) < 0.001)
+        precondition(abs(activity.bytesPerSecond(at: 11.6) - 1_875) < 0.001, "Startup averages use elapsed time until five seconds")
+        precondition(abs(activity.bytesPerSecond(at: 15) - 600) < 0.001, "Short gaps between reads stay in the five-second average")
+        precondition(abs(activity.bytesPerSecond(at: 15.5) - 400) < 0.001, "Only bytes within the rolling window count")
+        precondition(activity.bytesPerSecond(at: 16.2) == 0 && activity.isReading, "A genuine five-second stall settles to zero")
         activity.end()
         precondition(activity.bytesPerSecond(at: 12.3) == 0 && !activity.isReading)
         activity.begin(at: 20)
@@ -156,7 +159,7 @@ private final class FileProvider: NativeCloudDrive, @unchecked Sendable {
         precondition(activity.bytesRead == 4_000 && abs(activity.bytesPerSecond(at: 20.25) - 4_000) < 0.001,
                      "Rereads count even if the retained RAM window stays the same size")
         activity.end()
-        print("PASS real read throughput counts rereads, ages out during a stall and resets on idle/resume")
+        print("PASS five-second download average: burst gaps, rolling expiry, real rereads and idle/resume")
     }
 
     static func loaderTests(in directory: URL) async throws {
@@ -332,18 +335,18 @@ private final class FileProvider: NativeCloudDrive, @unchecked Sendable {
         precondition(share.bufferStatus == nil && share.bufferSource == nil, "A pending status update cannot restore a cleared preview")
         print("PASS a network share plays through the RAM loader, shows RAM ranges on the seek bar and frees them on clear")
 
-        // Internal disk and everything else are untouched: the original is played directly.
+        // Internal disks share the RAM limit with external disks and network shares.
         let internalModel = NativeMediaPreviewModel(settings: MediaPlaybackSettings(defaults: defaults))
         internalModel.bufferedVolume = { _ in nil }
         internalModel.prepare(item, provider: provider)
         await wait("internal preview ready") { internalModel.ready }
         let direct = internalModel.playback.player?.currentItem?.asset as? AVURLAsset
-        precondition(direct?.url == movie && internalModel.memoryLoader == nil && internalModel.playback.memoryBuffer == nil,
-                     "A file on the Mac's own disk plays directly")
-        precondition(internalModel.bufferStatus == nil && internalModel.bufferSource == nil)
+        precondition(direct?.url.scheme == FilePreviewResourceLoader.scheme && internalModel.memoryLoader != nil,
+                     "A file on the Mac's own disk shares the RAM loader")
+        precondition(internalModel.bufferStatus != nil && internalModel.memorySource == .cloud(.local))
         precondition(internalModel.sourceBufferStatus == nil, "The internal disk has no fallback buffering panel either")
         internalModel.clear()
-        print("PASS a file on an internal volume still plays directly")
+        print("PASS an internal volume shares the preview RAM limit")
 
         let legacy = directory.appendingPathComponent("Legacy.avi")
         try ffmpeg(["-f", "lavfi", "-i", "testsrc2=size=160x120:rate=12", "-t", "2", "-c:v", "mpeg4", "-threads", "2", legacy.path])
@@ -352,10 +355,10 @@ private final class FileProvider: NativeCloudDrive, @unchecked Sendable {
         compatible.bufferedVolume = { _ in .externalDisk }
         compatible.prepare(legacyItem, provider: provider)
         await wait("compatible external preview") { compatible.ready || compatible.failure != nil }
-        precondition(compatible.ready && compatible.preparation != nil && compatible.memoryLoader == nil)
+        precondition(compatible.ready && compatible.preparation != nil && compatible.memoryLoader != nil)
         precondition(compatible.sourceBufferStatus?.source == .volume(.externalDisk)
             && compatible.sourceBufferStatus?.phase == .available && compatible.sourceBufferStatus?.fraction == 1,
-            "A compatible copy keeps the external disk's buffering panel even when it no longer uses the RAM loader")
+            "A compatible copy keeps its source panel and shares the RAM loader")
         compatible.clear()
         precondition(compatible.sourceBufferStatus == nil)
         print("PASS compatible external video copies retain the buffering panel and clear it on close")
@@ -368,11 +371,12 @@ private final class FileProvider: NativeCloudDrive, @unchecked Sendable {
         await wait("first preview ready") { switching.ready }
         let first = switching.memoryLoader
         switching.prepare(second, provider: provider)
-        precondition(first?.snapshot.cachedBytes == 0, "Selecting another file invalidates the previous loader and releases its RAM")
+        precondition((first?.snapshot.cachedBytes ?? 0) > 0, "Selecting another file keeps the previous RAM buffer for two seconds")
         await wait("second preview ready") { switching.ready && switching.memoryLoader !== first }
         await wait("second preview status") { switching.bufferStatus?.cache.cachedBytes == length }
+        await wait("previous file expires after two seconds") { first?.snapshot.cachedBytes == 0 }
         switching.clear()
-        print("PASS selecting another file releases the previous file's RAM")
+        print("PASS selecting another file releases previous RAM after the grace period")
 
         // The seek bar maps byte ranges onto the track, whatever the player has loaded itself.
         let playback = MediaPlaybackController(settings: MediaPlaybackSettings(defaults: defaults))

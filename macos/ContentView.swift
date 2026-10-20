@@ -572,7 +572,6 @@ struct ContentView: View {
         .tint(FinderAppearance.accent)
         .accentColor(FinderAppearance.accent)
         .buttonStyle(FinderButtonStyle())
-        .focusedSceneValue(\.finderWindowActions, finderWindowActions)
         .background(FinderWindowActionRegistration(actions: finderWindowActions))
         .task(id: "\(selectedTab):\(model.isRunning):\(model.isBrowsingSharedLink)") {
             // A drive switch preserves the chosen tab even while PikPak's
@@ -1761,7 +1760,7 @@ struct ContentView: View {
                 .accessibilityHint(
                     model.showsSharedLinkOverview
                         ? "Each link shows its files and folders. Use folder disclosure buttons to expand or collapse, or double-click a folder to open it."
-                        : "Use Up and Down to select rows, Shift with Up or Down to extend the selection, Left and Right to collapse or expand folders, Return to open a folder, Space to Quick Look the selected file, and Command Delete to move selected items to Trash."
+                        : "Use Up and Down to select rows, Shift with Up or Down to extend the selection, Left and Right to collapse or expand folders, Return to open a folder, Space to play or pause a visible media preview or open Quick Look, and Command Delete to move selected items to Trash."
                 )
                 .onChange(of: model.selectedBrowserItemID) { _ in
                     model.browserSelectionChanged()
@@ -2129,7 +2128,7 @@ struct ContentView: View {
                         }
                         .accessibilityLabel("Cloud thumbnails")
                         .accessibilityHint(
-                            "Use the arrow keys to select items, Shift with an arrow to extend the selection, Return to open a folder, Space to Quick Look the selected file, and Command Delete to move selected items to Trash."
+                            "Use the arrow keys to select items, Shift with an arrow to extend the selection, Return to open a folder, Space to play or pause a visible media preview or open Quick Look, and Command Delete to move selected items to Trash."
                         )
                         .onChange(of: model.selectedBrowserItemID) { _ in
                             model.browserSelectionChanged()
@@ -3010,6 +3009,7 @@ struct ContentView: View {
         if let item = model.selectedBrowserItem {
             FinderPreviewPane(resetRevision: finderSettings.layoutResetRevision,
                 mediaPlayback: item.mediaKind == .video || item.mediaKind == .audio ? model.mediaPlayback : nil,
+                isMediaPreview: !item.isFolder && (item.mediaKind == .video || item.mediaKind == .audio),
                 onPreviewMove: { offset in
                     guard canMovePreviewSelection else { return }
                     model.movePreviewSelection(by: offset)
@@ -3071,16 +3071,8 @@ struct ContentView: View {
                 .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
 
             } media: {
-                VStack(spacing: 0) {
-                    previewCanvas(for: item)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    if !item.isFolder, item.mediaKind == .video || item.mediaKind == .audio {
-                        previewStreamingPanel(for: item)
-                            .padding(10)
-                            .background(Color(nsColor: .controlBackgroundColor))
-                            .overlay(alignment: .top) { Divider() }
-                    }
-                }
+                previewCanvas(for: item)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } details: {
                 VStack(alignment: .leading, spacing: 10) {
                     if !item.isFolder,
@@ -3327,88 +3319,44 @@ struct ContentView: View {
         }
     }
 
-    private func previewStreamingPanel(for item: BrowserItem) -> some View {
+    private func previewTransfer(for item: BrowserItem) -> MediaPreviewTransferState {
         let matches = model.previewFileID == item.id
-        let state = matches ? model.previewStreamingState : .preparing
         let preparation = matches ? model.previewPreparationProgress : nil
-        let usesCache = matches && model.previewUsesRetainedCache
         let fraction = preparation != nil ? preparation?.fraction : matches ? model.previewBufferedFraction : nil
-        let isComplete = usesCache && fraction == 1 && state != .failed
-        let totalBytes = usesCache && model.previewRetainedTotalBytes > 0 ? model.previewRetainedTotalBytes : item.size
-        let transferring = preparation?.activity == .transferring
-        let provider = model.isBrowsingSharedLink ? "Link" : "PikPak"
-        let sourceName = matches && preparation == nil
-            ? model.previewSourceLabel?.components(separatedBy: " • ").first : nil
-        var summary = MediaPreviewBufferSummary(
-            title: preparation.map { $0.activity == .transferring ? "Downloading preview" : "Preparing preview" }
-                ?? (isComplete ? "Fully buffered" : state.title),
-            symbol: preparation != nil ? (transferring ? "arrow.down.circle" : "gearshape.2")
-                : isComplete ? "checkmark.circle.fill" : state.systemImage,
-            color: isComplete ? .green : matches ? previewStreamingStateColor : .orange,
-            source: [provider, sourceName].compactMap { $0 }.joined(separator: " · "),
-            sourceDetails: matches ? model.previewSourceLabel : nil,
-            fraction: fraction,
-            showsProgress: state != .failed && state != .compatibility
-        )
-        if summary.showsProgress {
-            let speed = preparation != nil ? model.previewPreparationBytesPerSecond
-                : matches ? model.previewTransferBytesPerSecond : 0
-            if (preparation == nil || transferring), !isComplete, let speed, speed.isFinite {
-                summary.speed = speed > 0 ? formatByteRate(speed) : "0 B/s"
-            }
-            if let preparation {
-                if transferring {
-                    summary.amount = formatBytes(preparation.bytes)
-                    summary.amountSuffix = preparation.fileSize > 0
-                        ? "of \(formatBytes(preparation.fileSize)) downloaded" : "downloaded"
-                } else {
-                    summary.footnote = preparation.message
-                }
-            } else if usesCache {
-                summary.amount = formatBytes(model.previewRetainedBytes)
-                summary.amountSuffix = totalBytes > 0 && !isComplete ? "of \(formatBytes(totalBytes)) buffered" : "buffered"
-                summary.ranges = model.previewRetainedSegments.map { $0.start..<$0.end }
-                summary.help = isComplete
-                    ? "The whole file is buffered for this preview. Choosing another file clears the buffer."
-                    : "Cyan segments show downloaded parts of this file; gaps are still loading. Buffering continues while paused. Choosing another file clears the buffer."
+        let ranges: [ClosedRange<Double>]? = !matches ? []
+            : preparation != nil ? MediaPreviewTransferState.ranges(fraction: fraction)
+            : model.previewUsesRetainedCache ? model.previewRetainedSegments.map { $0.start...$0.end } : nil
+        return MediaPreviewTransferState(
+            bytesPerSecond: preparation != nil ? model.previewPreparationBytesPerSecond : matches ? model.previewTransferBytesPerSecond : nil,
+            ranges: ranges,
+            preparing: !matches || model.previewPlayer == nil,
+            complete: matches && preparation == nil && model.previewUsesRetainedCache && fraction == 1,
+            waitingForMemory: matches && PreviewMemoryBudget.shared.isUnderPressure && fraction != 1)
+    }
+
+    private func mediaArtwork(for item: BrowserItem) -> some View {
+        RemoteArtwork(url: item.artworkURL, systemName: previewSymbol(for: item), fit: true,
+            proxyURL: model.proxyURL, cache: model.thumbnailCache)
+            .padding(8).frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func cloudMediaPreview(for item: BrowserItem) -> some View {
+        let matches = model.previewFileID == item.id
+        let transfer = previewTransfer(for: item)
+        return VStack(spacing: 0) {
+            if matches && model.previewPlayer != nil {
+                MediaPreviewView(playback: model.mediaPlayback, isAudio: item.mediaKind == .audio,
+                    transfer: transfer, placeholder: AnyView(mediaArtwork(for: item)),
+                    onVideoFailure: { error, player in model.reportVideoPreviewFailure(error, fileID: item.id, player: player) })
             } else {
-                if matches && model.previewBufferedSeconds > 0 {
-                    summary.amount = formatMediaTime(model.previewBufferedSeconds)
-                    summary.amountSuffix = "ready to play"
-                } else if totalBytes > 0 {
-                    summary.amount = formatBytes(totalBytes)
-                    summary.amountSuffix = "file size"
+                mediaArtwork(for: item)
+                if matches, let error = model.previewPlaybackError {
+                    previewFailureSection(for: item, message: error).padding(10)
+                } else if matches && model.previewRequiresCompatibilityPlayer {
+                    Button("Open in \(model.previewCompatibilityPlayerName ?? "IINA")") { model.openCompatibilityPreview() }
+                        .disabled(!model.canOpenCompatibilityPreview).padding(10)
                 }
-                summary.help = "Available media ranges may change when you seek. Buffering continues while paused."
-                if matches && model.previewStreamedBytes > 0 {
-                    summary.help = "\(formatBytes(model.previewStreamedBytes)) received. " + (summary.help ?? "")
-                }
-            }
-            if preparation == nil && state == .paused && !isComplete {
-                summary.footnote = "Buffering continues while paused."
-            }
-        } else {
-            summary.fraction = nil
-        }
-        return MediaPreviewBufferDetails {
-            MediaPreviewBufferStatusView(summary) {
-                if state == .failed {
-                    Text(model.previewPlaybackError ?? "The preview could not be loaded. Try again or download the file.")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if let diagnostic = model.previewErrorDiagnostic {
-                        DisclosureGroup("Error details") {
-                            ErrorDiagnosticBlock(diagnostic: diagnostic,
-                                summary: model.previewPlaybackError ?? "Preview unavailable", compact: true)
-                        }.font(.caption2)
-                    }
-                } else if state == .compatibility {
-                    Text(model.previewCompatibilityPlayerName ?? "Compatibility player")
-                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    Text("Open the temporary stream in IINA for legacy AVI codec support.")
-                        .font(.caption2).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                MediaTransportBar(playback: model.mediaPlayback, settings: model.mediaPlayback.settings, transfer: transfer)
             }
         }
     }
@@ -3493,37 +3441,6 @@ struct ContentView: View {
         .accessibilityLabel("Preview error")
     }
 
-    private var previewStreamingStateColor: Color {
-        switch model.previewStreamingState {
-        case .playing: return .blue
-        case .buffering, .preparing: return .orange
-        case .finished: return .green
-        case .compatibility: return .blue
-        case .failed: return .red
-        case .idle, .ready, .paused: return .secondary
-        }
-    }
-
-    private func formatMediaTime(_ interval: TimeInterval) -> String {
-        guard interval.isFinite, interval >= 0 else { return "0:00" }
-        let seconds = SafeDisplayNumber.integer(interval)
-        if seconds >= 3_600 {
-            return String(
-                format: "%d:%02d:%02d",
-                seconds / 3_600,
-                (seconds % 3_600) / 60,
-                seconds % 60
-            )
-        }
-        return String(format: "%d:%02d", seconds / 60, seconds % 60)
-    }
-
-    private func formatByteRate(_ bytesPerSecond: Double) -> String {
-        guard bytesPerSecond.isFinite, bytesPerSecond > 0 else { return "—" }
-        let bounded = SafeDisplayNumber.bytes(bytesPerSecond)
-        return "\(formatBytes(bounded))/s"
-    }
-
     private func folderContentsSummary(_ measurement: FolderMeasurement) -> String {
         let files = measurement.fileCount
         let folders = measurement.folderCount
@@ -3534,146 +3451,91 @@ struct ContentView: View {
 
     @ViewBuilder
     private func previewCanvas(for item: BrowserItem) -> some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [Color.blue.opacity(0.07), Color.secondary.opacity(0.045)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
+        if !item.isFolder && (item.mediaKind == .video || item.mediaKind == .audio) {
+            cloudMediaPreview(for: item)
+        } else {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.blue.opacity(0.07), Color.secondary.opacity(0.045)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
                     )
-                )
 
-            if item.isFolder {
-                Image(systemName: "folder.fill")
-                    .resizable()
-                    .scaledToFit()
-                    .foregroundStyle(.blue)
-                    .padding(70)
-            } else if item.mediaKind == .image {
-                // Keep the same presentation mounted before/during/after the
-                // API resolves the full image. A new AsyncImage here used to
-                // discard the thumbnail and flash its empty phase a second time.
-                let generation = model.imagePreviewRequestGeneration
-                ImagePreviewSurface(
-                    model: model.imagePreview,
-                    request: ImagePreviewRequest(
-                        fileID: item.id,
-                        thumbnailURL: item.artworkURL,
-                        contentURL: model.previewFileID == item.id ? model.previewInfo?.contentURL : nil,
-                        generation: generation,
-                        proxyURL: model.proxyURL
-                    ),
-                    onFailure: { error in
-                        model.reportImagePreviewFailure(error, fileID: item.id, generation: generation)
-                    }
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-                .padding(8)
-            } else if model.previewFileID == item.id,
-                      model.previewPlaybackError != nil {
-                RemoteArtwork(
-                    url: item.artworkURL,
-                    systemName: previewSymbol(for: item),
-                    fit: true,
-                    proxyURL: model.proxyURL,
-                    cache: model.thumbnailCache
-                )
-                .padding(8)
-            } else if item.isTextPreviewable,
-                      model.previewFileID == item.id,
-                      let text = model.previewText {
-                SelectableTextPreview(text: text)
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .padding(8)
-            } else if item.mediaKind == .video || item.mediaKind == .audio,
-                      model.previewFileID == item.id,
-                      model.previewPlayer != nil {
-                MediaPreviewView(playback: model.mediaPlayback, isAudio: item.mediaKind == .audio,
-                    onVideoFailure: { error, player in
-                        model.reportVideoPreviewFailure(error, fileID: item.id, player: player)
-                    })
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-            } else {
-                RemoteArtwork(
-                    url: item.artworkURL,
-                    systemName: previewSymbol(for: item),
-                    fit: true,
-                    proxyURL: model.proxyURL,
-                    cache: model.thumbnailCache
-                )
-                .padding(8)
-            }
-
-            if !item.isFolder,
-               (item.mediaKind == .video || item.mediaKind == .audio),
-               model.previewFileID == item.id,
-               model.isPreviewLoading, model.previewPlayer == nil {
-                let preparation = model.previewPreparationProgress
-                let fraction = preparation != nil ? preparation?.fraction : model.previewBufferedFraction
-                MediaPreviewLoadingStatusView(isAudio: item.mediaKind == .audio, message: model.previewSourceLabel,
-                    fraction: fraction,
-                        bytesPerSecond: preparation != nil ? model.previewPreparationBytesPerSecond : model.previewTransferBytesPerSecond,
-                        receivedBytes: preparation.flatMap { $0.activity == .transferring ? $0.bytes : nil }
-                            ?? (preparation == nil ? model.previewStreamedBytes : nil),
-                        totalBytes: preparation.flatMap { $0.fileSize > 0 ? $0.fileSize : nil }
-                            ?? (preparation == nil && item.size > 0 ? item.size : nil))
-                .allowsHitTesting(false)
-            }
-
-            if !item.isFolder,
-               item.isTextPreviewable,
-               model.previewFileID == item.id,
-               model.isPreviewLoading {
-                VStack(spacing: 10) {
-                    ProgressView()
-                        .controlSize(.large)
-                    Text("Loading selectable text preview…")
-                        .font(.callout.weight(.semibold))
-                }
-                .padding(.horizontal, 22)
-                .padding(.vertical, 18)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-                .shadow(color: .black.opacity(0.12), radius: 10, y: 4)
-                .allowsHitTesting(false)
-            }
-
-            if !item.isFolder,
-               model.previewFileID == item.id,
-               model.previewRequiresCompatibilityPlayer {
-                VStack(spacing: 10) {
-                    Image(systemName: "play.rectangle.on.rectangle")
-                        .font(.title2)
+                if item.isFolder {
+                    Image(systemName: "folder.fill")
+                        .resizable()
+                        .scaledToFit()
                         .foregroundStyle(.blue)
-                    Text("AVI compatibility preview")
-                        .font(.headline)
-                    Text(
-                        "This AVI uses a legacy codec that macOS AVPlayer cannot decode. Open its temporary cloud stream in \(model.previewCompatibilityPlayerName ?? "IINA")."
+                        .padding(70)
+                } else if item.mediaKind == .image {
+                    // Keep the same presentation mounted before/during/after the
+                    // API resolves the full image. A new AsyncImage here used to
+                    // discard the thumbnail and flash its empty phase a second time.
+                    let generation = model.imagePreviewRequestGeneration
+                    ImagePreviewSurface(
+                        model: model.imagePreview,
+                        request: ImagePreviewRequest(
+                            fileID: item.id,
+                            thumbnailURL: item.artworkURL,
+                            contentURL: model.previewFileID == item.id ? model.previewInfo?.contentURL : nil,
+                            generation: generation,
+                            proxyURL: model.proxyURL
+                        ),
+                        onFailure: { error in
+                            model.reportImagePreviewFailure(error, fileID: item.id, generation: generation)
+                        }
                     )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 310)
-                    HStack(spacing: 8) {
-                        Button("Open in \(model.previewCompatibilityPlayerName ?? "IINA")") {
-                            model.openCompatibilityPreview()
-                        }
-                        .buttonStyle(.borderedProminent).pointingHandCursor()
-                        .disabled(!model.canOpenCompatibilityPreview)
-
-                        Button(model.isPreparingQuickLook ? "Preparing Quick Look…" : "Quick Look") {
-                            model.openPreviewInQuickLook()
-                        }
-                        .disabled(!model.canOpenPreviewInQuickLook)
-                    }
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .padding(8)
+                } else if model.previewFileID == item.id,
+                          model.previewPlaybackError != nil {
+                    RemoteArtwork(
+                        url: item.artworkURL,
+                        systemName: previewSymbol(for: item),
+                        fit: true,
+                        proxyURL: model.proxyURL,
+                        cache: model.thumbnailCache
+                    )
+                    .padding(8)
+                } else if item.isTextPreviewable,
+                          model.previewFileID == item.id,
+                          let text = model.previewText {
+                    SelectableTextPreview(text: text)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .padding(8)
+                } else {
+                    RemoteArtwork(
+                        url: item.artworkURL,
+                        systemName: previewSymbol(for: item),
+                        fit: true,
+                        proxyURL: model.proxyURL,
+                        cache: model.thumbnailCache
+                    )
+                    .padding(8)
                 }
-                .padding(.horizontal, 24)
-                .padding(.vertical, 18)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-                .shadow(color: .black.opacity(0.12), radius: 10, y: 4)
+
+                if !item.isFolder,
+                   item.isTextPreviewable,
+                   model.previewFileID == item.id,
+                   model.isPreviewLoading {
+                    VStack(spacing: 10) {
+                        ProgressView()
+                            .controlSize(.large)
+                        Text("Loading selectable text preview…")
+                            .font(.callout.weight(.semibold))
+                    }
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 18)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .shadow(color: .black.opacity(0.12), radius: 10, y: 4)
+                    .allowsHitTesting(false)
+                }
             }
+            .shadow(color: .black.opacity(0.055), radius: 8, y: 3)
         }
-        .shadow(color: .black.opacity(0.055), radius: 8, y: 3)
     }
 
     private var downloader: some View {

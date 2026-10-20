@@ -36,6 +36,9 @@ pub(super) struct VerifiedCompletion {
     hash: integrity::Prefix,
     file_id: String,
     revision: Option<String>,
+    /// Only a successful data-before-journal commit in this process can set
+    /// this. Reading an old journal or verifying copied bytes is insufficient.
+    durably_synced: bool,
 }
 
 impl VerifiedCompletion {
@@ -65,6 +68,51 @@ impl VerifiedCompletion {
             hash,
             file_id: file_id.into(),
             revision: revision.map(str::to_owned),
+            durably_synced: false,
+        })
+    }
+
+    async fn from_durable_checkpoint(
+        path: &Path,
+        part: &Path,
+        mut saved: ResumeState,
+        hash: integrity::Prefix,
+        control_id: &str,
+    ) -> Result<Self, DlError> {
+        crate::download_fs::validate(part)
+            .map_err(|error| fatal(error, "Download staging path changed"))?;
+        let file = crate::download_fs::open_async(path, rustix::fs::OFlags::RDONLY)
+            .await.map_err(|error| fatal(error, "Cannot retain verified download"))?;
+        let metadata = file.metadata().await
+            .map_err(|error| fatal(error, "Cannot inspect verified download"))?;
+        crate::download_fs::validate_open_file_async(path, &metadata).await
+            .map_err(|error| fatal(error, "Download staging file changed"))?;
+        hash.validate_restored(&metadata)?;
+        if saved.total == 0 || saved.durable_bytes != Some(saved.total)
+            || hash.bytes != saved.total || metadata.len() != saved.total
+        {
+            return Err(DlError::Fatal(anyhow::anyhow!("Verified checkpoint changed size")));
+        }
+        saved.prefix_sha256 = Some(hash.digest());
+        let journal = serde_json::to_vec(&saved)
+            .map_err(|error| fatal(error, "Cannot save verified download checkpoint"))?;
+        let gate = crate::download_verification::WriteGate::new(&file, control_id);
+        // The read guard has already ended. Finalizers can therefore share
+        // the normal bounded checkpoint write turn without holding a reader.
+        crate::download_checkpoint::commit(
+            &gate, &file, metadata, path, &state_path(part), journal,
+        ).await.map_err(DlError::Fatal)?;
+        let metadata = file.metadata().await
+            .map_err(|error| fatal(error, "Cannot inspect saved download"))?;
+        crate::download_fs::validate_open_file_async(path, &metadata).await
+            .map_err(|error| fatal(error, "Download staging file changed"))?;
+        hash.validate_restored(&metadata)?;
+        Ok(Self {
+            file: file.into_std().await,
+            hash,
+            file_id: saved.file_id,
+            revision: saved.source_revision,
+            durably_synced: true,
         })
     }
 
@@ -112,6 +160,10 @@ impl VerifiedCompletion {
         self.hash
             .validate_restored(metadata)
             .map_err(DlError::into_inner)
+    }
+
+    pub(super) fn durably_synced(&self) -> bool {
+        self.durably_synced
     }
 }
 
@@ -1987,6 +2039,7 @@ pub(super) async fn attempt_for_publication(
     progress: DownloadProgressContext<'_>,
     referer: Option<&str>,
 ) -> Result<Option<VerifiedCompletion>, DlError> {
+    progress.retry_state.set_final_verification_pending(false);
     match parts::attempt_outcome(http, link, total, part, show_progress, &progress, referer).await? {
         parts::Outcome::Complete(verified) => {
             progress.retry_state.clear(); return Ok(Some(verified));
@@ -1995,6 +2048,13 @@ pub(super) async fn attempt_for_publication(
     }
     let mut existing = partial_length(part).await?;
     let mut checkpoint = ResumeState::load(part, progress.source_file_id, total).map_err(DlError::Fatal)?;
+    if existing == total && total > 0 && checkpoint.as_ref().is_some_and(|saved| {
+        saved.durable_bytes == Some(total) && saved.prefix_sha256.is_some()
+            && pikpak::content_mode::matching_content_revision(
+                saved.source_revision.as_deref(), progress.source_revision.as_deref())
+    }) {
+        progress.retry_state.set_final_verification_pending(true);
+    }
     // A bound checkpoint supplies speculative HTTP coordinates. Its checksum
     // still has to pass before accepting those coordinates as disk coverage.
     let mut prefetch_permit = checkpoint.as_ref().filter(|saved| {
@@ -2032,6 +2092,7 @@ pub(super) async fn attempt_for_publication(
         .await
         .map(Some);
     }
+    progress.retry_state.set_final_verification_pending(false);
     crate::download_verification::ready_to_receive(progress.file_id).await.map_err(DlError::Fatal)?;
     let network = pikpak::download_network::Network::for_url(link);
     let _participant = network.register();

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 #[path = "download_checkpoint_batch.rs"]
 mod batch;
-pub(crate) use batch::{commit, snapshot};
+pub(crate) use batch::{commit, commit_guarded, snapshot};
 
 #[cfg(test)]
 #[path = "download_checkpoint_tests.rs"]

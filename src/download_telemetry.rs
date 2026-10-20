@@ -7,13 +7,15 @@ use std::{
 use serde::Serialize;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
-static ACTIVE: [AtomicU64; 28] = [const { AtomicU64::new(0) }; 28];
+const KIND_COUNT: usize = 32;
+static ACTIVE: [AtomicU64; KIND_COUNT] = [const { AtomicU64::new(0) }; KIND_COUNT];
 
 #[derive(Clone, Copy)]
 pub(crate) enum Kind { ResumeRead, FinalRead, Checkpoint, CacheHit, CacheMiss, CheckpointWait, CheckpointSync, PayloadWrite,
     ReadPreparation, ReadQueueWait, ReadGateWait, ReadTurnWait, ReadIo, ReadHash, SchedulerPass, ReplayRead,
     ResumeNew, ResumeMissing, ResumeUnverified, ResumeLength, ResumeRevision, ResumeSource, ResumeValidator,
-    ResumeRange, ResumeAccepted, ResumeFull, ResumePromoted, ResumeTail }
+    ResumeRange, ResumeAccepted, ResumeFull, ResumePromoted, ResumeTail,
+    PublicationPayloadSync, PublicationPendingReceipt, PublicationMove, PublicationCommittedReceipt }
 impl Kind {
     fn index(self) -> usize { self as usize }
     fn name(self) -> &'static str {
@@ -32,15 +34,20 @@ impl Kind {
             Self::ResumeValidator => "resume_plan_validator", Self::ResumeRange => "resume_plan_range",
             Self::ResumeAccepted => "resume_plan_accepted", Self::ResumeFull => "resume_plan_full",
             Self::ResumePromoted => "resume_plan_promoted", Self::ResumeTail => "resume_plan_tail",
+            Self::PublicationPayloadSync => "publication_payload_sync",
+            Self::PublicationPendingReceipt => "publication_pending_receipt",
+            Self::PublicationMove => "publication_move",
+            Self::PublicationCommittedReceipt => "publication_committed_receipt",
         }
     }
 }
-const KINDS: [Kind; 28] = [Kind::ResumeRead, Kind::FinalRead, Kind::Checkpoint, Kind::CacheHit, Kind::CacheMiss,
+const KINDS: [Kind; KIND_COUNT] = [Kind::ResumeRead, Kind::FinalRead, Kind::Checkpoint, Kind::CacheHit, Kind::CacheMiss,
     Kind::CheckpointWait, Kind::CheckpointSync, Kind::PayloadWrite, Kind::ReadPreparation, Kind::ReadQueueWait,
     Kind::ReadGateWait, Kind::ReadTurnWait, Kind::ReadIo, Kind::ReadHash, Kind::SchedulerPass, Kind::ReplayRead,
     Kind::ResumeNew, Kind::ResumeMissing, Kind::ResumeUnverified, Kind::ResumeLength, Kind::ResumeRevision,
     Kind::ResumeSource, Kind::ResumeValidator, Kind::ResumeRange, Kind::ResumeAccepted, Kind::ResumeFull,
-    Kind::ResumePromoted, Kind::ResumeTail];
+    Kind::ResumePromoted, Kind::ResumeTail, Kind::PublicationPayloadSync, Kind::PublicationPendingReceipt,
+    Kind::PublicationMove, Kind::PublicationCommittedReceipt];
 
 #[derive(Default, Serialize)]
 struct Metric {
@@ -54,7 +61,7 @@ struct Metric {
     transfer_id: Option<String>,
 }
 #[derive(Default)]
-struct Stats { metrics: [Metric; 28] }
+struct Stats { metrics: [Metric; KIND_COUNT] }
 impl Stats {
     fn add(&mut self, kind: Kind, id: &str, bytes: u64, elapsed: Duration, failed: bool) {
         let metric = &mut self.metrics[kind.index()];
@@ -272,5 +279,30 @@ mod tests {
         assert_eq!(summary["scheduler_pass"].elapsed_ms, 89);
         assert_eq!(summary["read_queue_wait"].max_ms, 400_000);
         assert!(summary.values().all(|metric| metric.transfer_id.is_none()));
+    }
+    #[test]
+    fn publication_timings_keep_each_stage_distinct_and_count_unsuccessful_moves() {
+        let mut stats = Stats::default();
+        for (kind, elapsed, failed) in [
+            (Kind::PublicationPayloadSync, 11, false),
+            (Kind::PublicationPendingReceipt, 22, false),
+            (Kind::PublicationMove, 33, true),
+            (Kind::PublicationCommittedReceipt, 44, false),
+        ] {
+            stats.add(kind, "", 0, Duration::from_millis(elapsed), failed);
+        }
+        let summary = stats.drain();
+        assert_eq!(summary.len(), 4);
+        for (name, elapsed) in [
+            ("publication_payload_sync", 11), ("publication_pending_receipt", 22),
+            ("publication_move", 33), ("publication_committed_receipt", 44),
+        ] {
+            assert_eq!(summary[name].count, 1);
+            assert_eq!(summary[name].elapsed_ms, elapsed);
+            assert_eq!(summary[name].failed, u64::from(name == "publication_move"));
+            assert!(summary[name].transfer_id.is_none());
+        }
+        assert!(serde_json::to_vec(&summary).unwrap().len() < 1024);
+        assert!(stats.drain().is_empty());
     }
 }

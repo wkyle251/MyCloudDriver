@@ -16,7 +16,9 @@ struct DownloadBufferDashboard: View {
     private var status: String {
         !isDownloading ? "Idle" : isPaused ? (used > 0 ? "Paused · saving buffer" : "Reception paused") : pressure >= 4 ? "Draining for memory"
             : pressure >= 2 ? "Memory pressure"
-            : used > 0 ? "Receiving ahead of disk" : "Ready to receive"
+            : used > 0 ? "Receiving ahead of disk"
+            : (usage?.traffic?.activeReadTasks ?? 0) > 0 || (usage?.traffic?.finalVerificationTasks ?? 0) > 0
+                ? "Verifying saved downloads" : "Ready to receive"
     }
     private var statusColor: Color { pressure >= 2 ? .orange : isDownloading ? .blue : .secondary }
 

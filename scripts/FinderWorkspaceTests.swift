@@ -50,7 +50,7 @@ struct FinderWorkspaceTests {
         settings.resetLayout()
         precondition(settings.layoutResetRevision == 1 && !settings.autoHideSidebar && settings.showsPreviewPane)
         precondition(defaults.double(forKey: "browserSplitFraction") == 0.64)
-        precondition(defaults.object(forKey: "previewCanvasWidth") == nil && defaults.double(forKey: "previewCanvasHeight") == 440)
+        precondition(defaults.object(forKey: "previewCanvasWidth") == nil && defaults.object(forKey: "previewCanvasHeight") == nil)
         precondition(defaults.double(forKey: "browserNameColumnWidth") == 250 && defaults.bool(forKey: "browserShowsSizeColumn"))
         precondition(defaults.integer(forKey: "browserViewMode") == 0 && defaults.integer(forKey: "linksViewMode") == 0)
         precondition(defaults.double(forKey: "browserListItemZoom") == 1 && defaults.double(forKey: "browserItemZoom") == 0)

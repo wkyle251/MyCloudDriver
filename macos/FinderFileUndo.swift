@@ -100,9 +100,12 @@ struct FinderFileUndoHistory {
     private var monitor: Any?
     private var observers: [NSObjectProtocol] = []
     private let notificationCenter: NotificationCenter
-    private var publicationScheduled = false
+    private lazy var publication = FinderCommandPublication(notificationCenter: notificationCenter) { [weak self] in
+        self?.objectWillChange.send()
+    }
     init(notificationCenter: NotificationCenter = .default) {
         self.notificationCenter = notificationCenter
+        _ = publication
         monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseUp]) { [weak self] event in
             MainActor.assumeIsolated { self?.schedulePublication() }
             return event
@@ -115,16 +118,7 @@ struct FinderFileUndoHistory {
         }
     }
     private func schedulePublication() {
-        guard !publicationScheduled else { return }
-        publicationScheduled = true
-        // Key-window and field-editor notifications can arrive from AppKit
-        // during SwiftUI layout. Read live focus immediately, but invalidate
-        // command views once on the next main turn, outside that update pass.
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.publicationScheduled = false
-            self.objectWillChange.send()
-        }
+        publication.request()
     }
     var editor: NSTextView? {
         guard let text = NSApp.keyWindow?.firstResponder as? NSTextView, text.isEditable else { return nil }

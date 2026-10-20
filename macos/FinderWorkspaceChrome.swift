@@ -156,44 +156,108 @@ struct FinderContentModeSelector: View {
     }
 }
 
+/// Frames stay in files/divider/preview order, regardless of their visual
+/// positions. Moving a pane must not recreate its player or browser scroll view.
+struct FinderBrowserSplitGeometry {
+    static let dividerThickness: CGFloat = 8
+    let placement: FinderPreviewPlacement
+    let contentSize: CGSize
+    let files: CGRect
+    let divider: CGRect
+    let preview: CGRect
+    let available: CGFloat
+    let fileMinimum: CGFloat
+    let previewMinimum: CGFloat
+    let scrolls: Bool
+    var stacked: Bool { placement.layout == .topAndBottom }
+    var fileExtent: CGFloat { stacked ? files.height : files.width }
+    var fileFraction: Double { Double(fileExtent / available) }
+
+    init(viewport: CGSize, placement: FinderPreviewPlacement, fraction: Double) {
+        self.placement = placement
+        let stacked = placement.layout == .topAndBottom
+        let width = viewport.width.isFinite ? max(0, viewport.width) : 0
+        let height = viewport.height.isFinite ? max(0, viewport.height) : 0
+        let extent = stacked ? height : width
+        fileMinimum = stacked ? 180 : FinderWorkspaceLayout.browserMinimumWidth
+        previewMinimum = stacked ? 220 : FinderWorkspaceLayout.previewMinimumWidth
+        let required = fileMinimum + previewMinimum + Self.dividerThickness
+        available = max(extent, required) - Self.dividerThickness
+        scrolls = extent < required
+        let fraction = fraction.isFinite ? min(1, max(0, fraction)) : (stacked ? 0.45 : 0.64)
+        let fileExtent = min(max(available * fraction, fileMinimum), available - previewMinimum)
+        let previewExtent = available - fileExtent
+        let dividerOffset = placement.previewFirst ? previewExtent : fileExtent
+        let fileOffset = placement.previewFirst ? previewExtent + Self.dividerThickness : 0
+        let previewOffset = placement.previewFirst ? 0 : fileExtent + Self.dividerThickness
+        if stacked {
+            contentSize = .init(width: width, height: available + Self.dividerThickness)
+            files = .init(x: 0, y: fileOffset, width: width, height: fileExtent)
+            divider = .init(x: 0, y: dividerOffset, width: width, height: Self.dividerThickness)
+            preview = .init(x: 0, y: previewOffset, width: width, height: previewExtent)
+        } else {
+            contentSize = .init(width: available + Self.dividerThickness, height: height)
+            files = .init(x: fileOffset, y: 0, width: fileExtent, height: height)
+            divider = .init(x: dividerOffset, y: 0, width: Self.dividerThickness, height: height)
+            preview = .init(x: previewOffset, y: 0, width: previewExtent, height: height)
+        }
+    }
+
+    func clampedFileFraction(_ fraction: Double) -> Double {
+        let size = fraction.isFinite ? available * fraction : fileExtent
+        return Double(min(max(size, fileMinimum), available - previewMinimum) / available)
+    }
+    func resizedFileFraction(from start: CGFloat, translation: CGSize) -> Double {
+        let proposed = stacked ? translation.height : translation.width
+        let delta = proposed.isFinite ? proposed : 0
+        return clampedFileFraction(Double(((start.isFinite ? start : fileExtent) +
+            (placement.previewFirst ? -delta : delta)) / available))
+    }
+}
+
+private struct FinderBrowserPaneLayout: Layout {
+    let geometry: FinderBrowserSplitGeometry
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize { geometry.contentSize }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        for (view, frame) in zip(subviews, [geometry.files, geometry.divider, geometry.preview]) {
+            view.place(at: .init(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY), anchor: .topLeading,
+                proposal: .init(width: frame.width, height: frame.height))
+        }
+    }
+}
+
 struct FinderBrowserSplit<Files: View, Preview: View>: View {
     let showsPreview: Bool
     var expanded = false
     var resetRevision = 0
     @ViewBuilder var files: () -> Files
     @ViewBuilder var preview: () -> Preview
-    @AppStorage("finderPreviewPlacement") private var placement = "right"
+    @AppStorage("finderPreviewPlacement") private var savedPlacement = "right"
+    // Keep the existing keys and file-list proportions when changing sides.
     @AppStorage("browserSplitFraction") private var rightFraction = 0.64
     @AppStorage("browserBottomSplitFraction") private var bottomFraction = 0.45
     @State private var dragStart: CGFloat?
     @State private var liveFraction: Double?
-    private var bottom: Bool { placement == "bottom" }
+    private var placement: FinderPreviewPlacement { FinderPreviewPlacement(rawValue: savedPlacement) ?? .right }
+    private var stacked: Bool { placement.layout == .topAndBottom }
     private var savedFraction: Double {
-        get { bottom ? bottomFraction : rightFraction }
-        nonmutating set { if bottom { bottomFraction = newValue } else { rightFraction = newValue } }
+        get { stacked ? bottomFraction : rightFraction }
+        nonmutating set { if stacked { bottomFraction = newValue } else { rightFraction = newValue } }
     }
     var body: some View {
         GeometryReader { viewport in
-            let fileMinimum: CGFloat = bottom ? 180 : FinderWorkspaceLayout.browserMinimumWidth
-            let previewMinimum: CGFloat = bottom ? 220 : FinderWorkspaceLayout.previewMinimumWidth
-            let extent = bottom ? viewport.size.height : viewport.size.width
-            let minimum = fileMinimum + previewMinimum + 8
-            let available = max(extent, minimum) - 8
-            let fraction = liveFraction ?? (savedFraction.isFinite ? savedFraction : (bottom ? 0.45 : 0.64))
-            let fileExtent = min(max(available * fraction, fileMinimum), available - previewMinimum)
-            let layout = bottom ? AnyLayout(VStackLayout(spacing: 0)) : AnyLayout(HStackLayout(spacing: 0))
-            let content = layout {
-                files().frame(width: bottom ? viewport.size.width : fileExtent,
-                              height: bottom ? fileExtent : viewport.size.height)
-                divider(available: available, fileExtent: fileExtent, minimum: fileMinimum, previewMinimum: previewMinimum)
-                preview().frame(width: bottom ? viewport.size.width : available - fileExtent,
-                                height: bottom ? available - fileExtent : viewport.size.height)
+            let geometry = FinderBrowserSplitGeometry(viewport: viewport.size, placement: placement,
+                fraction: liveFraction ?? savedFraction)
+            let content = FinderBrowserPaneLayout(geometry: geometry) {
+                files().frame(width: geometry.files.width, height: geometry.files.height)
+                divider(geometry)
+                preview().frame(width: geometry.preview.width, height: geometry.preview.height)
             }
             Group {
                 if !showsPreview { files() }
                 else if expanded { preview() }
-                else if extent < minimum {
-                    ScrollView(bottom ? .vertical : .horizontal) { content }
+                else if geometry.scrolls {
+                    ScrollView(stacked ? .vertical : .horizontal) { content }
                 } else { content }
             }.frame(width: viewport.size.width, height: viewport.size.height, alignment: .topLeading)
         }.background(Color(nsColor: .controlBackgroundColor))
@@ -201,30 +265,26 @@ struct FinderBrowserSplit<Files: View, Preview: View>: View {
             .overlay { RoundedRectangle(cornerRadius: 14).stroke(Color.primary.opacity(0.09)).allowsHitTesting(false) }
             .shadow(color: .black.opacity(0.055), radius: 12, y: 4)
             .onChange(of: resetRevision) { _ in liveFraction = nil; dragStart = nil }
-            .onChange(of: placement) { _ in liveFraction = nil; dragStart = nil; NSCursor.arrow.set() }
+            .onChange(of: savedPlacement) { _ in liveFraction = nil; dragStart = nil; NSCursor.arrow.set() }
     }
-    private func divider(available: CGFloat, fileExtent: CGFloat, minimum: CGFloat, previewMinimum: CGFloat) -> some View {
+    private func divider(_ geometry: FinderBrowserSplitGeometry) -> some View {
         Color(nsColor: .controlBackgroundColor)
-            .overlay { Rectangle().fill(Color.primary.opacity(0.1)).frame(width: bottom ? nil : 1, height: bottom ? 1 : nil) }
-            .frame(width: bottom ? nil : 8, height: bottom ? 8 : nil).contentShape(Rectangle())
-            .onHover { active in (active ? (bottom ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight) : NSCursor.arrow).set() }
+            .overlay { Rectangle().fill(Color.primary.opacity(0.1)).frame(width: stacked ? nil : 1, height: stacked ? 1 : nil) }
+            .frame(width: geometry.divider.width, height: geometry.divider.height).contentShape(Rectangle())
+            .onHover { active in (active ? (stacked ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight) : NSCursor.arrow).set() }
             .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .global)
                 .onChanged { value in
-                    if dragStart == nil { dragStart = fileExtent }
-                    let delta = bottom ? value.translation.height : value.translation.width
-                    let size = min(max((dragStart ?? fileExtent) + delta, minimum), available - previewMinimum)
-                    liveFraction = Double(size / available)
+                    if dragStart == nil { dragStart = geometry.fileExtent }
+                    liveFraction = geometry.resizedFileFraction(from: dragStart ?? geometry.fileExtent, translation: value.translation)
                 }
                 .onEnded { _ in
                     if let liveFraction { savedFraction = liveFraction }
                     liveFraction = nil; dragStart = nil; NSCursor.arrow.set()
                 })
             .accessibilityElement().accessibilityLabel("Resize file list and preview")
-            .accessibilityValue("File list \(Int((fileExtent / available * 100).rounded())) percent")
+            .accessibilityValue("File list \(Int((geometry.fileFraction * 100).rounded())) percent")
             .accessibilityAdjustableAction { direction in
-                let step = direction == .increment ? 0.05 : -0.05
-                savedFraction = min(max(Double(fileExtent / available) + step, Double(minimum / available)),
-                    Double(1 - previewMinimum / available))
+                savedFraction = geometry.clampedFileFraction(geometry.fileFraction + (direction == .increment ? 0.05 : -0.05))
             }
             .help("Drag to resize the file list and preview. This layout is shared across drives.")
     }

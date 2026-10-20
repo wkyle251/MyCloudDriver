@@ -43,8 +43,8 @@ enum NativeMediaBufferSource: Equatable {
     }
 }
 
-/// Cloud originals and compatible preview copies are made available locally before AVPlayer opens them.
-/// This is availability on this Mac, separate from the external-volume loader's retained RAM ranges.
+/// Provider originals and compatible copies can require local preparation.
+/// This tracks their availability separately from the shared loader's retained RAM ranges.
 struct NativeMediaSourceBufferStatus: Equatable {
     enum Phase: Equatable { case loading, available, failed }
     let source: NativeMediaBufferSource
@@ -64,7 +64,7 @@ struct NativeMediaSourceBufferStatus: Equatable {
     }
 }
 
-/// Download/materialize only the selected media; cancellation never deletes a
+/// Prioritize the selected media, then buffer visible successors; cancellation never deletes a
 /// user's iCloud original, nor a staging directory with a writer still active.
 @MainActor final class NativeMediaPreviewModel: ObservableObject {
     let playback: MediaPlaybackController
@@ -75,6 +75,7 @@ struct NativeMediaSourceBufferStatus: Equatable {
     @Published private(set) var bufferStatus: FilePreviewBufferStatus?
     @Published private(set) var sourceBufferStatus: NativeMediaSourceBufferStatus?
     private(set) var bufferSource: ExternalVolume.Kind?
+    private(set) var memorySource: NativeMediaBufferSource?
     /// A repackaged or converted copy is being made, which can take a while: another player is offered meanwhile.
     @Published private(set) var isPreparingCopy = false
     private var generation = UUID()
@@ -82,21 +83,22 @@ struct NativeMediaSourceBufferStatus: Equatable {
     private var task: Task<Void, Never>?
     private var aviCopy: VideoPreviewCopy?
     private var sourceURL: URL?
+    private var sourceProvider: (any NativeCloudDrive)?
     /// The file being previewed, where it is, once it has been materialized.
     var originalURL: URL? { sourceURL }
     private(set) var itemID: String?
     private(set) var sourceIdentity: NativeMediaSourceIdentity?
-    /// A file on an external disk or a network share is read into RAM and played from there. Tests replace all three settings.
+    /// Volume classification supplies the source label; all media use the same RAM budget.
     var bufferedVolume: @Sendable (URL) -> ExternalVolume.Kind? = { ExternalVolume.bufferedKind($0) }
     var preparationTimeout: TimeInterval = 30
     var materializationTimeout: TimeInterval = 300
     var selectionDelayNanoseconds: UInt64 = 80_000_000
     private var sourceContainer: MediaContainer?
-    var memoryBudget = MemoryRangeBuffer.automaticBudget()
+    var memoryBudget: Int64 = .max
     var memoryBlockSize = 1 << 20
-    /// How far past the playhead RAM is filled once playback starts. Selecting a video reads only its head and tail.
-    var memoryReadAheadBytes: Int64 = 128 << 20
-    private var readAheadObservation: AnyCancellable?
+    var memoryIO = FilePreviewResourceLoader.IO()
+    /// Read-ahead fills the shared RAM allowance, independently of playback.
+    var memoryReadAheadBytes: Int64 = .max
     private(set) var memoryLoader: FilePreviewResourceLoader?
     private var memoryBufferAttached = false
     private var bufferStatusTask: Task<Void, Never>?
@@ -107,18 +109,56 @@ struct NativeMediaSourceBufferStatus: Equatable {
     /// How the playing copy was made when the original could not be played as it is.
     enum Preparation: Equatable { case repackaged, transcoded }
     private(set) var preparation: Preparation?
-    /// A player that has not opened a transport stream within this long is abandoned for a repackaged copy. Tests
-    /// shorten the wait and simulate a stalled player.
+    /// Recover a video reader that remains unopened this long without read progress.
+    /// Slow but advancing sources keep their chance to open.
     var openTimeout: TimeInterval = 8
     var openStatus: (AVPlayer) -> AVPlayerItem.Status = { $0.currentItem?.status ?? .unknown }
     private var openWatchdog: Task<Void, Never>?
+    private struct BufferedFile {
+        let loader: FilePreviewResourceLoader
+        let source: NativeMediaBufferSource
+        let originalURL: URL
+        let directory: NativePreviewDirectory?
+        let container: MediaContainer?
+        let copy: VideoPreviewCopy?
+        let preparation: Preparation?
+    }
+    private let retiredBuffers = PreviewBufferRetention<NativeMediaSourceIdentity, BufferedFile> { $0.loader.invalidate() }
+    var nextItems: (() -> [(CloudDriveItem, any NativeCloudDrive)])?
+    var bufferingContext: (() -> String?)?
+    private var nextBufferIdentity: NativeMediaSourceIdentity?
+    private var nextBuffer: BufferedFile?
+    private var nextBufferTask: Task<Void, Never>?
+    private var queuedBuffers: [NativeMediaSourceIdentity: BufferedFile] = [:]
+    private var nextBufferOrder: [NativeMediaSourceIdentity] = []
+    private var nextBufferOwner: NativeMediaSourceIdentity?
+    private var nextBufferContext: String?
+    private var failedNextBuffers = Set<NativeMediaSourceIdentity>()
+    private var nextBufferRequest = UUID()
+    private var pendingBufferedFile: (NativeMediaSourceIdentity, BufferedFile)?
+    #if FINDER_WORKSPACE_TESTS
+    var prefetchedItemID: String? { nextBufferOrder.first(where: { queuedBuffers[$0] != nil || nextBufferIdentity == $0 })?.itemID }
+    var prefetchedLoader: FilePreviewResourceLoader? { nextBufferOrder.compactMap { queuedBuffers[$0]?.loader ?? (nextBufferIdentity == $0 ? nextBuffer?.loader : nil) }.first }
+    var prefetchedLoaders: [String: FilePreviewResourceLoader] {
+        var result = Dictionary(uniqueKeysWithValues: queuedBuffers.map { ($0.key.itemID, $0.value.loader) })
+        if let nextBufferIdentity, let nextBuffer { result[nextBufferIdentity.itemID] = nextBuffer.loader }
+        return result
+    }
+    #endif
     init(settings: MediaPlaybackSettings) { playback = MediaPlaybackController(settings: settings) }
 
     func prepare(_ item: CloudDriveItem, provider: any NativeCloudDrive, force: Bool = false) {
         let identity = NativeMediaSourceIdentity(item: item, kind: provider.kind, rootID: provider.root.id)
         guard identity != sourceIdentity || force else { return }
-        clear()
+        let retained: BufferedFile?
+        if !force, nextBufferIdentity == identity {
+            retained = nextBuffer; nextBuffer = nil; stopNextBuffer(retaining: false)
+        } else { retained = force ? nil : queuedBuffers.removeValue(forKey: identity) ?? retiredBuffers.take(identity) }
+        clear(preservingRAM: true, keeping: identity)
+        if force { retiredBuffers.remove(identity) }
         itemID = item.id; sourceIdentity = identity
+        sourceProvider = provider
+        if let retained { pendingBufferedFile = (identity, retained) }
         if provider.kind != .local, !item.isFolder, item.mediaType == "video" || item.mediaType == "audio" {
             sourceBufferStatus = .init(source: .cloud(provider.kind), totalBytes: item.bytes, message: "Preparing preview…")
         }
@@ -128,7 +168,8 @@ struct NativeMediaSourceBufferStatus: Equatable {
             // player is hidden immediately, and cancellation never waits for IO.
             do { if delay > 0 { try await Task.sleep(nanoseconds: delay) } }
             catch { return }
-            await self?.load(item, provider: provider, request: request)
+            if let retained { await self?.loadBuffered(retained, item: item, provider: provider, request: request) }
+            else { await self?.load(item, provider: provider, request: request) }
         }
     }
     func matches(_ item: CloudDriveItem, provider: any NativeCloudDrive) -> Bool {
@@ -197,13 +238,11 @@ struct NativeMediaSourceBufferStatus: Equatable {
             sourceURL = url
             ownedDirectory = directory
             let named = aviCopy == nil ? container.flatMap { $0.matches(fileExtension: url.pathExtension) ? nil : $0 } : nil
-            if aviCopy == nil, let player = try await bufferedPlayer(for: item, provider: provider, url: playableURL, container: named, volume: volume, request: request) {
+            if let player = try await bufferedPlayer(for: item, provider: provider, url: playableURL, container: named, volume: volume, request: request) {
                 playback.attach(player); memoryBufferAttached = true
                 if let loader = memoryLoader {
                     playback.updateMemoryBuffer(loader.snapshot)
-                    // Reading beyond what the player asks for follows playback, so flicking through a folder of
-                    // videos does not read each of them ahead.
-                    readAheadObservation = playback.$wantsPlayback.removeDuplicates().sink { [weak loader] wants in loader?.setReadingAhead(wants) }
+                    loader.setReadingAhead(true)
                 }
             } else {
                 let player = try await NativeFileWork.run(timeout: timeout, priority: .high) {
@@ -216,8 +255,9 @@ struct NativeMediaSourceBufferStatus: Equatable {
             }
             finishSourceProgress(availableURL: playableURL, availableBytes: availableBytes)
             ready = true
-            // Apple's transport-stream reader can stall on a damaged stream without ever failing.
-            if aviCopy == nil, container == .mpegTransportStream || named != nil, let player = playback.player {
+            // A damaged index or unsupported reader can stay unknown indefinitely,
+            // even when most of a file is in RAM.
+            if aviCopy == nil, item.mediaType == "video", let player = playback.player {
                 watchOpening(player, item: item, request: request)
             }
         } catch {
@@ -228,24 +268,30 @@ struct NativeMediaSourceBufferStatus: Equatable {
         }
     }
 
-    /// A player that reads `url` through RAM, or nil when the file is not on an external disk or network share. The
+    /// A player that reads `url` through RAM, or nil for non-media items. The
     /// start and end of the file are read first, with progress, so playback starts from memory instead of waiting on it.
     private func bufferedPlayer(for item: CloudDriveItem, provider: any NativeCloudDrive, url: URL, container: MediaContainer?,
-                                volume: ExternalVolume.Kind?, request: UUID) async throws -> AVPlayer? {
-        guard provider.kind == .local, item.mediaType == "video" || item.mediaType == "audio",
-              let volume else { return nil }
-        let budget = memoryBudget, blockSize = memoryBlockSize, ahead = memoryReadAheadBytes
+                                volume: ExternalVolume.Kind?, request: UUID,
+                                reusing: FilePreviewResourceLoader? = nil) async throws -> AVPlayer? {
+        guard item.mediaType == "video" || item.mediaType == "audio" else { return nil }
+        let budget = memoryBudget, blockSize = memoryBlockSize, ahead = memoryReadAheadBytes, io = memoryIO
         let snapshot: @MainActor (PreviewResourceCacheSnapshot) -> Void = { [weak self] value in
             guard let self, self.generation == request, self.memoryBufferAttached else { return }
             self.playback.updateMemoryBuffer(value)
         }
-        let loader = try await NativeFileWork.run(timeout: preparationTimeout, priority: .high) {
-            try FilePreviewResourceLoader(fileURL: url, contentType: container?.contentType,
-                budgetBytes: budget, blockSize: blockSize, readAheadBytes: ahead, onSnapshot: snapshot)
+        let loader: FilePreviewResourceLoader
+        if let reusing { loader = reusing }
+        else {
+            loader = try await NativeFileWork.run(timeout: preparationTimeout, priority: .high) {
+                try FilePreviewResourceLoader(fileURL: url, contentType: container?.contentType,
+                    budgetBytes: budget, blockSize: blockSize, readAheadBytes: ahead, io: io, onSnapshot: snapshot)
+            }
         }
         guard generation == request, !Task.isCancelled else { loader.invalidate(); throw CancellationError() }
         memoryLoader = loader
+        loader.setCachePriority(1)
         bufferSource = volume
+        memorySource = volume.map(NativeMediaBufferSource.volume) ?? .cloud(provider.kind)
         updateBufferStatus(loader)
         // Keep speed and the idle state current even when the retained ranges do not change (a full RAM window,
         // a slow read, or paused playback). One update per quarter second, only for the selected preview.
@@ -253,13 +299,17 @@ struct NativeMediaSourceBufferStatus: Equatable {
             while !Task.isCancelled {
                 guard let loader, self?.generation == request, self?.memoryLoader === loader else { return }
                 self?.updateBufferStatus(loader)
+                self?.refreshNextBuffer()
                 do { try await Task.sleep(nanoseconds: 250_000_000) }
                 catch { return }
             }
         }
-        message = volume.bufferingMessage; fraction = 0
+        message = volume?.bufferingMessage ?? "Buffering from \(provider.kind.title)…"; fraction = 0
         do {
-            try await loader.prime(noProgressTimeout: preparationTimeout) { [weak self] value in
+            // The player needs the header/index, not a fixed 18 MB admission
+            // window. Fetch one block at each end, then let its range requests
+            // take priority over whole-file read-ahead, even on a slow share.
+            try await loader.prime(headBlocks: 1, tailBlocks: 1, noProgressTimeout: preparationTimeout, invalidateOnCancel: false) { [weak self] value in
                 Task { @MainActor in
                     guard let self, self.generation == request else { return }
                     self.fraction = value
@@ -270,7 +320,7 @@ struct NativeMediaSourceBufferStatus: Equatable {
             guard generation == request else { throw CancellationError() }
             updateBufferStatus(loader)
         } catch {
-            loader.invalidate()
+            if generation == request { loader.invalidate() }
             if memoryLoader === loader {
                 updateBufferStatus(loader)
                 bufferStatusTask?.cancel(); bufferStatusTask = nil
@@ -290,6 +340,133 @@ struct NativeMediaSourceBufferStatus: Equatable {
     private func updateBufferStatus(_ loader: FilePreviewResourceLoader) {
         let status = loader.status
         if bufferStatus != status { bufferStatus = status }
+        if memoryBufferAttached, playback.memoryBuffer != status.cache { playback.updateMemoryBuffer(status.cache) }
+    }
+    private func loadBuffered(_ retained: BufferedFile, item: CloudDriveItem, provider: any NativeCloudDrive, request: UUID) async {
+        guard generation == request, !Task.isCancelled else { retained.loader.invalidate(); return }
+        pendingBufferedFile = nil
+        sourceURL = retained.originalURL; ownedDirectory = retained.directory; sourceContainer = retained.container
+        aviCopy = retained.copy; preparation = retained.preparation
+        let volume: ExternalVolume.Kind?
+        if case .volume(let kind) = retained.source { volume = kind } else { volume = nil }
+        do {
+            if let player = try await bufferedPlayer(for: item, provider: provider, url: retained.originalURL,
+                container: retained.container, volume: volume, request: request, reusing: retained.loader) {
+                try Task.checkCancellation()
+                guard generation == request else { return }
+                playback.attach(player); memoryBufferAttached = true; retained.loader.setReadingAhead(true)
+                finishSourceProgress(availableURL: retained.originalURL,
+                    availableBytes: retained.loader.snapshot.contentLength.map { UInt64(max(0, $0)) })
+                updateBufferStatus(retained.loader); ready = true
+                if item.mediaType == "video" { watchOpening(player, item: item, request: request) }
+            }
+        } catch {
+            if generation == request { retained.loader.invalidate() }
+            guard generation == request, !Task.isCancelled else { return }
+            failure = error.localizedDescription
+        }
+    }
+
+    private func bufferContext(for identity: NativeMediaSourceIdentity) -> String {
+        bufferingContext?() ?? "\(identity.kind.rawValue)|\(identity.rootID ?? "")"
+    }
+    /// Detach the active speculative reader without discarding already downloaded bytes.
+    private func stopNextBuffer(retaining: Bool) {
+        nextBufferRequest = UUID()
+        nextBufferTask?.cancel(); nextBufferTask = nil
+        if let nextBuffer {
+            nextBuffer.loader.setReadingAhead(false)
+            if retaining, let nextBufferIdentity { queuedBuffers[nextBufferIdentity] = nextBuffer }
+            else { nextBuffer.loader.invalidate() }
+        }
+        nextBuffer = nil; nextBufferIdentity = nil
+    }
+    private func cancelNextBuffer(unless identity: NativeMediaSourceIdentity? = nil) {
+        if let identity, !identity.isFolder, identity.mediaType == "video" || identity.mediaType == "audio",
+           nextBufferContext == bufferContext(for: identity) {
+            stopNextBuffer(retaining: true)
+            return
+        }
+        stopNextBuffer(retaining: false)
+        for buffer in queuedBuffers.values { buffer.loader.invalidate() }
+        queuedBuffers.removeAll(); nextBufferOrder = []; failedNextBuffers = []
+        nextBufferOwner = nil; nextBufferContext = nil
+    }
+    private func refreshNextBuffer() {
+        guard let owner = sourceIdentity else { return }
+        var seen = Set<NativeMediaSourceIdentity>()
+        let candidates = (nextItems?() ?? []).compactMap { item, provider -> (CloudDriveItem, any NativeCloudDrive, NativeMediaSourceIdentity)? in
+            let id = NativeMediaSourceIdentity(item: item, kind: provider.kind, rootID: provider.root.id)
+            guard id != owner, !item.isFolder, (item.mediaType == "video" || item.mediaType == "audio"), seen.insert(id).inserted else { return nil }
+            return (item, provider, id)
+        }
+        let order = candidates.map { $0.2 }, context = bufferContext(for: owner)
+        // A new filter/sort can change which file is next. Restart in that visible
+        // order; moving to a later file in the same folder preserves its successors.
+        if nextBufferContext != context || (nextBufferOwner == owner && nextBufferOrder != order) {
+            cancelNextBuffer()
+        }
+        nextBufferContext = context; nextBufferOwner = owner; nextBufferOrder = order
+        let desired = Set(order)
+        if let nextBufferIdentity, !desired.contains(nextBufferIdentity) { stopNextBuffer(retaining: false) }
+        for id in Array(queuedBuffers.keys) where !desired.contains(id) {
+            queuedBuffers.removeValue(forKey: id)?.loader.invalidate()
+        }
+        failedNextBuffers.formIntersection(desired)
+        guard memoryLoader?.snapshot.fraction == 1 else {
+            nextBuffer?.loader.setReadingAhead(false)
+            return
+        }
+        if let nextBuffer, nextBuffer.loader.status.failed {
+            if let nextBufferIdentity { failedNextBuffers.insert(nextBufferIdentity) }
+            stopNextBuffer(retaining: false)
+        } else if nextBuffer?.loader.snapshot.fraction == 1 {
+            stopNextBuffer(retaining: true)
+        }
+        if nextBufferIdentity != nil {
+            nextBuffer?.loader.setReadingAhead(true)
+            return
+        }
+        guard PreviewMemoryBudget.shared.permitsReadAhead,
+              let (item, provider, identity) = candidates.first(where: {
+                  !failedNextBuffers.contains($0.2) && queuedBuffers[$0.2]?.loader.snapshot.fraction != 1
+              }) else { return }
+        nextBufferIdentity = identity
+        if let retained = queuedBuffers.removeValue(forKey: identity) {
+            nextBuffer = retained; retained.loader.setReadingAhead(true)
+            return
+        }
+        let request = UUID(); nextBufferRequest = request
+        let classify = bufferedVolume, budget = memoryBudget, blockSize = memoryBlockSize, io = memoryIO
+        nextBufferTask = Task { [weak self] in
+            let directory = NativePreviewDirectory(FileManager.default.temporaryDirectory
+                .appendingPathComponent("MyCloudDriver-NextMedia-\(UUID().uuidString)", isDirectory: true))
+            defer { withExtendedLifetime(directory) {} }
+            do {
+                try await NativeFileWork.run { try CloudDriveFiles.privateDirectory(directory.url) }
+                let url = try await NativeFileWork.asyncRun(timeout: self?.materializationTimeout ?? 300) {
+                    try await provider.materialize(item, directory: directory.url, progress: { _ in })
+                }
+                try Task.checkCancellation()
+                let prepared = try await NativeFileWork.run {
+                    let container = MediaContainer.sniff(url)
+                    let loader = try FilePreviewResourceLoader(fileURL: url, contentType: container?.contentType,
+                        budgetBytes: budget, blockSize: blockSize, io: io)
+                    loader.setCachePriority(0)
+                    let source = (provider.kind == .local ? classify(url) : nil).map(NativeMediaBufferSource.volume)
+                        ?? .cloud(provider.kind)
+                    return BufferedFile(loader: loader, source: source, originalURL: url, directory: directory,
+                        container: container, copy: nil, preparation: nil)
+                }
+                guard let self, !Task.isCancelled, self.nextBufferRequest == request,
+                      self.nextBufferIdentity == identity else { prepared.loader.invalidate(); return }
+                self.nextBuffer = prepared
+                if self.memoryLoader?.snapshot.fraction == 1 { prepared.loader.setReadingAhead(true) }
+            } catch {
+                guard let self, !Task.isCancelled, self.nextBufferRequest == request else { return }
+                self.failedNextBuffers.insert(identity); self.stopNextBuffer(retaining: false)
+            }
+        }
     }
     private func stopSourceProgress() {
         sourceProgressID = UUID()
@@ -399,11 +576,15 @@ struct NativeMediaSourceBufferStatus: Equatable {
     private func watchOpening(_ player: AVPlayer, item: CloudDriveItem, request: UUID) {
         openWatchdog?.cancel()
         openWatchdog = Task { [weak self, weak player] in
-            let deadline = Date().addingTimeInterval(self?.openTimeout ?? 8)
-            while Date() < deadline {
+            let timeout = self?.openTimeout ?? 8
+            var lastProgress = Date(), previousBytes: Int64 = 0
+            while Date().timeIntervalSince(lastProgress) < timeout {
                 try? await Task.sleep(nanoseconds: 50_000_000)
                 guard !Task.isCancelled, let self, let player, self.generation == request, self.playback.player === player else { return }
-                if self.openStatus(player) != .unknown { return }
+                let status = self.openStatus(player)
+                if status != .unknown { return }
+                let bytes = self.memoryLoader?.status.bytesRead ?? 0
+                if bytes > previousBytes { previousBytes = bytes; lastProgress = Date() }
             }
             guard !Task.isCancelled, let self, let player, self.generation == request, self.playback.player === player else { return }
             self.recoverVideo(NSError(domain: AVFoundationErrorDomain, code: AVError.Code.fileFormatNotRecognized.rawValue,
@@ -412,8 +593,7 @@ struct NativeMediaSourceBufferStatus: Equatable {
     }
     private func releaseMemoryBuffer() {
         bufferStatusTask?.cancel(); bufferStatusTask = nil
-        bufferStatus = nil; bufferSource = nil
-        readAheadObservation = nil
+        bufferStatus = nil; bufferSource = nil; memorySource = nil
         memoryLoader?.invalidate(); memoryLoader = nil; memoryBufferAttached = false
     }
 
@@ -422,7 +602,8 @@ struct NativeMediaSourceBufferStatus: Equatable {
         let resume = playback.position, autoplay = playback.wantsPlayback
         task?.cancel(); openWatchdog?.cancel(); openWatchdog = nil
         // A disk that stopped answering explains the failure better than the player's generic error.
-        let diskFailure = memoryLoader?.failure
+        let diskFailure = memoryLoader?.failure, volume = bufferSource
+        let provider = sourceProvider
         playback.attach(nil); ready = false
         releaseMemoryBuffer()
         // A repackaged copy that fails as well is converted; a converted copy has nothing further to try.
@@ -445,14 +626,17 @@ struct NativeMediaSourceBufferStatus: Equatable {
                 try Task.checkCancellation()
                 guard self.generation == request else { return }
                 self.aviCopy = copy; self.preparation = kind
-                let prepared = try await NativeFileWork.run(timeout: self.preparationTimeout, priority: .high) {
+                let bytes = try await NativeFileWork.run(timeout: self.preparationTimeout, priority: .high) {
                     let bytes = (try? copy.url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { UInt64(max(0, $0)) }
-                    return (AVPlayer(url: copy.url), bytes)
+                    return bytes
                 }
+                guard let provider, let player = try await self.bufferedPlayer(for: item, provider: provider,
+                    url: copy.url, container: nil, volume: volume, request: request) else { throw CancellationError() }
                 try Task.checkCancellation()
                 guard self.generation == request else { return }
-                self.finishSourceProgress(availableURL: copy.url, availableBytes: prepared.1)
-                self.playback.attach(prepared.0); self.ready = true
+                self.finishSourceProgress(availableURL: copy.url, availableBytes: bytes)
+                self.playback.attach(player); self.memoryBufferAttached = true
+                self.memoryLoader?.setReadingAhead(true); self.ready = true
                 if resume > 0 || autoplay {
                     for _ in 0..<100 {
                         if self.playback.canPlay { break }
@@ -469,13 +653,29 @@ struct NativeMediaSourceBufferStatus: Equatable {
             }
         }
     }
-    func clear() {
+    func clear(preservingRAM: Bool = false, keeping identity: NativeMediaSourceIdentity? = nil) {
+        if let (identity, pending) = pendingBufferedFile {
+            if preservingRAM {
+                pending.loader.setCachePriority(-1, gracePeriod: 2)
+                retiredBuffers.insert(pending, for: identity)
+            } else { pending.loader.invalidate() }
+            pendingBufferedFile = nil
+        }
+        if preservingRAM, let sourceIdentity, let loader = memoryLoader, let sourceURL, let memorySource {
+            loader.setReadingAhead(false)
+            loader.setCachePriority(-1, gracePeriod: 2)
+            retiredBuffers.insert(.init(loader: loader, source: memorySource, originalURL: sourceURL,
+                directory: ownedDirectory, container: sourceContainer, copy: aviCopy, preparation: preparation), for: sourceIdentity)
+            memoryLoader = nil
+        }
+        if !preservingRAM { retiredBuffers.removeAll() }
+        cancelNextBuffer(unless: identity)
         task?.cancel(); task = nil; itemID = nil; sourceIdentity = nil
         generation = UUID(); playback.attach(nil); ready = false; failure = nil; fraction = nil
         stopSourceProgress(); sourceBufferStatus = nil
         releaseMemoryBuffer()
         openWatchdog?.cancel(); openWatchdog = nil
-        aviCopy = nil; preparation = nil; sourceURL = nil; sourceContainer = nil; isPreparingCopy = false
+        aviCopy = nil; preparation = nil; sourceURL = nil; sourceProvider = nil; sourceContainer = nil; isPreparingCopy = false
         ownedDirectory = nil
     }
 }
@@ -493,235 +693,48 @@ struct NativeMediaPreview: View {
                 .help("Open the original file in IINA, which plays most formats directly. The file is not copied or changed.")
         }
     }
+    private var thumbnail: some View {
+        NativeMediaThumbnail(item: item, kind: provider.kind, rootID: provider.root.id, cache: thumbnailCache)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.accentColor.opacity(0.05))
+    }
+
+    private func transferState(matches: Bool) -> MediaPreviewTransferState {
+        let status = matches ? model.bufferStatus : nil
+        let source = matches ? model.sourceBufferStatus : nil
+        return MediaPreviewTransferState(
+            bytesPerSecond: status?.bytesPerSecond ?? source?.bytesPerSecond,
+            ranges: status?.cache.normalizedRanges ?? MediaPreviewTransferState.ranges(fraction: source?.fraction ?? (matches ? model.fraction : nil)),
+            preparing: !matches || !model.ready,
+            complete: status?.cache.fraction == 1,
+            waitingForMemory: status?.memoryPressure == true && status?.cache.fraction != 1)
+    }
+
     var body: some View {
         let identity = NativeMediaSourceIdentity(item: item, kind: provider.kind, rootID: provider.root.id)
         let matches = model.matches(item, provider: provider)
+        let transfer = transferState(matches: matches)
         return VStack(spacing: 0) {
             if matches && model.ready {
-                MediaPreviewView(playback: model.playback, isAudio: item.mediaType == "audio",
+                MediaPreviewView(playback: model.playback, isAudio: item.mediaType == "audio", transfer: transfer,
+                    placeholder: AnyView(thumbnail),
                     onVideoFailure: { model.recoverVideo($0, player: $1, item: item) })
+            } else {
+                thumbnail
+                if matches, let failure = model.failure {
+                    HStack(spacing: 8) {
+                        Label("Preview unavailable", systemImage: "exclamationmark.triangle")
+                            .font(.caption).lineLimit(1).help(failure).accessibilityHint(failure)
+                        Spacer(minLength: 0)
+                        Button("Retry Preview") { model.prepare(item, provider: provider, force: true) }
+                        playInIINA
+                    }.padding(10)
+                } else if matches && model.isPreparingCopy {
+                    HStack { Spacer(); playInIINA }.padding(.horizontal, 10)
+                }
+                MediaTransportBar(playback: model.playback, settings: model.playback.settings, transfer: transfer)
             }
-            else {
-                ZStack {
-                    NativeMediaThumbnail(item: item, kind: provider.kind, rootID: provider.root.id, cache: thumbnailCache)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    VStack(spacing: 12) {
-                        if matches, let failure = model.failure {
-                            Image(systemName: "exclamationmark.triangle").font(.title2)
-                            Text("Preview unavailable").font(.headline)
-                            Text(failure).font(.caption).multilineTextAlignment(.center).lineLimit(4)
-                            Button("Retry Preview") { model.prepare(item, provider: provider, force: true) }
-                            playInIINA
-                        } else {
-                            ProgressView(value: matches ? (model.bufferStatus?.cache.fraction ?? model.sourceBufferStatus?.fraction ?? model.fraction) : nil)
-                                .progressViewStyle(.linear).controlSize(.small)
-                            Text(matches ? model.message : "Preparing preview…").font(.caption).multilineTextAlignment(.center).lineLimit(3)
-                            if matches, let status = model.bufferStatus {
-                                MediaPreviewTransferMetricsView(fraction: status.cache.fraction, bytesPerSecond: status.bytesPerSecond,
-                                    receivedBytes: UInt64(max(0, status.cache.cachedBytes)),
-                                    totalBytes: status.cache.contentLength.flatMap { $0 > 0 ? UInt64($0) : nil })
-                            } else if matches, let status = model.sourceBufferStatus {
-                                MediaPreviewTransferMetricsView(fraction: status.fraction, bytesPerSecond: status.bytesPerSecond,
-                                    receivedBytes: status.receivedBytes, totalBytes: status.totalBytes)
-                            }
-                            if matches, model.isPreparingCopy { playInIINA }
-                        }
-                    }.padding(16).frame(maxWidth: 320)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10)).padding(20)
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color.accentColor.opacity(0.05))
-            }
-            if matches, let status = model.bufferStatus, let source = model.bufferSource {
-                NativeMediaBufferStatusView(status: status, source: source)
-                    .padding(10)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .overlay(alignment: .top) { Divider() }
-            } else if matches, let status = model.sourceBufferStatus {
-                NativeMediaSourceBufferStatusView(status: status)
-                    .padding(10)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .overlay(alignment: .top) { Divider() }
-            }
-        // `.onChange` runs a closure that captured the previous item, which left
-        // the model one selection behind. `.task(id:)` is rebuilt for each identity.
+        // Rebuild the task for the current identity; a deferred onChange can capture the previous item.
         }.task(id: identity) { model.prepare(item, provider: provider) }
-    }
-}
-
-/// Compact transfer details stay inside the loading card, where they remain visible before a player exists.
-struct MediaPreviewTransferMetricsView: View {
-    let fraction: Double?
-    let bytesPerSecond: Double?
-    let receivedBytes: UInt64?
-    let totalBytes: UInt64?
-
-    private func amount(_ bytes: UInt64) -> String {
-        bytes == 0 ? "0 B" : ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file)
-    }
-    private var speedText: String {
-        bytesPerSecond.map { "\(amount(SafeDisplayNumber.bytes($0)))/s" } ?? "—"
-    }
-    private var progressText: String {
-        fraction.map { $0.formatted(.percent.precision(.fractionLength(0...1))) } ?? "Loading…"
-    }
-
-    var body: some View {
-        VStack(spacing: 5) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(bytesPerSecond == nil ? "Speed: —" : speedText)
-                    .accessibilityLabel("Transfer speed: \(speedText)")
-                Spacer(minLength: 4)
-                Text(progressText).accessibilityLabel("Preparation progress: \(progressText)")
-            }
-            if let receivedBytes {
-                Text(totalBytes.flatMap { $0 > 0 ? "\(amount(receivedBytes)) of \(amount($0)) received" : nil }
-                    ?? "\(amount(receivedBytes)) received")
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if let totalBytes, totalBytes > 0 {
-                Text("File size: \(amount(totalBytes))")
-            }
-        }.font(.caption2).monospacedDigit().foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity)
-    }
-}
-
-struct MediaPreviewLoadingStatusView: View {
-    let isAudio: Bool
-    let message: String?
-    let fraction: Double?
-    let bytesPerSecond: Double?
-    let receivedBytes: UInt64?
-    let totalBytes: UInt64?
-
-    var body: some View {
-        VStack(spacing: 10) {
-            ProgressView(value: fraction).progressViewStyle(.linear).controlSize(.large)
-            Text("Loading \(isAudio ? "audio" : "video") preview…").font(.callout.weight(.semibold))
-            if let message { Text(message).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
-            MediaPreviewTransferMetricsView(fraction: fraction, bytesPerSecond: bytesPerSecond,
-                receivedBytes: receivedBytes, totalBytes: totalBytes)
-        }
-        .padding(.horizontal, 22).padding(.vertical, 18)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .shadow(color: .black.opacity(0.12), radius: 10, y: 4)
-    }
-}
-
-struct MediaPreviewBufferDetails<Content: View>: View {
-    let content: Content
-    init(@ViewBuilder content: () -> Content) { self.content = content() }
-    var body: some View {
-        DisclosureGroup {
-            content
-        } label: {
-            Text("Buffering details").font(.caption2.weight(.medium))
-        }.frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-struct NativeMediaSourceBufferStatusView: View {
-    let status: NativeMediaSourceBufferStatus
-    private func amount(_ bytes: UInt64) -> String {
-        bytes == 0 ? "0 B" : ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file)
-    }
-    private var byteDetail: String {
-        if status.phase == .available {
-            return (status.receivedBytes ?? status.totalBytes).map { "\(amount($0)) available on this Mac" }
-                ?? "Preview available on this Mac"
-        }
-        if let bytes = status.receivedBytes {
-            return status.totalBytes.map { "\(amount(bytes)) of \(amount($0)) received" } ?? "\(amount(bytes)) received"
-        }
-        return status.totalBytes.map { "File size: \(amount($0))" } ?? "Waiting for media data"
-    }
-
-    var body: some View {
-        MediaPreviewBufferDetails {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Label(status.title, systemImage: status.phase == .failed ? "exclamationmark.triangle" : "arrow.down.circle")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(status.phase == .failed ? Color.orange : Color.cyan)
-                    Spacer(minLength: 4)
-                    Text(status.source.title).font(.caption2).foregroundStyle(.secondary)
-                }
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(status.bytesPerSecond.map { "Transfer speed: \(amount(SafeDisplayNumber.bytes($0)))/s" }
-                        ?? "Transfer speed: —")
-                        .monospacedDigit()
-                        .help("Speed is shown when the source reports transferred bytes.")
-                    Spacer(minLength: 4)
-                    Text(status.fraction.map { $0.formatted(.percent.precision(.fractionLength(0...1))) }
-                        ?? (status.phase == .failed ? "—" : "Loading…"))
-                        .monospacedDigit()
-                }.font(.caption2).foregroundStyle(.secondary)
-                ProgressView(value: status.phase == .failed ? status.fraction ?? 0 : status.fraction)
-                    .progressViewStyle(.linear).tint(.cyan)
-                    .accessibilityLabel("Preview buffering")
-                    .accessibilityValue(status.fraction.map { $0.formatted(.percent) } ?? "Preparing")
-                Text(byteDetail).font(.caption2).monospacedDigit().foregroundStyle(.secondary)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(status.message)
-                    Text("The bar shows preparation progress. Fully buffered means the preview is available on this Mac.")
-                }.font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }.frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-}
-
-/// The same byte-based buffer information as a streaming drive, kept visible while loading and playing.
-struct NativeMediaBufferStatusView: View {
-    let status: FilePreviewBufferStatus
-    let source: ExternalVolume.Kind
-    private var isNetwork: Bool { source == .networkShare }
-    private func amount(_ bytes: Int64) -> String {
-        bytes == 0 ? "0 B" : ByteCountFormatter.string(fromByteCount: bytes, countStyle: .memory)
-    }
-    private var activityDescription: String {
-        if status.failed { return "Reading stopped. Retry the preview when the drive is available." }
-        if status.cache.fraction == 1 { return "The entire file is available from RAM." }
-        if status.isReading { return "Reading from \(isNetwork ? "the network share" : "the external disk")…" }
-        return "No \(isNetwork ? "network" : "disk") reads. More data loads as playback needs it."
-    }
-
-    var body: some View {
-        MediaPreviewBufferDetails {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Label(status.title, systemImage: status.failed ? "exclamationmark.triangle" : "memorychip")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(status.failed ? Color.orange : Color.cyan)
-                    Spacer(minLength: 4)
-                    Text(isNetwork ? "Network share" : "External disk").font(.caption2).foregroundStyle(.secondary)
-                }
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text("Read speed: \(amount(Int64(SafeDisplayNumber.integer(status.bytesPerSecond))))/s")
-                        .monospacedDigit()
-                    Spacer(minLength: 4)
-                    Text((status.cache.fraction ?? 0).formatted(.percent.precision(.fractionLength(0...1))))
-                        .monospacedDigit()
-                }.font(.caption2).foregroundStyle(.secondary)
-                GeometryReader { geometry in
-                    ZStack(alignment: .leading) {
-                        RoundedRectangle(cornerRadius: 3).fill(Color.primary.opacity(0.08))
-                        ForEach(Array(status.cache.normalizedRanges.enumerated()), id: \.offset) { _, range in
-                            RoundedRectangle(cornerRadius: 3).fill(Color.cyan.opacity(0.7))
-                                .frame(width: geometry.size.width * (range.upperBound - range.lowerBound))
-                                .offset(x: geometry.size.width * range.lowerBound)
-                        }
-                    }
-                }.frame(height: 6)
-                    .accessibilityLabel("File held in RAM")
-                    .accessibilityValue((status.cache.fraction ?? 0).formatted(.percent))
-                Text("\(amount(status.cache.cachedBytes)) of \(amount(status.cache.contentLength ?? 0)) in RAM")
-                    .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("RAM limit: \(amount(status.budgetBytes)) · Total read: \(amount(status.bytesRead))")
-                        .monospacedDigit()
-                    Text(activityDescription)
-                    Text("Cyan segments show parts of this file held in memory. Large files use a moving window. Reading ahead pauses with playback; choosing another file clears the buffer.")
-                }.font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }.frame(maxWidth: .infinity, alignment: .leading)
-        }
     }
 }

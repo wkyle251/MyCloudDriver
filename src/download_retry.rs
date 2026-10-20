@@ -8,7 +8,7 @@ use std::{
     fs::{File, Metadata},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex,
     },
 };
@@ -84,6 +84,7 @@ struct Cached {
 
 pub(crate) struct RetryState {
     cached: Mutex<Option<Cached>>,
+    final_verification_pending: AtomicBool,
     pub(crate) preparation: crate::download_preparation::State,
     #[cfg(test)]
     enabled: bool,
@@ -92,6 +93,7 @@ impl Default for RetryState {
     fn default() -> Self {
         Self {
             cached: Mutex::new(None),
+            final_verification_pending: AtomicBool::new(false),
             preparation: Default::default(),
             #[cfg(test)]
             enabled: true,
@@ -113,6 +115,15 @@ fn checkpoint_key(value: &impl Serialize) -> Option<[u8; 32]> {
 }
 
 impl RetryState {
+    /// Scheduling hint only. This never certifies local bytes or skips a check.
+    /// It survives a deferred final check along with this transfer's state.
+    pub(crate) fn final_verification_pending(&self) -> bool {
+        self.final_verification_pending.load(Ordering::Relaxed)
+    }
+    pub(crate) fn set_final_verification_pending(&self, pending: bool) {
+        self.final_verification_pending.store(pending, Ordering::Relaxed);
+    }
+
     pub(super) fn clear(&self) {
         self.cached.lock().unwrap().take();
     }

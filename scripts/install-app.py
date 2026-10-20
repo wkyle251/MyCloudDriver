@@ -96,9 +96,14 @@ def quit_app(bundle):
     if not tracked:
         return False
     print("Quitting the installed app and waiting for its helpers to finish…", flush=True)
-    subprocess.run(["osascript", "-e", "on run args", "-e",
-                    "tell application (item 1 of args) to quit", "-e", "end run", str(bundle)],
-                   check=True, timeout=30)
+    try:
+        subprocess.run(["osascript", "-e", "on run args", "-e",
+                        "tell application (item 1 of args) to quit", "-e", "end run", str(bundle)],
+                       check=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        # The app may still be saving its RAM buffers after the quit request
+        # exceeds AppleScript's wait. Only observed process exit permits a swap.
+        print("The quit request timed out; waiting for the app and its helpers to finish…", flush=True)
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
         table = processes()

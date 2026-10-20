@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 struct FinderWindowActions {
     var section: Int
@@ -54,52 +55,87 @@ struct FinderWindowActions {
     var toggleFolderTitle = "Expand or Collapse Folder"
     var toggleFolder: () -> Void = {}
     var isFileWorkspace: Bool { section == 0 || section == 3 || section == FinderWorkspaceSection.bookmarks.rawValue }
-}
-
-private struct FinderWindowActionsKey: FocusedValueKey {
-    typealias Value = FinderWindowActions
-}
-
-extension FocusedValues {
-    var finderWindowActions: FinderWindowActions? {
-        get { self[FinderWindowActionsKey.self] }
-        set { self[FinderWindowActionsKey.self] = newValue }
+    struct Presentation: Equatable {
+        let section: Int
+        let viewMode: Int
+        let zoom: Double
+        let titles: [String]
+        let availability: [Bool]
+    }
+    var presentation: Presentation {
+        .init(section: section, viewMode: viewMode, zoom: zoom,
+            titles: [undoTitle, redoTitle, containerTitle, importTitle, exportTitle, trashTitle,
+                     emptyTitle, mergeTitle, toggleFolderTitle],
+            availability: [canUndo, canRedo, canRefresh, canGoBack, canUpload, canDownload,
+                canCreateFolder, canTrash, canCheckDuplicates, canReviewDuplicates,
+                canRemoveEmptyFolders, canRemoveDSStoreFiles, canMergeFolders,
+                supportsPikPakManagement, supportsDiskTrash, canToggleFolder])
     }
 }
 
-/// Observe drive/login changes as well as window focus. Reading these through
-/// App's session manager alone leaves shortcuts disabled after Home → drive.
-struct FinderSearchCommands: Commands {
-    @ObservedObject private var sessions: WorkspaceSessionManager
-    @ObservedObject private var hub: CloudDriveHub
-    @ObservedObject private var model: DownloaderModel
-    @ObservedObject private var similarity: FileSimilarityCoordinator
+/// Project command validation out of high-frequency transfer/preview models.
+/// Unrelated model updates must not invalidate an open View submenu.
+@MainActor final class FinderSearchCommandState: ObservableObject {
+    struct Snapshot: Equatable {
+        let drive: CloudDriveKind?
+        let isLoginPresented: Bool
+    }
+    @Published private(set) var snapshot: Snapshot
+    private let sessions: WorkspaceSessionManager
+    private var sessionObservation: AnyCancellable?
+    private var focusObservation: AnyCancellable?
+    private var hubObservations: [AnyCancellable] = []
+    private weak var observedHub: CloudDriveHub?
+    private lazy var publication = FinderCommandPublication { [weak self] in self?.refresh() }
 
     init(sessions: WorkspaceSessionManager) {
         self.sessions = sessions
-        hub = sessions.activeHub
-        model = sessions.activeHub.pikpak
-        similarity = sessions.activeHub.pikpak.fileSimilarity
+        snapshot = .init(drive: sessions.searchDrive, isLoginPresented: sessions.activeHub.pikpak.isLoginPresented)
+        _ = publication
+        sessionObservation = sessions.objectWillChange.sink { [weak self] in self?.publication.request() }
+        focusObservation = NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)
+            .sink { [weak self] _ in self?.publication.request() }
+        observeHub()
+    }
+    private func observeHub() {
+        let hub = sessions.activeHub
+        observedHub = hub
+        hubObservations = [hub.objectWillChange, hub.pikpak.objectWillChange, hub.pikpak.fileSimilarity.objectWillChange]
+            .map { publisher in publisher.sink { [weak self] in self?.publication.request() } }
+    }
+    private func refresh() {
+        if observedHub !== sessions.activeHub { observeHub() }
+        let next = Snapshot(drive: sessions.searchDrive, isLoginPresented: sessions.activeHub.pikpak.isLoginPresented)
+        if snapshot != next { snapshot = next }
+    }
+}
+
+struct FinderSearchCommands: Commands {
+    private let sessions: WorkspaceSessionManager
+    @StateObject private var state: FinderSearchCommandState
+
+    init(sessions: WorkspaceSessionManager) {
+        self.sessions = sessions
+        _state = StateObject(wrappedValue: FinderSearchCommandState(sessions: sessions))
     }
 
     var body: some Commands {
         CommandGroup(after: .textEditing) {
-            Button(sessions.searchDrive == .photos ? "Find in This Drive…" : "Find in Expanded Items…") {
+            Button(state.snapshot.drive == .photos ? "Find in This Drive…" : "Find in Expanded Items…") {
                 sessions.presentSearch(scope: .expanded)
             }
             .keyboardShortcut("f", modifiers: .command)
-            .disabled(sessions.searchDrive == nil || model.isLoginPresented)
-            Button("Find from \(sessions.searchDrive?.title ?? "Drive") Root…") { sessions.presentSearch(scope: .root) }
+            .disabled(state.snapshot.drive == nil || state.snapshot.isLoginPresented)
+            Button("Find from \(state.snapshot.drive?.title ?? "Drive") Root…") { sessions.presentSearch(scope: .root) }
                 .keyboardShortcut("f", modifiers: [.command, .shift])
-                .disabled(sessions.searchDrive == nil || sessions.searchDrive == .photos || model.isLoginPresented)
+                .disabled(state.snapshot.drive == nil || state.snapshot.drive == .photos || state.snapshot.isLoginPresented)
         }
     }
 }
 
 struct FinderCommands: Commands {
-    @FocusedValue(\.finderWindowActions) private var focusedActions
     @ObservedObject private var router = FinderCommandRouter.shared
-    private var actions: FinderWindowActions? { WorkspaceSessionManager.current == nil ? focusedActions : router.actions }
+    private var actions: FinderWindowActions? { router.actions }
     @ObservedObject var settings: FinderSettings
     var sessions: WorkspaceSessionManager? = nil
     @StateObject private var undoFocus = FinderUndoCommandFocus()
@@ -194,6 +230,9 @@ struct FinderCommands: Commands {
                 settings.showsPreviewPane.toggle()
             }
             .keyboardShortcut("p", modifiers: [.command, .shift])
+            Picker("Preview Placement", selection: $settings.previewPlacement) {
+                ForEach(FinderPreviewPlacement.allCases) { Text($0.title).tag($0) }
+            }.pickerStyle(.menu)
             Button(settings.autoHideSidebar ? "Show Sidebar" : "Automatically Hide Sidebar") {
                 settings.autoHideSidebar.toggle()
             }

@@ -16,6 +16,10 @@ use std::{
 };
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
+#[cfg(test)]
+#[path = "download_checkpoint_guard_tests.rs"]
+mod guard_tests;
+
 const MAX_PENDING: usize = 256;
 const MAX_BATCH: usize = 128;
 const COALESCE: Duration = Duration::from_millis(25);
@@ -99,6 +103,30 @@ pub(crate) async fn commit(
     journal_path: &Path,
     journal: Vec<u8>,
 ) -> anyhow::Result<()> {
+    commit_inner(gate, data, metadata, data_path, journal_path, journal, None).await
+}
+
+pub(crate) async fn commit_guarded(
+    gate: &WriteGate,
+    data: &tokio::fs::File,
+    metadata: Metadata,
+    data_path: &Path,
+    journal_path: &Path,
+    journal: Vec<u8>,
+    precondition: download_fs::CheckpointPrecondition,
+) -> anyhow::Result<()> {
+    commit_inner(gate, data, metadata, data_path, journal_path, journal, Some(precondition)).await
+}
+
+async fn commit_inner(
+    gate: &WriteGate,
+    data: &tokio::fs::File,
+    metadata: Metadata,
+    data_path: &Path,
+    journal_path: &Path,
+    journal: Vec<u8>,
+    precondition: Option<download_fs::CheckpointPrecondition>,
+) -> anyhow::Result<()> {
     let Some(key) = gate.key() else {
         let mut saving = crate::download_telemetry::Operation::new(
             crate::download_telemetry::Kind::CheckpointSync,
@@ -107,7 +135,10 @@ pub(crate) async fn commit(
         data.sync_data().await?;
         download_fs::validate_open_file(data_path, &metadata)?;
         let journal_path = journal_path.to_owned();
-        tokio::task::spawn_blocking(move || download_fs::atomic_write(&journal_path, &journal))
+        tokio::task::spawn_blocking(move || {
+            if let Some(check) = precondition { check()?; }
+            download_fs::atomic_write(&journal_path, &journal)
+        })
             .await??;
         saving.complete();
         return Ok(());
@@ -131,6 +162,7 @@ pub(crate) async fn commit(
                 metadata,
                 journal_path: journal_path.to_owned(),
                 journal,
+                precondition,
             }),
             gate: gate.clone(),
             result: Some(sender),
@@ -186,7 +218,7 @@ async fn run(pool: Arc<Pool>) {
             let start = Instant::now();
             let writes: Vec<_> = requests
                 .iter_mut()
-                .filter_map(|request| request.write.take())
+                .map(|request| request.write.take().expect("Queued checkpoint must retain its write"))
                 .collect();
             let result = download_fs::checkpoint_batch(&writes).map_err(Arc::new);
             if result.is_ok() {
@@ -201,20 +233,42 @@ async fn run(pool: Arc<Pool>) {
                 start.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 Ordering::Relaxed,
             );
-            for mut request in requests {
-                if let Some(sender) = request.result.take() {
+            let rejected = result.as_ref().err()
+                .and_then(|error| error.get_ref())
+                .and_then(|error| error.downcast_ref::<download_fs::CheckpointPreconditionFailure>())
+                .map(|error| error.index);
+            let mut requeue = Vec::new();
+            for (index, (mut request, write)) in requests.into_iter().zip(writes).enumerate() {
+                if rejected.is_some_and(|rejected| rejected != index) {
+                    // No journals were renamed. Keep the caller, descriptor,
+                    // capacity permit and original write; retry only the
+                    // durable commit rather than restarting its download.
+                    request.write = Some(write);
+                    request.waiting = Some(crate::download_telemetry::Operation::new(
+                        crate::download_telemetry::Kind::CheckpointWait,
+                        request.gate.id(),
+                    ));
+                    requeue.push(request);
+                } else if let Some(sender) = request.result.take() {
                     let _ = sender.send(result.clone());
                 }
             }
+            requeue
         })
         .await;
-        if result.is_err() {
-            // Dropped senders report an error to callers; no durable state is
-            // acknowledged after a failed blocking worker.
-            let mut state = pool.state.lock().unwrap();
-            state.running = false;
-            state.queue.clear();
-            return;
+        match result {
+            Ok(requeue) => {
+                let mut state = pool.state.lock().unwrap();
+                for request in requeue.into_iter().rev() { state.queue.push_front(request); }
+            }
+            Err(_) => {
+                // Dropped senders report an error to callers; no durable state
+                // is acknowledged after a failed blocking worker.
+                let mut state = pool.state.lock().unwrap();
+                state.running = false;
+                state.queue.clear();
+                return;
+            }
         }
     }
 }

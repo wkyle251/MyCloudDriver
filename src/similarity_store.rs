@@ -15,6 +15,7 @@ pub(super) struct AxisFile {
 
 pub(super) struct SavedMatrix {
     db: Connection,
+    path: PathBuf,
     run: String,
     revision: u64,
     legacy: bool,
@@ -25,6 +26,15 @@ pub(super) struct SavedMatrix {
 }
 
 impl SavedMatrix {
+    pub(super) fn grouping_identity(&self) -> Result<Option<[u8; 32]>> {
+        if self.legacy { return Ok(None); }
+        let source = group_index::identity(&self.path, &self.run, self.revision, 0)?;
+        let excluded = self.path.with_extension("excluded.json");
+        let mask = if excluded.exists() { group_index::identity(&excluded, &self.run, self.revision, 0)? } else { [0; 32] };
+        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+        hash.update(&source); hash.update(&mask);
+        Ok(Some(hash.finish().as_ref().try_into().unwrap()))
+    }
     pub fn open(directory: &Path, run: &str, revision: u64) -> Result<Self> {
         if !directory.is_absolute() || revision == 0 || revision > i64::MAX as u64 {
             bail!("Choose a saved scan revision.");
@@ -38,7 +48,7 @@ impl SavedMatrix {
             }
             directory.join("runs").join(format!("{run}.sqlite3"))
         };
-        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let mut files = Vec::new();
         let mut within_source = false;
         if legacy {
@@ -103,6 +113,13 @@ impl SavedMatrix {
                 files.push(row?);
             }
         }
+        if !legacy {
+            let excluded = exclusions::load(&path, run, revision)?;
+            for ordinal in excluded.ordinals {
+                let file = files.get_mut(ordinal).context("Invalid saved Trash ordinal.")?;
+                file.is_file = false;
+            }
+        }
         let axes = if !legacy && compact(&db)? {
             Some(read_axes(&db, files.len())?)
         } else {
@@ -115,6 +132,7 @@ impl SavedMatrix {
         };
         Ok(Self {
             db,
+            path,
             run: run.into(),
             revision,
             legacy,
@@ -149,6 +167,35 @@ impl SavedMatrix {
                 }
             }
         } else if let Some(axes) = &self.axes {
+            let expected = self.expected_scores.context("Missing comparison progress")?;
+            let identity = group_index::identity(&self.path, &self.run, self.revision, expected)?;
+            let index_path = group_index::path(&self.path);
+            if let Some(mut bounds_index) = group_index::Index::open(&index_path, &identity, expected,
+                axes.iter().map(Vec::len).collect(), cancel)? {
+                let mut query = self.db.prepare("SELECT n,data FROM score_chunks WHERE profile=?1 AND a=?2 AND b0=?3")?;
+                for bound in bounds_index.bounds()? {
+                    check_cancel(cancel)?;
+                    let bound = bound?;
+                    if bound.maximum < minimum { continue; }
+                    let (n, data) = query.query_row(params![bound.profile as i64, bound.a as i64, bound.b as i64],
+                        |r| Ok((index(r, 0)?, r.get::<_, Vec<u8>>(1)?)))?;
+                    if n != bound.n || data.len() != n * 8 { bail!("Invalid saved comparison chunk."); }
+                    let axis = &axes[bound.profile];
+                    let mut maximum = -1.0f64;
+                    for (offset, bytes) in data.chunks_exact(8).enumerate() {
+                        let score = decode_score(bytes)?; maximum = maximum.max(score);
+                        if score >= minimum { visit(&self.files[axis[bound.a]].id, &self.files[axis[bound.b + offset]].id, score)?; }
+                    }
+                    if maximum != bound.maximum { bail!("The saved comparison index changed."); }
+                }
+                if group_index::identity(&self.path, &self.run, self.revision, expected)? != identity {
+                    bail!("The saved comparison snapshot changed.");
+                }
+                return Ok(());
+            }
+            // Cache creation is optional: a full disk or read-only location
+            // must not prevent reviewing an otherwise valid saved matrix.
+            let mut builder = group_index::Builder::new(index_path, &identity, expected).ok();
             let mut query = self
                 .db
                 .prepare("SELECT profile,a,b0,n,data FROM score_chunks ORDER BY profile,a,b0")?;
@@ -160,16 +207,26 @@ impl SavedMatrix {
                 validate_chunk(&mut cursor, profile, a, b0, n, &data)?;
                 let axis = &axes[profile];
                 let left = &self.files[axis[a]];
+                let mut maximum = -1.0f64;
                 for (offset, bytes) in data.chunks_exact(8).enumerate() {
                     let score = decode_score(bytes)?;
+                    maximum = maximum.max(score);
                     if score >= minimum {
                         visit(&left.id, &self.files[axis[b0 + offset]].id, score)?;
                     }
+                }
+                if builder.as_mut().is_some_and(|b| b.push(group_index::Bounds { profile, a, b: b0, n, maximum }).is_err()) {
+                    builder = None;
                 }
             }
             if Some(cursor.completed) != self.expected_scores {
                 bail!("The saved comparison snapshot is incomplete.");
             }
+            if group_index::identity(&self.path, &self.run, self.revision, expected)? != identity {
+                bail!("The saved comparison snapshot changed.");
+            }
+            check_cancel(cancel)?;
+            if let Some(builder) = builder { let _ = builder.finish(); }
         } else {
             let mut query = self
                 .db
@@ -191,7 +248,7 @@ impl SavedMatrix {
         let file = self
             .files
             .get(request.row_offset as usize)
-            .filter(|f| f.id == request.file_id)
+            .filter(|f| f.id == request.file_id && f.is_file)
             .context(
                 "This file no longer belongs to the selected scan revision. Run a new scan.",
             )?;
@@ -288,16 +345,17 @@ impl SavedMatrix {
         }
         let mut entries = Vec::new();
         let mut unavailable = std::collections::BTreeMap::<&str, u64>::new();
-        for other in &self.files {
+        for (ordinal, other) in self.files.iter().enumerate() {
             check_cancel(cancel)?;
-            if other.id == file.id {
+            if other.id == file.id || !other.is_file {
                 continue;
             }
             if let Some(score) = scores.get(&other.id) {
                 if !score.is_finite() || !(-1.0..=1.0).contains(score) {
                     bail!("A saved similarity score is invalid.");
                 }
-                entries.push(json!({"file_id":other.id,"score":score}));
+                entries.push(if request.compact { json!({"ordinal":ordinal,"score":score}) }
+                    else { json!({"file_id":other.id,"score":score}) });
             } else {
                 let reason = if !file.available || !other.available {
                     "file_unavailable"
@@ -848,9 +906,7 @@ fn validate_chunk(
     {
         bail!("Invalid saved comparison chunk.");
     }
-    for bytes in data.chunks_exact(8) {
-        decode_score(bytes)?;
-    }
+    // The caller decodes and validates each value exactly once while visiting.
     cursor.advance(n)
 }
 fn decode_score(bytes: &[u8]) -> Result<f64> {

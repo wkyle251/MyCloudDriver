@@ -79,7 +79,6 @@ struct NativeDriveWorkspace: View {
                     section: navigation.section, bookmarkCount: bookmarkBrowserIsOpen ? nil : bookmarks.items(provider: model.kind.rawValue, scope: model.bookmarkScope).count, showsStatus: $showsStatus)
             }
         }
-        .focusedSceneValue(\.finderWindowActions, actions)
         .background(FinderWindowActionRegistration(actions: actions))
         .overlay { FileSearchOverlay(search: model.fileSearch, onReveal: model.revealFileSearch) }
         .onChange(of: model.query) { _ in if model.kind == .photos { model.reload() } }
@@ -116,7 +115,7 @@ struct NativeDriveWorkspace: View {
             selectSection(0)
             if !model.presentFileSearch() { showsSearch = true; searchFocused = true }
         }
-        .onDisappear { model.fileSearch.close(); model.closePreview(); model.mediaPreview.clear(); model.setThumbnailPrefetchActive(false) }
+        .onDisappear { model.fileSearch.close(); model.closePreview(); model.mediaPreview.clear(preservingRAM: true); model.setThumbnailPrefetchActive(false) }
         .sheet(item: $prompt) { prompt in
             NativeNameSheet(prompt: prompt) { name in
                 if let item = prompt.item { model.rename(item, name: name) }
@@ -128,7 +127,8 @@ struct NativeDriveWorkspace: View {
         }
         .confirmationDialog(model.kind == .photos ? "Delete from Apple Photos?" : "Move to Trash?", isPresented: $showsDelete, titleVisibility: .visible) {
             Button(model.kind == .photos ? "Delete from Photos" : "Move to Trash", role: .destructive) { model.delete(pendingDelete); pendingDelete = [] }
-            Button("Cancel", role: .cancel) { pendingDelete = [] }
+                .keyboardShortcut(.defaultAction)
+            Button("Cancel", role: .cancel) { pendingDelete = [] }.keyboardShortcut(.cancelAction)
         } message: {
             Text(model.kind == .photos
                  ? "Delete \(pendingDelete.count) selected item(s)? Deleting an album keeps its media in the library. Deleted photos and videos can be restored in Photos → Recently Deleted."
@@ -516,6 +516,7 @@ private struct NativeDriveInspector: View {
         if let item = model.inspectorItem {
             FinderPreviewPane(resetRevision: resetRevision,
                 mediaPlayback: previewPlayback(for: item),
+                isMediaPreview: !item.isFolder && (item.mediaType == "video" || item.mediaType == "audio"),
                 onPreviewMove: { model.moveSelection($0) }) {
                 HStack(spacing: 11) {
                     Image(systemName: item.symbol).font(.system(size: 18, weight: .semibold))
@@ -555,7 +556,7 @@ private struct NativeDriveInspector: View {
                     HStack {
                         if item.isFolder { Button("Open \(model.kind.containerName)") { model.enter(item) } }
                         else {
-                            Button("Quick Look") { model.togglePreview(in: NSApp.keyWindow) }.help("Preview · Space")
+                            Button("Quick Look") { model.togglePreview(in: NSApp.keyWindow) }.help("Open Quick Look")
                             Button("Open") { model.open(item) }
                         }
                         Spacer()

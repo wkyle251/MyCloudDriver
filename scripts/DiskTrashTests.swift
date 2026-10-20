@@ -1,6 +1,9 @@
 import Foundation
 
-@main @MainActor struct DiskTrashTests {
+#if !SIMILARITY_QUERY_TEST_LIBRARY
+@main
+#endif
+@MainActor struct DiskTrashTests {
     static let data = Data("Generated Trash test contents\n".utf8)
     static func rejects(_ body: () async throws -> Void) async throws {
         do { try await body() } catch { return }
@@ -136,6 +139,26 @@ import Foundation
         let restore = try await redo.apply()
         _ = try await restore.apply()
         print("PASS disk Trash: duplicate names, saved original locations, reopening and repeated Undo/Redo")
+
+        let isolatedRoot = root.appendingPathComponent("isolated")
+        try fm.createDirectory(at: isolatedRoot, withIntermediateDirectories: false)
+        let isolated = DiskTrash(volumeRoot: isolatedRoot, volumeID: LocalFileAccess.volumeID(isolatedRoot))
+        let good = isolatedRoot.appendingPathComponent("good.txt"), foreignOriginal = isolatedRoot.appendingPathComponent("foreign.txt")
+        try data.write(to: good); try data.write(to: foreignOriginal)
+        _ = try await isolated.trash([good,foreignOriginal], title: "Generated isolated records", progress: { _ in })
+        let before = try await isolated.list(), foreignItem = before.first { $0.name == "foreign.txt" }!
+        let record = isolated.storage.appendingPathComponent(foreignItem.id.uuidString).appendingPathComponent(".original-location.json")
+        var fields = try JSONSerialization.jsonObject(with: Data(contentsOf: record)) as! [String:Any]
+        fields["volumeID"] = "network-volume:smb://generated.invalid/share"
+        try JSONSerialization.data(withJSONObject: fields).write(to: record, options: .atomic)
+        let listing = try await isolated.listing()
+        precondition(listing.items.map(\.name) == ["good.txt"] && listing.unavailableCount == 1)
+        try await rejects { _ = try await isolated.putBack([foreignItem.id]) }
+        try await rejects { try await isolated.empty([foreignItem.id], progress: { _ in }) }
+        let preservedForeignContents = try Data(contentsOf: record.deletingLastPathComponent().appendingPathComponent("foreign.txt"))
+        precondition(preservedForeignContents == data)
+        _ = try await isolated.putBack(listing.items.map(\.id))
+        print("PASS one foreign Trash record cannot hide valid entries; unverified contents cannot be restored or emptied")
 
         _ = try await store.trash(originals, title: "Move to Trash", progress: { _ in })
         let conflictItems = try await store.list()

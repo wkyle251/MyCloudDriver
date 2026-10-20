@@ -1,7 +1,10 @@
 import AppKit
 import Foundation
 
-@main struct SimilarityTreeExpansionTests {
+#if !SIMILARITY_QUERY_TEST_LIBRARY
+@main
+#endif
+struct SimilarityTreeExpansionTests {
     @MainActor static func main() async throws {
         _ = NSApplication.shared
         let files = (0..<500).map { index in
@@ -84,6 +87,40 @@ import Foundation
         refresh()
         precondition(model.roots.allSatisfy { outline.isItemExpanded($0) })
         print("PASS repeated commands, individual toggles and switching between Groups / All files")
+
+        model.select(files[300].id); refresh()
+        let selectedRow = outline.selectedRow
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, outline.rect(ofRow: selectedRow).minY - 200)))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        model.setTrashed(files[300].id, true)
+        precondition(model.selectedID == files[302].id, "Skip the remaining singleton and continue in the next surviving group")
+        try await waitForTree { model.tree.nodes[files[300].id] == nil }
+        refresh()
+        precondition((outline.item(atRow: outline.selectedRow) as? SimilarityTreeNode)?.id == files[302].id)
+        precondition(scroll.contentView.bounds.minY > 0 && outline.visibleRect.intersects(outline.rect(ofRow: outline.selectedRow)),
+            "Deleting a file in the middle must preserve the viewport and reveal its successor")
+        model.setTrashed(files[300].id, false)
+        precondition(model.selectedID == files[302].id, "Undo must not move the current selection")
+        model.select(files[499].id); model.setTrashed(files[499].id, true)
+        precondition(model.selectedID == files[497].id, "At the end, select the nearest surviving preceding file")
+        print("PASS Trash advances to the next surviving group, preserves the viewport and falls back locally at the end")
+
+        model.showAllFiles()
+        try await waitForTree { !model.tree.grouped && model.tree.nodes[files[240].id] != nil }
+        model.select(files[240].id); model.setTrashedIDs([files[240].id, files[241].id, files[242].id], true)
+        precondition(model.selectedID == files[243].id, "Bulk Trash skips every removed file")
+        model.query = "Image 48"
+        try await waitForTree { model.tree.nodes[files[480].id] != nil && model.tree.nodes[files[470].id] == nil }
+        model.select(files[480].id); model.setTrashed(files[480].id, true)
+        precondition(model.selectedID == files[481].id, "Selection follows the filtered display order")
+        model.query = "Image 42.jpg"
+        try await waitForTree { model.tree.fileIDs == [files[42].id] }
+        model.select(files[42].id); model.setTrashed(files[42].id, true)
+        precondition(model.selectedID == nil && model.selectedGroupID == nil, "An empty filtered list must not jump to the first group")
+        let matches = ["previous", "removed", "next", "last"]
+        precondition(SimilarityResultSelection.next(after: "removed", in: matches) { $0 != "removed" } == "next")
+        precondition(SimilarityResultSelection.next(after: "last", in: matches) { $0 != "removed" && $0 != "last" } == "next")
+        print("PASS bulk and filtered Trash selection, empty results and next-match selection")
 
         model.setMinimumScoreFromSlider(0.714); precondition(model.minimumScore == 0.71)
         model.setMinimumScoreFromSlider(0.716); precondition(model.minimumScore == 0.72)

@@ -3,8 +3,26 @@ import Foundation
 /// A ceiling, never an up-front allocation. The helper can lower this under
 /// system memory pressure without discarding bytes already received.
 enum DownloadBufferPolicy {
+    static let preferenceKey = "downloadBufferCapMiB"
+    static let legacyPreviewPreferenceKey = "previewBufferCapMiB"
     static let gib: UInt64 = 1_073_741_824
-    static let capsMiB = [0, 128, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768]
+    static func maximumMiB(memory: UInt64 = ProcessInfo.processInfo.physicalMemory) -> Int {
+        max(1, Int(clamping: memory / 1_048_576))
+    }
+    static func clampedCapMiB(_ value: Int, memory: UInt64 = ProcessInfo.processInfo.physicalMemory) -> Int {
+        value <= 0 ? 0 : min(value, maximumMiB(memory: memory))
+    }
+    static func savedCapMiB(defaults: UserDefaults, memory: UInt64 = ProcessInfo.processInfo.physicalMemory) -> Int {
+        // An explicit download setting, including Automatic (zero), takes precedence.
+        let key = defaults.object(forKey: preferenceKey) != nil ? preferenceKey : legacyPreviewPreferenceKey
+        return clampedCapMiB(defaults.integer(forKey: key), memory: memory)
+    }
+    static func capsMiB(memory: UInt64 = ProcessInfo.processInfo.physicalMemory) -> [Int] {
+        let maximum = maximumMiB(memory: memory)
+        let wholeGiB = maximum / 1_024
+        let values = [0, 128, 256, 512] + (wholeGiB > 0 ? (1...wholeGiB).map { $0 * 1_024 } : []) + [maximum]
+        return Array(Set(values.filter { $0 <= maximum })).sorted()
+    }
     static func limitBytes(memory: UInt64, capMiB: Int) -> UInt64 {
         capMiB == 0 ? memory : min(memory, UInt64(max(1, capMiB)) * 1_048_576)
     }
@@ -76,6 +94,9 @@ struct DownloadDiskTraffic: Decodable, Equatable {
     var deferredReadTasks: Int? = nil
     var deferredReadBytes: UInt64? = nil
     var readAdmissionDeferrals: UInt64? = nil
+    var discoveryOutstandingFiles: Int? = nil
+    var discoveryWaitingFiles: Int? = nil
+    var finalVerificationTasks: Int? = nil
     var receivingTasks: Int? = nil
     var ramDrainingTasks: Int? = nil
     var diskOnlyTasks: Int? = nil

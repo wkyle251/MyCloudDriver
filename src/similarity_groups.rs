@@ -39,6 +39,15 @@ pub fn group_scores(request: GroupQuery, cancel: &AtomicBool) -> Result<SavedGro
     }
     let matrix =
         store::SavedMatrix::open(&request.data_dir, &request.run_id, request.result_revision)?;
+    let identity = matrix.grouping_identity()?;
+    if let Some(identity) = identity {
+        if let Some(saved) = cached_groups(&request, identity) {
+            check_cancel(cancel)?;
+            if matrix.grouping_identity()? == Some(identity) {
+                return Ok(saved);
+            }
+        }
+    }
     let mut files = BTreeMap::<String, Option<String>>::new();
     for file in &matrix.files {
         check_cancel(cancel)?;
@@ -75,12 +84,114 @@ pub fn group_scores(request: GroupQuery, cancel: &AtomicBool) -> Result<SavedGro
         Ok(())
     })?;
     let groups = spool.partition(&ids, &hashes, cancel)?;
-    Ok(SavedGroups {
-        run_id: request.run_id,
+    let result = SavedGroups {
+        run_id: request.run_id.clone(),
         result_revision: request.result_revision,
         minimum_score: request.minimum_score,
         groups,
-    })
+    };
+    check_cancel(cancel)?;
+    if let Some(identity) =
+        identity.filter(|id| matrix.grouping_identity().ok().flatten().as_ref() == Some(id))
+    {
+        let _ = cache_groups(&request, identity, &result);
+    }
+    Ok(result)
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedGroups {
+    version: u32,
+    identity: [u8; 32],
+    include_identical: bool,
+    result: SavedGroups,
+}
+#[derive(Serialize)]
+struct CachedGroupsRef<'a> {
+    version: u32,
+    identity: [u8; 32],
+    include_identical: bool,
+    result: &'a SavedGroups,
+}
+fn cache_path(request: &GroupQuery) -> PathBuf {
+    request.data_dir.join("runs").join(format!(
+        "{}.groups-{:016x}-{}.zst",
+        request.run_id,
+        request.minimum_score.to_bits(),
+        u8::from(request.include_identical)
+    ))
+}
+fn cached_groups(request: &GroupQuery, identity: [u8; 32]) -> Option<SavedGroups> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(cache_path(request))
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    zstd::stream::read::Decoder::new(file)
+        .ok()?
+        .take((512 << 20) + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 512 << 20 {
+        return None;
+    }
+    let cached: CachedGroups = serde_json::from_slice(&bytes).ok()?;
+    (cached.version == 1
+        && cached.identity == identity
+        && cached.include_identical == request.include_identical
+        && cached.result.run_id == request.run_id
+        && cached.result.result_revision == request.result_revision
+        && cached.result.minimum_score == request.minimum_score)
+        .then_some(cached.result)
+}
+fn cache_groups(request: &GroupQuery, identity: [u8; 32], result: &SavedGroups) -> Result<()> {
+    let target = cache_path(request);
+    let parent = target.parent().context("Missing saved groups directory")?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    {
+        let mut encoder = zstd::stream::Encoder::new(file.as_file_mut(), 1)?;
+        encoder.include_checksum(true)?;
+        // Serialize by reference so large member lists are never cloned.
+        serde_json::to_writer(
+            &mut encoder,
+            &CachedGroupsRef {
+                version: 1,
+                identity,
+                include_identical: request.include_identical,
+                result,
+            },
+        )?;
+        encoder.finish()?;
+    }
+    file.as_file().sync_all()?;
+    file.persist(&target)?;
+    // Keep at most eight threshold results per run. These are disposable
+    // derived files; neither originals nor the saved matrix are removed.
+    let prefix = format!("{}.groups-", request.run_id);
+    let mut entries = std::fs::read_dir(parent)?
+        .filter_map(|e| e.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            if !name.starts_with(&prefix) || !name.ends_with(".zst") {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            (metadata.is_file() && entry.path() != target)
+                .then(|| (metadata.modified().ok(), entry.path()))
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(time, _)| *time);
+    let remove = entries.len().saturating_sub(7);
+    for (_, path) in entries.into_iter().take(remove) {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
 }
 
 /// This temporary database contains only numeric ordinals and measurements.

@@ -64,7 +64,9 @@ fn unpacked<T: serde::de::DeserializeOwned>(bytes: &[u8], maximum: u64) -> Resul
     Ok(serde_json::from_slice(&data)?)
 }
 fn origin(record: &FileRecord) -> (u32, u32, bool) {
-    let finished = matches!(record.state, FileState::Ready | FileState::Unsupported);
+    let finished = !record.error.as_ref().is_some_and(|error| {
+        matches!(error.code, filetwin_core::ErrorCode::Cancelled | filetwin_core::ErrorCode::SourceChanged)
+    });
     (
         u32::from(record.state == FileState::Ready && record.vector.is_some() && !record.reused),
         u32::from(finished && record.reused),
@@ -224,6 +226,12 @@ impl Checkpoint {
         Ok(saved
             .record
             .filter(|record| {
+                // Keep final exclusions and failures as results of this saved
+                // scan. A new scan can retry them; Resume only retries attempts
+                // that were cancelled or invalidated by a changing original.
+                if record.error.as_ref().is_some_and(|error| matches!(error.code,
+                    filetwin_core::ErrorCode::Cancelled | filetwin_core::ErrorCode::SourceChanged)) { return false; }
+                if record.state != FileState::Ready { return true; }
                 record.state == FileState::Ready
                     && record
                         .profile_id
@@ -637,7 +645,7 @@ mod tests {
             "Checkpoint replay must not relabel this session's new analysis as reused"
         );
         drop(checkpoint);
-        let checkpoint = Checkpoint::open(&request).unwrap().unwrap();
+        let mut checkpoint = Checkpoint::open(&request).unwrap().unwrap();
         assert_eq!(
             checkpoint.statistics(),
             json!({"newly_analysed":1,"reused":0}),
@@ -653,15 +661,35 @@ mod tests {
             checkpoint.reused(&alias).unwrap().is_some(),
             "macOS /var and /private/var aliases use the same revision"
         );
+        for state in [FileState::Unsupported, FileState::Skipped, FileState::Failed] {
+            let mut excluded = record.clone();
+            excluded.state = state;
+            excluded.vector = None;
+            excluded.profile_id = None;
+            excluded.error = Some(filetwin_core::Error::new(
+                filetwin_core::ErrorCode::InsufficientContent, "encoding", "Generated exclusion"));
+            checkpoint.completed(&file, &excluded).unwrap();
+            drop(checkpoint);
+            checkpoint = Checkpoint::open(&request).unwrap().unwrap();
+            let saved = checkpoint.reused(&file).unwrap().expect("A completed exclusion must not read the original again on Resume");
+            assert_eq!(saved.state, state);
+            assert!(saved.reused && saved.vector.is_none());
+        }
         std::fs::write(&path, "changed original").unwrap();
         assert!(checkpoint.reused(&file).unwrap().is_none());
         let mut failed = record;
         failed.state = FileState::Failed;
+        failed.error = Some(filetwin_core::Error::new(filetwin_core::ErrorCode::Cancelled,
+            "encoding", "Generated interrupted attempt"));
         checkpoint.completed(&file, &failed).unwrap();
         assert!(
             checkpoint.reused(&file).unwrap().is_none(),
-            "An interrupted/failed file must be tried again"
+            "An interrupted attempt must be tried again"
         );
+        failed.error = Some(filetwin_core::Error::new(filetwin_core::ErrorCode::SourceChanged,
+            "encoding", "Generated changed original"));
+        checkpoint.completed(&file, &failed).unwrap();
+        assert!(checkpoint.reused(&file).unwrap().is_none());
     }
     #[test]
     fn checkpoint_is_private_exclusive_and_scope_bound() {

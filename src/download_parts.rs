@@ -258,9 +258,18 @@ async fn verify_finished_staging(
     saved: ResumeState,
     proof: &[(u64, u64, String)],
     control_id: &str,
-) -> Result<integrity::Prefix, DlError> {
-    match save_serial_prefix(part, &data_path(part), saved, proof, control_id, None).await {
-        Ok(hash) => Ok(hash),
+) -> Result<VerifiedCompletion, DlError> {
+    let result = async {
+        // Shutdown can leave a valid partial checkpoint. Honor its control
+        // before applying the complete-file coverage requirement below.
+        transfer_control::disk_interruptible(control_id, std::future::ready(()))
+            .await.map_err(DlError::Fatal)?;
+        let data = data_path(part);
+        let hash = integrity::Prefix::read_verified(&data, total, proof, control_id).await?;
+        VerifiedCompletion::from_durable_checkpoint(&data, part, saved, hash, control_id).await
+    }.await;
+    match result {
+        Ok(verified) => Ok(verified),
         Err(error) => {
             // Stopping a queued/in-progress check is not evidence of damage.
             // Retain synced complete-piece proof for the next helper; it still
@@ -270,7 +279,13 @@ async fn verify_finished_staging(
                     cause.is::<transfer_control::Paused>() || cause.is::<transfer_control::Cancelled>()
                         || cause.is::<crate::download_verification::Deferred>(),
             };
-            if !interrupted { withdraw_trust(part, file_id, total).await; }
+            if !interrupted {
+                // A control arriving during a failed check must not turn a
+                // paused/cancelled attempt into journal invalidation work.
+                transfer_control::disk_interruptible(control_id, std::future::ready(()))
+                    .await.map_err(DlError::Fatal)?;
+                withdraw_trust(part, file_id, total).await;
+            }
             Err(error)
         }
     }
@@ -298,7 +313,7 @@ async fn withdraw_trust(part: &Path, file_id: &str, total: u64) {
 async fn save_serial_prefix(
     part: &Path,
     data: &Path,
-    mut saved: ResumeState,
+    saved: ResumeState,
     proof: &[(u64, u64, String)],
     control_id: &str,
     retry_state: Option<&RetryState>,
@@ -310,6 +325,19 @@ async fn save_serial_prefix(
         integrity::Prefix::read_verified(data, bytes, proof, control_id)
             .await?
     };
+    save_verified_prefix(part, data, saved, hash, retry_state).await
+}
+
+async fn save_verified_prefix(
+    part: &Path,
+    data: &Path,
+    mut saved: ResumeState,
+    hash: integrity::Prefix,
+    retry_state: Option<&RetryState>,
+) -> Result<integrity::Prefix, DlError> {
+    if saved.durable_bytes != Some(hash.bytes) {
+        return Err(DlError::Fatal(anyhow::anyhow!("Verified checkpoint changed size")));
+    }
     saved.prefix_sha256 = Some(hash.digest());
     saved.save_async(part).await.map_err(DlError::Fatal)?;
     if let Some(retry_state) = retry_state {
@@ -640,6 +668,7 @@ pub(super) async fn attempt_outcome(
         }
     }
     let mut retained_hashes = None;
+    let mut completed_prefix = None;
     let mut healed = None;
     if let Some(saved) = &journal {
         if saved
@@ -660,15 +689,32 @@ pub(super) async fn attempt_outcome(
             .is_some_and(|size| size >= saved.ranges.extent())
         {
             let digests = saved.piece_sha256.as_deref().unwrap_or(&[]);
-            let mut hashes = match progress.retry_state.pieces(&data, saved) {
-                Some(hashes) => hashes,
-                None => restore_hashes(&data, &saved.ranges, digests, saved.data_identity.as_ref(), progress.file_id).await?.hashes,
+            let mut hashes = if data_length == Some(total)
+                && saved.ranges.complete() && saved.ranges.received() == total
+                && pikpak::content_mode::matching_content_revision(
+                    saved.source_revision.as_deref(), progress.source_revision.as_deref())
+            {
+                progress.retry_state.set_final_verification_pending(true);
+                let partitions: Vec<_> = saved.ranges.covered_ranges().map(|(_, _, bytes)| bytes).collect();
+                let (hash, pieces) = integrity::Prefix::read_complete_pieces(
+                    &data, total, &partitions, progress.file_id).await?;
+                completed_prefix = Some(hash);
+                pieces
+            } else {
+                match progress.retry_state.pieces(&data, saved) {
+                    Some(hashes) => hashes,
+                    None => restore_hashes(&data, &saved.ranges, digests, saved.data_identity.as_ref(), progress.file_id).await?.hashes,
+                }
             };
             if digests.len() == hashes.len() {
                 // A piece whose bytes still match its digest is certified. One that no longer does is forgotten and
                 // fetched again, and only that one: damage to a piece must not cost the rest of the file.
                 let damaged: Vec<usize> = (0..hashes.len()).filter(|&index| digests[index] != hashes[index].digest()).collect();
                 if !damaged.is_empty() {
+                    // Repair changes the file: its aggregate proof cannot
+                    // stand in for the mandatory final pass after new writes.
+                    completed_prefix = None;
+                    progress.retry_state.set_final_verification_pending(false);
                     let mut state = saved.ranges.clone();
                     for &index in &damaged {
                         state.forget_piece(index);
@@ -783,8 +829,8 @@ pub(super) async fn attempt_outcome(
                 progress.source_revision.as_deref(),
             )
     }) {
+        progress.retry_state.set_final_verification_pending(true);
         let journal = journal.unwrap();
-        let proof = prefix_proof(&journal.ranges, journal.piece_sha256.as_ref().unwrap());
         // The journal follows data sync. A complete original whose GCID still
         // matches fresh metadata needs publication, never another CDN probe.
         let file = crate::download_fs::open_async(&data_path(part), rustix::fs::OFlags::RDONLY)
@@ -801,10 +847,7 @@ pub(super) async fn attempt_outcome(
                 "Completed download pieces changed size"
             )));
         }
-        let hash = save_serial_prefix(
-            part,
-            &data_path(part),
-            ResumeState {
+        let saved = ResumeState {
                 file_id: progress.source_file_id.into(),
                 total,
                 etag: journal.ranges.etag().into(),
@@ -814,12 +857,17 @@ pub(super) async fn attempt_outcome(
                 durable_bytes: Some(total),
                 unverified_tail: None,
                 prefix_sha256: None,
-            },
-            &proof,
-            progress.file_id,
-            None,
-        )
-        .await?;
+            };
+        let hash = match completed_prefix {
+            Some(hash) => {
+                hash.validate_restored(&opened)?;
+                hash
+            }
+            None => {
+                let proof = prefix_proof(&journal.ranges, journal.piece_sha256.as_ref().unwrap());
+                integrity::Prefix::read_verified(&data_path(part), total, &proof, progress.file_id).await?
+            }
+        };
         crate::download_fs::validate_open_file_async(
             &data_path(part),
             &file
@@ -828,11 +876,12 @@ pub(super) async fn attempt_outcome(
                 .map_err(|error| fatal(error, "Cannot inspect completed download pieces"))?,
         ).await
         .map_err(|error| fatal(error, "Download staging file changed"))?;
-        let verified = VerifiedCompletion::from_prefix(
+        let verified = VerifiedCompletion::from_durable_checkpoint(
             &data_path(part),
+            part,
+            saved,
             hash,
-            progress.source_file_id,
-            progress.source_revision.as_deref(),
+            progress.file_id,
         )
         .await?
         .rename(&data_path(part), part)
@@ -1155,7 +1204,8 @@ pub(super) async fn attempt_outcome(
                     "Incomplete download range coverage"
                 )));
             }
-            let hash = verify_finished_staging(
+            progress.retry_state.set_final_verification_pending(true);
+            let verified = verify_finished_staging(
                 part,
                 progress.source_file_id,
                 total,
@@ -1174,14 +1224,7 @@ pub(super) async fn attempt_outcome(
                 progress.file_id,
             )
             .await?;
-            let verified = VerifiedCompletion::from_prefix(
-                &data_path(part),
-                hash,
-                progress.source_file_id,
-                progress.source_revision.as_deref(),
-            )
-            .await?
-            .rename(&data_path(part), part)
+            let verified = verified.rename(&data_path(part), part)
             .await?;
             remove(part).map_err(DlError::Fatal)?;
             if show_progress {

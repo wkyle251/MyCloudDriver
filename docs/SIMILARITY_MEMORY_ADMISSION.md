@@ -40,6 +40,12 @@ wait cancellably for capacity; unknown-size streams wait for a positive allowanc
 before choosing their bounded claim. Initial encoder configuration and analysis
 allowances retain their positive minimum.
 
+If a warning persists after all held work has drained, the scheduler funds the
+smallest waiting native read and its completion headroom. Only one original may
+enter this recovery lane; its source bank closes before the analysis handoff.
+After that file finishes, the next can proceed without waiting indefinitely for
+the warning to clear. Critical pressure still stops new acquisition.
+
 Reading releases its allowance before a decoded input enters the ready queue.
 Reading never holds analysis RAM while waiting for original RAM; this prevents
 a cycle in which an original cannot be released because its decoder cannot run.

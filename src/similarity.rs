@@ -37,6 +37,13 @@ const READY_QUEUE_CAPACITY: usize = 100_000;
 mod grouping;
 pub use grouping::{group_scores, GroupQuery};
 
+#[path = "similarity_group_index.rs"]
+mod group_index;
+
+#[path = "similarity_exclusions.rs"]
+mod exclusions;
+pub use exclusions::{update_result_files, ResultFilesUpdate};
+
 #[path = "similarity_acceleration.rs"]
 mod acceleration;
 #[path = "similarity_auto_memory.rs"]
@@ -416,6 +423,8 @@ pub struct ScoreRowRequest {
     pub result_revision: u64,
     pub file_id: String,
     pub row_offset: u64,
+    #[serde(default)]
+    pub compact: bool,
 }
 
 /// Query saved measurements only. Locators and temporary paths never leave this
@@ -1056,6 +1065,7 @@ mod tests {
         std::fs::remove_dir_all(&r.local_paths[0]).unwrap();
         let row = score_row(
             ScoreRowRequest {
+                compact: false,
                 data_dir: r.data_dir.clone(),
                 run_id: report.run_id.clone().unwrap(),
                 result_revision: report.result_revision.unwrap(),
@@ -1125,6 +1135,7 @@ mod tests {
         );
         assert!(score_row(
             ScoreRowRequest {
+                compact: false,
                 data_dir: r.data_dir.clone(),
                 run_id: report.run_id.clone().unwrap(),
                 result_revision: report.result_revision.unwrap(),
